@@ -144,6 +144,8 @@ export const fastTests = [
   "native-font-postscript-file",
   "native-font-postscript-procedure-file",
   "native-font-postscript-compression",
+  "native-font-postscript-image-filters",
+  "native-font-postscript-color",
   "native-font-postscript-state",
   "native-font-postscript-global",
   "native-font-postscript-graphics",

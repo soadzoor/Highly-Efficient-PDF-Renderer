@@ -31,13 +31,21 @@ float heprRasterBinaryLinear(vec2 uv) {
 vec4 heprRasterColor(vec2 uv, vec2 uvDx, vec2 uvDy) {
   vec4 color = vec4(0.0);
   if (uRasterMonochrome < 0.5) {
-    color = textureGrad(uRasterTex, uv, uvDx, uvDy);
+    if (uRasterMonochrome < -0.5) {
+      ivec2 size = textureSize(uRasterTex, 0);
+      color = texelFetch(uRasterTex, clamp(ivec2(floor(uv * vec2(size))), ivec2(0), size - 1), 0);
+    } else color = textureGrad(uRasterTex, uv, uvDx, uvDy);
     if (uRasterOpaque > 0.5) color.a = 1.0;
   } else {
     float footprint = max(length(uvDx * uRasterMonoSize), length(uvDy * uRasterMonoSize));
     float lod = max(0.0, log2(max(footprint, 1.0)));
     float coverage = 0.0;
-    if (uRasterMonochrome > 2.5) {
+    if (uRasterMonochrome > 4.5) {
+      ivec2 pixel = clamp(ivec2(floor(uv * uRasterMonoSize)), ivec2(0), ivec2(uRasterMonoSize) - 1);
+      coverage = texelFetch(uRasterTex, pixel, 0).r;
+    } else if (uRasterMonochrome > 3.5) {
+      coverage = heprRasterBit(ivec2(floor(uv * uRasterMonoSize)));
+    } else if (uRasterMonochrome > 2.5) {
       coverage = heprCompactSample(uRasterTex, ivec2(uRasterMonoSize), uv, lod);
     } else if (lod < 1.0) {
       float base = uRasterMonochrome > 1.5 ? textureLod(uRasterTex, uv, 0.0).r : heprRasterBinaryLinear(uv);

@@ -93,6 +93,7 @@ interface RasterTileEntry extends RasterLayerEntry {
 
 interface RasterLayerSource {
   opacity?: number;
+  interpolate?: boolean;
   width: number;
   height: number;
   data: Uint8Array<ArrayBufferLike>;

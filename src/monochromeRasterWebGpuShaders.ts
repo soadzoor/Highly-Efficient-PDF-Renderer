@@ -24,14 +24,20 @@ fn heprMonochromeBilinear(uv : vec2f, size : vec2i) -> f32 {
 }
 
 fn heprMonochromeColor(uv : vec2f, uvDx : vec2f, uvDy : vec2f) -> vec4f {
-  // A half-integer width marks the compact atlas without enlarging the shared UBO.
-  let compact = fract(abs(uRaster.matrixB.w)) > 0.25;
+  // A half-integer width marks compact data; a quarter marks nearest sampling.
+  let fraction = fract(abs(uRaster.matrixB.w));
+  let compact = fraction > 0.375;
+  let nearest = fraction > 0.125 && fraction < 0.375;
   var size = vec2i(i32(abs(uRaster.matrixB.w)), i32(textureDimensions(uRasterTex).y));
   if (compact) { size = vec2i(i32(heprCompactWord(uRasterTex, 0u)), i32(heprCompactWord(uRasterTex, 1u))); }
   let footprint = max(length(uvDx * vec2f(size)), length(uvDy * vec2f(size)));
   let lod = max(log2(max(footprint, 1.0)), 0.0);
   var coverage : f32;
-  if (compact) {
+  if (nearest) {
+    let pixel = clamp(vec2i(floor(uv * vec2f(size))), vec2i(0), size - vec2i(1));
+    if (uRaster.matrixB.w < 0.0) { coverage = textureLoad(uRasterTex, pixel, 0).r; }
+    else { coverage = heprMonochromeBit(pixel, size); }
+  } else if (compact) {
     coverage = heprCompactSample(uRasterTex, size, uv, lod);
   } else if (lod < 1.0) {
     var base : f32;

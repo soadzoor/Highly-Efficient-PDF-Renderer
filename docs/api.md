@@ -1161,26 +1161,41 @@ subset supports font data, arithmetic and control flow, strings and token
 conversion, dictionary stacks, matrices, local/global resources and VM allocation,
 `stopped` error handling and `save`/`restore`. Memory-backed files and lazy
 procedure sources support ASCIIHex, ASCII85, RunLength, LZW, Flate with predictors,
-SubFile, reusable-stream and `eexec` decoding. Retained streams preserve their
+JPEG DCT, CCITT Group 3/4 fax, SubFile, reusable-stream and `eexec` decoding.
+JPEG uses the existing bundled decoder, prepared asynchronously during PDF font
+loading; standalone synchronous font/VM callers must first await
+`prepareBundledJpegCodec`. Unavailable preparation retains a diagnosed fallback.
+Retained streams preserve their
 positions within each glyph and start independently for subsequent glyphs.
 Glyph path, clipping, color and line-style operations retain ordered vector paint
 records alongside the charstring outline. Lasting color, clip and stroke changes
-also apply to the final implicit glyph paint; composite components retain their
-individual states under the selected embedded-font paint policy. Conflicting
-parent and component `seac` states are diagnosed when full inheritance cannot
-be reproduced. Stroke settings not changed by the program inherit the invoking
-PDF state. A lasting PostScript CTM change followed by charstring path construction is diagnosed
-when that later construction cannot reproduce the altered transform.
+also apply to the final implicit glyph paint. Type1 and CFF Type1 `seac`
+components share their parent's glyph-local VM, graphics state and current path;
+the combined outline receives one final implicit paint. Component execution
+preserves mutable helper data, explicit paint order, clipping and CTM changes,
+without using an independently cached component's state. Stroke settings not
+changed by the program inherit the invoking PDF state. Type1 charstring
+coordinates retain the character-space mapping established at glyph entry;
+local PostScript CTMs transform explicit PostScript marks and stroke pens.
 Sampled `image`, `imagemask` and
-`colorimage` operations support 1-, 2-, 4-, 8- and 12-bit components, DeviceGray,
-DeviceRGB and DeviceCMYK, and procedure, file or repeating-string sources.
-Pixels retain vector rectangles with equal runs coalesced; detailed images can
-increase HEP size and pixel-edge antialiasing can differ, as reported by
-`font.postscript-image-vectorized`. Smooth interpolation uses a diagnosed
-nearest-pixel approximation. Access permissions, caller limits and cancellation
+`colorimage` operations support 1-, 2-, 4-, 8- and 12-bit components and procedure,
+file or repeating-string sources. Dictionary images use the current color space,
+including Indexed string/procedure palettes, Separation/DeviceN alternate tint
+procedures, and CIEBasedA/ABC/DEF/DEFG decoding, matrices and interpolated lookup
+tables. These color spaces also support `setcolor`, source component queries and
+graphics-state restoration. CIE output uses the canonical sRGB conversion;
+printer color-rendering dictionaries, gamut mapping and nonzero source black-point
+compensation remain diagnosed approximations.
+Sampled images retain reusable RGBA image assets, clipping and source transforms,
+with interpolation preserved through HEP save/reload and GPU texture sampling.
+Noninterpolated stencils retain coalesced vector runs; interpolated stencils retain
+image masks and inherit the invoking paint. Smooth interpolation algorithms can
+differ between viewers, as permitted by the PostScript image specification.
+Access permissions, caller limits and cancellation
 remain enforced. Device-dependent matrix queries require an explicit execution context.
-Host filesystem access, printer/device control, other image/color-space forms
-and other filter codecs remain unsupported; this is not a general PostScript engine.
+Host filesystem access, printer/device control, Pattern painting, masked/composite
+image dictionaries and other filter codecs remain unsupported; this is not a
+general PostScript engine.
 Unsupported PostScript retains available geometry with diagnostics identifying
 the failing operator.
 Unsupported Type1 loader code that leaves readable declarative records uses

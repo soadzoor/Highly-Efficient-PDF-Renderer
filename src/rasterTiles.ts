@@ -39,6 +39,7 @@ export interface RasterTilePlan {
 }
 
 export interface RasterTileSource {
+  readonly interpolate?: boolean;
   readonly width: number;
   readonly height: number;
   /** Straight-alpha RGBA rows. */

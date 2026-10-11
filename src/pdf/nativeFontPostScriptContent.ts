@@ -1,8 +1,9 @@
-import type { NativeGlyphPathCommand, NativeGlyphPostScriptPaint } from "./nativeFont";
+import type { NativeGlyphPathCommand, NativeGlyphPostScriptPaint, NativeGlyphPostScriptImagePaint } from "./nativeFont";
 import type { DensePdfExtGStateDefinition } from "./nativeContentCompiler";
+import type { PdfStream, PdfValue } from "./nativeCos";
 import { PdfError, throwIfAborted } from "./nativeTypes";
 
-/** Lower font-local imaging to the same retained path compiler as PDF content.
+/** Lower font-local imaging to the retained PDF path and image compiler.
  * Paths are already in normalized glyph coordinates. A stroke's matrix is
  * installed after constructing its path, preserving the independent pen CTM.
  */
@@ -14,9 +15,11 @@ export function serializeNativeGlyphPostScriptPaints(
   readonly bytes: Uint8Array;
   readonly extGStates: ReadonlyMap<string, DensePdfExtGStateDefinition>;
   readonly inheritsPaint: boolean;
+  readonly images: ReadonlyMap<string, NativeGlyphPostScriptImagePaint>;
 } {
   const tokens: string[] = [];
   const extGStates = new Map<string, DensePdfExtGStateDefinition>();
+  const images = new Map<string, NativeGlyphPostScriptImagePaint>();
   let inheritsPaint = false;
   for (const paint of paints) {
     throwIfAborted(signal);
@@ -27,7 +30,7 @@ export function serializeNativeGlyphPostScriptPaints(
       appendPath(tokens, clip.commands, signal);
       tokens.push(clip.fillRule === 1 ? "W* n" : "W n");
     }
-    if (paint.color) {
+    if (paint.color && (paint.kind !== "image" || paint.imageMask)) {
       tokens.push(`${paint.color.slice(0, 3).map(number).join(" ")} ${paint.kind === "stroke" ? "RG" : "rg"}`);
       if (paint.color[3] !== 1) {
         const resourceName = `PSAlpha${extGStates.size}`;
@@ -35,7 +38,16 @@ export function serializeNativeGlyphPostScriptPaints(
         extGStates.set(resourceName, { resourceName, fillAlpha: alpha, strokeAlpha: alpha });
         tokens.push(`/${resourceName} gs`);
       }
-    } else inheritsPaint = true;
+    } else if (paint.kind !== "image" || paint.imageMask) inheritsPaint = true;
+    if (paint.kind === "image") {
+      const name = `PSImage${images.size}`, [a, b, c, d, e, f] = paint.transform;
+      images.set(name, paint);
+      // PDF images place their first source row at v=1; metadata uses row-down
+      // pixel coordinates. Translate and flip that axis exactly once.
+      tokens.push(`${[a * paint.width, b * paint.width, -c * paint.height, -d * paint.height,
+        c * paint.height + e, d * paint.height + f].map(number).join(" ")} cm`, `/${name} Do`, "Q");
+      continue;
+    }
     appendPath(tokens, paint.commands, signal);
     if (paint.kind === "fill") tokens.push(paint.fillRule === 1 ? "f*" : "f");
     else {
@@ -51,7 +63,39 @@ export function serializeNativeGlyphPostScriptPaints(
     }
     tokens.push("Q");
   }
-  return Object.freeze({ bytes: new TextEncoder().encode(tokens.join("\n")), extGStates, inheritsPaint });
+  return Object.freeze({ bytes: new TextEncoder().encode(tokens.join("\n")), extGStates, inheritsPaint, images });
+}
+
+/** Image XObjects reuse native PDF decoding and retained image storage. */
+export function nativeGlyphPostScriptImageStream(image: NativeGlyphPostScriptImagePaint, signal?: AbortSignal): PdfStream {
+  const dictionary = new Map<string, PdfValue>([
+    ["Type", { kind: "name", value: "XObject" }], ["Subtype", { kind: "name", value: "Image" }],
+    ["Width", image.width], ["Height", image.height], ["Interpolate", image.interpolate]
+  ]);
+  const pixels = image.width * image.height;
+  if (image.imageMask) {
+    const rowBytes = Math.ceil(image.width / 8), bytes = new Uint8Array(rowBytes * image.height);
+    for (let y = 0; y < image.height; y++) {
+      throwIfAborted(signal);
+      for (let x = 0; x < image.width; x++) if (image.rgba[(y * image.width + x) * 4 + 3]) {
+        bytes[y * rowBytes + (x >>> 3)] |= 1 << (7 - (x & 7));
+      }
+    }
+    dictionary.set("ImageMask", true); dictionary.set("BitsPerComponent", 1); dictionary.set("Decode", [1, 0]);
+    return { kind: "stream", dictionary, bytes };
+  }
+  const bytes = new Uint8Array(pixels * 3), alpha = new Uint8Array(pixels); let transparent = false;
+  for (let i = 0; i < pixels; i++) {
+    if ((i & 65535) === 0) throwIfAborted(signal);
+    bytes[i * 3] = image.rgba[i * 4]; bytes[i * 3 + 1] = image.rgba[i * 4 + 1]; bytes[i * 3 + 2] = image.rgba[i * 4 + 2];
+    alpha[i] = image.rgba[i * 4 + 3]; transparent ||= alpha[i] !== 255;
+  }
+  dictionary.set("BitsPerComponent", 8); dictionary.set("ColorSpace", { kind: "name", value: "DeviceRGB" });
+  if (transparent) dictionary.set("SMask", { kind: "stream", bytes: alpha,
+    dictionary: new Map<string, PdfValue>([["Type", { kind: "name", value: "XObject" }],
+      ["Subtype", { kind: "name", value: "Image" }], ["Width", image.width], ["Height", image.height],
+      ["BitsPerComponent", 8], ["ColorSpace", { kind: "name", value: "DeviceGray" }], ["Interpolate", image.interpolate]]) });
+  return { kind: "stream", dictionary, bytes };
 }
 
 function appendPath(tokens: string[], commands: readonly NativeGlyphPathCommand[], signal?: AbortSignal): void {

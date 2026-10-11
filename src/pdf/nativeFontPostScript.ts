@@ -9,6 +9,8 @@ import type { NativeFontPostScriptFile, NativeFontPostScriptFilterParameters } f
 import { createNativeFontPostScriptProcedureFile, snapshotNativeFontPostScriptProcedureFile,
   restoreNativeFontPostScriptProcedureFile } from "./nativeFontPostScriptProcedureFile";
 import type { NativeFontPostScriptGlyphContext, NativeFontPostScriptGraphicsState } from "./nativeFontPostScriptGraphics";
+import { parseNativeFontPostScriptColorSpace } from "./nativeFontPostScriptColor";
+import type { NativeFontPostScriptColorSpace } from "./nativeFontPostScriptColor";
 
 export interface NativeFontPostScriptName { readonly kind: "name"; readonly value: string; readonly literal: boolean; }
 export interface NativeFontPostScriptProcedure { readonly kind: "procedure"; readonly tokens: readonly NativeFontPostScriptValue[]; }
@@ -70,6 +72,7 @@ export function executeNativeFontPostScript(cleartext: Uint8Array, privatePlaint
       const procedure = Array.isArray(copiedSubrs) ? copiedSubrs[index] : undefined;
       if (!isProcedure(procedure)) return null;
       try {
+        local.beginGlyphState();
         local.runProcedure(procedure, [...args].reverse());
         return Object.freeze([...local.stack].reverse().map(value => requireNumber(value)));
       } finally { local.finishGlyphState(); local.stack.length = 0; }
@@ -128,6 +131,7 @@ class FontPostScriptVm {
   private errors: Dictionary = new Map();
   private readonly saves: PsSave[] = [];
   private readonly colorSpaces = new WeakMap<readonly number[], Value>();
+  private readonly colorModels = new WeakMap<readonly number[], NativeFontPostScriptColorSpace>();
   private matrix: NativeFontPostScriptMatrix;
   private matrixKnown: boolean;
   private readonly graphics: { matrix: NativeFontPostScriptMatrix; known: boolean; glyphState?: NativeFontPostScriptGraphicsState }[] = [];
@@ -183,6 +187,9 @@ class FontPostScriptVm {
   // Font engines can inspect an opaque Private dictionary while executing its
   // OtherSubrs. This does not grant explicit PS get/put/begin extra access.
   enterDictionary(dictionary: Dictionary): void { this.dictionaries.push(dictionary); this.privilegedDictionaries.add(dictionary); }
+  beginGlyphState(): void {
+    if (this.options.glyphContext) { this.matrix = this.readMatrix([...this.options.glyphContext.strokeStyle.transform]); this.matrixKnown = true; }
+  }
   finishGlyphState(): void { this.options.glyphContext?.setCurrentMatrix(this.matrix); }
 
   glyphEnvironment(dictionary: Dictionary): Dictionary {
@@ -402,6 +409,22 @@ class FontPostScriptVm {
     if (!array) { array = reduceAccess([literalName(space)], 2); this.register(array, true); this.colorSpaces.set(values, array); }
     return array;
   }
+  private colorModel(value: Value): NativeFontPostScriptColorSpace {
+    return parseNativeFontPostScriptColorSpace(value, {
+      read: value => { if (isComposite(value)) requireAccess(value, 2); },
+      call: (procedure, values, outputs) => this.executeColorProcedure(procedure, values, outputs),
+      notice: (code, message) => this.glyphContext("setcolorspace").noteColorApproximation(code, message)
+    });
+  }
+  private currentColorModel(): NativeFontPostScriptColorSpace {
+    const values = this.glyphContext("setcolor").sourceColorValues;
+    return values && this.colorModels.get(values) || this.colorModel(this.currentColorSpace());
+  }
+  private setColor(model: NativeFontPostScriptColorSpace, value: Value, values: readonly number[]): void {
+    const normalized = model.normalize(values), converted = model.convert(normalized), context = this.glyphContext("setcolor");
+    context.setColorSpaceColor(model.name, normalized, converted.rgba, converted.deviceSpace, converted.deviceValues, converted.deviceCmyk);
+    this.colorSpaces.set(context.sourceColorValues!, value); this.colorModels.set(context.sourceColorValues!, model);
+  }
   private imageSource(value: Value): NativeFontPostScriptFile {
     if (value instanceof Uint8Array) {
       requireAccess(value, 2);
@@ -414,7 +437,8 @@ class FontPostScriptVm {
   private image(name: "image" | "imagemask" | "colorimage"): void {
     const context = this.glyphContext(name), ctm = this.contextMatrix(name);
     let width: number, height: number, bits: number, matrix: NativeFontPostScriptMatrix;
-    let components: 1 | 3 | 4 = 1, sources: Value[], decode: number[] | undefined, interpolate = false, polarity = true;
+    let components = 1, sources: Value[], decode: number[] | undefined, interpolate = false, polarity = true;
+    let convertColor: ((values: readonly number[]) => readonly [number, number, number, number]) | undefined;
     const dictionary = this.stack.at(-1);
     if (dictionary instanceof Map && name !== "colorimage") {
       this.pop(); requireAccess(dictionary, 2);
@@ -430,9 +454,9 @@ class FontPostScriptVm {
         if (decode.length !== 2 || !((decode[0] === 0 && decode[1] === 1) || (decode[0] === 1 && decode[1] === 0))) throw unsupported("PostScript imagemask Decode must be [0 1] or [1 0].", name, "rangecheck");
         polarity = decode[0] === 1;
       } else {
-        const space = context.sourceColorSpace;
-        if (!space) throw unsupported("PostScript image needs an explicit DeviceGray, DeviceRGB or DeviceCMYK color space.", name);
-        components = space === "DeviceGray" ? 1 : space === "DeviceRGB" ? 3 : 4;
+        if (!context.sourceColorSpace) throw unsupported("PostScript image needs an explicit color space.", name);
+        const model = this.currentColorModel(); components = model.components;
+        convertColor = values => model.convert(values).rgba;
       }
       const interpolation = dictionary.get("Interpolate") ?? false;
       if (typeof interpolation !== "boolean") throw unsupported("PostScript image Interpolate requires a boolean.", name); interpolate = interpolation;
@@ -454,6 +478,7 @@ class FontPostScriptVm {
       height = this.integer(); width = this.integer();
     }
     if (!Number.isSafeInteger(width) || width < 0 || !Number.isSafeInteger(height) || height < 0 || ![1, 2, 4, 8, 12].includes(bits) || (name === "imagemask" && bits !== 1)) throw unsupported("Invalid PostScript image dimensions or bit depth.", name, "rangecheck");
+    if (decode && (decode.length !== components * 2 || decode.some(value => !Number.isFinite(value)))) throw unsupported("Invalid PostScript image Decode array.", name, "rangecheck");
     // Validate the matrix before consuming inline bytes from currentfile.
     nativeFontPostScriptInvertMatrix(matrix);
     if (width === 0 || height === 0) return;
@@ -482,7 +507,8 @@ class FontPostScriptVm {
       }
     }
     context.image({ width, height, bitsPerComponent: bits as 1 | 2 | 4 | 8 | 12, components,
-      data: data.subarray(0, used), imageMatrix: matrix, ctm, decode, mask: name === "imagemask", polarity, interpolate });
+      data: data.subarray(0, used), imageMatrix: matrix, ctm, decode, mask: name === "imagemask", polarity, interpolate,
+      ...(convertColor ? { convertColor } : {}) });
   }
   private resource(category: string, global = this.globalMode): Dictionary {
     const resources = global ? this.globalResources : this.resources;
@@ -529,6 +555,17 @@ class FontPostScriptVm {
     } catch (error) {
       if (error instanceof RangeError && /call stack/i.test(error.message)) throw new PdfError("resource-limit", "The host stack cannot execute this nested PostScript stream chain.", { cause: error });
       throw error;
+    } finally { this.unwindTasks(depth); this.activeCommand = command; }
+  }
+  private executeColorProcedure(procedure: Procedure, values: readonly number[], outputs: number): readonly number[] {
+    const boundary: Task = { kind: "source-boundary" }, depth = this.tasks.length, stackDepth = this.stack.length;
+    const command = this.activeCommand;
+    this.tasks.push(boundary);
+    try {
+      for (const value of values) this.push(value);
+      this.schedule(procedure); this.run(boundary);
+      if (this.stack.length !== stackDepth + outputs) throw unsupported("A PostScript color procedure returned the wrong number of components.", "setcolor", "rangecheck");
+      return Object.freeze(this.stack.splice(stackDepth).map(requireNumber));
     } finally { this.unwindTasks(depth); this.activeCommand = command; }
   }
   private save(): PsSave {
@@ -873,13 +910,11 @@ class FontPostScriptVm {
       }
       case "setcolorspace": {
         const value = this.pop(); if (isComposite(value)) requireAccess(value, 2);
-        const sequence = arraySequence(value), space = isName(value) ? value.value : sequence?.length === 1 && isName(sequence[0]) ? sequence[0].value : null;
-        const context = this.glyphContext(name);
-        if (space === "DeviceGray") context.setColorGray(0);
-        else if (space === "DeviceRGB") context.setColorRGB(0, 0, 0);
-        else if (space === "DeviceCMYK") context.setColorCMYK(0, 0, 0, 1);
-        else throw unsupported("PostScript glyph colors support DeviceGray, DeviceRGB and DeviceCMYK.", name);
-        if (sequence) this.colorSpaces.set(context.sourceColorValues!, value);
+        const model = this.colorModel(value);
+        // The name shorthand returns an array, as with the device setters.
+        const space = isName(value) ? reduceAccess([literalName(value.value)], 2) : value;
+        if (isName(value)) this.register(space, true);
+        this.setColor(model, space, model.initial);
         break;
       }
       case "currentcolor": {
@@ -888,13 +923,9 @@ class FontPostScriptVm {
         for (const value of values) this.push(value); break;
       }
       case "setcolor": {
-        const context = this.glyphContext(name), space = context.sourceColorSpace;
-        const colorSpace = this.currentColorSpace();
-        if (space === "DeviceGray") context.setColorGray(this.number());
-        else if (space === "DeviceRGB") { const b = this.number(), g = this.number(), r = this.number(); context.setColorRGB(r, g, b); }
-        else if (space === "DeviceCMYK") { const k = this.number(), y = this.number(), m = this.number(), c = this.number(); context.setColorCMYK(c, m, y, k); }
-        else throw unsupported("PostScript setcolor requires an explicit color space in the cached glyph context.", name);
-        this.colorSpaces.set(context.sourceColorValues!, colorSpace); break;
+        const colorSpace = this.currentColorSpace(), model = this.currentColorModel(), values: number[] = [];
+        for (let i = 0; i < model.components; i++) values.unshift(this.number());
+        this.setColor(model, colorSpace, values); break;
       }
       case "currentfile": {
         const active = [...this.tasks].reverse().find(task => task.kind === "input" && task.sourceFile !== false);
@@ -994,8 +1025,8 @@ function postScriptFilterParameters(dictionary: Dictionary | null): NativeFontPo
     if (key === "CloseSource") { if (typeof value !== "boolean") throw unsupported("PostScript CloseSource requires a boolean."); parameters[key] = value; }
     else if (key === "EODCount") { if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw unsupported("PostScript EODCount requires a nonnegative integer."); parameters[key] = value; }
     else if (key === "EODString") { if (!(value instanceof Uint8Array)) throw unsupported("PostScript EODString requires a string."); requireAccess(value, 2); parameters[key] = value; }
-    else if (["EarlyChange", "Predictor", "Colors", "BitsPerComponent", "Columns", "UnitLength"].includes(key)) { if (typeof value !== "number" || !Number.isSafeInteger(value)) throw unsupported(`PostScript ${key} requires an integer.`); parameters[key] = value; }
-    else if (key === "LowBitFirst") { if (typeof value !== "boolean") throw unsupported("PostScript LowBitFirst requires a boolean."); parameters[key] = value; }
+    else if (["EarlyChange", "Predictor", "Colors", "BitsPerComponent", "Columns", "UnitLength", "K", "Rows", "DamagedRowsBeforeError", "ColorTransform"].includes(key)) { if (typeof value !== "number" || !Number.isSafeInteger(value)) throw unsupported(`PostScript ${key} requires an integer.`); parameters[key] = value; }
+    else if (["LowBitFirst", "EndOfLine", "EncodedByteAlign", "EndOfBlock", "BlackIs1", "Uncompressed"].includes(key)) { if (typeof value !== "boolean") throw unsupported(`PostScript ${key} requires a boolean.`); parameters[key] = value; }
     else if (key === "Filter") { if (isName(value)) parameters[key] = value.value; else { requireAccess(value, 2); if (!Array.isArray(value)) throw unsupported("PostScript Filter requires a name or name array."); parameters[key] = value.map(item => { if (!isName(item)) throw unsupported("PostScript Filter array requires names."); return item.value; }); } }
     else if (key === "DecodeParms") { if (value instanceof Map) parameters[key] = postScriptFilterParameters(value); else { requireAccess(value, 2); if (!Array.isArray(value)) throw unsupported("PostScript DecodeParms requires a dictionary or array."); parameters[key] = value.map(item => item === null ? null : item instanceof Map ? postScriptFilterParameters(item) : (() => { throw unsupported("PostScript DecodeParms array requires dictionaries."); })()); } }
   }

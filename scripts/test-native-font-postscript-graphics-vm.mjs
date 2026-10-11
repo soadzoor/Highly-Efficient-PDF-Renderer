@@ -85,7 +85,7 @@ const cases=[
       {3 record source blue readstring pop}
       true 3 colorimage
     /nextByte source read pop def
-  `,expect:{calls:[1,2,3,1,2,3],cursor:6,nextByte:255},paints:4},
+  `,expect:{calls:[1,2,3,1,2,3],cursor:6,nextByte:255},paints:1},
   {name:"explicit strokes preserve unspecified invoking styles",code:`
     newpath 0 0 moveto 10 0 lineto stroke
     gsave 2 setlinecap [3 2] 1 setdash newpath 0 10 moveto 10 10 lineto stroke grestore
@@ -114,8 +114,8 @@ try{
     if(fixture.name.startsWith("gsave"))assert.deepEqual(context.paintRecords[0].commands,
       [{kind:"move",x:100,y:200},{kind:"line",x:110,y:200}]);
     if(fixture.name.startsWith("current line"))assert.deepEqual(context.paintRecords.map(paint=>paint.clips.length),[2,1]);
-    if(fixture.name.startsWith("planar procedure"))assert.deepEqual(context.paintRecords.map(paint=>paint.color),
-      [[16/255,48/255,80/255,1],[32/255,64/255,96/255,1],[112/255,144/255,176/255,1],[128/255,160/255,192/255,1]]);
+    if(fixture.name.startsWith("planar procedure"))assert.deepEqual([...context.paintRecords[0].rgba],
+      [16,48,80,255,32,64,96,255,112,144,176,255,128,160,192,255]);
     if(fixture.name.startsWith("explicit strokes"))assert.deepEqual(context.paintRecords.map(paint=>paint.changedStrokeFields),
       [[],["lineCap","dashArray","dashPhase"],[]],"only explicit setters override the invoking PDF style");
   }catch(error){failures.push(fixture.name);console.error(`${fixture.name}: ${error.stack}`);}

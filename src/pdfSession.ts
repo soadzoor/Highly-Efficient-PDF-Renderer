@@ -120,7 +120,7 @@ import {
   type NativeTextFontResource
 } from "./pdf/nativeText";
 import { buildNativePageTextResources } from "./pdf/nativePageText";
-import { serializeNativeGlyphPostScriptPaints } from "./pdf/nativeFontPostScriptContent";
+import { serializeNativeGlyphPostScriptPaints, nativeGlyphPostScriptImageStream } from "./pdf/nativeFontPostScriptContent";
 import { nativeGlyphPostScriptPaintBounds } from "./pdf/nativeFontPostScriptGraphics";
 import { paintNativeGlyphCommands } from "./pdf/nativeGlyphPaint";
 import { computeNativePdfPageGeometry } from "./pdf/nativePageGeometry";
@@ -5420,6 +5420,7 @@ async function compileNativeType3Programs(
     return localProgramIndex;
   };
 
+  const postScriptImageIndices = new WeakMap<Uint8Array, Map<string, Promise<number>>>();
   const compilePostScriptPaints = async (
     resource: NativeTextFontResource,
     glyphId: number,
@@ -5471,6 +5472,18 @@ async function compileNativeType3Programs(
         clips: finalState.clips, color: finalState.color, ...(stroke ? { stroke } : {}) });
     }
     const content = serializeNativeGlyphPostScriptPaints(paints, initialGraphicsState.fillAlpha, signal);
+    const imageXObjects = new Map<string, number>();
+    for (const [name, image] of content.images) {
+      let variants = postScriptImageIndices.get(image.rgba);
+      if (!variants) postScriptImageIndices.set(image.rgba, variants = new Map());
+      const key = `${image.width}:${image.height}:${image.interpolate}:${image.imageMask === true}`;
+      let index = variants.get(key);
+      if (!index) {
+        index = resources.registry.add(nativeGlyphPostScriptImageStream(image, signal), undefined, signal);
+        variants.set(key, index);
+      }
+      imageXObjects.set(name, await index);
+    }
     const inheritedState: DensePdfInitialGraphicsState = {
       ...initialGraphicsState,
       // PostScript has a single current color. Its inherited strokes use
@@ -5493,6 +5506,7 @@ async function compileNativeType3Programs(
       pageBounds: { minX, minY, maxX, maxY },
       initialGraphicsState: inheritedState,
       extGStates: [...content.extGStates.values()],
+      imageXObjects,
       colorSpaceResolver: resources.colorSpaceResolver,
       ...densePathCompileLimits(document, options),
       enableSegmentMerge: nativeVectorSegmentMergeEnabled(options),

@@ -42,12 +42,14 @@ import {
   NativeCffFont,
   type NativeCffParserLimits
 } from "./nativeCff";
+import { nativeCffUsesPostScript } from "./nativeCffPostScriptProbe";
 import {
   DEFAULT_NATIVE_TYPE1_PARSER_LIMITS,
   NativeType1Font,
   type NativeType1ParserLimits
 } from "./nativeType1";
 import { transformNativeGlyphPostScriptPaints, transformNativeGlyphPostScriptFinalState } from "./nativeFontPostScriptGraphics";
+import { prepareBundledJpegCodec } from "./nativeJpegCodec";
 
 /** Minimal resolver surface needed by the font engine. */
 export interface NativePdfFontResolver {
@@ -238,7 +240,9 @@ export interface NativeGlyphPostScriptClip {
   readonly fillRule: 0 | 1;
 }
 
-export interface NativeGlyphPostScriptPaint {
+export type NativeGlyphPostScriptPaint = NativeGlyphPostScriptPathPaint | NativeGlyphPostScriptImagePaint;
+
+export interface NativeGlyphPostScriptPathPaint {
   readonly kind: "fill" | "stroke";
   readonly commands: readonly NativeGlyphPathCommand[];
   readonly fillRule: 0 | 1;
@@ -257,6 +261,25 @@ export interface NativeGlyphPostScriptPaint {
     readonly dashPhase: number;
     readonly transform: readonly number[];
   };
+}
+
+/** Decoded source pixels, before placement, with straight RGBA8 alpha. */
+export interface NativeGlyphPostScriptImagePaint {
+  readonly kind: "image";
+  readonly width: number;
+  readonly height: number;
+  readonly rgba: Uint8Array;
+  /** Source pixel coordinates (row index increases downwards) to glyph space. */
+  readonly transform: readonly [number, number, number, number, number, number];
+  readonly interpolate: boolean;
+  readonly clips: readonly NativeGlyphPostScriptClip[];
+  /** Stencils use the current color; ordinary sampled images ignore this field. */
+  readonly color: NativeGlyphPostScriptPathPaint["color"];
+  readonly imageMask?: boolean;
+  readonly commands?: never;
+  readonly fillRule?: never;
+  readonly stroke?: never;
+  readonly changedStrokeFields?: never;
 }
 
 export type NativeGlyphPostScriptStrokeField = "width" | "lineCap" | "lineJoin" | "miterLimit" | "dashArray" | "dashPhase";
@@ -3004,7 +3027,7 @@ async function readEmbeddedSfnt(
   // those records participate in HEPR's glyph mapping, metrics, or outlines.
   // Keep every table we do consume fully bounds checked, while treating the
   // unused directory metadata as advisory at this PDF trust boundary.
-  return NativeSfntFont.parse(bytes, 0, limits, "pdf-embedded", signal);
+  return await preparePostScriptFontCodecs(() => NativeSfntFont.parse(bytes, 0, limits, "pdf-embedded", signal), signal);
 }
 
 async function readEmbeddedType1(
@@ -3033,7 +3056,7 @@ async function readEmbeddedType1(
     }
     framing[field] = length;
   }
-  return NativeType1Font.parse(bytes, limits, framing);
+  return await preparePostScriptFontCodecs(() => NativeType1Font.parse(bytes, limits, framing), signal);
 }
 
 async function readEmbeddedCff(
@@ -3064,12 +3087,35 @@ async function readEmbeddedCff(
   }
   const bytes = await resolver.decodeStream(stream, signal);
   throwIfAborted(signal);
-  const font = NativeCffFont.parse(bytes, limits, optionalName(fontDictionary.get("BaseFont")) ?? undefined, signal);
+  const font = await preparePostScriptFontCodecs(() => NativeCffFont.parse(bytes, limits,
+    optionalName(fontDictionary.get("BaseFont")) ?? undefined, signal), signal);
   if (font.formatVersion === 2 &&
       !["CIDFontType0", "CIDFontType2"].includes(optionalName(fontDictionary.get("Subtype")) ?? "")) {
     throw unsupportedFont("A raw CFF2 simple font has no glyph-name Encoding; an OpenType cmap or CID/GID mapping is required.");
   }
   return font;
+}
+
+async function preparePostScriptFontCodecs<T extends { readonly usesPostScript: boolean }>(parse: () => T,
+  signal?: AbortSignal): Promise<T> {
+  let font: T;
+  try { font = parse(); }
+  catch (error) {
+    if (!(error instanceof PdfError) || error.code !== "unsupported-font" || error.details?.reason !== "font-postscript-codec-not-prepared") throw error;
+    await prepareBundledJpegCodec(signal);
+    return parse();
+  }
+  if (!font.usesPostScript) return font;
+  try { await prepareBundledJpegCodec(signal); }
+  catch (error) {
+    // An unavailable optional image codec must not prevent ordinary font-local
+    // vector programs from opening. Actual DCT uses retain typed diagnostics.
+    if (!(error instanceof PdfError) || error.code !== "unsupported-image") throw error;
+    return font;
+  }
+  // Loading PostScript may itself have requested DCT before preparation;
+  // construct a fresh provider so no approximate program/glyph cache survives.
+  return parse();
 }
 
 function reportFontDiagnostics(
@@ -3576,6 +3622,24 @@ export class NativeSfntFont {
     return Object.freeze({ advanceWidth, leftSideBearing });
   }
 
+  get usesPostScript(): boolean {
+    if (this.outlineFormat !== "cff" && this.outlineFormat !== "cff2") return false;
+    const table = this.requireTable(this.outlineFormat === "cff2" ? "CFF2" : "CFF ");
+    return nativeCffUsesPostScript(new Uint8Array(this.view.buffer, this.view.byteOffset + table.offset, table.length), this.signal);
+  }
+
+  private requireCffFont(): NativeCffFont {
+    if (this.cffFont === null) {
+      const table = this.requireTable(this.outlineFormat === "cff2" ? "CFF2" : "CFF ");
+      const bytes = new Uint8Array(this.view.buffer, this.view.byteOffset + table.offset, table.length);
+      const cff = NativeCffFont.parse(bytes, this.cffParserLimits, undefined, this.signal);
+      if (cff.numGlyphs !== this.numGlyphs) throw unsupportedFont("The OpenType CFF/CFF2 CharStrings count disagrees with maxp.numGlyphs.");
+      this.cffFont = cff;
+      if (cff.diagnostics.length) this.diagnosticData = Object.freeze([...this.diagnosticData, ...cff.diagnostics]);
+    }
+    return this.cffFont;
+  }
+
   getGlyphOutline(glyphId: number, applyIntrinsicPaint = true): NativeGlyphOutline {
     throwIfAborted(this.signal);
     this.requireGlyphId(glyphId);
@@ -3583,18 +3647,7 @@ export class NativeSfntFont {
     const cached = cache.get(glyphId);
     if (cached) return cached;
     if (this.outlineFormat === "cff" || this.outlineFormat === "cff2") {
-      if (this.cffFont === null) {
-        const table = this.requireTable(this.outlineFormat === "cff2" ? "CFF2" : "CFF ");
-        const bytes = new Uint8Array(this.view.buffer, this.view.byteOffset + table.offset, table.length);
-        const cff = NativeCffFont.parse(bytes, this.cffParserLimits, undefined, this.signal);
-        if (cff.numGlyphs !== this.numGlyphs) {
-          throw unsupportedFont("The OpenType CFF/CFF2 CharStrings count disagrees with maxp.numGlyphs.");
-        }
-        this.cffFont = cff;
-        if (cff.diagnostics.length) {
-          this.diagnosticData = Object.freeze([...this.diagnosticData, ...cff.diagnostics]);
-        }
-      }
+      this.cffFont = this.requireCffFont();
       const previousDiagnosticCount = this.cffFont.diagnostics.length;
       const source = this.cffFont.getGlyphOutline(glyphId, this.signal, applyIntrinsicPaint);
       if (this.cffFont.diagnostics.length > previousDiagnosticCount) {

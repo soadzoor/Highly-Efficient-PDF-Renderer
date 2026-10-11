@@ -73,6 +73,11 @@ export interface NativeType1CharStringOptions {
   readonly onUnknownOtherSubr?: (index: number) => void;
   readonly blendWeights?: readonly number[];
   readonly executeOtherSubr?: (index: number, args: readonly number[], context: NativeFontPostScriptGlyphContext) => readonly number[] | null;
+  /** Shared only while building one seac glyph; components retain the same
+   * PostScript state and path until its final endchar. */
+  readonly glyphContext?: NativeFontPostScriptGlyphContext;
+  readonly initialCommands?: readonly NativeGlyphPathCommand[];
+  readonly charStringOrigin?: readonly [number, number];
   /** Return base commands followed by accent commands translated by (x,y). */
   readonly resolveComposite?: (
     baseCode: number, accentCode: number, x: number, y: number
@@ -117,6 +122,10 @@ export class NativeType1Font {
   private readonly limits: Readonly<NativeType1ParserLimits>;
   private readonly signal?: AbortSignal;
   private otherSubrExecutorFactory?: NativeFontPostScriptResult["createOtherSubrExecutor"];
+
+  get usesPostScript(): boolean {
+    return this.otherSubrExecutorFactory !== undefined || this.fontDiagnostics.some(diagnostic => diagnostic.code === "font.type1-postscript-approximated");
+  }
 
   private constructor(
     charStrings: readonly Uint8Array[],
@@ -460,6 +469,40 @@ export class NativeType1Font {
   }
 
   private getRawOutline(glyphId: number): NativeType1RawOutline {
+    if (this.otherSubrExecutorFactory) {
+      const cached = this.rawCache.get(glyphId);
+      if (cached) return cached;
+      let executeOtherSubr: ReturnType<NativeFontPostScriptResult["createOtherSubrExecutor"]> | undefined;
+      let otherSubrFailure: PdfError | undefined;
+      const raw = evaluateNativeType1CompositeGlyph({ source: this.charStrings[glyphId], glyphId, subrs: this.subrs }, {
+        limits: this.limits, signal: this.signal, blendWeights: this.blendWeights ?? undefined,
+        executeOtherSubr: (index, args, context) => {
+          otherSubrFailure = undefined;
+          try { executeOtherSubr ??= this.otherSubrExecutorFactory!(this.signal, context); return executeOtherSubr(index, args); }
+          catch (error) { if (!isUnsupported(error)) throw error; otherSubrFailure = error; return null; }
+        },
+        onUnknownOtherSubr: index => {
+          if (this.unknownOtherSubrs.has(index)) return;
+          this.unknownOtherSubrs.add(index);
+          this.fontDiagnostics = Object.freeze([...this.fontDiagnostics, Object.freeze({
+            code: "font.type1-othersubr-approximated", severity: "warning" as const,
+            message: `Type1 OtherSubr ${index} uses the format's argument-preserving compatibility fallback; extension-specific rendering may differ.`,
+            details: Object.freeze({ reason: "type1-unknown-othersubr", othersubr: index, approximate: true,
+              ...(otherSubrFailure ? type1PostScriptFailureDetails(otherSubrFailure) : {}) })
+          })]);
+        },
+        resolveGlyph: code => {
+          const name = standardEncodingName(code), id = name === null ? undefined : this.glyphIds.get(name);
+          if (id === undefined) throw invalid("A Type1 seac references a missing StandardEncoding glyph.", "seac-glyph");
+          return { source: this.charStrings[id], glyphId: id, subrs: this.subrs };
+        }
+      });
+      for (const diagnostic of raw.postScriptDiagnostics ?? []) {
+        if (!this.fontDiagnostics.some(existing => existing.code === diagnostic.code)) this.fontDiagnostics = Object.freeze([...this.fontDiagnostics, diagnostic]);
+      }
+      this.rawCache.set(glyphId, raw);
+      return raw;
+    }
     // Explicit dependency traversal avoids a JS call-stack limit on composites.
     const pending = [glyphId];
     const active = new Set(pending);
@@ -474,7 +517,7 @@ export class NativeType1Font {
       let entry = evaluated.get(id);
       if (!entry) {
         const composite: { value?: Composite } = {};
-        const executorFactory = this.otherSubrExecutorFactory;
+        const executorFactory = this.otherSubrExecutorFactory as NativeFontPostScriptResult["createOtherSubrExecutor"] | undefined;
         let executeOtherSubr: ReturnType<NonNullable<typeof executorFactory>> | undefined;
         let otherSubrFailure: PdfError | undefined;
         const raw = evaluateNativeType1CharString(this.charStrings[id], {
@@ -560,6 +603,62 @@ export class NativeType1Font {
   }
 }
 
+export interface NativeType1CompositeGlyph {
+  readonly source: Uint8Array;
+  readonly glyphId: number;
+  readonly subrs?: NativeType1CharStringOptions["subrs"];
+}
+
+/** Build seac in one glyph-local PostScript environment. The base endchar
+ * ends its subglyph, while the accent endchar finishes the combined path;
+ * neither component gets a separate implicit paint or VM clone. An explicit
+ * traversal avoids the host call stack on nested composites. */
+export function evaluateNativeType1CompositeGlyph(
+  glyph: NativeType1CompositeGlyph,
+  options: Omit<NativeType1CharStringOptions, "glyphId" | "subrs" | "resolveComposite" | "glyphContext" | "initialCommands" | "charStringOrigin"> & {
+    readonly resolveGlyph: (standardEncodingCode: number) => NativeType1CompositeGlyph;
+  }
+): NativeType1RawOutline {
+  const limits = mergeType1Limits(options.limits ?? {});
+  const context = new NativeFontPostScriptGlyphContext({ signal: options.signal, maxPathCommands: limits.maxType1PathCommands });
+  const budget = options.budget ?? { operators: 0, executedBytes: 0, subrCalls: 0 };
+  type Frame = { glyph: NativeType1CompositeGlyph; origin: readonly [number, number];
+    children?: readonly { glyph: NativeType1CompositeGlyph; origin: readonly [number, number] }[]; next: number };
+  const frames: Frame[] = [{ glyph, origin: [0, 0], next: 0 }];
+  const active = new Set<number>([glyph.glyphId]);
+  let root: NativeType1RawOutline | undefined;
+  while (frames.length) {
+    throwIfAborted(options.signal);
+    ceiling(frames.length, limits.maxType1SubrDepth, "composite-depth");
+    const frame = frames[frames.length - 1];
+    if (!frame.children) {
+      let children: Frame["children"];
+      const raw = evaluateNativeType1CharString(frame.glyph.source, { ...options, budget,
+        glyphId: frame.glyph.glyphId, subrs: frame.glyph.subrs,
+        glyphContext: context, initialCommands: context.pathCommands, charStringOrigin: frame.origin,
+        resolveComposite: (baseCode, accentCode, x, y) => {
+          children = [{ glyph: options.resolveGlyph(baseCode), origin: frame.origin },
+            { glyph: options.resolveGlyph(accentCode), origin: [finite(frame.origin[0] + x), finite(frame.origin[1] + y)] }];
+          return [];
+        } });
+      root ??= raw;
+      frame.children = children ?? [];
+    }
+    const child = frame.children[frame.next++];
+    if (child) {
+      if (active.has(child.glyph.glyphId)) throw invalid("A Type1 seac composite contains a glyph cycle.", "seac-cycle");
+      active.add(child.glyph.glyphId);
+      frames.push({ ...child, next: 0 });
+    } else { active.delete(frame.glyph.glyphId); frames.pop(); }
+  }
+  const commands = context.pathCommands, postScriptPaints = context.paintRecords, postScriptFinalState = context.finalState;
+  ceiling(commands.length + nativeGlyphPostScriptCommandCount(postScriptPaints, postScriptFinalState), limits.maxType1PathCommands, "path-commands");
+  return Object.freeze({ commands, advanceWidth: root!.advanceWidth, advanceY: root!.advanceY,
+    leftSideBearing: root!.leftSideBearing, sideBearingY: root!.sideBearingY,
+    ...(postScriptPaints.length ? { postScriptPaints } : {}), ...(postScriptFinalState ? { postScriptFinalState } : {}),
+    ...(context.diagnostics.length ? { postScriptDiagnostics: context.diagnostics } : {}) });
+}
+
 /** Evaluates untransformed Type1 charstrings; CFF callers use lenIV=-1. */
 export function evaluateNativeType1CharString(
   source: Uint8Array,
@@ -573,9 +672,11 @@ export function evaluateNativeType1CharString(
   const frames: { bytes: Uint8Array; offset: number; subr: number | null }[] = [{ bytes: plain(source), offset: 0, subr: null }];
   const activeSubrs = new Set<number>();
   const stack: number[] = [], results: number[] = [];
-  const commands: NativeGlyphPathCommand[] = [];
-  let graphics: NativeFontPostScriptGlyphContext | undefined;
-  let x = 0, y = 0, sbx = 0, sby = 0, wx = 0, wy = 0;
+  const initialCommands = options.initialCommands ?? [];
+  const commands: NativeGlyphPathCommand[] = [...initialCommands];
+  let graphics: NativeFontPostScriptGlyphContext | undefined = options.glyphContext;
+  const [originX, originY] = options.charStringOrigin ?? [0, 0];
+  let x = originX, y = originY, sbx = 0, sby = 0, wx = 0, wy = 0;
   let metrics = false, open = false, ended = false;
   let flex: { x: number; y: number }[] | null = null;
   const budget = options.budget ?? { operators: 0, executedBytes: 0, subrCalls: 0 };
@@ -594,18 +695,17 @@ export function evaluateNativeType1CharString(
     commands.push(command);
   };
   const close = () => { if (open) { append({ kind: "close" }); open = false; } };
+  // BuildChar keeps its original character-space mapping and point. OtherSubr
+  // CTMs affect PostScript marks and pens, rather than these charstring deltas.
   const move = (dx: number, dy: number) => {
-    graphics?.noteCharStringPath();
     x = finite(x + dx); y = finite(y + dy);
     if (!flex) { close(); append({ kind: "move", x, y }); open = true; }
   };
   const line = (dx: number, dy: number) => {
-    graphics?.noteCharStringPath();
     if (!open || flex) fail("A line occurs outside an ordinary contour.");
     x = finite(x + dx); y = finite(y + dy); append({ kind: "line", x, y });
   };
   const curve = (dx1: number, dy1: number, dx2: number, dy2: number, dx3: number, dy3: number) => {
-    graphics?.noteCharStringPath();
     if (!open || flex) fail("A curve occurs outside an ordinary contour.");
     const control1X = finite(x + dx1), control1Y = finite(y + dy1);
     const control2X = finite(control1X + dx2), control2Y = finite(control1Y + dy2);
@@ -640,7 +740,8 @@ export function evaluateNativeType1CharString(
         case 1: case 2: args(6); break; // vstem3 / hstem3
         case 6: {
           const [asb, adx, ady, baseCode, accentCode] = args(5);
-          if (!metrics || commands.length || flex) fail("An invalid seac composite was encountered.");
+          const priorPathOnly = commands.length === initialCommands.length && commands.every((command, index) => command === initialCommands[index]);
+          if (!metrics || (!priorPathOnly && commands.length) || flex) fail("An invalid seac composite was encountered.");
           if (!Number.isSafeInteger(baseCode) || baseCode < 0 || baseCode > 255 ||
             !Number.isSafeInteger(accentCode) || accentCode < 0 || accentCode > 255) fail("seac codes are outside StandardEncoding.");
           if (!options.resolveComposite) fail("seac requires a composite resolver.");
@@ -650,8 +751,9 @@ export function evaluateNativeType1CharString(
         }
         case 7: {
           const values = args(4);
-          if (metrics || commands.length) fail("Duplicate or late sbw.");
-          [sbx, sby, wx, wy] = values; x = sbx; y = sby; metrics = true; break;
+          if (metrics || commands.length !== initialCommands.length) fail("Duplicate or late sbw.");
+          [sbx, sby, wx, wy] = values; x = finite(sbx + originX); y = finite(sby + originY); metrics = true;
+          graphics?.setMetrics(wx, wy); break;
         }
         case 12: { const right = pop(), left = pop(); if (right === 0) fail("div divides by zero."); push(left / right); break; }
         case 16: {
@@ -714,7 +816,7 @@ export function evaluateNativeType1CharString(
           break;
         }
         case 17: if (!results.length) fail("pop has no OtherSubr result."); else push(results.shift()!); break;
-        case 33: { const values = args(2); if (flex) fail("setcurrentpoint occurs during flex."); [x, y] = values; break; }
+        case 33: { const values = args(2); if (flex) fail("setcurrentpoint occurs during flex."); x = finite(values[0] + originX); y = finite(values[1] + originY); break; }
         default: fail(`Escaped operator 12 ${escape} is unsupported.`);
       }
       continue;
@@ -743,8 +845,9 @@ export function evaluateNativeType1CharString(
         activeSubrs.delete(frame.subr!); frames.pop(); break;
       case 13: {
         const values = args(2);
-        if (metrics || commands.length) fail("Duplicate or late hsbw.");
-        [sbx, wx] = values; x = sbx; y = 0; metrics = true; break;
+        if (metrics || commands.length !== initialCommands.length) fail("Duplicate or late hsbw.");
+        [sbx, wx] = values; x = finite(sbx + originX); y = originY; metrics = true;
+        graphics?.setMetrics(wx, wy); break;
       }
       case 14: args(0); if (flex || !metrics) fail("An incomplete glyph ended."); close(); ended = true; break;
       case 21: { const [dx, dy] = args(2); move(dx, dy); break; }
@@ -755,6 +858,7 @@ export function evaluateNativeType1CharString(
     }
   }
   if (!ended || !metrics) fail("The charstring has no complete outline definition.");
+  if (options.glyphContext) graphics!.replacePath(commands, [x, y]);
   const postScriptPaints = graphics?.paintRecords;
   const postScriptFinalState = graphics?.finalState;
   const totalCommands = commands.length + nativeGlyphPostScriptCommandCount(postScriptPaints ?? [], postScriptFinalState);

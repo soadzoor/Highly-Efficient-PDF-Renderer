@@ -1,6 +1,9 @@
 import { PdfError, throwIfAborted } from "./nativeTypes";
 import { createNativeFontPostScriptCompressionDecoder } from "./nativeFontPostScriptCompression";
 import type { NativeFontPostScriptByteDecoder, NativeFontPostScriptCompressionParameters } from "./nativeFontPostScriptCompression";
+import { decodeNativeCcittFaxSource } from "./nativeCcitt";
+import type { NativeCcittParameters } from "./nativeCcitt";
+import { decodeBundledJpegSync } from "./nativeJpegCodec";
 
 export interface NativeFontPostScriptFileOptions {
   readonly signal?: AbortSignal;
@@ -8,8 +11,10 @@ export interface NativeFontPostScriptFileOptions {
   readonly maxDecodedBytes?: number;
 }
 
-export interface NativeFontPostScriptFilterParameters extends NativeFontPostScriptCompressionParameters {
+export interface NativeFontPostScriptFilterParameters extends NativeFontPostScriptCompressionParameters, NativeCcittParameters {
   readonly CloseSource?: boolean;
+  readonly ColorTransform?: number;
+  readonly Uncompressed?: boolean;
   readonly EODCount?: number;
   readonly EODString?: Uint8Array;
   readonly Filter?: string | readonly string[];
@@ -430,6 +435,79 @@ class CompressionFile extends InputFile {
   }
 }
 
+/** Image codecs retain a decoded buffer after their first pull. Creation and
+ * close remain lazy, and cloned glyph VMs own independent source positions. */
+class ImageCodecFile extends InputFile {
+  private output: Uint8Array | undefined;
+  private encoded: Uint8Array | undefined;
+  private outputOffset = 0;
+  readonly filterName: "DCTDecode" | "CCITTFaxDecode";
+  readonly parameters: NativeFontPostScriptFilterParameters;
+  constructor(source: NativeFontPostScriptFile, filterName: "DCTDecode" | "CCITTFaxDecode",
+    parameters: NativeFontPostScriptFilterParameters, options: NativeFontPostScriptFileOptions) {
+    super(options, source, parameters.CloseSource);
+    this.filterName = filterName; this.parameters = parameters;
+  }
+  protected readDecodedByte(): number {
+    if (!this.output) {
+      try {
+        this.output = this.filterName === "CCITTFaxDecode" ? decodeNativeCcittFaxSource(() => this.source!.readByte(), this.parameters, {
+          signal: this.options.signal, limits: { maxOutputBytes: this.options.maxDecodedBytes ?? Number.MAX_SAFE_INTEGER }
+        }).bytes : decodeBundledJpegSync(this.encoded ??= readJpegThroughEoi(this.source!, this.options.signal),
+          this.parameters.ColorTransform === undefined ? {} : { ColorTransform: this.parameters.ColorTransform },
+          { signal: this.options.signal, maxOutputBytes: this.options.maxDecodedBytes }).samples;
+      } catch (cause) {
+        if (!(cause instanceof PdfError) || cause.code === "resource-limit" || cause.code === "aborted" || cause.code === "unsupported-font") throw cause;
+        throw new PdfError("unsupported-font", `${this.filterName} font data could not be decoded: ${cause.message}`, {
+          cause, details: { ...cause.details, reason: cause.details?.reason === "codec-not-prepared"
+            ? "font-postscript-codec-not-prepared" : "font-postscript-image-filter", operator: this.filterName, postScriptError: "ioerror" }
+        });
+      }
+    }
+    return this.outputOffset < this.output.length ? this.output[this.outputOffset++] : -1;
+  }
+  cloneFile(cloneSource: (file: NativeFontPostScriptFile) => NativeFontPostScriptFile,
+    cloneBytes: (bytes: Uint8Array) => Uint8Array, options = this.options): ImageCodecFile {
+    const result = new ImageCodecFile(cloneSource(this.source!), this.filterName, { ...this.parameters }, options);
+    result.output = this.output ? cloneBytes(this.output) : undefined;
+    result.encoded = this.encoded ? cloneBytes(this.encoded) : undefined;
+    result.outputOffset = this.outputOffset; return this.copyState(result);
+  }
+}
+
+/** JPEG APP/table payloads may contain FF D9, so marker lengths and entropy
+ * byte stuffing must be respected instead of scanning for a byte pair. */
+function readJpegThroughEoi(source: NativeFontPostScriptFile, signal?: AbortSignal): Uint8Array {
+  const output: number[] = [];
+  const read = (): number => {
+    throwIfAborted(signal);
+    const value = source.readByte();
+    if (value < 0) throw invalid("DCTDecode font data ended before its JPEG EOI marker.", "ioerror");
+    output.push(value); return value;
+  };
+  if (read() !== 255 || read() !== 216) throw invalid("DCTDecode font data has no JPEG SOI marker.", "ioerror");
+  let entropy = false;
+  while (true) {
+    let marker: number;
+    if (entropy) {
+      if (read() !== 255) continue;
+      do { marker = read(); } while (marker === 255);
+      if (marker === 0 || (marker >= 208 && marker <= 215)) continue;
+    } else {
+      if (read() !== 255) throw invalid("DCTDecode encountered bytes outside a JPEG marker segment.", "ioerror");
+      do { marker = read(); } while (marker === 255);
+    }
+    if (marker === 217) return Uint8Array.from(output);
+    if (marker === 216 || marker === 0 || (marker >= 208 && marker <= 215)) throw invalid("DCTDecode encountered an invalid JPEG marker.", "ioerror");
+    if (marker === 1) continue;
+    const length = read() * 256 + read();
+    if (length < 2) throw invalid("DCTDecode encountered an invalid JPEG segment length.", "ioerror");
+    for (let i = 2; i < length; i++) read();
+    // DNL can occur inside an entropy scan without ending it.
+    if (marker !== 220) entropy = marker === 218;
+  }
+}
+
 /** The caller memoizes sources and byte views to preserve its complete VM graph. */
 export function cloneNativeFontPostScriptFile(file: NativeFontPostScriptFile,
   cloneSource: (file: NativeFontPostScriptFile) => NativeFontPostScriptFile,
@@ -457,6 +535,7 @@ export function createNativeFontPostScriptFilter(source: NativeFontPostScriptFil
     case "RunLengthDecode": return new RunLengthFile(options, input, parameters.CloseSource);
     case "SubFileDecode": return new SubFile(input, parameters, options);
     case "LZWDecode": case "FlateDecode": return new CompressionFile(input, name, parameters, options);
+    case "DCTDecode": case "CCITTFaxDecode": return new ImageCodecFile(input, name, parameters, options);
     case "ReusableStreamDecode": {
       let decoded = input;
       const filters = typeof parameters.Filter === "string" ? [parameters.Filter] : parameters.Filter ?? [];

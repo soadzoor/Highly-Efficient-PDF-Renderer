@@ -360,6 +360,15 @@ layer indices, transforms, paint order, pages and opacity are unchanged, and pac
 the pixels of small layers into shared atlas images. A reader crops every atlas
 cell back into that layer's own straight-alpha RGBA; atlases never reach the GPU.
 
+The optional `scene.rasterLayers.interpolation` string has one character per
+layer: `0` selects nearest source pixels, `1` selects smooth interpolation, and
+`-` keeps the viewer's legacy policy. The string is omitted when every layer uses
+the legacy policy. Readers validate its length and alphabet. This optional
+manifest metadata leaves the binary raster records unchanged; older readers
+ignore it and retain their previous sampling behavior. Nearest layers keep
+independent GPU sampling instead of entering smooth strip/atlas batches, and
+packed monochrome layers retain packed storage with direct texel sampling.
+
 `geometry/raster-layers.varint` holds `atlasCount`, then per atlas an encoding
 byte (0 raw RGBA8, 1 PNG), `width` and `height`. Then `layerCount` and per layer
 a flags byte (bits 0-1 storage: 0 raw RGBA8, 1 PNG, 2 WebP, 3 atlas cell; bit 2

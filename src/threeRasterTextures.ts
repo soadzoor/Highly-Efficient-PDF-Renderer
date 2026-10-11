@@ -46,7 +46,7 @@ export function markThreeRasterTextureForUpload(texture: THREE.Texture): void {
 
 /** Display derivatives preserve packed canonical pixels and never invoke their RGBA getter. */
 export function createThreeRasterTileTextures(source: { width: number; height: number; data: Uint8Array;
-  monochrome?: MonochromeRaster; gpuCompression?: PreparedRasterCompression; gpuPreparation?: PreparedRasterPixels },
+  monochrome?: MonochromeRaster; gpuCompression?: PreparedRasterCompression; gpuPreparation?: PreparedRasterPixels; interpolate?: boolean },
   plan: RasterTilePlan, compressor?: ThreeRasterCompressor,
   format?: RasterCompressionFormat | null, prepared?: PreparedRasterPixels): THREE.Texture[] {
   prepared ??= source.gpuPreparation;
@@ -66,7 +66,7 @@ export function createThreeRasterTileTextures(source: { width: number; height: n
         const bits = packed ? prepared?.monochromeTiles?.[index] ?? monochromeRasterTile(mono, source.width, source.height, tile) : mono;
         const atlas = prepared?.coverageAtlases?.[index] ?? (packed ? buildPackedMonochromeMipAtlas(bits, tile.width, tile.height)
           : buildPackedCoverageMipAtlas(pixels[index], tile.width, tile.height));
-        const compact = prepared?.compactAtlases ? prepared.compactAtlases[index]
+        const compact = source.interpolate === false ? null : prepared?.compactAtlases ? prepared.compactAtlases[index]
           : buildCompactMonochromeAtlas(bits, tile.width, tile.height, atlas, packed ? undefined : pixels[index]);
         if (compact) {
           texture = dataTexture(compact.data, compact.width, compact.height);
@@ -81,7 +81,7 @@ export function createThreeRasterTileTextures(source: { width: number; height: n
           coverage.generateMipmaps = false;
           coverage.minFilter = THREE.LinearFilter;
           texture.addEventListener("dispose", () => coverage.dispose());
-          information.set(texture, monoInfo(bits, coverage, tile.width, tile.height, packed ? 1 : 2));
+          information.set(texture, monoInfo(bits, coverage, tile.width, tile.height, source.interpolate === false ? packed ? 4 : 5 : packed ? 1 : 2));
         }
       } else if (format && compressor) {
         texture = compressor.upload(pixels[index], tile.width, tile.height, format, encoded?.[index]);
@@ -89,6 +89,15 @@ export function createThreeRasterTileTextures(source: { width: number; height: n
         texture = dataTexture(pixels[index], tile.width, tile.height);
         information.set(texture, { ...threeRasterTextureInfo(texture), size: new THREE.Vector2(tile.width, tile.height),
           estimatedBytes: estimateRasterTextureBytes(tile.width, tile.height, false) });
+      }
+      if (source.interpolate === false) {
+        texture.minFilter = THREE.NearestFilter;
+        // Three omits sampler bindings when both filters are nearest. Ordinary
+        // images use explicit texel loads in mode -1; keep their unused sampler
+        // filterable so a material can also switch back to smooth sampling.
+        texture.magFilter = mono ? THREE.NearestFilter : THREE.LinearFilter;
+        texture.generateMipmaps = false;
+        if (!mono) information.set(texture, { ...threeRasterTextureInfo(texture), mode: -1 });
       }
       textures.push(texture);
     }
@@ -108,7 +117,7 @@ function monoInfo(mono: MonochromeRaster, coverage: THREE.Texture,
       mono.colors[offset + 2] / 255 * alpha, alpha);
   };
   return { mode, coverage, size: new THREE.Vector2(width, height), color0: color(0), color1: color(4),
-    estimatedBytes: estimateRasterTextureBytes(width, height, mode === 1, null, mode === 2), uvScale: [1, 1] };
+    estimatedBytes: estimateRasterTextureBytes(width, height, mode === 1 || mode === 4, null, mode === 2 || mode === 5), uvScale: [1, 1] };
 }
 
 function dataTexture(data: Uint8Array, width: number, height: number, singleChannel = false): THREE.DataTexture {

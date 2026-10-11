@@ -510,7 +510,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       imagePixels.set(key, pixels);
     } else pixels = compositeBinaryStencilPlates(pending.plates, pending.width, pending.height, stencilScale, signal);
     const first = scene.rasterLayers.length;
-    scene.rasterLayers.push({ ...pixels, matrix: pending.matrix, paintOrder: first, pageIndex: 0 });
+    scene.rasterLayers.push({ ...pixels, matrix: pending.matrix, paintOrder: first, pageIndex: 0, interpolate: false });
     const previousItem = currentItem;
     currentItem = pending.item;
     try { appendRun("raster", first, 1, pending.clip, pending.condition); } finally { currentItem = previousItem; }
@@ -975,7 +975,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
         const layerMatrix = Float32Array.from(multiplyHeprMatrices(matrix, [1, 0, 0, -1, 0, 1]));
         // Flatten only co-located binary plates in one source-over scope. Other
         // paints, clips, layers, marked-content items and groups end the tile.
-        let canComposite = stencil?.[3] === 1 && images.softMaskImageIndices[index] < 0 &&
+        let canComposite = stencil?.[3] === 1 && images.interpolate[index] === 0 && images.softMaskImageIndices[index] < 0 &&
           images.formats[index] === HEPR_IMAGE_FORMAT.Gray8 && source.length === images.widths[index] * images.heights[index] &&
           !knockoutScopes.has(stack.at(-1)!);
         if (canComposite) {
@@ -1032,7 +1032,8 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
           imagePixels.set(key, pixels = { data, width, height });
         }
         const first = scene.rasterLayers.length; budget(6);
-        const base = { width: pixels.width, height: pixels.height, matrix: layerMatrix, paintOrder: first, pageIndex: 0 };
+        const base = { width: pixels.width, height: pixels.height, matrix: layerMatrix, paintOrder: first, pageIndex: 0,
+          interpolate: images.interpolate[index] !== 0 };
         scene.rasterLayers.push(pixels.monochrome
           ? createMonochromeRasterLayer(base, pixels.monochrome)
           : { ...base, data: pixels.data });

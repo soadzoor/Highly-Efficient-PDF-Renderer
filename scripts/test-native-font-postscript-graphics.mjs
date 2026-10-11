@@ -13,6 +13,7 @@ try {
   const { NativeType1Font, evaluateNativeType1CharString } = await import("../src/pdf/nativeType1.ts");
   const { executeNativeFontPostScript } = await import("../src/pdf/nativeFontPostScript.ts");
   const { PdfError } = await import("../src/pdf/nativeTypes.ts");
+  const { serializeNativeGlyphPostScriptPaints, nativeGlyphPostScriptImageStream } = await import("../src/pdf/nativeFontPostScriptContent.ts");
   const identity = [1, 0, 0, 1, 0, 0];
   const bytes = value => new TextEncoder().encode(value);
   const near = (actual, expected, tolerance = 1e-9) => {
@@ -109,32 +110,64 @@ try {
   image.image({ width: 2, height: 2, bitsPerComponent: 8, components: 3,
     data: Uint8Array.of(255, 0, 0, 0, 0, 255, 255, 0, 0, 0, 0, 255),
     imageMatrix: [2, 0, 0, -2, 0, 2], ctm: [100, 0, 0, 200, 10, 20] });
-  assert.equal(image.paintRecords.length, 2); assert(image.paintRecords.every(record => record.commands.length === 5));
-  assert.deepEqual(image.paintRecords.map(record => record.color), [[1, 0, 0, 1], [0, 0, 1, 1]]);
-  assert.deepEqual(image.paintRecords[0].commands[0], { kind: "move", x: 10, y: 220 });
+  assert.equal(image.paintRecords.length, 1); assert.equal(image.paintRecords[0].kind, "image");
+  assert.deepEqual([...image.paintRecords[0].rgba], [255,0,0,255,0,0,255,255,255,0,0,255,0,0,255,255]);
+  assert.deepEqual(image.paintRecords[0].transform, [50, 0, 0, -100, 10, 220]);
+  const movedImage = transformNativeGlyphPostScriptPaints(image.paintRecords, [2, 0, 0, 3, 5, 7]);
+  assert.equal(movedImage[0].rgba, image.paintRecords[0].rgba, "transforms share immutable sampled pixels");
+  near(nativeGlyphPostScriptPaintBounds(movedImage), [25, 67, 225, 667]);
+  assert.equal(nativeGlyphPostScriptCommandCount(image.paintRecords), 5);
   near(nativeGlyphPostScriptPaintBounds(image.paintRecords), [10, 20, 110, 220]);
-  assert.deepEqual(image.diagnostics.map(diagnostic => diagnostic.code), ["font.postscript-image-vectorized"]);
+  assert.deepEqual(image.diagnostics, []);
   const packedImage = new Graphics();
   packedImage.image({ width: 3, height: 1, bitsPerComponent: 2, components: 1,
     data: Uint8Array.of(0x1c), imageMatrix: identity, ctm: identity });
-  near(packedImage.paintRecords.map(record => record.color[0]), [0, 1 / 3, 1]);
+  assert.deepEqual([...packedImage.paintRecords[0].rgba], [0,0,0,255,85,85,85,255,255,255,255,255]);
   const twelveBit = new Graphics();
   twelveBit.image({ width: 1, height: 1, bitsPerComponent: 12, components: 1,
     data: Uint8Array.of(0x80, 0x00), decode: [1, 0], imageMatrix: identity, ctm: identity });
-  near([twelveBit.paintRecords[0].color[0]], [1 - 2048 / 4095]);
+  assert.deepEqual([...twelveBit.paintRecords[0].rgba], [127,127,127,255]);
   const cmykImage = new Graphics();
   cmykImage.image({ width: 1, height: 1, bitsPerComponent: 8, components: 4,
     data: Uint8Array.of(255, 0, 0, 0), imageMatrix: identity, ctm: identity });
-  assert.deepEqual(cmykImage.paintRecords[0].color, [0, 1, 1, 1]);
+  assert.deepEqual([...cmykImage.paintRecords[0].rgba], [0,255,255,255]);
   const partialImage = new Graphics();
   partialImage.image({ width: 1000000, height: 1000000, bitsPerComponent: 8, components: 1,
     data: Uint8Array.of(127), imageMatrix: identity, ctm: identity, interpolate: true });
-  assert.equal(partialImage.paintRecords[0].commands.length, 5, "early source termination does not traverse undeclared billions of missing samples");
+  assert.equal(partialImage.paintRecords[0].width, 1, "early source termination retains only the available pixel");
+  assert.equal(partialImage.paintRecords[0].height, 1);
+  assert.equal(partialImage.paintRecords[0].interpolate, true);
   assert.deepEqual(partialImage.diagnostics.map(diagnostic => diagnostic.code),
-    ["font.postscript-image-vectorized", "font.postscript-image-truncated", "font.postscript-image-interpolation-approximated"]);
+    ["font.postscript-image-truncated"]);
   assert.throws(() => new Graphics({ maxPathCommands: 4 }).image({ width: 1, height: 1,
     bitsPerComponent: 8, components: 1, data: Uint8Array.of(0), imageMatrix: identity, ctm: identity }),
     error => error instanceof PdfError && error.code === "resource-limit");
+
+  const limitedImage = new Graphics({ maxImageBytes: 3 });
+  assert.throws(() => limitedImage.image({ width:1,height:1,bitsPerComponent:8,components:1,
+    data:Uint8Array.of(0),imageMatrix:identity,ctm:identity }), error=>error instanceof PdfError&&error.code==="resource-limit");
+  const indexedImage = new Graphics();
+  indexedImage.image({width:1,height:1,bitsPerComponent:8,components:1,data:Uint8Array.of(255),
+    decode:[0,7],imageMatrix:identity,ctm:identity,convertColor:values=>{
+      assert.deepEqual(values,[7],"Indexed Decode values reach the color converter unclamped");return [1,0,.5,.25];}});
+  assert.deepEqual([...indexedImage.paintRecords[0].rgba],[255,0,128,64]);
+  const interpolatedMask = new Graphics();
+  interpolatedMask.image({width:2,height:1,bitsPerComponent:1,components:1,data:Uint8Array.of(0x80),
+    decode:[1,0],mask:true,polarity:true,interpolate:true,imageMatrix:identity,ctm:identity});
+  assert.equal(interpolatedMask.paintRecords[0].imageMask,true);
+  assert.deepEqual([...interpolatedMask.paintRecords[0].rgba],[255,255,255,255,255,255,255,0]);
+  assert.deepEqual(interpolatedMask.diagnostics,[]);
+  const imageContent=serializeNativeGlyphPostScriptPaints(image.paintRecords,1);
+  assert.equal(imageContent.images.size,1);assert.equal(imageContent.inheritsPaint,false,"ordinary image colors do not inherit text paint");
+  assert(new TextDecoder().decode(imageContent.bytes).includes("100 0 0 200 10 20 cm"),"row-down source transforms convert to PDF image coordinates without a vertical flip");
+  const alphaStream=nativeGlyphPostScriptImageStream(indexedImage.paintRecords[0]);
+  assert.deepEqual([...alphaStream.bytes],[255,0,128]);assert.deepEqual([...alphaStream.dictionary.get("SMask").bytes],[64]);
+  const stencilStream=nativeGlyphPostScriptImageStream(interpolatedMask.paintRecords[0]);
+  assert.deepEqual([...stencilStream.bytes],[0x80]);assert.deepEqual(stencilStream.dictionary.get("Decode"),[1,0]);
+  assert.equal(stencilStream.dictionary.get("Interpolate"),true);
+  const cancelledImage=new AbortController();cancelledImage.abort();
+  assert.throws(()=>new Graphics({signal:cancelledImage.signal}).image({width:1,height:1,bitsPerComponent:8,components:1,
+    data:Uint8Array.of(0),imageMatrix:identity,ctm:identity}),error=>error instanceof PdfError&&error.code==="aborted");
 
   const arc = new Graphics(); arc.moveTo(0, 0, identity);
   near(arc.arcTo(100, 0, 100, 100, 25, identity), [75, 0, 100, 25]);
@@ -187,20 +220,20 @@ try {
   assert.equal(vmMask.context.paintRecords[0].commands.length, 10, "string image sources repeat until all rows are supplied");
   assert.equal(vmMask.context.paintRecords[0].color, null);
   const vmGray = vmImage("2 1 8 [1 0 0 1 0 0] <00ff> image");
-  assert.deepEqual(vmGray.context.paintRecords.map(record => record.color), [[0, 0, 0, 1], [1, 1, 1, 1]]);
+  assert.deepEqual([...vmGray.context.paintRecords[0].rgba], [0,0,0,255,255,255,255,255]);
   const vmRGB = vmImage(`1 0 0 setrgbcolor
     << /ImageType 1 /Width 2 /Height 1 /BitsPerComponent 8 /ImageMatrix [1 0 0 1 0 0]
       /Decode [0 1 0 1 0 1] /DataSource <ff00000000ff> >> image`);
-  assert.deepEqual(vmRGB.context.paintRecords.map(record => record.color), [[1, 0, 0, 1], [0, 0, 1, 1]]);
+  assert.deepEqual([...vmRGB.context.paintRecords[0].rgba], [255,0,0,255,0,0,255,255]);
   const vmPlanar = vmImage("2 1 8 [1 0 0 1 0 0] <ff00> <0000> <00ff> true 3 colorimage");
-  assert.deepEqual(vmPlanar.context.paintRecords.map(record => record.color), [[1, 0, 0, 1], [0, 0, 1, 1]]);
+  assert.deepEqual([...vmPlanar.context.paintRecords[0].rgba], [255,0,0,255,0,0,255,255]);
   const vmProcedures = vmImage(`/calls 0 def
     2 1 8 [1 0 0 1 0 0] { /calls calls 1 add def calls 1 eq { <00> } { <ff> } ifelse } image`);
   assert.equal(vmProcedures.dictionary.get("calls"), 2);
-  assert.deepEqual(vmProcedures.context.paintRecords.map(record => record.color), [[0, 0, 0, 1], [1, 1, 1, 1]]);
+  assert.deepEqual([...vmProcedures.context.paintRecords[0].rgba], [0,0,0,255,255,255,255,255]);
   const vmEarlyEOF = vmImage(`/calls 0 def
     3 1 8 [1 0 0 1 0 0] { /calls calls 1 add def calls 1 eq { <40> } { () } ifelse } image`);
-  assert.equal(vmEarlyEOF.context.paintRecords[0].commands.length, 5);
+  assert.equal(vmEarlyEOF.context.paintRecords[0].width, 1);
   assert(vmEarlyEOF.context.diagnostics.some(diagnostic => diagnostic.code === "font.postscript-image-truncated"));
   const vmFile = vmImage(`/source <00ffee> /ReusableStreamDecode filter def
     2 1 8 [1 0 0 1 0 0] source image
@@ -210,7 +243,7 @@ try {
   const vmInline = vmImage(concatType1Bytes("2 1 8 [1 0 0 1 0 0] currentfile image ",
     Uint8Array.of(0, 255), "\n/afterImage 123 def\n"));
   assert.equal(vmInline.dictionary.get("afterImage"), 123, "inline image bytes resume at the next PostScript token");
-  assert.deepEqual(vmInline.context.paintRecords.map(record => record.color), [[0, 0, 0, 1], [1, 1, 1, 1]]);
+  assert.deepEqual([...vmInline.context.paintRecords[0].rgba], [0,0,0,255,255,255,255,255]);
 
   // Direct evaluator callbacks receive a live path, while the Type1 BuildChar
   // register is explicitly changed only by setcurrentpoint (Type1 §6.4).
@@ -253,8 +286,10 @@ try {
         0, 4, "callothersubr", 0, 100, "rlineto", "endchar")]] });
   const imageFont = NativeType1Font.parse(imageFixture.bytes);
   const imageOutline = imageFont.getGlyphOutline(imageFont.glyphIdForName("A"), false);
-  assert.deepEqual(imageOutline.postScriptPaints.map(record => record.color), [[1, 0, 0, 1], [0, 0, 0, 1], [1, 1, 1, 1]]);
-  assert.deepEqual(imageFont.diagnostics.map(diagnostic => diagnostic.code), ["font.postscript-image-vectorized"]);
+  assert.deepEqual(imageOutline.postScriptPaints.map(record => record.kind), ["fill","image"]);
+  assert.deepEqual(imageOutline.postScriptPaints[0].color,[1,0,0,1]);
+  assert.deepEqual([...imageOutline.postScriptPaints[1].rgba],[0,0,0,255,255,255,255,255]);
+  assert.deepEqual(imageFont.diagnostics, []);
 
   const finalFixture = buildType1Fixture({ fontMatrix: [0.002, 0, 0, 0.003, 0.01, 0.02],
     privateExtra: `/OtherSubrs [{} {} {} {} {
@@ -273,8 +308,23 @@ try {
   assert.deepEqual(finalOutline.postScriptFinalState.stroke.transform, [4, 0, 0, 9, 10, 20]);
   assert.equal(finalOutline.postScriptFinalState.clips.length, 0, "restored clip must not constrain the final outline");
   assert(finalOutline.commands.length > 0, "state-aware fill must keep the raw outline for PDF stroke and clip modes");
-  assert(finalFont.diagnostics.some(diagnostic => diagnostic.code === "font.postscript-charstring-ctm-approximated"),
-    "lasting PS transforms before later charstring operators must disclose the retained glyph-coordinate approximation");
+  assert.deepEqual(finalOutline.commands[2], { kind: "line", x: 310, y: 320 },
+    "Type1 character-space deltas keep their original mapping after an OtherSubr changes the PS CTM");
+  assert.deepEqual(finalFont.diagnostics, []);
+
+  const mappedFixture = buildType1Fixture({ privateExtra: `/OtherSubrs [{} {} {} {} { 2 3 scale } {
+      gsave currentpoint newpath moveto 10 0 rlineto 0 10 rlineto fill grestore
+    }] def`, glyphs: [[".notdef", type1CharString(0, 500, "hsbw", "endchar")],
+      ["A", type1CharString(0, 600, "hsbw", 100, 100, "rmoveto", 100, 0, "rlineto",
+        0, 4, "callothersubr", 0, 100, "rlineto", 0, 5, "callothersubr", "endchar")]] });
+  const mappedFont = NativeType1Font.parse(mappedFixture.bytes), mapped = mappedFont.getGlyphOutline(1, false);
+  assert.deepEqual(mapped.commands.slice(0, 3), [{ kind: "move", x: 100, y: 100 },
+    { kind: "line", x: 200, y: 100 }, { kind: "line", x: 200, y: 200 }]);
+  assert.deepEqual(mapped.postScriptPaints[0].commands.map(command => ({ ...command,
+    x: Math.round(command.x * 1e9) / 1e9, y: Math.round(command.y * 1e9) / 1e9 })), [{ kind: "move", x: 200, y: 200 },
+    { kind: "line", x: 220, y: 200 }, { kind: "line", x: 220, y: 230 }],
+    "OtherSubr currentpoint inverse-maps the frozen character path through the lasting PS CTM; its own relative marks use that CTM");
+  assert.deepEqual(mappedFont.diagnostics, []);
 
   const clippedFixture = buildType1Fixture({ privateExtra: `/OtherSubrs [{} {} {} {} { clip 0 1 0 setrgbcolor }] def`,
     glyphs: [[".notdef", type1CharString(0, 500, "hsbw", "endchar")],
@@ -300,19 +350,51 @@ try {
   const compositeId = compositeFont.glyphIdForName("Aacute");
   const pdfComposite = compositeFont.getGlyphOutline(compositeId, false);
   const fontComposite = compositeFont.getGlyphOutline(compositeId, true);
-  assert.deepEqual(pdfComposite.postScriptPaints.map(record => record.kind), ["fill", "fill", "fill"]);
-  assert.deepEqual(fontComposite.postScriptPaints.map(record => record.kind), ["fill", "stroke", "stroke"],
-    "seac component implicit paints follow the selected PDF/font policy without poisoning the other cache");
-  assert.deepEqual(pdfComposite.postScriptPaints.map(record => record.color), [[0, 0, 1, 1], [1, 0, 0, 1], [0, 1, 0, 1]],
-    "parent marks precede independently colored base and accent final paints");
-  assert.deepEqual(pdfComposite.postScriptPaints[2].commands[0], { kind: "move", x: 130, y: 350 });
-  assert.deepEqual(pdfComposite.postScriptFinalState, { clips: [], color: null, omitFinalPaint: true });
-  assert.equal(compositeFont.diagnostics.filter(diagnostic => diagnostic.code === "font.type1-seac-state-approximated").length, 1,
-    "parent/component PostScript state conflicts must diagnose the approximation once across both policy caches");
+  assert.deepEqual(pdfComposite.postScriptPaints.map(record => record.kind), ["fill"]);
+  assert.deepEqual(fontComposite.postScriptPaints, pdfComposite.postScriptPaints,
+    "explicit parent marks survive both PDF/font policies without poisoning either cache");
+  assert.deepEqual(pdfComposite.postScriptPaints[0].color, [0, 0, 1, 1]);
+  assert.deepEqual(pdfComposite.commands[5], { kind: "move", x: 130, y: 350 });
+  assert.deepEqual(pdfComposite.postScriptFinalState, { clips: [], color: [0, 1, 0, 1] },
+    "the accent's lasting state paints the combined seac path once at its final endchar");
+  assert.deepEqual(compositeFont.diagnostics, []);
   assert.equal(pdfComposite.commands.length, 9, "composite raw contours remain available for PDF stroke/clip");
-  assert(fontComposite.postScriptPaints.slice(1).every(record => record.stroke.width === 0 && record.changedStrokeFields.includes("width")),
-    "component hairlines retain device-dependent width zero and inherit remaining invoking stroke style");
-  assert.throws(() => NativeType1Font.parse(compositeFixture.bytes, { maxType1PathCommands: 21 }).getGlyphOutline(compositeId, false),
+  assert.equal(fontComposite.intrinsicStroke.width, 0, "the combined final font paint retains its device-dependent hairline");
+  assert.equal(pdfComposite.intrinsicStroke, undefined);
+  assert.throws(() => NativeType1Font.parse(compositeFixture.bytes, { maxType1PathCommands: 12 }).getGlyphOutline(compositeId, false),
+    error => error instanceof PdfError && error.code === "resource-limit");
+
+  const inheritedFixture = buildType1Fixture({ privateExtra: `/state [0] def
+    /OtherSubrs [{} {} {} {} {
+      state 0 state 0 get 1 add put
+      gsave newpath 0 0 moveto state 0 get 10 mul 0 lineto 0 10 lineto fill grestore
+      1 0 0 setrgbcolor 2 3 scale
+    } {
+      state 0 state 0 get 1 add put
+      gsave newpath 0 0 moveto state 0 get 10 mul 0 lineto 0 10 lineto fill grestore
+    } { state 0 7 put 0.25 setgray 0 0 500 500 rectclip }] def`,
+    glyphs: [[".notdef", type1CharString(0, 500, "hsbw", "endchar")],
+      ["A", type1CharString(50, 600, "hsbw", 0, 0, "rmoveto", 40, 0, "rlineto", 0, 4, "callothersubr", "endchar")],
+      ["acute", type1CharString(20, 0, "hsbw", 0, 0, "rmoveto", 10, 0, "rlineto", 0, 5, "callothersubr", "endchar")],
+      ["Aacute", type1CharString(50, 600, "hsbw", 0, 6, "callothersubr", 20, 80, 350, 65, 194, "seac")],
+      ["B", type1CharString(50, 600, "hsbw", 0, 6, "callothersubr", 20, 80, 350, 65, 194, "seac")]] });
+  const inheritedFont = NativeType1Font.parse(inheritedFixture.bytes);
+  const standalone = inheritedFont.getGlyphOutline(1, false);
+  assert.equal(standalone.postScriptPaints[0].commands[1].x, 10);
+  const inherited = inheritedFont.getGlyphOutline(3, false);
+  assert.deepEqual(inherited.postScriptPaints.map(record => record.commands[1].x), [80, 180],
+    "one mutable Private state persists parent→base→accent, independently of cached standalone component outlines");
+  assert.deepEqual(inherited.postScriptPaints.map(record => record.color), [[0.25, 0.25, 0.25, 1], [1, 0, 0, 1]]);
+  assert(inherited.postScriptPaints.every(record => record.clips.length === 1), "both component marks inherit the parent's clip");
+  assert.deepEqual(inherited.postScriptFinalState.color, [1, 0, 0, 1]);
+  assert.deepEqual(inherited.postScriptFinalState.stroke.transform, [2, 0, 0, 3, 0, 0]);
+  assert.deepEqual(inherited.commands.filter(command => command.kind === "move"),
+    [{ kind: "move", x: 50, y: 0 }, { kind: "move", x: 130, y: 350 }]);
+  assert.equal(inherited.advanceWidth, 600, "accent metrics cannot replace the composite's width");
+  assert.deepEqual(inheritedFont.getGlyphOutline(4, false).postScriptPaints, inherited.postScriptPaints,
+    "a different glyph gets a fresh VM even after a stateful composite was cached");
+  assert.deepEqual(inheritedFont.diagnostics, []);
+  assert.throws(() => NativeType1Font.parse(inheritedFixture.bytes, { maxType1SubrDepth: 1 }).getGlyphOutline(3, false),
     error => error instanceof PdfError && error.code === "resource-limit");
 
   const wideFixture = buildType1Fixture({ paintType: 2, clearExtra: "/StrokeWidth 1 def",

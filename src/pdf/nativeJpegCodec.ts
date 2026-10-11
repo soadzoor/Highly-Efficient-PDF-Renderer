@@ -105,6 +105,42 @@ const JPEG_CODEC_OVERHEAD_BYTES = 1024 * 1024;
 const JPEG_COEFFICIENT_BYTES = 2;
 
 let compiledModulePromise: Promise<WebAssembly.Module> | undefined;
+let preparedModule: WebAssembly.Module | undefined;
+
+/** Prepare the shared package asset for synchronous font-local DCT filters.
+ * The normal async image resolver and font interpreter reuse one module. */
+export async function prepareBundledJpegCodec(signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  try { await waitForModule(loadCompiledModule(), signal); }
+  catch (cause) {
+    if (cause instanceof PdfError) throw cause;
+    throw jpegError("Unable to prepare the bundled JPEG codec.", "codec-load-failed", {}, cause);
+  }
+  throwIfAborted(signal);
+}
+
+/** Embedded-font PostScript executes synchronously after PDF preparation. */
+export function decodeBundledJpegSync(encoded: Uint8Array,
+  decodeParameters: Readonly<Record<string, CodecMetadataValue>> = {},
+  options: { readonly signal?: AbortSignal; readonly maxOutputBytes?: number } = {}): NativeImageCodecResult {
+  throwIfAborted(options.signal);
+  if (!preparedModule) throw jpegError("The JPEG codec must be prepared before synchronous font decoding.", "codec-not-prepared");
+  const markers = inspectJpegMarkers(encoded, options.signal);
+  const request: NativeImageCodecRequest = { codec: "jpeg", encoded, globals: new Uint8Array(),
+    width: markers.width, height: markers.height, components: markers.components,
+    bitsPerComponent: markers.precision, imageMask: false, decodeParameters };
+  validateRequest(request);
+  const plan = preflightJpeg(request, options.signal);
+  const bytes = checkedOutputByteLength(request.width, request.height, request.components);
+  if (bytes > (options.maxOutputBytes ?? Number.MAX_SAFE_INTEGER)) {
+    throw new PdfError("resource-limit", "The synchronous JPEG output exceeds the configured decoded-file byte limit.",
+      { details: { reason: "font-postscript-file-limit", bytes, limit: options.maxOutputBytes ?? Number.MAX_SAFE_INTEGER } });
+  }
+  let instance: WebAssembly.Instance;
+  try { instance = new WebAssembly.Instance(preparedModule, jpegImports()); }
+  catch (cause) { throw jpegError("Unable to instantiate the bundled JPEG codec.", "codec-instantiate-failed", {}, cause); }
+  return decodeJpeg(instance, request, plan, 1, options.signal);
+}
 
 /**
  * HEPR's package-relative default image-codec bridge.
@@ -1006,7 +1042,9 @@ function loadCompiledModule(): Promise<WebAssembly.Module> {
         `${BUNDLED_JPEG_CODEC_ASSET.byteLength}.`
       );
     }
-    return await WebAssembly.compile(bytes);
+    const module = await WebAssembly.compile(bytes);
+    preparedModule = module;
+    return module;
   })();
   compiledModulePromise = pending;
   void pending.catch(() => {

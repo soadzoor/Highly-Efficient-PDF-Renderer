@@ -72,7 +72,7 @@ export function buildRasterStripBatches(
 }
 
 function isStrip(source: RasterLayer | undefined, maxWidth: number): source is RasterLayer {
-  return !!source && !source.monochrome && source.height === 1 && Number.isInteger(source.width) && source.width > 0 &&
+  return !!source && source.interpolate !== false && !source.monochrome && source.height === 1 && Number.isInteger(source.width) && source.width > 0 &&
     source.width <= maxWidth && source.data instanceof Uint8Array && source.data.length >= source.width * 4 &&
     !detectMonochromeRaster(source.data, source.width, source.height) &&
     source.matrix instanceof Float32Array && source.matrix.length >= 6 &&

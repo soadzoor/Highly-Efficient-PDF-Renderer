@@ -42,6 +42,33 @@ try {
   renderer.deleteRasterLayerTextures(gpu);
   assert.equal(mock.alive.size, 0, "both packed and coverage textures are destroyed");
 
+  // An explicit PDF Interpolate=false keeps packed storage while selecting
+  // exact base pixels, even when a compact filtered atlas was prepared.
+  const nearest = makeRenderer(WebGlFloorplanRenderer, 64);
+  const nearestSource = nearest.renderer.getSceneRasterLayers({ rasterLayers: [{ ...layer, interpolate: false }] })[0];
+  assert.equal(nearestSource.interpolate, false);
+  const nearestGpu = nearest.renderer.createRasterLayerGpu(nearestSource, 0);
+  assert.equal(nearestGpu.interpolate, false); assert.equal(nearestGpu.monochrome.compact, false);
+  nearest.renderer.drawRasterTile(nearestGpu);
+  assert(nearest.mock.calls.some(call => call[0] === "uniform1f" && call[1] === "uRasterMonochrome" && call[2] === 4));
+  const coverageNearest = nearest.renderer.createMonochromeRasterTile(mono, 2, 1, undefined,
+    Uint8Array.of(0, 255), { width: 1, height: 1, data: new Uint8Array(4) }, true, false);
+  coverageNearest.interpolate = false;
+  assert.equal(coverageNearest.monochrome.compact, false, "nearest pixels cannot use a filtered compact atlas");
+  nearest.renderer.drawRasterTile(coverageNearest);
+  assert(nearest.mock.calls.some(call => call[0] === "uniform1f" && call[1] === "uRasterMonochrome" && call[2] === 5));
+  assert(nearest.mock.calls.some(call => call[0] === "texParameteri" && call[2] === "TEXTURE_MAG_FILTER" && call[3] === "NEAREST"));
+  nearest.renderer.deleteRasterLayerTextures(nearestGpu); nearest.renderer.deleteRasterLayerTextures(coverageNearest);
+
+  const rgbaNearest = makeRenderer(WebGlFloorplanRenderer, 64);
+  const threeColors = { width: 3, height: 1, data: Uint8Array.of(255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255),
+    matrix: layer.matrix, interpolate: false };
+  const rgbaGpu = rgbaNearest.renderer.createRasterLayerGpu(threeColors, 0);
+  assert(!rgbaGpu.monochrome);
+  assert(rgbaNearest.mock.calls.some(call => call[0] === "texParameteri" && call[2] === "TEXTURE_MIN_FILTER" && call[3] === "NEAREST"),
+    "ordinary RGBA images preserve explicit nearest minification and magnification");
+  rgbaNearest.renderer.deleteRasterLayerTextures(rgbaGpu);
+
   const single = renderer.createRasterLayerGpu(createMonochromeRasterLayer({ width: 1, height: 1,
     matrix: layer.matrix, paintOrder: 0, pageIndex: 0 }, { data: Uint8Array.of(128), colors: mono.colors }), 0);
   assert.equal(mock.calls.filter(call => call[0] === "texImage2D").at(-1).at(-1)[0], 240,
@@ -152,24 +179,35 @@ function testRasterColor(shader) {
   // Expand componentwise vector multiplication for the scalar evaluator;
   // execute the shipped helper's sampling branches and palette interpolation.
   const source = shader.match(/vec4 heprRasterColor\([\s\S]*?\n}/)[0]
-    .replace(/uvD([xy]) \* uRasterMonoSize/g, "vec2(uvD$1.x * uRasterMonoSize.x, uvD$1.y * uRasterMonoSize.y)");
+    .replace(/uvD([xy]) \* uRasterMonoSize/g, "vec2(uvD$1.x * uRasterMonoSize.x, uvD$1.y * uRasterMonoSize.y)")
+    .replace(/floor\(uv \* uRasterMonoSize\)/g, "vec2(floor(uv.x * uRasterMonoSize.x), floor(uv.y * uRasterMonoSize.y))")
+    .replace(/ivec2\(uRasterMonoSize\) - 1/g, "ivec2(uRasterMonoSize.x - 1, uRasterMonoSize.y - 1)")
+    .replace(/floor\(uv \* vec2\(size\)\)/g, "vec2(floor(uv.x * size.x), floor(uv.y * size.y))")
+    .replace(/size - 1/g, "ivec2(size.x - 1, size.y - 1)")
+    .replace(/\bivec2 (pixel|size) =/g, "vec2 $1 =");
   const palette0 = { r: 0.1, g: 0.2, b: 0.3, a: 0.4 }, palette1 = { r: 0.5, g: 0.6, b: 0.7, a: 0.8 };
   const sampledColor = { r: 0.2, g: 0.3, b: 0.4, a: 0.5 };
   for (const [mode, lod, opaque, coverage, expectedReads] of [
     [0, 2, 0, null, ["rgba"]], [0, 2, 1, null, ["rgba"]],
+    [-1, 0, 0, null, ["nearest-rgba"]], [-1, 4, 1, null, ["nearest-rgba"]],
     [3, 2, 1, 0.6, ["compact"]],
     [1, 0, 0, 0.25, ["binary", "packed"]],
     [1, 0.5, 0, 0.5, ["binary", "packed"]],
     [2, 0.5, 0, 0.625, ["reduced", "packed"]],
     [1, 1, 0, 0.75, ["packed"]],
-    [1, 2, 0, 0.75, ["packed"]], [2, 2, 0, 0.75, ["packed"]]
+    [1, 2, 0, 0.75, ["packed"]], [2, 2, 0, 0.75, ["packed"]],
+    [4, 0, 0, 1, ["nearest-bit"]], [4, 4, 0, 1, ["nearest-bit"]],
+    [5, 0, 0, 0.5, ["nearest-coverage"]], [5, 4, 0, 0.5, ["nearest-coverage"]]
   ]) {
     const reads = [], uv = { x: 0.25, y: 0.75 }, size = { x: 8, y: 4 };
     const dx = { x: 2 ** lod / size.x, y: 0 }, dy = { x: 0, y: 0 };
     const { heprRasterColor } = evaluateGlsl(source, {
       uRasterTex: "raster", uRasterMonoMips: "mips", uRasterMonochrome: mode,
       uRasterOpaque: opaque, uRasterMonoSize: size, uRasterMonoColor0: palette0, uRasterMonoColor1: palette1,
-      vec4: (r, g = r, b = r, a = r) => ({ r, g, b, a }), ivec2: value => ({ ...value }),
+      vec4: (r, g = r, b = r, a = r) => ({ r, g, b, a }),
+      ivec2: (value, y = value) => typeof value === "object" ? { ...value } : ({ x: value, y }),
+      clamp: (value, low, high) => typeof value === "number" ? Math.min(Math.max(value, low), high) :
+        ({ x: Math.min(Math.max(value.x, low.x), high.x), y: Math.min(Math.max(value.y, low.y), high.y) }),
       length: value => Math.hypot(value.x, value.y),
       mix: (a, b, weight) => typeof a === "number" ? a + (b - a) * weight :
         Object.fromEntries(Object.keys(a).map(key => [key, a[key] + (b[key] - a[key]) * weight])),
@@ -184,6 +222,13 @@ function testRasterColor(shader) {
       },
       heprRasterBinaryLinear(sampledUv) {
         assert.equal(sampledUv, uv); reads.push("binary"); return 0.25;
+      },
+      heprRasterBit(pixel) { assert.deepEqual(pixel, { x: 2, y: 3 }); reads.push("nearest-bit"); return 1; },
+      textureSize(texture,level) { assert.equal(texture,"raster");assert.equal(level,0);return size; },
+      texelFetch(texture, pixel, level) {
+        assert.equal(texture, "raster"); assert.deepEqual(pixel, { x: 2, y: 3 }); assert.equal(level, 0);
+        if(mode===-1){reads.push("nearest-rgba");return {...sampledColor};}
+        reads.push("nearest-coverage"); return { r: 0.5 };
       },
       heprPackedCoverage(texture, sampledSize, sampledUv, sampledLod) {
         assert.equal(texture, "mips"); assert.deepEqual(sampledSize, size); assert.equal(sampledUv, uv);

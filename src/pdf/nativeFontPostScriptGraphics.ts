@@ -10,7 +10,9 @@ type Point = readonly [number, number];
 type Rectangle = readonly [number, number, number, number];
 type Stroke = NonNullable<NativeGlyphPostScriptPaint["stroke"]>;
 type Color = NativeGlyphPostScriptPaint["color"];
-type SourceColor = { readonly space: "DeviceGray" | "DeviceRGB" | "DeviceCMYK"; readonly values: readonly number[]; readonly hsb?: readonly [number, number, number] };
+type SourceColor = { readonly space: string; readonly values: readonly number[]; readonly hsb?: readonly [number, number, number];
+  readonly deviceSpace?: "DeviceGray" | "DeviceRGB" | "DeviceCMYK"; readonly deviceValues?: readonly number[];
+  readonly deviceCmyk?: readonly [number, number, number, number] };
 export interface NativeFontPostScriptGraphicsState {
   readonly commands: readonly NativeGlyphPathCommand[];
   readonly currentPoint: Point | null;
@@ -31,12 +33,13 @@ export interface NativeFontPostScriptGlyphMetrics {
 export interface NativeFontPostScriptGraphicsOptions {
   readonly signal?: AbortSignal;
   readonly maxPathCommands?: number;
+  readonly maxImageBytes?: number;
 }
 export interface NativeFontPostScriptImageOptions {
   readonly width: number;
   readonly height: number;
   readonly bitsPerComponent: 1 | 2 | 4 | 8 | 12;
-  readonly components: 1 | 3 | 4;
+  readonly components: number;
   readonly data: Uint8Array;
   readonly decode?: readonly number[];
   readonly imageMatrix: NativeFontPostScriptMatrix;
@@ -44,6 +47,7 @@ export interface NativeFontPostScriptImageOptions {
   readonly mask?: boolean;
   readonly polarity?: boolean;
   readonly interpolate?: boolean;
+  readonly convertColor?: (values: readonly number[]) => readonly [number, number, number, number];
 }
 
 /** Glyph-local PostScript graphics (PLRM chapters 4 and 8). Path coordinates
@@ -65,6 +69,7 @@ export class NativeFontPostScriptGlyphContext {
   private changedStrokeFields = new Set<NativeGlyphPostScriptStrokeField>();
   private readonly paints: NativeGlyphPostScriptPaint[] = [];
   private retainedCommands = 0;
+  private retainedImageBytes = 0;
   private readonly states: NativeFontPostScriptGraphicsState[] = [];
   private readonly notices: PdfDiagnostic[] = [];
   private readonly noticeCodes = new Set<string>();
@@ -74,6 +79,9 @@ export class NativeFontPostScriptGlyphContext {
     this.options = options;
     if (options.maxPathCommands !== undefined && (!Number.isSafeInteger(options.maxPathCommands) || options.maxPathCommands < 0)) {
       throw new RangeError("PostScript graphics maxPathCommands must be a nonnegative safe integer.");
+    }
+    if (options.maxImageBytes !== undefined && (!Number.isSafeInteger(options.maxImageBytes) || options.maxImageBytes < 0)) {
+      throw new RangeError("PostScript graphics maxImageBytes must be a nonnegative safe integer.");
     }
   }
   get pathCommands(): readonly NativeGlyphPathCommand[] { return Object.freeze([...this.commands]); }
@@ -95,20 +103,25 @@ export class NativeFontPostScriptGlyphContext {
     matrix.forEach(finite);
     this.stroke = Object.freeze({ ...this.stroke, transform: Object.freeze([...matrix]) });
   }
-  noteCharStringPath(): void {
-    if (this.stroke.transform.some((value, index) => value !== (index === 0 || index === 3 ? 1 : 0))) {
-      this.notice("font.postscript-charstring-ctm-approximated", "A font-local PostScript matrix change remains active before further Type1 path operators; the native charstring coordinates retain their original glyph space.");
-    }
-  }
   get sourceColorSpace(): SourceColor["space"] | null { return this.sourceColor?.space ?? null; }
   get sourceColorValues(): readonly number[] | null { return this.sourceColor?.values ?? null; }
   get currentRGB(): readonly [number, number, number] {
     if (!this.paintColor) throw unsupported("The enclosing PDF glyph color is unavailable during cached font execution.", "currentrgbcolor");
+    // CIE source spaces do not participate in the device query operators
+    // (PLRM 4.8.3). Indexed/spot spaces use their underlying device space.
+    if (this.sourceColor && !this.sourceColor.space.startsWith("Device") && !this.sourceColor.deviceSpace) return Object.freeze([0, 0, 0]);
+    if (this.sourceColor?.space === "DeviceN" && !this.sourceColor.deviceSpace) return Object.freeze([0, 0, 0]);
     return Object.freeze([this.paintColor[0], this.paintColor[1], this.paintColor[2]]);
   }
-  get currentGray(): number { if (this.sourceColor?.space === "DeviceGray") return this.sourceColor.values[0]; const [r, g, b] = this.currentRGB; return 0.3 * r + 0.59 * g + 0.11 * b; }
+  get currentGray(): number {
+    if (this.sourceColor?.space === "DeviceGray") return this.sourceColor.values[0];
+    if (this.sourceColor?.deviceSpace === "DeviceGray") return this.sourceColor.deviceValues![0];
+    const [r, g, b] = this.currentRGB; return 0.3 * r + 0.59 * g + 0.11 * b;
+  }
   get currentCMYK(): readonly [number, number, number, number] {
+    if (this.sourceColor?.deviceCmyk) return this.sourceColor.deviceCmyk;
     if (this.sourceColor?.space === "DeviceCMYK") return this.sourceColor.values as readonly [number, number, number, number];
+    if (this.sourceColor?.deviceSpace === "DeviceCMYK") return this.sourceColor.deviceValues as readonly [number, number, number, number];
     const [r, g, b] = this.currentRGB, c = 1 - r, m = 1 - g, y = 1 - b, k = Math.min(c, m, y);
     return Object.freeze([c - k, m - k, y - k, k]);
   }
@@ -308,6 +321,15 @@ export class NativeFontPostScriptGlyphContext {
     const hsb: readonly [number, number, number] = Object.freeze([h, s, b]);
     this.sourceColor = Object.freeze({ space: "DeviceRGB", values: Object.freeze(rgb), hsb });
   }
+  setColorSpaceColor(space: string, values: readonly number[], color: readonly [number, number, number, number],
+    deviceSpace?: SourceColor["deviceSpace"], deviceValues?: readonly number[], deviceCmyk?: SourceColor["deviceCmyk"]): void {
+    values.forEach(finite); color.forEach(finite);
+    this.paintColor = Object.freeze([...color]) as NonNullable<Color>;
+    this.sourceColor = Object.freeze({ space, values: Object.freeze([...values]), deviceSpace,
+      ...(deviceValues ? { deviceValues: Object.freeze([...deviceValues]) } : {}),
+      ...(deviceCmyk ? { deviceCmyk: Object.freeze([...deviceCmyk]) as SourceColor["deviceCmyk"] } : {}) });
+  }
+  noteColorApproximation(code: string, message: string): void { this.notice(code, message); }
   paint(kind: "fill" | "eofill" | "stroke", matrix: NativeFontPostScriptMatrix): void {
     throwIfAborted(this.options.signal);
     if (this.commands.some(command => command.kind !== "move" && command.kind !== "close")) this.paints.push(Object.freeze({
@@ -324,14 +346,16 @@ export class NativeFontPostScriptGlyphContext {
     this.clips = Object.freeze([...this.clips, Object.freeze({ commands: this.pathCommands, fillRule })]);
     this.retainedCommands += this.commands.length;
   }
-  /** Sampled glyph images lower to exact pixel rectangles, coalescing equal
-   * horizontal runs across adjacent rows. Stencils inherit the current paint.
-   * Image operators do not consume or otherwise change the current path.
+  /** Retain sampled images and their sampling policy. Noninterpolated stencils
+   * keep exact vector runs so they can inherit the caller's current paint.
+   * Image operators preserve the current path and graphics state.
    */
   image(options: NativeFontPostScriptImageOptions): void {
+    throwIfAborted(this.options.signal);
     const { width, height, bitsPerComponent: bits, components, data } = options;
     if (!Number.isSafeInteger(width) || width < 0 || !Number.isSafeInteger(height) || height < 0 ||
-      ![1, 2, 4, 8, 12].includes(bits) || ![1, 3, 4].includes(components) || !(data instanceof Uint8Array) ||
+      ![1, 2, 4, 8, 12].includes(bits) || !Number.isSafeInteger(components) || components < 1 ||
+      (!options.convertColor && ![1, 3, 4].includes(components)) || !(data instanceof Uint8Array) ||
       (options.mask && (bits !== 1 || components !== 1))) throw unsupported("Invalid PostScript glyph image dimensions or samples.", "rangecheck");
     if (width === 0 || height === 0) return;
     const rowBytes = Math.ceil(width * components * bits / 8), needed = rowBytes * height;
@@ -340,6 +364,63 @@ export class NativeFontPostScriptGlyphContext {
     if (decode.length !== components * 2 || decode.some(value => !Number.isFinite(value))) throw unsupported("Invalid PostScript image Decode array.", "rangecheck");
     const transform = nativeFontPostScriptConcatMatrices(inverse(options.imageMatrix), options.ctm);
     const maximum = 2 ** bits - 1;
+    if (!options.mask || options.interpolate) {
+      const completeRows = Math.min(height, Math.floor(data.length / rowBytes));
+      const remaining = completeRows < height ? data.length - completeRows * rowBytes : 0;
+      const tailWidth = Math.min(width, Math.floor(remaining * 8 / (components * bits)));
+      const retain = (imageWidth: number, imageHeight: number, firstRow: number): void => {
+        if (imageWidth === 0 || imageHeight === 0) return;
+        const byteLength = imageWidth * imageHeight * 4;
+        if (!Number.isSafeInteger(byteLength) || byteLength > (this.options.maxImageBytes ?? Number.MAX_SAFE_INTEGER) - this.retainedImageBytes) {
+          throw new PdfError("resource-limit", "PostScript glyph exceeds its configured decoded-image byte limit.", {
+            details: { reason: "font-postscript-image-byte-limit", maxImageBytes: this.options.maxImageBytes ?? null }
+          });
+        }
+        this.checkCount(this.commands.length + 5);
+        let rgba: Uint8Array;
+        try { rgba = new Uint8Array(byteLength); }
+        catch (cause) { throw new PdfError("resource-limit", "Cannot allocate PostScript glyph image pixels.", { cause }); }
+        const values = new Array<number>(components);
+        let maskSample = 0;
+        for (let y = 0; y < imageHeight; y++) {
+          throwIfAborted(this.options.signal);
+          for (let x = 0; x < imageWidth; x++) {
+            if ((x & 255) === 0) throwIfAborted(this.options.signal);
+            for (let component = 0; component < components; component++) {
+              const bit = (firstRow + y) * rowBytes * 8 + (x * components + component) * bits;
+              let sample = 0;
+              for (let offset = 0; offset < bits; offset++) sample = sample * 2 +
+                ((data[Math.floor((bit + offset) / 8)] >>> (7 - ((bit + offset) % 8))) & 1);
+              if (options.mask) maskSample = sample;
+              values[component] = finite(decode[component * 2] + sample / maximum * (decode[component * 2 + 1] - decode[component * 2]));
+            }
+            const offset = (y * imageWidth + x) * 4;
+            if (options.mask) {
+              rgba[offset] = rgba[offset + 1] = rgba[offset + 2] = 255;
+              rgba[offset + 3] = maskSample === (options.polarity === false ? 0 : 1) ? 255 : 0;
+            } else {
+              const color = options.convertColor?.(values) ?? (components === 1
+                ? [values[0], values[0], values[0], 1] : components === 3
+                  ? [values[0], values[1], values[2], 1]
+                  : [1 - Math.min(1, unit(values[0]) + unit(values[3])),
+                    1 - Math.min(1, unit(values[1]) + unit(values[3])),
+                    1 - Math.min(1, unit(values[2]) + unit(values[3])), 1]);
+              for (let channel = 0; channel < 4; channel++) rgba[offset + channel] = Math.round(unit(color[channel]) * 255);
+            }
+          }
+        }
+        const placed = firstRow === 0 ? transform : nativeFontPostScriptConcatMatrices([1, 0, 0, 1, 0, firstRow], transform);
+        this.paints.push(Object.freeze({ kind: "image", width: imageWidth, height: imageHeight,
+          rgba, transform: Object.freeze([...placed]) as NativeFontPostScriptMatrix,
+          interpolate: options.interpolate === true, clips: this.clips,
+          color: options.mask ? this.paintColor : null, ...(options.mask ? { imageMask: true } : {}) }));
+        this.retainedCommands += 5; this.retainedImageBytes += byteLength;
+      };
+      retain(width, completeRows, 0);
+      retain(tailWidth, 1, completeRows);
+      if (data.length < needed) this.notice("font.postscript-image-truncated", "PostScript image data ended early; only available samples were painted.");
+      return;
+    }
     type Rect = { left: number; right: number; bottom: number; top: number };
     const groups = new Map<string, { color: Color; rectangles: Rect[] }>();
     let previous = new Map<string, Rect>(), rectangleCount = 0;
@@ -394,9 +475,7 @@ export class NativeFontPostScriptGlyphContext {
       this.paints.push(Object.freeze({ kind: "fill", commands: Object.freeze(commands), fillRule: 0, clips: this.clips, color: group.color }));
     }
     this.retainedCommands += rectangleCount * 5;
-    if (!options.mask) this.notice("font.postscript-image-vectorized", "PostScript sampled images use vector pixel rectangles; pixel-edge antialiasing may differ from image rendering and retained output can be larger.");
     if (data.length < needed) this.notice("font.postscript-image-truncated", "PostScript image data ended early; only available samples were painted.");
-    if (options.interpolate) this.notice("font.postscript-image-interpolation-approximated", "PostScript image interpolation uses exact sampled pixel rectangles; smooth interpolation is unavailable for the vector glyph image.");
   }
   save(): void { this.states.push(this.localState()); }
   restore(): void { const state = this.states.pop(); if (state) this.restoreState(state); }
@@ -446,12 +525,15 @@ export class NativeFontPostScriptGlyphContext {
 
 export function transformNativeGlyphPostScriptPaints(records: readonly NativeGlyphPostScriptPaint[],
   matrix: NativeFontPostScriptMatrix): readonly NativeGlyphPostScriptPaint[] {
-  return Object.freeze(records.map(record => Object.freeze({ ...record,
-    commands: transformCommands(record.commands, matrix),
-    clips: Object.freeze(record.clips.map(clip => Object.freeze({ ...clip, commands: transformCommands(clip.commands, matrix) }))),
-    ...(record.stroke ? { stroke: Object.freeze({ ...record.stroke,
-      transform: nativeFontPostScriptConcatMatrices(record.stroke.transform, matrix) }) } : {})
-  })));
+  return Object.freeze(records.map(record => {
+    const clips = Object.freeze(record.clips.map(clip => Object.freeze({ ...clip,
+      commands: transformCommands(clip.commands, matrix) })));
+    if (record.kind === "image") return Object.freeze({ ...record, clips,
+      transform: nativeFontPostScriptConcatMatrices(record.transform, matrix) });
+    return Object.freeze({ ...record, clips, commands: transformCommands(record.commands, matrix),
+      ...(record.stroke ? { stroke: Object.freeze({ ...record.stroke,
+        transform: nativeFontPostScriptConcatMatrices(record.stroke.transform, matrix) }) } : {}) });
+  }));
 }
 export function transformNativeGlyphPostScriptFinalState(state: NativeGlyphPostScriptFinalState,
   matrix: NativeFontPostScriptMatrix): NativeGlyphPostScriptFinalState {
@@ -469,7 +551,11 @@ export function nativeGlyphPostScriptPaintBounds(records: readonly NativeGlyphPo
   for (const record of records) {
     let left = Infinity, bottom = Infinity, right = -Infinity, top = -Infinity;
     const include = (x: number, y: number) => { left = Math.min(left, x); bottom = Math.min(bottom, y); right = Math.max(right, x); top = Math.max(top, y); };
-    for (const command of record.commands) if (command.kind !== "close") {
+    if (record.kind === "image") {
+      for (const [x, y] of [[0, 0], [record.width, 0], [record.width, record.height], [0, record.height]]) {
+        const transformed = nativeFontPostScriptTransform(x, y, record.transform); include(transformed[0], transformed[1]);
+      }
+    } else for (const command of record.commands) if (command.kind !== "close") {
       include(command.x, command.y);
       if (command.kind === "quadratic") include(command.controlX, command.controlY);
       else if (command.kind === "cubic") { include(command.control1X, command.control1Y); include(command.control2X, command.control2Y); }
@@ -488,7 +574,7 @@ export function nativeGlyphPostScriptCommandCount(records: readonly NativeGlyphP
   finalState?: NativeGlyphPostScriptFinalState): number {
   let count = 0; const clips = new Set<NativeGlyphPostScriptClip>();
   for (const record of records) {
-    count += record.commands.length;
+    count += record.kind === "image" ? 5 : record.commands.length;
     for (const clip of record.clips) if (!clips.has(clip)) { clips.add(clip); count += clip.commands.length; }
   }
   for (const clip of finalState?.clips ?? []) if (!clips.has(clip)) { clips.add(clip); count += clip.commands.length; }

@@ -174,11 +174,28 @@ export function decodeNativeCcittFax(
       limit: limits.maxScanBits
     });
   }
+  return decodeCcittReader(new MsbBitReader(input, limits.maxScanBits, options.signal), params, limits, options);
+}
+
+/** Pull only the bytes needed through the fax EOD boundary. This is used by
+ * PostScript filters whose source can continue with executable font data. */
+export function decodeNativeCcittFaxSource(
+  read: () => number,
+  parameters: NativeCcittParameters = {},
+  options: NativeCcittDecodeOptions = {}
+): NativeCcittDecodeResult {
+  const limits = mergeLimits(options.limits);
+  const params = readParameters(parameters, limits);
+  throwIfAborted(options.signal);
+  return decodeCcittReader(new MsbBitReader(read, limits.maxScanBits, options.signal), params, limits, options);
+}
+
+function decodeCcittReader(reader: MsbBitReader, params: NormalizedParameters,
+  limits: Readonly<NativeCcittLimits>, options: NativeCcittDecodeOptions): NativeCcittDecodeResult {
   if (!params.endOfBlock && params.rows > 0) {
     enforceProspectiveOutput(params.columns, params.rows, params.rowStride, limits);
   }
 
-  const reader = new MsbBitReader(input, limits.maxScanBits, options.signal);
   const budget = new TransitionBudget(limits.maxTransitions, options.signal);
   const output = new PackedRowWriter(params.rowStride, limits.maxOutputBytes);
   let reference: DecodedRow | null = null;
@@ -752,14 +769,17 @@ function enforceNextDecodedRow(
 
 class MsbBitReader {
   get work(): number { return this.scanCount; }
-  private readonly bytes: Uint8Array;
+  private readonly bytes: Uint8Array | number[];
+  private readonly source?: () => number;
+  private sourceEnded = false;
   private readonly maxScanBits: number;
   private readonly signal?: AbortSignal;
   private bitOffset = 0;
   private scanCount = 0;
 
-  constructor(bytes: Uint8Array, maxScanBits: number, signal?: AbortSignal) {
-    this.bytes = bytes;
+  constructor(bytes: Uint8Array | (() => number), maxScanBits: number, signal?: AbortSignal) {
+    this.bytes = typeof bytes === "function" ? [] : bytes;
+    this.source = typeof bytes === "function" ? bytes : undefined;
     this.maxScanBits = maxScanBits;
     this.signal = signal;
   }
@@ -773,7 +793,7 @@ class MsbBitReader {
   }
 
   get atEnd(): boolean {
-    return this.bitOffset >= this.bytes.length * 8;
+    return !this.ensureByte(Math.floor(this.bitOffset / 8));
   }
 
   mark(): number {
@@ -864,6 +884,12 @@ class MsbBitReader {
   }
 
   hasOnlyFinalZeroPadding(): boolean {
+    if (this.source) {
+      const byte = Math.floor(this.bitOffset / 8), offset = this.bitOffset & 7;
+      if (!this.ensureByte(byte)) return true;
+      if (offset === 0 || (this.bytes[byte] & ((1 << (8 - offset)) - 1)) !== 0) return false;
+      if (this.ensureByte(byte + 1)) return false;
+    }
     const remaining = this.bytes.length * 8 - this.bitOffset;
     if (remaining === 0) return true;
     if (remaining > 7) return false;
@@ -902,6 +928,20 @@ class MsbBitReader {
       });
     }
     if ((this.scanCount & 0x0fff) === 0) throwIfAborted(this.signal);
+  }
+
+  private ensureByte(index: number): boolean {
+    if (!this.source) return index < this.bytes.length;
+    while (this.bytes.length <= index && !this.sourceEnded) {
+      throwIfAborted(this.signal);
+      const value = this.source();
+      if (value < 0) { this.sourceEnded = true; break; }
+      if (this.bytes.length >= Math.ceil(this.maxScanBits / 8)) {
+        throw resourceLimit("CCITT encoded input exceeds the configured scan ceiling.", { limit: this.maxScanBits });
+      }
+      (this.bytes as number[]).push(value);
+    }
+    return index < this.bytes.length;
   }
 }
 

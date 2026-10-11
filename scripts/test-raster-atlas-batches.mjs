@@ -14,6 +14,10 @@ try {
   });
   const scene = makeScene([[1, 1], [3, 5], [5, 3], [16, 4], [1, 1024], [1024, 1], [7, 9], [2, 2]]);
   const original = structuredClone(scene);
+  const nearest = makeScene(Array(9).fill([2, 2]));
+  nearest.rasterLayers[4].interpolate = false;
+  assert.deepEqual(buildRasterAtlasBatches(nearest, 4096).map(({ first, count }) => [first, count]), [[0, 4], [5, 4]],
+    "nearest images keep independent sampling rather than entering the smooth atlas shader");
   const batches = buildRasterAtlasBatches(scene, 4096);
   assert.equal(batches.reduce((n, batch) => n + batch.count, 0), scene.rasterLayers.length);
   for (const batch of batches) {

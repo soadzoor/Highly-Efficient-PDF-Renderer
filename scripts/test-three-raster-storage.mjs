@@ -39,6 +39,19 @@ try {
   assert.equal(packedInfo.color1.w,128/255);
   assert(Math.abs(packedInfo.color1.x-10/255*128/255)<1e-12,"palette colors are premultiplied");
   const [coverage] = createThreeRasterTileTextures(small,reducedPlan), coverageInfo = threeRasterTextureInfo(coverage);
+  for (const [plan, mode] of [[fullPlan, 4], [reducedPlan, 5]]) {
+    const nearestSource = Object.defineProperties({}, Object.getOwnPropertyDescriptors(small));
+    nearestSource.interpolate = false;
+    const [nearest] = createThreeRasterTileTextures(nearestSource, plan);
+    assert.equal(threeRasterTextureInfo(nearest).mode, mode, "nearest monochrome sampling preserves packed/R8 storage");
+    assert.equal(nearest.minFilter, THREE.NearestFilter); assert.equal(nearest.magFilter, THREE.NearestFilter);
+    assert.equal(nearest.generateMipmaps, false);
+    nearest.dispose();
+  }
+  const [nearestRgba] = createThreeRasterTileTextures({ width: 2, height: 1, interpolate: false,
+    data: Uint8Array.of(255, 0, 0, 255, 0, 0, 255, 255) }, planRasterTiles(2, 1, 512));
+  assert.equal(nearestRgba.minFilter, THREE.NearestFilter); assert.equal(nearestRgba.magFilter, THREE.LinearFilter);
+  assert.equal(threeRasterTextureInfo(nearestRgba).mode,-1,"nearest RGBA uses explicit texel loads while retaining Three sampler bindings");
   assert.equal(coverageInfo.mode,3); assert.equal(coverageInfo.coverage,coverage);
   assert.equal(coverageInfo.estimatedBytes,coverage.image.data.length);
   assert(coverage.image.data.length < 16*8, "uniform reduced coverage benefits from compact blocks");
@@ -91,6 +104,39 @@ try {
     state.material.dispose();
   }
   geometry.dispose();
+  // Nearest-only Three textures lose their generated sampler binding. RGBA and
+  // compressed images therefore fetch texels explicitly while keeping a valid
+  // sampler for the shared smooth branch and source replacements.
+  const nearestSource={width:2,height:1,interpolate:false,data:Uint8Array.of(255,0,0,255,0,0,255,255)};
+  const [nearestCompressed]=createThreeRasterTileTextures(nearestSource,planRasterTiles(2,1,512),{
+    format:"bc7",upload(){
+      const texture=new THREE.CompressedTexture([{data:new Uint8Array(16),width:4,height:4}],4,4,THREE.RGBA_BPTC_Format);
+      registerThreeCompressedTexture(texture,2,1,"bc7",16,[.5,.25]);return texture;
+    }
+  },"bc7");
+  const [smoothRgba]=createThreeRasterTileTextures({...nearestSource,interpolate:true},planRasterTiles(2,1,512));
+  const nearestMono=Object.defineProperties({},Object.getOwnPropertyDescriptors(small));nearestMono.interpolate=false;
+  const [nearestPacked]=createThreeRasterTileTextures(nearestMono,fullPlan);
+  const [nearestCoverage]=createThreeRasterTileTextures(nearestMono,reducedPlan);
+  for(const initial of [nearestRgba,nearestCompressed,nearestPacked,nearestCoverage]){
+    const state=createThreeWebGpuRasterMaterial({texture:initial,viewport:new THREE.Vector2(800,600),
+      cameraCenter:new THREE.Vector2(),localToClip:new THREE.Matrix4(),colorCompositing:"display",
+      matrixABCD:new THREE.Vector4(1,0,0,1),matrixEF:new THREE.Vector2()});
+    const builder=build(state.material,geometry),shader=builder.fragmentShader;
+    assert.match(shader,/if \(mode < -0.5\)/);assert.match(shader,/textureLoad\(image, pixel, 0\)/);
+    assert.match(shader,/textureDimensions\(image\)/,"compressed padding UVs address the uploaded texture dimensions");
+    for(const match of shader.matchAll(/\b(nodeUniform\d+_sampler)\b/g))assert(shader.includes(`var ${match[1]} : sampler;`),
+      "every sampler referenced by the nearest RGBA/packed/R8 material has an actual WGSL binding");
+    const textureBindings=builder.getBindings().flatMap(group=>group.bindings).filter(binding=>binding.isSampledTexture);
+    for(const next of [smoothRgba,nearestCompressed,nearestPacked,nearestCoverage,nearestRgba]){
+      state.updateSource(next,Float32Array.of(1,0,0,1,0,0),1);textureBindings.forEach(binding=>binding.update());
+      assert.deepEqual(new Set(textureBindings.map(binding=>binding.texture)),new Set([next,threeRasterTextureInfo(next).coverage]),
+        "nearest/smooth and packed/R8 replacements preserve both existing texture bindings");
+    }
+    state.material.dispose();
+  }
+  for(const texture of [nearestRgba,nearestCompressed,smoothRgba,nearestPacked,nearestCoverage])texture.dispose();
+
   let coverageDisposed = 0;
   packedInfo.coverage.addEventListener("dispose",() => coverageDisposed++);
   packed.dispose(); assert.equal(coverageDisposed,1); coverage.dispose();

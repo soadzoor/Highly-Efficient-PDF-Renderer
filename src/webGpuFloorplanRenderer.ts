@@ -112,6 +112,7 @@ interface WebGpuRasterTileResource {
 
 interface RasterLayerSource {
   opacity?: number;
+  interpolate?: boolean;
   width: number;
   height: number;
   data: Uint8Array<ArrayBufferLike>;
@@ -1245,6 +1246,7 @@ export class WebGpuFloorplanRenderer {
   private readonly vectorCompositeUniformBuffer: any;
 
   private readonly rasterLayerSampler: any;
+  private readonly rasterLayerNearestSampler: any;
 
   private readonly textRasterSampler: any;
 
@@ -1927,6 +1929,10 @@ export class WebGpuFloorplanRenderer {
       mipmapFilter: "linear",
       addressModeU: "clamp-to-edge",
       addressModeV: "clamp-to-edge"
+    });
+    this.rasterLayerNearestSampler = this.gpuDevice.createSampler({
+      magFilter: "nearest", minFilter: "nearest", mipmapFilter: "nearest",
+      lodMaxClamp: 0, addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge"
     });
 
     // WebGPU guarantees sampler anisotropy values through 16. Keep the glyph
@@ -4953,6 +4959,7 @@ export class WebGpuFloorplanRenderer {
           compressionEligible: !monochrome && !!this.rasterCompression?.available && (!!layer.gpuCompression || assessRasterCompression(layer).eligible),
           preferCompression: !monochrome && (layer.compressionHint === "scan" || !!layer.gpuCompression),
           opacity: layer.opacity,
+          interpolate: layer.interpolate,
           matrix: layer.matrix instanceof Float32Array ? layer.matrix : new Float32Array(layer.matrix),
           paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
           pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
@@ -5045,6 +5052,7 @@ export class WebGpuFloorplanRenderer {
     return { width: layer.width, height: layer.height, data: monochrome ? new Uint8Array(0) : layer.data,
       ...(monochrome ? { monochrome } : {}),
       compressionHint: layer.compressionHint, gpuCompression: layer.gpuCompression, gpuPreparation: layer.gpuPreparation,
+      interpolate: layer.interpolate,
       compressionEligible: !monochrome && !!this.rasterCompression?.available && (!!layer.gpuCompression || assessRasterCompression(layer).eligible),
       preferCompression: !monochrome && (layer.compressionHint === "scan" || !!layer.gpuCompression),
       matrix: layer.matrix, opacity: layer.opacity, paintOrder: layer.paintOrder, pageIndex: layer.pageIndex };
@@ -5208,7 +5216,7 @@ export class WebGpuFloorplanRenderer {
         }
         const textures = packed || coverage
           ? this.createMonochromeTextures(tile.width, tile.height, tileMonochrome!, prepared?.coverageAtlases?.[tileIndex],
-            coverage ? pixels![tileIndex] : undefined, prepared?.compactAtlases?.[tileIndex], !!prepared?.compactAtlases)
+            coverage ? pixels![tileIndex] : undefined, prepared?.compactAtlases?.[tileIndex], !!prepared?.compactAtlases, source.interpolate)
           : { texture: compressed?.texture ?? this.createRgba8Texture(tile.width, tile.height, pixels![tileIndex]) };
         if ("compactBytes" in textures && textures.compactBytes !== undefined) compactSavings +=
           estimateRasterTextureBytes(tile.width, tile.height, !!packed, null, coverage) - textures.compactBytes;
@@ -5218,7 +5226,8 @@ export class WebGpuFloorplanRenderer {
         ] } : tile;
         try {
           tiles.push(this.createRasterTileResource(matrix, textures.texture, source.opacity ?? 1, uploadedTile,
-            "coverageTexture" in textures ? textures.coverageTexture : undefined, tileMonochrome, !!compressed, coverage, "compact" in textures && !!textures.compact));
+            "coverageTexture" in textures ? textures.coverageTexture : undefined, tileMonochrome, !!compressed, coverage,
+            "compact" in textures && !!textures.compact, source.interpolate));
         } catch (error) {
           textures.texture.destroy();
           if ("coverageTexture" in textures && textures.coverageTexture !== textures.texture) textures.coverageTexture.destroy();
@@ -5249,7 +5258,7 @@ export class WebGpuFloorplanRenderer {
 
   private createRasterTileResource(
     matrix: Float32Array, texture: any, opacity: number, tile: RasterTile,
-    coverageTexture?: any, monochrome?: MonochromeRaster, compressedOpaque = false, coverageOnly = false, compact = false
+    coverageTexture?: any, monochrome?: MonochromeRaster, compressedOpaque = false, coverageOnly = false, compact = false, interpolate?: boolean
   ): WebGpuRasterTileResource {
     const gpuBufferUsage = (globalThis as any).GPUBufferUsage;
     const rasterUniforms = new Float32Array(RASTER_UNIFORM_FLOATS);
@@ -5260,7 +5269,8 @@ export class WebGpuFloorplanRenderer {
     rasterUniforms[4] = matrix[4];
     rasterUniforms[5] = matrix[5];
     rasterUniforms[6] = opacity;
-    rasterUniforms[7] = monochrome ? compact ? tile.width + 0.5 : tile.width * (coverageOnly ? -1 : 1) : 0;
+    rasterUniforms[7] = monochrome ? interpolate === false ? (tile.width + 0.25) * (coverageOnly ? -1 : 1)
+      : compact ? tile.width + 0.5 : tile.width * (coverageOnly ? -1 : 1) : 0;
     rasterUniforms.set(tile.quad, 8);
     rasterUniforms.set(tile.uv, 12);
     if (compressedOpaque) rasterUniforms[16] = 1;
@@ -5296,7 +5306,7 @@ export class WebGpuFloorplanRenderer {
           },
           {
             binding: 2,
-            resource: this.rasterLayerSampler
+            resource: interpolate === false ? this.rasterLayerNearestSampler : this.rasterLayerSampler
           },
           {
             binding: 3,
@@ -5416,14 +5426,14 @@ export class WebGpuFloorplanRenderer {
   /** Exact packed bits or an R8 display base, with separate four-bit coverage mips. */
   private createMonochromeTextures(width: number, height: number, source: MonochromeRaster,
     preparedAtlas?: PackedMonochromeCoverageAtlas, coveragePixels?: Uint8Array, preparedCompact?: CompactMonochromeAtlas,
-    compactPrepared = false): {
+    compactPrepared = false, interpolate?: boolean): {
     texture: any; coverageTexture: any; compact?: boolean; compactBytes?: number;
   } {
     const gpuTextureUsage = (globalThis as any).GPUTextureUsage;
     const packedWidth = coveragePixels ? width : Math.ceil(width / 8);
     const atlas = preparedAtlas ?? (coveragePixels ? buildPackedCoverageMipAtlas(coveragePixels, width, height)
       : buildPackedMonochromeMipAtlas(source, width, height));
-    const compact = compactPrepared ? preparedCompact : buildCompactMonochromeAtlas(source, width, height, atlas, coveragePixels);
+    const compact = interpolate === false ? undefined : compactPrepared ? preparedCompact : buildCompactMonochromeAtlas(source, width, height, atlas, coveragePixels);
     if (compact) {
       const texture = this.createRgba8DataTexture(compact.width, compact.height, compact.data);
       return { texture, coverageTexture: texture, compact: true, compactBytes: compact.data.length };

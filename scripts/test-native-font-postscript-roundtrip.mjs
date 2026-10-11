@@ -72,24 +72,32 @@ try {
   const artifactDirectory=artifactFlag<0?null:resolve(process.argv[artifactFlag+1]);
   if(artifactDirectory)await mkdir(artifactDirectory,{recursive:true});
   for(const options of [{final:"color"},{final:"clip"},{final:"empty"},{final:"color",noExplicit:true},
-    {alpha:true},{form:true},{emptyOutline:true},{inheritStroke:true},{final:"stroke",fontPaint:true}]){
+    {alpha:true},{form:true},{emptyOutline:true},{inheritStroke:true},{final:"stroke",fontPaint:true},
+    {interpolate:true},{interpolate:true,imageAffine:true,imageClip:true},{imageMaskInterpolate:true}]){
     const openOptions=options.fontPaint?{embeddedFontPaint:"font"}:{};
     const actualPdf=fixture(false,options),actualPage=await compile(actualPdf,openOptions),expectedPage=await compile(fixture(true,options),openOptions);
     const actualRender=await renderHeprPageToCanvas2d(actualPage,{scale,background:[1,1,1,1],surfaceFactory});
     const expectedRender=await renderHeprPageToCanvas2d(expectedPage,{scale,background:[1,1,1,1],surfaceFactory});
     const delta=difference(pixels(actualRender.surface.canvas),pixels(expectedRender.surface.canvas));
     assert(delta<.015,`lasting glyph state/nested scope ${JSON.stringify(options)} differs from ordinary PDF paths by ${delta}`);
+    if(options.interpolate&&!options.imageAffine){
+      const origin=cell(0),pixel=[...actualRender.surface.context.getImageData(Math.floor((origin.x+44)*scale),Math.floor((height-origin.y-7.5)*scale),1,1).data];
+      assert(pixel[0]>0&&pixel[0]<255&&pixel[1]>0&&pixel[1]<255,"interpolated pixels blend adjacent source samples");
+    }
     const extra={options,difference:delta};
-    if((options.final==="color"&&!options.noExplicit)||options.final==="empty"||options.fontPaint){
+    if((options.final==="color"&&!options.noExplicit)||options.final==="empty"||options.fontPaint||options.interpolate||options.imageMaskInterpolate||options.alpha){
       const saved=await buildHep(actualPdf,{compression:"deflate",encodeRasterImages:false,withTextLod:true,withVectorLod:true,...openOptions});
       const savedBytes=new Uint8Array(await saved.arrayBuffer()),loaded=await loadSceneFromHep(savedBytes),canvas=renderScene(loaded);
       const savedArchive=await HepArchive.loadAsync(savedBytes);for(const entry of Object.values(savedArchive.files))await entry.async("uint8array");
       extra.hepDifference=difference(pixels(canvas),pixels(actualRender.surface.canvas));extra.hepBytes=savedBytes.length;
       assert(extra.hepDifference<.04,`lasting final state ${JSON.stringify(options)} survives HEP serialization: ${extra.hepDifference}`);
-      assert.equal(loaded.rasterLayers?.length??0,0,"lasting font state remains vector");
-      if(artifactDirectory){const label=`final-${options.final}`;await Promise.all([
-        writeFile(resolve(artifactDirectory,`${label}.pdf`),actualPdf),writeFile(resolve(artifactDirectory,`${label}.hep`),savedBytes),
+      assert.equal(loaded.rasterLayers?.length??0,options.noExplicit?0:options.imageMaskInterpolate?8:4,"only source font images become raster layers");
+      assert(loaded.rasterLayers.every(layer=>layer.width===2&&layer.height===2),"retained images preserve their original sample dimensions");
+      if(options.interpolate||options.imageMaskInterpolate)assert(loaded.rasterLayers.some(layer=>layer.interpolate===true),"saved HEP retains explicit interpolation");
+      if(artifactDirectory){const label=options.interpolate?(options.imageAffine?"interpolated-affine-image":"interpolated-image"):options.imageMaskInterpolate?"interpolated-mask":options.alpha?"image-alpha":`final-${options.final}`;await Promise.all([
+        writeFile(resolve(artifactDirectory,`${label}.pdf`),actualPdf),writeFile(resolve(artifactDirectory,`${label}-reference.pdf`),fixture(true,options)),writeFile(resolve(artifactDirectory,`${label}.hep`),savedBytes),
         writeFile(resolve(artifactDirectory,`${label}-retained.png`),actualRender.surface.canvas.toBuffer("image/png")),
+        writeFile(resolve(artifactDirectory,`${label}-reference.png`),expectedRender.surface.canvas.toBuffer("image/png")),
         writeFile(resolve(artifactDirectory,`${label}-hep.png`),canvas.toBuffer("image/png"))]);}
     }
     extraResults.push(extra);
@@ -101,7 +109,9 @@ try {
   const bytes = new Uint8Array(await hep.arrayBuffer()), archive = await HepArchive.loadAsync(bytes);
   for (const entry of Object.values(archive.files)) await entry.async("uint8array");
   const scene = await loadSceneFromHep(bytes), reloaded = renderScene(scene);
-  assert.equal(scene.rasterLayers?.length??0,0,"custom font drawing remains vector in the saved HEP");
+  assert.equal(scene.rasterLayers?.length??0,4,"four fill-bearing invocations retain the source color image");
+  assert(scene.rasterLayers.every(layer=>layer.width===2&&layer.height===2&&layer.interpolate===false),"HEP preserves nearest sampling and source dimensions");
+  assert.equal(page.stores.images.widths.length,1,"the source image asset is shared across repeated glyph invocations");
   assert(scene.fillPathCount>0&&scene.textInstanceCount>0&&scene.segmentCount>0,
     "HEP stores explicit filled paints, ordinary glyph text, and real device hairlines");
   assert(!diagnostics.some(diagnostic=>/font.*(?:substitut|unavailable|unsupported|approximat)/.test(diagnostic.code)),
@@ -120,14 +130,16 @@ try {
   console.log(`Font PostScript PDF/display/HEP roundtrip passed: modes0–7, ordered explicit/implicit paints, inherited/explicit colors, clipping, affine hairlines, colorimage/imagemask; ${bytes.length} bytes, ${Object.keys(archive.files).length} CRC-verified sections.`);
 } finally { hooks.deregister(); }
 
-function imaging() { return `
+function imaging(options={}) { return `
   gsave newpath -100 0 moveto 100 0 lineto 100 100 lineto -100 100 lineto closepath 0 1 0 setrgbcolor fill grestore
   gsave newpath 200 0 moveto 300 0 lineto 300 100 lineto 200 100 lineto closepath fill grestore
   gsave newpath 0 150 moveto 100 150 lineto 100 250 lineto 0 250 lineto closepath clip
     newpath 0 150 moveto 300 150 lineto 300 250 lineto 0 250 lineto closepath 0 0 1 setrgbcolor fill grestore
   gsave newpath 0 0 moveto 300 0 lineto [1 .2 .4 1 0 300] concat 0 setlinewidth stroke grestore
-  gsave 400 0 translate 100 100 scale 2 2 8 [2 0 0 -2 0 2] <ff000000ff000000ff000000> false 3 colorimage grestore
-  gsave 400 150 translate 100 100 scale 2 2 true [2 0 0 -2 0 2] <8040> imagemask grestore
+  gsave 400 0 translate 100 100 scale ${options.imageAffine?"[1 .2 .3 1 0 0] concat":""}
+    ${options.imageClip?"newpath 0 0 moveto .8 0 lineto .8 1 lineto 0 1 lineto closepath clip":""}
+    ${options.interpolate?"/DeviceRGB setcolorspace << /ImageType 1 /Width 2 /Height 2 /BitsPerComponent 8 /ImageMatrix [2 0 0 -2 0 2] /Decode [0 1 0 1 0 1] /DataSource <ff000000ff000000ff000000> /Interpolate true >> image":"2 2 8 [2 0 0 -2 0 2] <ff000000ff000000ff000000> false 3 colorimage"} grestore
+  gsave 400 150 translate 100 100 scale ${options.imageMaskInterpolate?"<< /ImageType 1 /Width 2 /Height 2 /BitsPerComponent 1 /ImageMatrix [2 0 0 -2 0 2] /Decode [1 0] /DataSource <8040> /Interpolate true >> imagemask":"2 2 true [2 0 0 -2 0 2] <8040> imagemask"} grestore
 `; }
 function fixture(reference,options={}) {
   const base = options.emptyOutline?[0,1000,"hsbw"]:[0,1000,"hsbw",50,0,"rmoveto",100,0,"rlineto",0,100,"rlineto",-100,0,"rlineto","closepath"];
@@ -136,7 +148,7 @@ function fixture(reference,options={}) {
       "newpath 50 0 moveto 150 0 lineto 150 100 lineto 50 100 lineto closepath":options.final==="empty"?
       "newpath clip newpath 50 0 moveto 150 0 lineto 150 100 lineto 50 100 lineto closepath":options.final==="stroke"?"60 setlinewidth 2 setlinecap":"";
   const font = buildType1Fixture({...(options.fontPaint?{paintType:2,clearExtra:"/StrokeWidth 20 def"}:{}),
-    privateExtra:reference?"":`/OtherSubrs [{} {} {} {} {${options.noExplicit?"":imaging()} `+
+    privateExtra:reference?"":`/OtherSubrs [{} {} {} {} {${options.noExplicit?"":imaging(options)} `+
       `${options.inheritStroke?"gsave newpath 0 350 moveto 300 350 lineto stroke grestore":""} ${finalCode}}] def`,
     glyphs:[[".notdef",cs(0,1000,"hsbw","endchar")],["A",cs(...base,...(reference?[]:[0,4,"callothersubr"]),"endchar")]]});
   const content=[];
@@ -147,9 +159,8 @@ function fixture(reference,options={}) {
       "q 0 1 0 rg -100 0 200 100 re f Q 200 0 100 100 re f "+
       "q 0 150 100 100 re W n 0 0 1 rg 0 150 300 100 re f Q "+
       "q 0 0 m 300 0 l 1 .2 .4 1 0 300 cm 0 w 1 0 0 RG S Q "+
-      "1 0 0 rg 400 50 50 50 re f 0 1 0 rg 450 50 50 50 re f "+
-      "0 0 1 rg 400 0 50 50 re f 0 0 0 rg 450 0 50 50 re f "+
-      "1 0 0 rg 400 200 50 50 re f 450 150 50 50 re f Q");
+      `q 100 0 0 100 400 0 cm ${options.imageAffine?"1 .2 .3 1 0 0 cm":""} ${options.imageClip?"0 0 .8 1 re W n":""} /Im Do Q `+
+      `${options.imageMaskInterpolate?"q 100 0 0 100 400 150 cm /Mask Do Q":"1 0 0 rg 400 200 50 50 re f 450 150 50 50 re f"} Q`);
     if(reference&&options.inheritStroke&&[0,2,4,6].includes(mode))content.push(`q .1 0 0 .1 ${x} ${y} cm 1 0 0 RG 0 350 m 300 350 l S Q`);
     let normalMode=mode;
     if(reference&&options.final&&[0,2,4,6].includes(mode)){
@@ -162,16 +173,20 @@ function fixture(reference,options={}) {
     if(mode>=4)content.push("0 1 1 rg 0 0 480 280 re f");
     content.push("Q");
   }
+  const images=reference?"/XObject << /Im 9 0 R /Mask 10 0 R >>":"";
   const graphics=options.alpha?"/ExtGState << /A << /ca .5 /CA .75 >> >>":"";
   return writeTinyPdf({objects:[
     {number:1,body:"<< /Type /Catalog /Pages 2 0 R >>"},
     {number:2,body:"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"},
-    {number:3,body:`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${width} ${height}] /Resources << /Font << /F 5 0 R >> ${graphics} ${options.form?"/XObject << /Fm 8 0 R >>":""} >> /Contents 4 0 R >>`},
+    {number:3,body:`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${width} ${height}] /Resources << /Font << /F 5 0 R >> ${graphics} ${options.form?"/XObject << /Fm 8 0 R >>":images} >> /Contents 4 0 R >>`},
     {number:4,body:tinyPdfStream("",options.form?"/Fm Do":content.join("\n"))},
     {number:5,body:"<< /Type /Font /Subtype /Type1 /BaseFont /FixtureType1 /FirstChar 65 /LastChar 65 /Widths [1000] /Encoding << /Differences [65 /A] >> /FontDescriptor 6 0 R >>"},
     {number:6,body:"<< /Type /FontDescriptor /FontName /FixtureType1 /Flags 4 /FontBBox [-100 0 500 400] /ItalicAngle 0 /Ascent 400 /Descent 0 /CapHeight 400 /StemV 10 /FontFile 7 0 R >>"},
     {number:7,body:tinyPdfStream(`/Length1 ${font.length1} /Length2 ${font.length2} /Length3 ${font.length3}`,font.bytes)},
-    ...(options.form?[{number:8,body:tinyPdfStream(`/Type /XObject /Subtype /Form /BBox [0 0 ${width} ${height}] /Resources << /Font << /F 5 0 R >> ${graphics} >>`,content.join("\n"))}]:[])
+    ...(options.form?[{number:8,body:tinyPdfStream(`/Type /XObject /Subtype /Form /BBox [0 0 ${width} ${height}] /Resources << /Font << /F 5 0 R >> ${graphics} ${images} >>`,content.join("\n"))}]:[]),
+    {number:9,body:tinyPdfStream(`/Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8 /ColorSpace /DeviceRGB /Interpolate ${!!options.interpolate}`,
+      Uint8Array.of(255,0,0,0,255,0,0,0,255,0,0,0))},
+    {number:10,body:tinyPdfStream(`/Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 1 /ImageMask true /Decode [1 0] /Interpolate ${!!options.imageMaskInterpolate}`,Uint8Array.of(0x80,0x40))}
   ]});
 }
 function cell(mode){return{x:30+(mode%4)*110,y:mode<4?200:80};}
@@ -183,13 +198,13 @@ function difference(actual,expected){let delta=0,ink=0;for(let i=0;i<actual.leng
 // fonts. Fixture paths are lines; all packed types still preserve quadratic
 // segments, subpaths, colors, source ordering and persistent clipping.
 function renderScene(scene){
-  const canvas=createCanvas(width*scale,height*scale),ctx=canvas.getContext("2d");ctx.fillStyle="white";ctx.fillRect(0,0,canvas.width,canvas.height);
+  const canvas=createCanvas(width*scale,height*scale);let ctx=canvas.getContext("2d");ctx.fillStyle="white";ctx.fillRect(0,0,canvas.width,canvas.height);
   ctx.setTransform(scale,0,0,-scale,0,height*scale);
   const color=(r,g,b,a)=>`rgba(${r*255},${g*255},${b*255},${a})`;
   const path=(a,b,first,count)=>{ctx.beginPath();let x=NaN,y=NaN;for(let i=first;i<first+count;i++){
     const o=i*4;if(a[o]!==x||a[o+1]!==y)ctx.moveTo(a[o],a[o+1]);
     if(b[o+2]>=.5)ctx.quadraticCurveTo(a[o+2],a[o+3],b[o],b[o+1]);else ctx.lineTo(b[o],b[o+1]);x=b[o];y=b[o+1];}};
-  for(const run of scene.drawRuns){ctx.save();
+  const drawRun=run=>{ctx.save();
     for(let index=run.clipIndex;index!==undefined&&index>=0;){const clip=scene.clipPaths[index];ctx.beginPath();let x=NaN,y=NaN;
       for(let o=0;o<clip.edges.length;o+=4){const e=clip.edges;if(e[o]!==x||e[o+1]!==y)ctx.moveTo(e[o],e[o+1]);ctx.lineTo(e[o+2],e[o+3]);x=e[o+2];y=e[o+3];}
       ctx.clip(clip.fillRule?"evenodd":"nonzero");index=clip.parent;}
@@ -204,7 +219,17 @@ function renderScene(scene){
         ctx.strokeStyle=color(scene.styles[o+1],scene.styles[o+2],scene.styles[o+3],packed-flags*2);
         ctx.lineWidth=scene.styles[o]===0?1/scale:scene.styles[o]*2;ctx.lineCap=flags&2?"round":"butt";ctx.setLineDash([]);
         path(scene.endpoints,scene.primitiveMeta,i,1);ctx.stroke();
+      }else if(run.kind==="raster"){const layer=scene.rasterLayers[i],surface=createCanvas(layer.width,layer.height),image=surface.getContext("2d").createImageData(layer.width,layer.height);
+        image.data.set(layer.data);surface.getContext("2d").putImageData(image,0,0);ctx.save();ctx.transform(...layer.matrix);
+        ctx.imageSmoothingEnabled=layer.interpolate!==false;ctx.globalAlpha=layer.opacity??1;ctx.drawImage(surface,0,0,1,1);ctx.restore();
       }else throw new Error(`Unexpected HEP fixture draw kind ${run.kind}`);
     }ctx.restore();
-  }return canvas;
+  };
+  const visit=nodes=>{for(const node of nodes){if(node.kind==="draw")drawRun(scene.drawRuns[node.runIndex]);else{
+    assert(!node.softMask&&!node.knockout&&node.blendMode==="Normal","fixture graph uses ordinary source-over opacity");
+    const parent=ctx,surface=createCanvas(width*scale,height*scale);ctx=surface.getContext("2d");ctx.setTransform(scale,0,0,-scale,0,height*scale);
+    visit(node.children);ctx=parent;ctx.save();ctx.setTransform(1,0,0,1,0,0);ctx.globalAlpha=node.alpha;ctx.drawImage(surface,0,0);ctx.restore();
+  }}};
+  if(scene.paintGraph)visit(scene.paintGraph.roots);else for(const run of scene.drawRuns)drawRun(run);
+  return canvas;
 }

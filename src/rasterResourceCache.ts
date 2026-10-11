@@ -16,7 +16,7 @@ export class RasterResourceCache<T extends object> {
     let identity = this.identities.get(pixels);
     if (identity === undefined) this.identities.set(pixels, identity = ++this.nextIdentity);
     return `${identity}:${source.width}:${source.height}:${plan.width}:${plan.height}:${plan.tiles.map(tile =>
-      `${tile.x},${tile.y},${tile.width},${tile.height}`).join(";")}:${format ?? ""}:${source.opacity ?? 1}:${
+      `${tile.x},${tile.y},${tile.width},${tile.height}`).join(";")}:${format ?? ""}:${source.interpolate === false ? "nearest" : "smooth"}:${source.opacity ?? 1}:${
       source.matrix ? Array.from(source.matrix).join(",") : ""}:${source.pageIndex ?? 0}:${source.paintOrder ?? 0}:${source.monochrome ? Array.from(source.monochrome.colors).join(",") : ""}`;
   }
 

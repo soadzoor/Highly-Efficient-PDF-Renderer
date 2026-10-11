@@ -11,7 +11,7 @@ import {
   CFF_EXPERT_ENCODING,
   CFF_EXPERT_SUBSET_CHARSET
 } from "./nativeCffExpertData";
-import { evaluateNativeType1CharString } from "./nativeType1";
+import { evaluateNativeType1CharString, evaluateNativeType1CompositeGlyph } from "./nativeType1";
 import type { NativeType1ParserLimits } from "./nativeType1";
 import { paintNativeGlyphCommands } from "./nativeGlyphPaint";
 import { executeNativeFontPostScript } from "./nativeFontPostScript";
@@ -148,6 +148,10 @@ export class NativeCffFont {
   private readonly pdfOutlineCache = new Map<number, NativeGlyphOutline>();
   private diagnosticData: readonly PdfDiagnostic[];
   private readonly unknownType1OtherSubrs = new Set<number>();
+
+  get usesPostScript(): boolean {
+    return this.otherSubrExecutorFactory !== undefined || this.diagnosticData.some(diagnostic => diagnostic.code.includes("postscript"));
+  }
 
   private constructor(options: {
     readonly charStrings: readonly Uint8Array[];
@@ -531,6 +535,49 @@ export class NativeCffFont {
       const dictionary = this.fontDictionaries[this.fdSelect[glyphId]];
       if (this.charStringType === 1) {
         let executeOtherSubr: ReturnType<NativeFontPostScriptResult["createOtherSubrExecutor"]> | undefined;
+        if (this.otherSubrExecutorFactory) {
+          let otherSubrFailure: PdfError | undefined;
+          const interpreted = evaluateNativeType1CompositeGlyph({ source: this.charStrings[glyphId], glyphId,
+            subrs: dictionary.localSubrs }, {
+            signal: budget.signal, budget, limits: type1LimitsFromCff(this.limits),
+            blendWeights: this.legacyMasterState?.registers[0].slice(0, this.legacyMasterState.masterCount),
+            executeOtherSubr: (index, args, context) => {
+              otherSubrFailure = undefined;
+              try {
+                executeOtherSubr ??= this.otherSubrExecutorFactory!(budget.signal, context);
+                return executeOtherSubr(index, args);
+              } catch (error) {
+                if (!(error instanceof PdfError) || error.code !== "unsupported-font") throw error;
+                otherSubrFailure = error;
+                return null;
+              }
+            },
+            onUnknownOtherSubr: index => {
+              if (this.unknownType1OtherSubrs.has(index)) return;
+              this.unknownType1OtherSubrs.add(index);
+              this.diagnosticData = Object.freeze([...this.diagnosticData, Object.freeze({
+                code: "font.type1-othersubr-approximated", severity: "warning" as const,
+                message: `CFF Type 1 OtherSubr ${index} uses the required argument-preserving fallback; custom PostScript effects may differ.`,
+                details: Object.freeze({ reason: "type1-unknown-othersubr", othersubr: index, approximate: true,
+                  ...(otherSubrFailure ? cffPostScriptFailureDetails(otherSubrFailure) : {}) })
+              })]);
+            },
+            resolveGlyph: code => {
+              const name = standardEncodingGlyphName(code), id = name === null ? undefined : this.glyphIdsByName.get(name);
+              if (this.glyphIdsByCid !== null || id === undefined) throw cffUnsupported("A CFF Type 1 composite references a missing StandardEncoding glyph.", "type1-seac-missing-glyph");
+              return { source: this.charStrings[id], glyphId: id, subrs: this.fontDictionaries[this.fdSelect[id]].localSubrs };
+            }
+          });
+          for (const diagnostic of interpreted.postScriptDiagnostics ?? []) {
+            if (!this.diagnosticData.some(existing => existing.code === diagnostic.code)) this.diagnosticData = Object.freeze([...this.diagnosticData, diagnostic]);
+          }
+          const result = Object.freeze({ commands: interpreted.commands,
+            advanceWidth: interpreted.advanceWidth, advanceY: interpreted.advanceY,
+            ...(interpreted.postScriptPaints ? { postScriptPaints: interpreted.postScriptPaints } : {}),
+            ...(interpreted.postScriptFinalState ? { postScriptFinalState: interpreted.postScriptFinalState } : {}) });
+          this.rawOutlineCache.set(glyphId, result);
+          return result;
+        }
         let compositePaints: readonly NativeGlyphPostScriptPaint[] = [];
         let compositeSequence: readonly CffPostScriptPaintSequenceItem[] | undefined;
         let otherSubrFailure: PdfError | undefined;
@@ -1702,9 +1749,12 @@ function applyCffPostScript(
       maxStringBytes: limits.maxCffStringBytes,
       standardEncoding: Array.from({ length: 256 }, (_, code) => standardEncodingGlyphName(code)), expertEncoding: CFF_EXPERT_ENCODING });
     const dictionary = computed.dictionary;
-    const knownKeys = new Set(["FontName", "FontType", "FontMatrix", "FontBBox", "PaintType", "StrokeWidth", "Encoding", "CharStrings", "FontInfo",
-      "FSType", "OrigFontType", "UniqueID", "XUID", "UIDBase", "BaseFontName", "BaseFontBlend", "OtherSubrs"]);
-    if ([...dictionary.keys()].some(key => !knownKeys.has(key)) || dictionary.get("FontType") !== initialFontType) return unchanged;
+    // Font programs may keep arbitrary helper procedures and mutable data in
+    // their dictionary. Those are retained by the glyph VM, not a reason to
+    // discard otherwise valid computed records. Active hooks outside the CFF
+    // charstring engine still require an explicit diagnosed fallback.
+    rejectUnsupportedCffPostScriptHooks(dictionary);
+    if (dictionary.get("FontType") !== initialFontType) return unchanged;
     const matrixValue = dictionary.get("FontMatrix");
     if (!Array.isArray(matrixValue) || matrixValue.some(value => typeof value !== "number")) return unchanged;
     const matrix = validateCffFontMatrix(matrixValue as number[]);
@@ -1780,9 +1830,8 @@ function applyCffFontDictionaryPostScript(
       maxStack: limits.maxCffPostScriptStack, maxStringBytes: limits.maxCffStringBytes,
       standardEncoding: Array.from({ length: 256 }, (_, code) => standardEncodingGlyphName(code)), expertEncoding: CFF_EXPERT_ENCODING
     }).dictionary;
-    const knownKeys = new Set(["FontType", "FontName", "FontMatrix", "FontBBox", "PaintType", "StrokeWidth", "FontInfo",
-      "FSType", "OrigFontType", "UniqueID", "XUID", "UIDBase", "BaseFontName", "BaseFontBlend"]);
-    if ([...computed.keys()].some(key => !knownKeys.has(key)) || computed.get("FontType") !== 1) return unchanged;
+    rejectUnsupportedCffPostScriptHooks(computed, true);
+    if (computed.get("FontType") !== 1) return unchanged;
     const matrixValue = computed.get("FontMatrix");
     if (!Array.isArray(matrixValue) || matrixValue.some(value => typeof value !== "number")) return unchanged;
     const matrix = validateCffFontMatrix(matrixValue as number[]);
@@ -1796,6 +1845,19 @@ function applyCffFontDictionaryPostScript(
   } catch (error) {
     if (!(error instanceof PdfError) || error.code !== "unsupported-font") throw error;
     return { ...unchanged, failure: error };
+  }
+}
+
+function rejectUnsupportedCffPostScriptHooks(dictionary: ReadonlyMap<string, NativeFontPostScriptValue>, fontDictionary = false): void {
+  const active = ["BuildChar", "BuildGlyph", "CDevProc", "Metrics", "Metrics2", "WMode", "FMapType", "FDepVector",
+    "FDArray", "FDSelect", "CIDMap", "CIDMapOffset", "CIDCount", "GDBytes", "FDBytes", "CIDFontType"];
+  if (fontDictionary) active.push("OtherSubrs", "CharStrings", "Encoding");
+  const key = active.find(name => dictionary.has(name));
+  if (key !== undefined) throw cffUnsupported(`CFF PostScript defines an active /${key} font hook that the native CFF glyph engine does not execute.`, "cff-postscript-font-hook");
+  const privateDictionary = dictionary.get("Private");
+  if (privateDictionary instanceof Map) {
+    const privateKey = ["Subrs", "lenIV", ...(fontDictionary ? ["OtherSubrs"] : [])].find(name => privateDictionary.has(name));
+    if (privateKey !== undefined) throw cffUnsupported(`CFF PostScript defines an active Private /${privateKey} record that cannot replace the binary CFF data.`, "cff-postscript-font-hook");
   }
 }
 

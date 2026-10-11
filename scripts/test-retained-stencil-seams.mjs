@@ -39,6 +39,7 @@ try {
   const page = await compile();
   const full = await lower(page);
   assert.equal(full.rasterLayers.length, 1, "matching plates become one image before GPU filtering");
+  assert.equal(full.rasterLayers[0].interpolate, false, "binary plates preserve the source's nearest sampling");
   const expected = Array.from({ length: 8 }, (_, i) => (i % 4 + Math.floor(i / 4)) % 2 === 0
     ? [164, 174, 172, 255] : [140, 150, 148, 255]).flat();
   assert.deepEqual([...full.rasterLayers[0].data], expected, "original binary samples retain their paint colors");
@@ -52,11 +53,13 @@ try {
   const oldAlpha = 128 / 255 + (128 / 255) * (1 - 128 / 255);
   assert(oldAlpha < .76, "separately reduced checkerboard plates reproduce the old translucent background");
 
-  // Sample the actual atlas's mip rectangles, including bilinear/trilinear
-  // filtering at tile boundaries. Every zoom keeps the same opaque gray.
+  // Nearest layers bypass smooth atlases. Explicit smooth derivatives still
+  // retain opaque coverage through bilinear/trilinear filtering at boundaries.
   const tiled = { ...reduced, rasterLayers: Array.from({ length: 4 }, (_, i) =>
     ({ ...tile, paintOrder: i, matrix: Float32Array.of(20, 0, 0, 10, 10 + i * 19.6, 10) })) };
-  const [atlas] = buildRasterAtlasBatches(tiled, 1024);
+  assert.deepEqual(buildRasterAtlasBatches(tiled, 1024), [], "nearest stencil plates retain their individual samplers");
+  const [atlas] = buildRasterAtlasBatches({ ...tiled,
+    rasterLayers: tiled.rasterLayers.map(layer => ({ ...layer, interpolate: true })) }, 1024);
   assert.equal(atlas.count, 4);
   const sampleLevel = (image, requested, u) => {
     const meta = atlas.instances.subarray(image * 12, image * 12 + 12);

@@ -287,6 +287,7 @@ type FrameListener = (stats: DrawStats) => void;
 
 interface RasterTileGpu {
   texture: WebGLTexture;
+  interpolate?: boolean;
   compressionFormat?: RasterCompressionFormat;
   monochrome?: { mipTexture: WebGLTexture; width: number; height: number; colors: Float32Array; coverage?: boolean; compact?: boolean; estimatedBytes?: number };
   /** This tile's part of the image's unit square and its texture coordinates; absent for a whole image. */
@@ -308,6 +309,7 @@ interface RasterLayerGpu extends RasterTileGpu {
 
 interface RasterLayerSource {
   opacity?: number;
+  interpolate?: boolean;
   width: number;
   height: number;
   data: Uint8Array<ArrayBufferLike>;
@@ -3151,7 +3153,8 @@ export class WebGlFloorplanRenderer {
     this.bindOrderedTexture(12, tile.texture);
     // Unit 13 is shared with text through the ordinary ordered binding cache.
     this.bindOrderedTexture(13, tile.monochrome?.mipTexture ?? tile.texture);
-    gl.uniform1f(this.uRasterMonochrome, tile.monochrome ? tile.monochrome.compact ? 3 : tile.monochrome.coverage ? 2 : 1 : 0);
+    gl.uniform1f(this.uRasterMonochrome, tile.monochrome ? tile.interpolate === false ? tile.monochrome.coverage ? 5 : 4
+      : tile.monochrome.compact ? 3 : tile.monochrome.coverage ? 2 : 1 : 0);
     gl.uniform1f(this.uRasterOpaque, tile.compressionFormat ? 1 : 0);
     if (tile.monochrome) {
       gl.uniform2f(this.uRasterMonoSize, tile.monochrome.width, tile.monochrome.height);
@@ -3791,7 +3794,7 @@ export class WebGlFloorplanRenderer {
     };
     const queueRaster = (index: number): boolean => {
       const layer = this.rasterLayers?.[index];
-      if (!layer || layer.monochrome || layer.compressionFormat || layer.quad || layer.uv || layer.extraTiles?.length || this.rasterTextureBatchUnavailable) return false;
+      if (!layer || layer.interpolate === false || layer.monochrome || layer.compressionFormat || layer.quad || layer.uv || layer.extraTiles?.length || this.rasterTextureBatchUnavailable) return false;
       let slot = rasterTextures.indexOf(layer.texture);
       if (rasterIndices.length === RASTER_BATCH_INSTANCES || slot < 0 && rasterTextures.length === RASTER_BATCH_TEXTURES) {
         flushRaster(); slot = -1;
@@ -5023,14 +5026,14 @@ export class WebGlFloorplanRenderer {
     try {
       for (const [tileIndex, tile] of plan.tiles.entries()) {
         if (coverage) {
-          const resource = this.createMonochromeRasterTile(monochrome!, tile.width, tile.height, prepared?.coverageAtlases?.[tileIndex], pixels[tileIndex], prepared?.compactAtlases?.[tileIndex], !!prepared?.compactAtlases);
+          const resource = this.createMonochromeRasterTile(monochrome!, tile.width, tile.height, prepared?.coverageAtlases?.[tileIndex], pixels[tileIndex], prepared?.compactAtlases?.[tileIndex], !!prepared?.compactAtlases, source.interpolate);
           tiles.push(plan.tiles.length > 1
             ? { ...resource, quad: Float32Array.from(tile.quad), uv: Float32Array.from(tile.uv) } : resource);
           continue;
         }
         if (packed) {
           const resource = this.createMonochromeRasterTile(
-            prepared?.monochromeTiles?.[tileIndex] ?? monochromeRasterTile(monochrome, source.width, source.height, tile), tile.width, tile.height, prepared?.coverageAtlases?.[tileIndex], undefined, prepared?.compactAtlases?.[tileIndex], !!prepared?.compactAtlases);
+            prepared?.monochromeTiles?.[tileIndex] ?? monochromeRasterTile(monochrome, source.width, source.height, tile), tile.width, tile.height, prepared?.coverageAtlases?.[tileIndex], undefined, prepared?.compactAtlases?.[tileIndex], !!prepared?.compactAtlases, source.interpolate);
           tiles.push(plan.tiles.length > 1
             ? { ...resource, quad: Float32Array.from(tile.quad), uv: Float32Array.from(tile.uv) }
             : resource);
@@ -5042,6 +5045,7 @@ export class WebGlFloorplanRenderer {
             : encoder.upload(pixels[tileIndex], tile.width, tile.height, compressionFormat,
               Math.min(MAX_WEBGL_RASTER_COMPRESSION_WORKSPACE_BYTES, automaticRasterMemoryBudget().bytes / 4));
           const uv = tile.uv.map((value, offset) => value * resource.uvScale[offset % 2]);
+          if (source.interpolate === false) { gl.bindTexture(gl.TEXTURE_2D, resource.texture); configureRasterTexture(gl, false); }
           tiles.push({ texture: resource.texture, compressionFormat,
             ...(plan.tiles.length > 1 ? { quad: Float32Array.from(tile.quad) } : {}),
             ...(plan.tiles.length > 1 || resource.uvScale.some(value => value !== 1) ? { uv: Float32Array.from(uv) } : {}) });
@@ -5052,7 +5056,7 @@ export class WebGlFloorplanRenderer {
           ? { texture, quad: Float32Array.from(tile.quad), uv: Float32Array.from(tile.uv) }
           : { texture });
         gl.bindTexture(gl.TEXTURE_2D, texture);
-        configureRasterTexture(gl);
+        configureRasterTexture(gl, source.interpolate);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, tile.width, tile.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels[tileIndex]);
         gl.generateMipmap(gl.TEXTURE_2D);
       }
@@ -5060,6 +5064,8 @@ export class WebGlFloorplanRenderer {
       for (const tile of tiles) this.deleteRasterTileTextures(tile);
       throw error;
     }
+
+    for (const tile of tiles) tile.interpolate = source.interpolate;
 
     const matrix = new Float32Array(6);
     if (source.matrix.length >= 6) {
@@ -5098,19 +5104,19 @@ export class WebGlFloorplanRenderer {
 
   private createMonochromeRasterTile(source: MonochromeRaster, width: number, height: number,
     preparedAtlas?: PackedMonochromeCoverageAtlas, coveragePixels?: Uint8Array, preparedCompact?: CompactMonochromeAtlas,
-    compactPrepared = false): RasterTileGpu {
+    compactPrepared = false, interpolate?: boolean): RasterTileGpu {
     const gl = this.gl;
     const atlas = preparedAtlas ?? (coveragePixels ? buildPackedCoverageMipAtlas(coveragePixels, width, height)
       : buildPackedMonochromeMipAtlas(source, width, height));
-    const compact = compactPrepared ? preparedCompact : buildCompactMonochromeAtlas(source, width, height, atlas, coveragePixels);
+    const compact = interpolate === false ? undefined : compactPrepared ? preparedCompact : buildCompactMonochromeAtlas(source, width, height, atlas, coveragePixels);
     const texture = this.mustCreateTexture();
     let mipTexture: WebGLTexture | null = null;
     try {
       mipTexture = compact ? texture : this.mustCreateTexture();
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
       gl.bindTexture(gl.TEXTURE_2D, texture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, coveragePixels ? gl.LINEAR : gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, coveragePixels ? gl.LINEAR : gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, coveragePixels && interpolate !== false ? gl.LINEAR : gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, coveragePixels && interpolate !== false ? gl.LINEAR : gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       if (compact) {
@@ -5164,6 +5170,7 @@ export class WebGlFloorplanRenderer {
           gpuCompression: layer.gpuCompression,
           gpuPreparation: layer.gpuPreparation,
           opacity: layer.opacity,
+          interpolate: layer.interpolate,
           matrix: layer.matrix instanceof Float32Array ? layer.matrix : new Float32Array(layer.matrix),
           paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
           pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
@@ -6335,9 +6342,9 @@ function configureVectorMinifyTexture(gl: WebGL2RenderingContext): void {
 }
 
 
-function configureRasterTexture(gl: WebGL2RenderingContext): void {
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+function configureRasterTexture(gl: WebGL2RenderingContext, interpolate?: boolean): void {
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, interpolate === false ? gl.NEAREST : gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, interpolate === false ? gl.NEAREST : gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 }

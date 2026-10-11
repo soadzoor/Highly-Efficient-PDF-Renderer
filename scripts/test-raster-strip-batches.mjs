@@ -13,6 +13,10 @@ try {
   });
   const scene = makeScene([1, 2, 3, 5, 7, 16, 293, 1024]);
   const original = structuredClone(scene);
+  const nearest = makeScene(Array(9).fill(5));
+  nearest.rasterLayers[4].interpolate = false;
+  assert.deepEqual(buildRasterStripBatches(nearest, 4096).map(({ first, count }) => [first, count]), [[0, 4], [5, 4]],
+    "nearest images do not enter a shader that blends texels and mip levels");
   for (const mipFilter of ["box", "linear"]) {
     const [batch] = buildRasterStripBatches(scene, 4096, mipFilter);
     assert.equal(batch.count, scene.rasterLayers.length);

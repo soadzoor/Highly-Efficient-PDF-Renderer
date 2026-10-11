@@ -27,6 +27,31 @@ try {
   const sceneWith = (...layers) => Object.assign(createEmptyVectorScene(), { rasterLayers: layers });
 
   {
+    const { renderer, device } = create();
+    const layer = Object.assign(packedLayer(17, 17), { interpolate: false });
+    const rgba = { width: 3, height: 1, data: Uint8Array.of(255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255),
+      matrix: layer.matrix, paintOrder: 1, pageIndex: 0, interpolate: false };
+    const scene = sceneWith(layer, rgba); renderer.scene = scene; renderer.configureRasterLayers(scene);
+    const [packed, regular] = renderer.rasterLayerResources;
+    assert.equal(packed.texture.descriptor.format, "r8unorm", "nearest sampling keeps packed source bits");
+    assert.equal(device.writes.find(write => write.buffer === packed.uniformBuffer).values[7], 17.25,
+      "quarter width selects unfiltered packed sampling without changing the uniform ABI");
+    for (const resource of [packed, regular]) {
+      const sampler = resource.bindGroup.entries.find(entry => entry.binding === 2).resource;
+      assert.equal(sampler.magFilter, "nearest"); assert.equal(sampler.minFilter, "nearest");
+      assert.equal(sampler.lodMaxClamp, 0, "nearest uses original pixels rather than averaged mip levels");
+    }
+    const shader = renderer.rasterPipeline.descriptor.fragment.module.code;
+    assert.match(shader, /let nearest = fraction > 0\.125 && fraction < 0\.375/);
+    assert.match(shader, /textureLoad\(uRasterTex, pixel, 0\)\.r/);
+    const coverage = renderer.createRasterTileResource(layer.matrix, packed.texture, 1,
+      { width: 2, height: 1, quad: [0, 0, 1, 1], uv: [0, 0, 1, 1] }, undefined, layer.monochrome, false, true, false, false);
+    assert.equal(device.writes.find(write => write.buffer === coverage.uniformBuffer).values[7], -2.25,
+      "nearest reduced R8 coverage uses the same marker with a negative width");
+    coverage.uniformBuffer.destroy(); renderer.dispose();
+  }
+
+  {
     const layer = packedLayer(17, 17);
     const { renderer, device } = create();
     const scene = sceneWith(layer, { width: 2, height: 2, data: new Uint8Array(16).fill(255),

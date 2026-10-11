@@ -47,6 +47,8 @@ export interface RasterLayer {
   pageDemandSlot?: boolean;
   /** Constant paint alpha, independent of the retained image RGBA; absent means one. */
   opacity?: number;
+  /** Explicit image sampling; absent keeps the viewer's legacy smooth policy. */
+  interpolate?: boolean;
   width: number;
   height: number;
   data: Uint8Array<ArrayBufferLike>;

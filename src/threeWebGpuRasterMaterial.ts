@@ -147,13 +147,23 @@ fn heprThreeRasterSample(image: texture_2d<f32>, imageSampler: sampler,
   uv: vec2f, mode: f32, size: vec2f, color0: vec4f, color1: vec4f, opaque: f32) -> vec4f {
   let dx = dpdx(uv); let dy = dpdy(uv);
   if (mode < 0.5) {
-    var color = textureSampleGrad(image, imageSampler, uv, dx, dy);
+    var color: vec4f;
+    if (mode < -0.5) {
+      let dimensions = vec2i(textureDimensions(image));
+      let pixel = clamp(vec2i(floor(uv * vec2f(dimensions))), vec2i(0), dimensions - vec2i(1));
+      color = textureLoad(image, pixel, 0);
+    } else { color = textureSampleGrad(image, imageSampler, uv, dx, dy); }
     if (opaque > 0.5) { color.a = 1.0; }
     return color;
   }
   let lod = max(0.0, log2(max(1.0, max(length(dx * size), length(dy * size)))));
   var coverage: f32;
-  if (mode > 2.5) {
+  if (mode > 4.5) {
+    let pixel = clamp(vec2i(floor(uv * size)), vec2i(0), vec2i(size) - vec2i(1));
+    coverage = textureLoad(image, pixel, 0).r;
+  } else if (mode > 3.5) {
+    coverage = heprThreeRasterBit(image, size, vec2i(floor(uv * size)));
+  } else if (mode > 2.5) {
     coverage = heprCompactSample(image, vec2i(size), uv, lod);
   } else if (lod < 1.0) {
     let position = uv * size - vec2f(0.5);

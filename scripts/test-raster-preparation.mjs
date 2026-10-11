@@ -52,6 +52,8 @@ try {
   const released = [], cache = new RasterResourceCache(resource => released.push(resource));
   const source = binary(17, 9), plan = planRasterTiles(17, 9, 32), a = {}, b = {}, zero = {};
   cache.remember(a, source, plan); cache.park(a, 100);
+  assert.equal(cache.take(Object.assign(Object.create(source), { interpolate: false }), plan), null,
+    "a nearest layer cannot reuse smooth textures and sampler bindings for the same pixels");
   assert(cache.has(source, plan));
   assert(!cache.has(source, plan, "astc-12x12"));
   assert(!cache.has(Object.assign(Object.create(source), { pageIndex: 1 }), plan));

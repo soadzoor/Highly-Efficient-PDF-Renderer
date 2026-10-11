@@ -1534,7 +1534,7 @@ function asciiSignature(bytes: Uint8Array, offset: number): string {
   return output;
 }
 
-function xyzToSrgb(
+export function xyzToSrgb(
   xyz: readonly number[],
   sourceWhite: readonly number[]
 ): readonly [number, number, number] {

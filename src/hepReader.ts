@@ -1292,6 +1292,10 @@ async function readRasterLayersFromParsedData(
   const meta = readSceneSectionDescriptor(sceneMeta.rasterLayers, SCENE_RASTER_LAYERS_PATH, "raster layers");
   const count = readSceneSectionCount(meta, "count", "raster layers");
   const atlasCount = readSceneSectionCount(meta, "atlasCount", "raster layers");
+  const interpolation = meta.interpolation;
+  if (interpolation !== undefined && (typeof interpolation !== "string" || interpolation.length !== count || /[^01-]/.test(interpolation))) {
+    throw new Error("Scene raster layer interpolation does not match its layers.");
+  }
   const tableEntry = archive.file(SCENE_RASTER_LAYERS_PATH);
   const tableByteLength = tableEntry ? readHepEntryUncompressedSize(tableEntry) : null;
   if (tableByteLength === null || tableByteLength > (count + atlasCount + 1) * MAX_RASTER_RECORD_BYTES) {
@@ -1334,6 +1338,7 @@ async function readRasterLayersFromParsedData(
       matrix: record.matrix,
       paintOrder: record.paintOrder,
       pageIndex: record.pageIndex,
+      ...(typeof interpolation === "string" && interpolation[i] !== "-" ? { interpolate: interpolation[i] === "1" } : {}),
       ...(record.opacity === undefined ? {} : { opacity: record.opacity })
     };
     if (record.storage === "mono") {

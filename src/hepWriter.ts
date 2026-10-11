@@ -313,7 +313,10 @@ export async function buildHepBlobForLayout(
       textGlyphCount: scene.textGlyphCount,
       textGlyphPrimitiveCount: scene.textGlyphSegmentCount,
       rasterLayers: rasterLayersManifest && {
-        file: rasterLayersManifest.file, count: rasterLayersManifest.count, atlasCount: rasterLayersManifest.atlasCount
+        file: rasterLayersManifest.file, count: rasterLayersManifest.count, atlasCount: rasterLayersManifest.atlasCount,
+        ...(rasterLayers.some(layer => layer.interpolate !== undefined) ? {
+          interpolation: rasterLayers.map(layer => layer.interpolate === undefined ? "-" : layer.interpolate ? "1" : "0").join("")
+        } : {})
       }
     },
     textures: textureEntries.map((entry) => ({

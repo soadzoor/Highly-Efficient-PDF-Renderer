@@ -9,6 +9,7 @@ export function validateRasterLayerUpdates(scene: VectorScene, updates: Readonly
       !Number.isSafeInteger(layer.width) || !Number.isSafeInteger(layer.height) || layer.width < 1 || layer.height < 1 ||
       !Number.isSafeInteger(layer.width * layer.height * 4) ||
       (layer.opacity !== undefined && (!Number.isFinite(layer.opacity) || layer.opacity < 0 || layer.opacity > 1)) ||
+      (layer.interpolate !== undefined && typeof layer.interpolate !== "boolean") ||
       (layer.monochrome ? !(layer.monochrome.data instanceof Uint8Array) || !(layer.monochrome.colors instanceof Uint8Array) ||
         layer.monochrome.data.length !== Math.ceil(layer.width / 8) * layer.height || layer.monochrome.colors.length !== 8
         : layer.data.length !== layer.width * layer.height * 4) || layer.matrix.length !== 6 || !layer.matrix.every(Number.isFinite)) {

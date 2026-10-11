@@ -305,6 +305,28 @@ try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const seedScene = createEmptyVectorScene();
 
+  const samplingPixels = Uint8Array.of(255, 0, 0, 255, 0, 0, 255, 255);
+  const samplingScene = createRasterScene(seedScene, 2, 1, samplingPixels);
+  samplingScene.rasterLayers = [true, false, undefined].map((interpolate, index) => ({
+    ...samplingScene.rasterLayers[0], data: samplingPixels.slice(), paintOrder: index,
+    ...(interpolate === undefined ? {} : { interpolate })
+  }));
+  const samplingBytes = await (await zipBuilder.buildHep(samplingScene, { encodeRasterImages: false, compression: "store" })).arrayBuffer();
+  const samplingArchive = await HepArchive.loadAsync(samplingBytes);
+  const samplingManifest = JSON.parse(await samplingArchive.file("manifest.json").async("string"));
+  assert.equal(samplingManifest.scene.rasterLayers.interpolation, "10-", "image sampling adds compact optional metadata without changing raster records");
+  const samplingLoaded = await parsedData.loadSceneFromHep(samplingBytes);
+  assert.deepEqual(samplingLoaded.rasterLayers.map(layer => layer.interpolate), [true, false, undefined]);
+  for (const invalid of ["10", "10-x", "10x", true, [true, false, null]]) {
+    samplingManifest.scene.rasterLayers.interpolation = invalid;
+    samplingArchive.file("manifest.json", JSON.stringify(samplingManifest));
+    await assert.rejects(parsedData.loadSceneFromHep(await samplingArchive.generateAsync({ type: "arraybuffer", compression: "STORE" })), /interpolation/);
+  }
+  delete samplingManifest.scene.rasterLayers.interpolation;
+  samplingArchive.file("manifest.json", JSON.stringify(samplingManifest));
+  const legacySampling = await parsedData.loadSceneFromHep(await samplingArchive.generateAsync({ type: "arraybuffer", compression: "STORE" }));
+  assert(legacySampling.rasterLayers.every(layer => layer.interpolate === undefined), "older scenes retain the legacy sampling policy");
+
   const width = 64;
   const height = 64;
   const rgba = new Uint8Array(width * height * 4);
@@ -356,7 +378,8 @@ try {
     createRasterScene(seedScene, 1, 1, tinyRgba),
     { compression: "store" }
   );
-  const rawArchive = await HepArchive.loadAsync(await rawBlob.arrayBuffer());
+  const rawBytes = await rawBlob.arrayBuffer();
+  const rawArchive = await HepArchive.loadAsync(rawBytes);
   assert.equal((await readRasterTable(rawArchive)).layers[0].storage, "rgba");
   assert.ok(rawArchive.file("raster/layer-0.rgba"));
 
@@ -370,12 +393,12 @@ try {
   await assert.rejects(
     parsedData.loadSceneFromHep(
       patchHepEntryUncompressedSize(
-        encodedBytes,
-        encodedFile,
-        768 * 1024 * 1024 + 1
+        rawBytes,
+        "raster/layer-0.rgba",
+        5
       )
     ),
-    /section .* exceeds its decoded byte limit|HEP section size is invalid or exceeds the memory budget/
+    /raw byte length does not match its metadata/
   );
 
   const mismatchedArchive = await HepArchive.loadAsync(encodedBytes);
