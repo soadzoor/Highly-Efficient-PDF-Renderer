@@ -264,6 +264,7 @@ export async function openPdfWithWorkerEndpoint(
       repair: options.repair,
       password: options.password,
       iccEngine: options.iccEngine,
+      embeddedFontPaint: options.embeddedFontPaint,
       limits: options.limits,
       hasMissingFontResolver: options.missingFontResolver !== undefined,
       hasImageCodecResolver: options.imageCodecResolver !== undefined,

@@ -6,6 +6,7 @@ import type { VectorScene, VectorDrawRun } from "../pdfVectorExtractor";
 import type { ScenePaintNode } from "../scenePaintGraph";
 import { buildNativeGlyphHairline } from "./nativeGlyphHairline";
 import { PdfError, throwIfAborted } from "./nativeTypes";
+import { paintNativeGlyphCommands } from "./nativeGlyphPaint";
 
 export interface NativeStrokeTextStores {
   instanceA: Float32Array;
@@ -42,7 +43,8 @@ export function buildNativeVectorTextStrokes(
   maxCoordinates: number,
   signal?: AbortSignal
 ): { glyphToInstance: Int32Array | null; hairlines: NativeHairlineTextStrokes | null; approximated: boolean; approximateHairlineStyle: boolean } {
-  if (!sidecar.glyphStrokePaints?.some(paint => paint && paint.color[3] > 1e-3)) {
+  if (!sidecar.glyphStrokePaints?.some(paint => paint && paint.color[3] > 1e-3) &&
+      !sidecar.glyphFontPaints?.some(paint => paint && paint.color[3] > 1e-3)) {
     return { glyphToInstance: null, hairlines: null, approximated: false, approximateHairlineStyle: false };
   }
   const glyphToInstance = new Int32Array(text.glyphs.glyphIds.length).fill(-1);
@@ -57,8 +59,9 @@ export function buildNativeVectorTextStrokes(
   let approximated = false;
   let approximateHairlineStyle = false;
   for (let run = 0; run < sidecar.glyphRunMeta.length / 3; run++) {
-    const stroke = sidecar.glyphStrokePaints[run];
-    if (!stroke || stroke.color[3] <= 1e-3) continue;
+    const externalStroke = sidecar.glyphStrokePaints?.[run];
+    const fontPaint = sidecar.glyphFontPaints?.[run];
+    if ((!externalStroke || externalStroke.color[3] <= 1e-3) && (!fontPaint || fontPaint.color[3] <= 1e-3)) continue;
     const first = sidecar.glyphRunMeta[run * 3], end = first + sidecar.glyphRunMeta[run * 3 + 1];
     const clip = sidecar.glyphClipBounds?.subarray(run * 4, run * 4 + 4);
     for (let glyph = first; glyph < end; glyph++) {
@@ -68,12 +71,21 @@ export function buildNativeVectorTextStrokes(
       }
       const fontIndex = text.glyphs.fontIndices[glyph], glyphId = text.glyphs.glyphIds[glyph];
       const transform = text.glyphs.transformIndices[glyph] * 6;
-      const placement = text.transforms.values.subarray(transform, transform + 6);
+      const glyphPlacement = text.transforms.values.subarray(transform, transform + 6);
+      const sourceOutline = fonts[fontIndex].getGlyphOutline(glyphId);
+      const intrinsic = sourceOutline.intrinsicStroke;
+      const intrinsicHairline = !externalStroke && fontPaint && intrinsic?.width === 0 && sidecar.glyphRunMeta[run * 3 + 2] === 0;
+      if (!externalStroke && !intrinsicHairline) continue;
+      const placement = intrinsicHairline ? multiply(glyphPlacement, intrinsic!.transform) : glyphPlacement;
+      const stroke = intrinsicHairline ? { ...fontPaint!, width: 0, transform: placement } : externalStroke!;
+      const commands = intrinsicHairline ? intrinsic!.commands : intrinsic
+        ? paintNativeGlyphCommands(intrinsic.commands, 0, 0, { transform: intrinsic.transform, signal }).commands
+        : sourceOutline.commands;
       const key = nativeGlyphStrokeCacheKey(fontIndex, glyphId, placement, stroke);
       if (stroke.width === 0) {
         let geometry = hairlineAtlas.get(key);
         if (geometry === undefined) {
-          geometry = buildNativeGlyphHairline(fonts[fontIndex].getGlyphOutline(glyphId).commands,
+          geometry = buildNativeGlyphHairline(commands,
             [placement[0], placement[1], placement[2], placement[3], 0, 0], stroke, signal);
           hairlineAtlas.set(key, geometry);
         }
@@ -120,7 +132,7 @@ export function buildNativeVectorTextStrokes(
       }
       const cached = atlas.get(key);
       if (cached === null) continue;
-      const geometry = cached ? null : buildNativeGlyphStrokeAtOrigin(fonts[fontIndex].getGlyphOutline(glyphId).commands, placement, stroke, signal);
+      const geometry = cached ? null : buildNativeGlyphStrokeAtOrigin(commands, placement, stroke, signal);
       if (!cached && !geometry) { atlas.set(key, null); continue; }
       const outline = cached ?? geometry!;
       const x = placement[4], y = placement[5];
@@ -180,6 +192,12 @@ export function buildNativeVectorTextStrokes(
   stores.glyphSegmentsA = append(stores.glyphSegmentsA, segmentsA);
   stores.glyphSegmentsB = append(stores.glyphSegmentsB, segmentsB);
   return { glyphToInstance, hairlines, approximated, approximateHairlineStyle };
+}
+
+function multiply(a: ArrayLike<number>, b: ArrayLike<number>): number[] {
+  return [a[0] * b[0] + a[2] * b[1], a[1] * b[0] + a[3] * b[1],
+    a[0] * b[2] + a[2] * b[3], a[1] * b[2] + a[3] * b[3],
+    a[0] * b[4] + a[2] * b[5] + a[4], a[1] * b[4] + a[3] * b[5] + a[5]];
 }
 
 /** Paint a translucent glyph's overlapping contour segments with opacity once. */

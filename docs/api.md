@@ -1151,14 +1151,46 @@ PDF encoding differences. Explicit PDF character widths take precedence, and
 Unicode mappings remain independent of painted glyph selection. Unsupported or
 damaged Type1 programs can still use the configured substitute-font resolver;
 `font.type1-substituted` includes the font-program failure reason and marks the
-result as approximate. Unknown custom OtherSubrs use the Type1 format's
-argument-preserving fallback with `font.type1-othersubr-approximated` diagnostics.
-The CFF v1 engine also supports Expert encodings and
-charsets, Type1 and Type2 charstrings, deterministic Type2 `random`, named
-FontSets and SyntheticBase inheritance. CFF2 and uninstantiated Multiple Master
-programs remain unsupported. Stroked CFF fonts and embedded PostScript retain
-the available outlines with fidelity warnings (`font.cff-paint-type-approximation`
-and `font.cff-postscript-approximation`). Path, clip, glyph and resource complexity
+result as approximate. Type1 Multiple Master programs use the embedded
+WeightVector, including standard blending OtherSubrs. Computed font records and
+custom OtherSubrs can execute in a font-local PostScript interpreter; mutable
+private state is shared within each glyph and isolated between glyphs. Unknown
+custom OtherSubrs retain the Type1 format's argument-preserving fallback with
+`font.type1-othersubr-approximated` diagnostics. The interpreter supports font
+data and arithmetic/control-flow operations, without host file or device
+access; unsupported PostScript retains available geometry with diagnostics.
+Unsupported Type1 loader code that leaves readable declarative records uses
+`font.type1-postscript-approximated`; failures computing required records can
+still use the configured substitute resolver.
+
+The CFF v1 engine also supports Expert encodings and charsets, Type1 and Type2
+charstrings, deterministic Type2 `random`, named FontSets, SyntheticBase
+inheritance and legacy Multiple Master interpolation. CFF2 supports variation
+stores, `vsindex`/`blend`, blended private dictionaries and FDSelect format 4.
+PDF conversion uses the font's default variation instance; OpenType CFF2 metrics
+come from `hmtx`. The low-level CFF parser also accepts normalized variation
+coordinates. Raw CFF2 requires a CID/GID mapping because it has no glyph-name
+Encoding.
+
+PDF loading and conversion default to `embeddedFontPaint: "pdf"`: the PDF text
+rendering mode controls fill/stroke and the font program's PaintType is ignored,
+as required by the [Adobe PDF Reference, section 5.8, p. 439](https://opensource.adobe.com/dc-acrobat-sdk-docs/pdfstandards/pdfreference1.6.pdf).
+For documents that depend on Ghostscript's intrinsic Type1/CFF PaintType 2
+behavior, pass `embeddedFontPaint: "font"` to `openPdf`, the PDF scene loader or
+`buildHep`. This explicit compatibility mode retains the font's stroke width,
+transformed pen, live joins/caps/dashes and zero-width hairlines, and emits
+`font.intrinsic-paint-compatibility` once per affected font. Other PDF viewers may
+show a different result. Explicit PDF text stroke modes use the raw glyph
+contours and PDF line style in both modes. Ghostscript also differs on explicit
+text dashes; HEPR retains the graphics-state dash pattern. Positive font strokes
+become vector outlines, with diagnostics when curves or round joins require
+approximation.
+HEP stores the resulting geometry rather than complete font programs.
+The retained Canvas2D renderer preserves one-pixel hairlines under affine
+transforms; dashed curves can report `device-hairline-approximation` when their
+curve or seam treatment is approximate.
+
+Path, clip, glyph and resource complexity
 has no default admission budget: conversion attempts vector processing on the
 host device. Caller-supplied resource limits remain available. Typed-array and
 wire-format ranges, allocation failures, cancellation and malformed-data checks
@@ -1347,7 +1379,8 @@ Default resets are accepted; unsupported custom functions use the screen default
 with a warning. In particular, BG/UCR can affect RGB-to-CMYK conversion inside a
 transparency group, so their omission is an approximation even for RGB output.
 
-The low-level Canvas2D renderer also accepts `onDiagnostic` for gradient warnings.
+The low-level Canvas2D renderer also accepts `onDiagnostic` for gradient and
+hairline fidelity warnings.
 Cancellation, malformed required data, custom resolver errors, and hard resource
 limits are not converted into successful output. Fallback uses HEPR's own renderer,
 so features that it cannot compile or render can still fail. Node raster fallback

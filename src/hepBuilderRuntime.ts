@@ -34,6 +34,7 @@ async function buildHepFromPdf(
     pages: options.pages,
     maxPagesPerRow: options.maxPagesPerRow,
     annotationAppearances: options.annotationAppearances,
+    embeddedFontPaint: options.embeddedFontPaint,
     sourceKind: "pdf",
     onProgress: (payload) => forwardParseProgress(parseProgress, payload)
   }, options.signal);

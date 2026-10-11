@@ -43,6 +43,7 @@ import type {
 } from "./nativeText";
 import { DEFAULT_PDF_RESOURCE_LIMITS, PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
 import { NativeTextClipTester } from "./nativeTextClip";
+import { paintNativeGlyphCommands, type NativeGlyphPaintOptions } from "./nativeGlyphPaint";
 
 /**
  * Inputs for the bounded one-page native-parser to VectorScene boundary.
@@ -82,6 +83,7 @@ interface GlyphGeometry {
   readonly segmentsA: readonly number[];
   readonly segmentsB: readonly number[];
   readonly bounds: Bounds;
+  readonly strokeApproximated: boolean;
 }
 
 /** CFF/Type1 kernels may retain cubics even when the current TS font surface narrows them. */
@@ -111,6 +113,7 @@ interface TextBuildResult {
   readonly glyphSegmentsA: Float32Array;
   readonly glyphSegmentsB: Float32Array;
   readonly textIndex: PageTextIndex;
+  readonly intrinsicStrokeApproximated: boolean;
 }
 
 interface MutableBounds extends Bounds {
@@ -195,11 +198,21 @@ export function buildNativeVectorPage(
     pageInfo.sourcePageIndex,
     signal
   );
+  const maxCoordinates = input.maxPathCoordinates ?? DEFAULT_PDF_RESOURCE_LIMITS.maxPathCoordinatesPerPage;
+  if (compiled.fillSegmentsA.length + compiled.fillSegmentsB.length + compiled.endpoints.length +
+      text.glyphSegmentsA.length + text.glyphSegmentsB.length > maxCoordinates) {
+    throw new PdfError("resource-limit", "Glyph outlines exceed the configured page geometry limit.", {
+      pageIndex: pageInfo.sourcePageIndex,
+      details: { reason: "vector-glyph-stroke-limit", maxCoordinates }
+    });
+  }
   const strokeText = buildNativeVectorTextStrokes(compiled, sidecar, textCompilation, text, fonts,
-    pageBounds, maxPaths, input.maxPathCoordinates ?? DEFAULT_PDF_RESOURCE_LIMITS.maxPathCoordinatesPerPage, signal);
-  if (strokeText.approximated) input.onDiagnostic?.({ code: "glyph-stroke-curve-approximation", severity: "warning",
+    pageBounds, maxPaths, maxCoordinates, signal);
+  if (strokeText.approximated || text.intrinsicStrokeApproximated) input.onDiagnostic?.({ code: "glyph-stroke-curve-approximation", severity: "warning",
     pageIndex: pageInfo.sourcePageIndex,
-    message: "Stroked glyph curves use vector outlines with a maximum 0.01-point centerline subdivision tolerance." });
+    message: text.intrinsicStrokeApproximated
+      ? "Stroked font curves and round joins use bounded vector approximations in font coordinates."
+      : "Stroked glyph curves use vector outlines with a maximum 0.01-point centerline subdivision tolerance." });
   if (strokeText.approximateHairlineStyle) input.onDiagnostic?.({ code: "glyph-hairline-style-approximation", severity: "warning",
     pageIndex: pageInfo.sourcePageIndex,
     message: "Hairline glyph joins and square caps use rounded device-pixel coverage; their contours remain vector." });
@@ -481,6 +494,10 @@ function readVectorSceneData(
   if (sidecar.glyphStrokePaints !== undefined && (!Array.isArray(sidecar.glyphStrokePaints) ||
       sidecar.glyphStrokePaints.length !== glyphRunCount)) {
     throw invalid("Native glyph stroke paints do not match its runs.", pageIndex, "vector-glyph-stroke-count");
+  }
+  if (sidecar.glyphFontPaints !== undefined && (!Array.isArray(sidecar.glyphFontPaints) ||
+      sidecar.glyphFontPaints.length !== glyphRunCount)) {
+    throw invalid("Native font paint states do not match their runs.", pageIndex, "vector-glyph-font-paint-count");
   }
   if (sidecar.glyphFillColors.length !== glyphRunCount * 4) {
     throw invalid("Native VectorScene glyph colors do not match its runs.", pageIndex,
@@ -953,14 +970,15 @@ function buildVectorText(
           maxY: sidecar.glyphClipBounds[clipOffset + 3]
         }
       : null;
-    const visuallyPainted = (renderingMode === 0 || renderingMode === 2) && alpha > TEXT_VISIBLE_ALPHA_EPSILON;
+    const paintsFill = (renderingMode === 0 || renderingMode === 2) && alpha > TEXT_VISIBLE_ALPHA_EPSILON;
+    const fontPaint = sidecar.glyphFontPaints?.[runIndex];
     const composited = ((sidecar.glyphRunFlags?.[runIndex] ?? 0) &
       DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_COMPOSITED) !== 0;
     const exactClip = sidecar.glyphRunClips?.[runIndex];
     for (let glyph = first; glyph < first + count; glyph += 1) {
       if ((glyph & 0x3fff) === 0) throwIfAborted(signal);
       const flags = compilation.glyphs.flags[glyph];
-      if (visuallyPainted && (flags & GLYPH_FLAG_TYPE3) !== 0) {
+      if (paintsFill && (flags & GLYPH_FLAG_TYPE3) !== 0) {
         throw unsupported(
           `Visible Type3 glyph ${compilation.glyphs.glyphIds[glyph]} cannot use the VectorScene renderer.`,
           pageIndex,
@@ -969,6 +987,8 @@ function buildVectorText(
       }
       const fontIndex = compilation.glyphs.fontIndices[glyph];
       const glyphId = compilation.glyphs.glyphIds[glyph];
+      const intrinsicStroke = paintsFill ? fonts[fontIndex].getGlyphOutline(glyphId).intrinsicStroke : undefined;
+      const visuallyPainted = paintsFill && !(renderingMode === 0 && intrinsicStroke?.width === 0);
       const glyphTransform = readGlyphTransform(compilation, glyph, pageIndex);
       const vertical = (flags & GLYPH_FLAG_VERTICAL) !== 0;
       const rawWidthUnits = readVectorGlyphWidthEm(compilation, glyph, pageIndex) *
@@ -992,10 +1012,12 @@ function buildVectorText(
       let geometryIndex = -1;
       let transformed: Bounds;
       if (visuallyPainted) {
-        const key = `${fontIndex}:${glyphId}`;
+        const key = `${fontIndex}:${glyphId}:${intrinsicStroke ? renderingMode === 0
+          ? JSON.stringify([fontPaint?.lineCap ?? 0, fontPaint?.lineJoin ?? 0, fontPaint?.miterLimit ?? 10,
+            fontPaint?.dashArray ?? [], fontPaint?.dashPhase ?? 0]) : "raw" : "fill"}`;
         const cachedGeometryIndex = geometryByKey.get(key);
         if (cachedGeometryIndex === undefined) {
-          const geometry = deriveGlyphGeometry(fonts[fontIndex], glyphId, pageIndex, signal);
+          const geometry = deriveGlyphGeometry(fonts[fontIndex], glyphId, pageIndex, signal, renderingMode, fontPaint ?? undefined);
           if (geometry.segmentsA.length === 0) {
             geometryIndex = -1;
           } else {
@@ -1054,7 +1076,13 @@ function buildVectorText(
       if ((exactClip && (visuallyPainted || composited)) ||
           ((composited || sidecar.glyphStrokePaints?.[runIndex]) && (renderingMode === 1 || renderingMode === 2))) {
         const key = `${fontIndex}:${glyphId}`;
-        let ink = glyphInkBounds.get(key);
+        // A stroked font's ink depends on the live join and dash settings.
+        // Its provider's default silhouette cannot prove that this instance
+        // lies outside a clip (a miter can extend farther than that default).
+        const geometryBounds = intrinsicStroke && geometryIndex >= 0
+          ? geometries[geometryIndex].bounds : null;
+        let ink = geometryBounds ? [geometryBounds.minX, geometryBounds.minY,
+          geometryBounds.maxX, geometryBounds.maxY] as const : glyphInkBounds.get(key);
         if (ink === undefined) {
           const outline = fonts[fontIndex].getGlyphOutline(glyphId);
           ink = outline.commands.length === 0 ? null : outline.bounds;
@@ -1154,6 +1182,7 @@ function buildVectorText(
     glyphMetaB,
     glyphSegmentsA,
     glyphSegmentsB,
+    intrinsicStrokeApproximated: geometries.some(geometry => geometry.strokeApproximated),
     textIndex: convertTextIndex(
       compilation,
       fonts,
@@ -1171,7 +1200,9 @@ function deriveGlyphGeometry(
   font: NativePdfFont,
   glyphId: number,
   pageIndex: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  renderingMode = 0,
+  paint?: NativeGlyphPaintOptions
 ): GlyphGeometry {
   throwIfAborted(signal);
   let outline;
@@ -1191,7 +1222,10 @@ function deriveGlyphGeometry(
       details: { reason: "legacy-vector-glyph-outline", glyphId }
     });
   }
-  const commands = outline.commands as readonly NativeVectorGlyphPathCommand[];
+  const intrinsic = outline.intrinsicStroke;
+  const painted = intrinsic ? paintNativeGlyphCommands(intrinsic.commands, renderingMode === 0 ? 2 : 0,
+    intrinsic.width, { ...paint, transform: intrinsic.transform, signal }) : undefined;
+  const commands = (painted?.commands ?? outline.commands) as readonly NativeVectorGlyphPathCommand[];
   const segmentsA: number[] = [];
   const segmentsB: number[] = [];
   const bounds = emptyBounds();
@@ -1279,7 +1313,7 @@ function deriveGlyphGeometry(
       "legacy-vector-glyph-contour");
   }
   if (bounds.empty) includeRect(bounds, 0, 0, 0, 0);
-  return { segmentsA, segmentsB, bounds: finalBounds(bounds) };
+  return { segmentsA, segmentsB, bounds: finalBounds(bounds), strokeApproximated: painted?.approximated ?? false };
 }
 
 /** Bounded cubic approximation shared with the established VectorScene glyph ABI. */

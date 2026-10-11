@@ -111,7 +111,7 @@ import {
   type PdfValue
 } from "./pdf/nativePdf";
 import type { NativeOptionalContentRegistry } from "./pdf/nativeOptionalContent";
-import type { NativeMissingFontResolver } from "./pdf/nativeFont";
+import type { NativeEmbeddedFontPaint, NativeMissingFontResolver } from "./pdf/nativeFont";
 import { NativePageFontRegistry } from "./pdf/nativeFontResources";
 import {
   NativeTextCompiler,
@@ -191,6 +191,8 @@ export interface OpenPdfOptions extends PdfIccOptions {
   readonly onProgress?: PdfCompileOptions["onProgress"];
   /** Deterministic substitutes for missing fonts and unsupported embedded Type1 outlines. */
   readonly missingFontResolver?: NativeMissingFontResolver;
+  /** Honor embedded Type1/CFF PaintType for Ghostscript compatibility. @default "pdf" */
+  readonly embeddedFontPaint?: NativeEmbeddedFontPaint;
   /** Focused decoder bridge returning validated packed image samples. */
   readonly imageCodecResolver?: NativeImageCodecResolver;
 }
@@ -311,6 +313,9 @@ export async function openPdf(
   options: OpenPdfOptions = {}
 ): Promise<PdfSession> {
   throwIfSessionAborted(options.signal);
+  if (options.embeddedFontPaint !== undefined && options.embeddedFontPaint !== "pdf" && options.embeddedFontPaint !== "font") {
+    throw new RangeError('embeddedFontPaint must be either "pdf" or "font".');
+  }
   const ownedSource = createSessionOwnedSource(source);
   let document: NativePdfDocument | null = null;
   try {
@@ -365,7 +370,8 @@ export async function openPdf(
       options.imageCodecResolver,
       options.iccTransformResolver,
       optionalContent,
-      options.iccEngine
+      options.iccEngine,
+      options.embeddedFontPaint
     );
   } catch (error) {
     if (document) await document.close().catch(() => undefined);
@@ -443,6 +449,7 @@ class NativePdfSession implements NativeVectorPdfSession {
   private readonly defaultProgress?: PdfCompileOptions["onProgress"];
   private readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   private readonly missingFontResolver?: NativeMissingFontResolver;
+  private readonly embeddedFontPaint: NativeEmbeddedFontPaint;
   private readonly imageCodecResolver?: NativeImageCodecResolver;
   private readonly iccTransformResolver?: NativeIccTransformResolver;
   private readonly iccEngine: NonNullable<PdfIccOptions["iccEngine"]>;
@@ -459,7 +466,8 @@ class NativePdfSession implements NativeVectorPdfSession {
     imageCodecResolver?: NativeImageCodecResolver,
     iccTransformResolver?: NativeIccTransformResolver,
     optionalContent?: NativeOptionalContentRegistry,
-    iccEngine?: PdfIccOptions["iccEngine"]
+    iccEngine?: PdfIccOptions["iccEngine"],
+    embeddedFontPaint: NativeEmbeddedFontPaint = "pdf"
   ) {
     this.document = document;
     if (!optionalContent) {
@@ -472,6 +480,7 @@ class NativePdfSession implements NativeVectorPdfSession {
     this.structure = new NativePdfStructureTree(document, diagnostic => this.appendDiagnostics([diagnostic]));
     this.appearanceSynthesizer = new NativePdfAppearanceSynthesizer(document, {
       missingFontResolver,
+      embeddedFontPaint,
       optionalContent
     });
     this.defaultProgress = defaultProgress;
@@ -483,6 +492,7 @@ class NativePdfSession implements NativeVectorPdfSession {
     }
     this.onDiagnostic = onDiagnostic;
     this.missingFontResolver = missingFontResolver;
+    this.embeddedFontPaint = embeddedFontPaint;
     this.imageCodecResolver = imageCodecResolver;
     this.iccTransformResolver = iccTransformResolver;
     this.iccEngine = validateIccEngine(iccEngine);
@@ -905,6 +915,7 @@ class NativePdfSession implements NativeVectorPdfSession {
         ));
       }
       const densePageData = createHeprPageDataFromDense(pageInfo, compiled, {
+        signal,
         retainOptionalContent: (options as NativeVectorCompileOptions).retainOptionalContent === true,
         text,
         forms: compositingPrograms.forms,
@@ -1477,7 +1488,8 @@ class NativePdfSession implements NativeVectorPdfSession {
       this.document,
       sourcePageIndex,
       this.missingFontResolver,
-      type3Registry
+      type3Registry,
+      this.embeddedFontPaint
     );
     const fontResources = await fontRegistry.loadScope(
       resources,
@@ -1617,7 +1629,8 @@ class NativePdfSession implements NativeVectorPdfSession {
       this.document,
       sourcePageIndex,
       this.missingFontResolver,
-      new NativePdfType3Registry(this.document)
+      new NativePdfType3Registry(this.document),
+      this.embeddedFontPaint
     );
     const imageResources = await loadPageImages(
       this.document,

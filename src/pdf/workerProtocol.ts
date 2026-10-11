@@ -19,7 +19,8 @@ import type {
 } from "./rangeTransport";
 import type {
   NativeMissingFontRequest,
-  NativeMissingFontResult
+  NativeMissingFontResult,
+  NativeEmbeddedFontPaint
 } from "./nativeFont";
 import type {
   NativeImageCodecRequest,
@@ -38,7 +39,8 @@ import type {
 // Version 11 adds bounded page previews; old workers must not transfer full-resolution pages instead.
 // Version 12 requires workers to honor text-only viewing instead of decoding scans.
 // Version 13 preserves vector overviews and substitutes OCR before scan decoding.
-export const PDF_WORKER_PROTOCOL_VERSION = 13 as const;
+// Version 14 requires workers to honor the embedded-font painting policy.
+export const PDF_WORKER_PROTOCOL_VERSION = 14 as const;
 
 /** Clone-safe subset of RequestInit used by the worker's GET-only URL reader. */
 export interface PdfWorkerRequestInit {
@@ -73,6 +75,7 @@ export type PdfWorkerSource =
     };
 
 export interface PdfWorkerOpenOptions {
+  readonly embeddedFontPaint?: NativeEmbeddedFontPaint;
   readonly iccEngine?: PdfIccOptions["iccEngine"];
   readonly repair?: "off" | "safe";
   readonly password?: string;

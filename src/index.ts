@@ -263,6 +263,7 @@ export type {
   CodecMetadataValue
 } from "./pdf/nativeImage";
 export type { PdfDiagnostic } from "./pdf/nativeTypes";
+export type { NativeEmbeddedFontPaint } from "./pdf/nativeFont";
 
 export type {
   BuildHepFromPdfOptions,

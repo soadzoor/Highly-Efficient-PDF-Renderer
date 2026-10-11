@@ -11,6 +11,7 @@ import {
 import type { NativePdfDocument } from "./nativeDocument";
 import {
   parseNativePdfFont,
+  type NativeEmbeddedFontPaint,
   type NativeMissingFontResolver,
   type NativePdfFont
 } from "./nativeFont";
@@ -33,6 +34,7 @@ import {
 
 export interface NativePdfAppearanceSynthesisOptions {
   readonly missingFontResolver?: NativeMissingFontResolver;
+  readonly embeddedFontPaint?: NativeEmbeddedFontPaint;
   /** Required when synthesized annotations carry an /OC association. */
   readonly optionalContent?: NativeOptionalContentRegistry;
   /** Maximum automatically selected text size in default user-space units. @default 72 */
@@ -141,6 +143,7 @@ export class NativePdfAppearanceSynthesizer {
   readonly document: NativePdfDocument;
 
   private readonly missingFontResolver?: NativeMissingFontResolver;
+  private readonly embeddedFontPaint?: NativeEmbeddedFontPaint;
   private readonly optionalContent?: NativeOptionalContentRegistry;
   private readonly maxAutoFontSize: number;
   private readonly onDiagnostic?: (diagnostic: Readonly<PdfDiagnostic>) => void;
@@ -155,6 +158,7 @@ export class NativePdfAppearanceSynthesizer {
   ) {
     this.document = document;
     this.missingFontResolver = options.missingFontResolver;
+    this.embeddedFontPaint = options.embeddedFontPaint;
     this.optionalContent = options.optionalContent;
     const maxAutoFontSize = options.maxAutoFontSize ?? 72;
     if (!Number.isFinite(maxAutoFontSize) || maxAutoFontSize <= 0) {
@@ -1015,7 +1019,8 @@ export class NativePdfAppearanceSynthesizer {
     }
     const font = await parseNativePdfFont(rawFont, this.document, {
       signal,
-      missingFontResolver: this.missingFontResolver
+      missingFontResolver: this.missingFontResolver,
+      embeddedFontPaint: this.embeddedFontPaint
     });
     if (font.subtype === "Type3" || font.writingMode !== 0) {
       throw synthesisFontError(annotation, "Type3 and vertical fonts are unsupported for synthesized field text.", {

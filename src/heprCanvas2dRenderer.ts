@@ -41,6 +41,9 @@ import {
 } from "./heprPatchMeshTessellator";
 import { HeprColorEvaluator } from "./heprColorEvaluator";
 import { findRgbaAlphaBounds } from "./rgbaBounds";
+import type { NativeGlyphPathCommand } from "./pdf/nativeFont";
+import { paintNativeGlyphCommands } from "./pdf/nativeGlyphPaint";
+import { buildNativeGlyphHairline } from "./pdf/nativeGlyphHairline";
 
 export const HEPR_CANVAS_2D_ERROR_CODES = Object.freeze({
   InvalidOptions: "canvas2d.invalid-options",
@@ -496,6 +499,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
   private liveWorkingPixels = 0;
   private emittedMeshTriangles = 0;
   private diagnosedMeshPrecision = false;
+  private diagnosedHairlineApproximation = false;
   private rootCompleted = false;
   private disposed = false;
 
@@ -917,7 +921,16 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
         context.save();
         try {
           this.applyClips(context, execution.state.clips);
-          setCanvasTransform(context, multiplyHeprMatrices(this.deviceMatrix, transform));
+          const canvasTransform = multiplyHeprMatrices(this.deviceMatrix, transform);
+          const strokes = this.page.stores.strokes;
+          const hairline = (strokes.flags[command.strokeStyleIndex] & HEPR_STROKE_FLAG.Hairline) !== 0 ||
+            strokes.lineWidths[command.strokeStyleIndex] === 0;
+          if (hairline && !isSimilarityTransform(canvasTransform)) {
+            await this.drawDeviceHairlinePath(context, pathIndex, command.strokeStyleIndex,
+              stroke, canvasTransform, transform, localTransform, execution.commandPath);
+            continue;
+          }
+          setCanvasTransform(context, canvasTransform);
           context.beginPath();
           appendStoredPath(context, this.page, pathIndex);
           this.applyGenericStrokeStyle(
@@ -938,6 +951,127 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
         }
       }
     }
+  }
+
+  /** Paint an affine-transformed zero-width pen in device space. Dash lengths
+   * still belong to the original path coordinate system, independently of the
+   * one-pixel pen. One stroke/fill applies translucent paint to overlaps once. */
+  private async drawDeviceHairlinePath(
+    context: CanvasRenderingContext2D, pathIndex: number, styleIndex: number,
+    paint: ResolvedPaint, canvasTransform: PdfMatrix, ownerTransform: PdfMatrix,
+    localTransform: PdfMatrix, path: string
+  ): Promise<void> {
+    const strokes = this.page.stores.strokes;
+    if ((strokes.flags[styleIndex] & HEPR_STROKE_FLAG.StrokeAdjust) !== 0) {
+      throw canvasError(HEPR_CANVAS_2D_ERROR_CODES.UnsupportedStroke,
+        "Canvas2D cannot exactly represent PDF stroke adjustment.", `${path}.strokeStyleIndex`);
+    }
+    const commands: NativeGlyphPathCommand[] = [];
+    visitHeprPath(this.page.stores.paths, pathIndex, {
+      moveTo: (x, y) => commands.push({ kind: "move", x, y }),
+      lineTo: (x, y) => commands.push({ kind: "line", x, y }),
+      quadraticTo: (controlX, controlY, x, y) => commands.push({ kind: "quadratic", controlX, controlY, x, y }),
+      cubicTo: (control1X, control1Y, control2X, control2Y, x, y) =>
+        commands.push({ kind: "cubic", control1X, control1Y, control2X, control2Y, x, y }),
+      close: () => commands.push({ kind: "close" })
+    });
+    const dash = strokes.dashValues.subarray(strokes.dashOffsets[styleIndex], strokes.dashOffsets[styleIndex + 1]);
+    let approximated = false, approximateStyle = false;
+    setCanvasTransform(context, IDENTITY);
+    context.beginPath();
+    const append = (outline: readonly NativeGlyphPathCommand[]): void => {
+      for (const command of outline) {
+        if (command.kind === "move") context.moveTo(command.x, command.y);
+        else if (command.kind === "line") context.lineTo(command.x, command.y);
+        else if (command.kind === "quadratic") context.quadraticCurveTo(command.controlX, command.controlY, command.x, command.y);
+        else if (command.kind === "cubic") context.bezierCurveTo(command.control1X, command.control1Y, command.control2X, command.control2Y, command.x, command.y);
+        else context.closePath();
+      }
+    };
+    // Solid paint can use the native device-space stroke directly, retaining
+    // exact cubic curves, caps, joins and the host's usual stroke antialiasing.
+    if (paint.kind === "solid") {
+      context.lineWidth = 1;
+      context.lineCap = lineCap(strokes.lineCaps[styleIndex]);
+      context.lineJoin = lineJoin(strokes.lineJoins[styleIndex]);
+      context.miterLimit = strokes.miterLimits[styleIndex];
+      context.setLineDash([]);
+      if (!dash.length) appendStoredPath(context, this.page, pathIndex, canvasTransform);
+      else {
+        const geometry = buildNativeGlyphHairline(commands, canvasTransform, {
+          transform: canvasTransform, width: 0,
+          lineCap: strokes.lineCaps[styleIndex] as 0 | 1 | 2, lineJoin: strokes.lineJoins[styleIndex] as 0 | 1 | 2,
+          miterLimit: strokes.miterLimits[styleIndex], dashArray: [...dash], dashPhase: strokes.dashPhases[styleIndex]
+        }, this.options.signal);
+        if (!geometry) return;
+        approximated = geometry.approximated; approximateStyle = geometry.approximateStyle;
+        let previousX = NaN, previousY = NaN, startX = NaN, startY = NaN;
+        for (let offset = 0; offset < geometry.endpoints.length; offset += 4) {
+          this.options.signal?.throwIfAborted();
+          const x0 = geometry.endpoints[offset], y0 = geometry.endpoints[offset + 1];
+          const x1 = geometry.primitiveMeta[offset], y1 = geometry.primitiveMeta[offset + 1];
+          const quadratic = geometry.primitiveMeta[offset + 2] >= 0.5;
+          const point = x0 === x1 && y0 === y1 && (!quadratic ||
+            (geometry.endpoints[offset + 2] === x0 && geometry.endpoints[offset + 3] === y0));
+          // The packed adapter adds round points at butt-cap joins. Connected
+          // Canvas subpaths already retain those joins with the actual style.
+          if (point && strokes.lineCaps[styleIndex] === 0) continue;
+          if (x0 !== previousX || y0 !== previousY) {
+            context.moveTo(x0, y0); startX = x0; startY = y0;
+          }
+          if (quadratic) context.quadraticCurveTo(geometry.endpoints[offset + 2], geometry.endpoints[offset + 3], x1, y1);
+          else context.lineTo(x1, y1);
+          previousX = x1; previousY = y1;
+          if (!point && x1 === startX && y1 === startY) {
+            context.closePath(); previousX = previousY = NaN;
+          }
+        }
+      }
+      if ((approximated || approximateStyle) && !this.diagnosedHairlineApproximation) {
+        this.diagnosedHairlineApproximation = true;
+        this.options.onDiagnostic?.({ code: "device-hairline-approximation", severity: "warning",
+          pageIndex: this.page.pageInfo.sourcePageIndex,
+          message: "Affine device hairlines retain a one-pixel pen; dashed curves use a vector approximation within 0.01 device pixels, and a dash crossing a closed contour seam may have a different cap or join." });
+      }
+      await this.strokeCurrentPath(context, paint, ownerTransform, localTransform, `${path}.strokePaintIndex`);
+      return;
+    }
+    if (!dash.length) {
+      const deviceCommands = paintNativeGlyphCommands(commands, 0, 0,
+        { transform: canvasTransform, signal: this.options.signal }).commands;
+      const result = paintNativeGlyphCommands(deviceCommands, 2, 1, {
+        lineCap: strokes.lineCaps[styleIndex] as 0 | 1 | 2, lineJoin: strokes.lineJoins[styleIndex] as 0 | 1 | 2,
+        miterLimit: strokes.miterLimits[styleIndex], signal: this.options.signal
+      });
+      append(result.commands); approximated = result.approximated;
+    } else {
+      const geometry = buildNativeGlyphHairline(commands, canvasTransform, {
+        transform: canvasTransform, width: 0,
+        lineCap: strokes.lineCaps[styleIndex] as 0 | 1 | 2, lineJoin: strokes.lineJoins[styleIndex] as 0 | 1 | 2,
+        miterLimit: strokes.miterLimits[styleIndex], dashArray: [...dash], dashPhase: strokes.dashPhases[styleIndex]
+      }, this.options.signal);
+      if (!geometry) return;
+      approximateStyle = geometry.approximateStyle; approximated = geometry.approximated;
+      for (let offset = 0; offset < geometry.endpoints.length; offset += 4) {
+        this.options.signal?.throwIfAborted();
+        const start = { kind: "move" as const, x: geometry.endpoints[offset], y: geometry.endpoints[offset + 1] };
+        const end = { x: geometry.primitiveMeta[offset], y: geometry.primitiveMeta[offset + 1] };
+        const segment: NativeGlyphPathCommand = geometry.primitiveMeta[offset + 2] >= 0.5
+          ? { kind: "quadratic", controlX: geometry.endpoints[offset + 2], controlY: geometry.endpoints[offset + 3], ...end }
+          : { kind: "line", ...end };
+        const roundCap = (Math.trunc(geometry.primitiveMeta[offset + 3] / 2) & DENSE_STYLE_FLAG_ROUND_CAP) !== 0;
+        const result = paintNativeGlyphCommands([start, segment], 2, 1,
+          { lineCap: roundCap ? 1 : 0, signal: this.options.signal });
+        append(result.commands); approximated ||= result.approximated;
+      }
+    }
+    if ((approximated || approximateStyle) && !this.diagnosedHairlineApproximation) {
+      this.diagnosedHairlineApproximation = true;
+      this.options.onDiagnostic?.({ code: "device-hairline-approximation", severity: "warning",
+        pageIndex: this.page.pageInfo.sourcePageIndex,
+        message: "Affine device hairlines retain a one-pixel pen; curves use a vector approximation within 0.02 device pixels, and dashed square caps or nonround joins may differ within the hairline width." });
+    }
+    await this.fillCurrentPath(context, paint, "nonzero", ownerTransform, localTransform, `${path}.strokePaintIndex`);
   }
 
   private async drawDenseFills(
@@ -3396,14 +3530,7 @@ function setCanvasTransform(context: CanvasRenderingContext2D, matrix: PdfMatrix
 
 function hairlineWidth(matrix: PdfMatrix, path: string): number {
   const firstScale = Math.hypot(matrix[0], matrix[1]);
-  const secondScale = Math.hypot(matrix[2], matrix[3]);
-  const dot = matrix[0] * matrix[2] + matrix[1] * matrix[3];
-  const tolerance = 1e-6 * Math.max(1, firstScale * secondScale);
-  if (
-    !(firstScale > 0) || !(secondScale > 0) ||
-    Math.abs(firstScale - secondScale) > 1e-6 * Math.max(firstScale, secondScale) ||
-    Math.abs(dot) > tolerance
-  ) {
+  if (!isSimilarityTransform(matrix)) {
     throw canvasError(
       HEPR_CANVAS_2D_ERROR_CODES.UnsupportedStroke,
       "Canvas2D cannot make a device-pixel hairline exact under a non-similarity transform.",
@@ -3411,6 +3538,15 @@ function hairlineWidth(matrix: PdfMatrix, path: string): number {
     );
   }
   return 1 / firstScale;
+}
+
+function isSimilarityTransform(matrix: PdfMatrix): boolean {
+  const firstScale = Math.hypot(matrix[0], matrix[1]);
+  const secondScale = Math.hypot(matrix[2], matrix[3]);
+  const dot = matrix[0] * matrix[2] + matrix[1] * matrix[3];
+  const tolerance = 1e-6 * Math.max(1, firstScale * secondScale);
+  return firstScale > 0 && secondScale > 0 &&
+    Math.abs(firstScale - secondScale) <= 1e-6 * Math.max(firstScale, secondScale) && Math.abs(dot) <= tolerance;
 }
 
 function lineCap(value: number): CanvasLineCap {

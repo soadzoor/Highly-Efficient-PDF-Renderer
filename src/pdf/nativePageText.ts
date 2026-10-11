@@ -16,6 +16,7 @@ import type {
   NativeTextCompilation,
   NativeTextFontResource
 } from "./nativeText";
+import { paintNativeGlyphCommands } from "./nativeGlyphPaint";
 import {
   DEFAULT_PDF_RESOURCE_LIMITS,
   PdfError,
@@ -41,6 +42,8 @@ export interface NativePageTextResourceOptions {
 
 export interface NativePageTextResources extends NativeTextCompilation {
   readonly fonts: HeprFontStore;
+  /** Transient font paint information; exported commands bake it into paths. */
+  readonly intrinsicGlyphStrokes?: ReadonlyMap<string, NonNullable<NativeGlyphOutline["intrinsicStroke"]>>;
   /** Generic paths containing only derived glyph outlines. */
   readonly outlinePaths: Pick<
     HeprPathStore,
@@ -141,6 +144,7 @@ export function buildNativePageTextResources(
   const outlinePathStarts: number[] = [];
   const outlinePathCounts: number[] = [];
   const type3ProgramIndices: number[] = [];
+  const intrinsicGlyphStrokes = new Map<string, NonNullable<NativeGlyphOutline["intrinsicStroke"]>>();
 
   // Font-store encoding is deterministic and page-local: glyphOffsets spans
   // ascending glyphIds for each contiguous font index. An ordinary outline is
@@ -185,7 +189,16 @@ export function buildNativePageTextResources(
         type3ProgramIndices.push(programIndex);
         continue;
       }
-      const outline = font.getGlyphOutline(glyphId);
+      const sourceOutline = font.getGlyphOutline(glyphId);
+      if (sourceOutline.intrinsicStroke) intrinsicGlyphStrokes.set(`${fontIndex}:${glyphId}`, sourceOutline.intrinsicStroke);
+      // PDF's explicit stroke/fill-stroke modes and text clipping use the
+      // character path, independently of the font's intrinsic PaintType2.
+      const rawCommands = sourceOutline.intrinsicStroke
+        ? paintNativeGlyphCommands(sourceOutline.intrinsicStroke.commands, 0, 0,
+          { transform: sourceOutline.intrinsicStroke.transform, signal: options.signal }).commands
+        : null;
+      const outline = rawCommands ? { ...sourceOutline,
+        commands: rawCommands, bounds: measureOutlineControlBounds(rawCommands) } : sourceOutline;
       throwIfAborted(options.signal);
       validateOutline(
         outline,
@@ -229,6 +242,7 @@ export function buildNativePageTextResources(
   return Object.freeze({
     ...compilation,
     textIndex,
+    intrinsicGlyphStrokes,
     fonts: {
       names: Object.freeze(fonts.map((font) => font.baseFont)),
       kinds: Uint8Array.from(fonts.map(fontKind)),
@@ -254,6 +268,26 @@ export function buildNativePageTextResources(
       flags: Uint8Array.from(flags)
     }
   });
+}
+
+// Control-point bounds conservatively enclose curves as well as straight
+// character paths. Intrinsic stroke bounds describe a different silhouette
+// and cannot be reused for explicit PDF text painting or text clipping.
+function measureOutlineControlBounds(commands: readonly NativeGlyphPathCommand[]): readonly [number, number, number, number] {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const include = (x: number, y: number): void => {
+    minX = Math.min(minX, x); minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+  };
+  for (const command of commands) {
+    if (command.kind === "close") continue;
+    include(command.x, command.y);
+    if (command.kind === "quadratic") include(command.controlX, command.controlY);
+    else if (command.kind === "cubic") {
+      include(command.control1X, command.control1Y); include(command.control2X, command.control2Y);
+    }
+  }
+  return minX === Infinity ? [0, 0, 0, 0] : [minX, minY, maxX, maxY];
 }
 
 function resolveLimits(options: NativePageTextResourceOptions): ResolvedPageTextLimits {

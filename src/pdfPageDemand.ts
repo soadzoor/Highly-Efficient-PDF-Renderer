@@ -419,6 +419,7 @@ export async function openPdfPageDemand(pdfData: ArrayBuffer, options: VectorExt
   const session = await open({ kind: "bytes", bytes: new Uint8Array(pdfData), ownership: "copy" }, {
     repair: "safe", password: options.password, signal, missingFontResolver,
     imageCodecResolver: options.imageCodecResolver, iccEngine: options.iccEngine,
+    embeddedFontPaint: options.embeddedFontPaint,
     iccTransformResolver: options.iccTransformResolver, onDiagnostic: options.onDiagnostic
   });
   try { return new PdfPageDemandLoader(session as NativeVectorPdfSession, onChange, options); }

@@ -1,6 +1,8 @@
 import type { NativeGlyphOutline, NativeGlyphPathCommand } from "./nativeFont";
 import { PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
 import { CFF_EXPERT_ENCODING } from "./nativeCffExpertData";
+import { executeNativeFontPostScript, type NativeFontPostScriptResult, type NativeFontPostScriptValue } from "./nativeFontPostScript";
+import { paintNativeGlyphCommands } from "./nativeGlyphPaint";
 
 /** Caller-selected ceilings; defaults do not impose machine-dependent limits. */
 export interface NativeType1ParserLimits {
@@ -13,6 +15,8 @@ export interface NativeType1ParserLimits {
   readonly maxType1SubrDepth: number;
   readonly maxType1SubrCalls: number;
   readonly maxType1PathCommands: number;
+  readonly maxType1PostScriptOperations: number;
+  readonly maxType1PostScriptStack: number;
 }
 
 export const DEFAULT_NATIVE_TYPE1_PARSER_LIMITS: Readonly<NativeType1ParserLimits> = Object.freeze({
@@ -24,7 +28,9 @@ export const DEFAULT_NATIVE_TYPE1_PARSER_LIMITS: Readonly<NativeType1ParserLimit
   maxType1Operators: Number.MAX_SAFE_INTEGER,
   maxType1SubrDepth: Number.MAX_SAFE_INTEGER,
   maxType1SubrCalls: Number.MAX_SAFE_INTEGER,
-  maxType1PathCommands: Number.MAX_SAFE_INTEGER
+  maxType1PathCommands: Number.MAX_SAFE_INTEGER,
+  maxType1PostScriptOperations: Number.MAX_SAFE_INTEGER,
+  maxType1PostScriptStack: Number.MAX_SAFE_INTEGER
 });
 
 export interface NativeType1Framing {
@@ -51,6 +57,8 @@ export interface NativeType1CharStringOptions {
   readonly signal?: AbortSignal;
   readonly budget?: NativeType1Budget;
   readonly onUnknownOtherSubr?: (index: number) => void;
+  readonly blendWeights?: readonly number[];
+  readonly executeOtherSubr?: (index: number, args: readonly number[]) => readonly number[] | null;
   /** Return base commands followed by accent commands translated by (x,y). */
   readonly resolveComposite?: (
     baseCode: number, accentCode: number, x: number, y: number
@@ -68,11 +76,11 @@ type PsToken =
   | { readonly kind: "number"; readonly value: number }
   | { readonly kind: "name" | "word" | "mark"; readonly value: string }
   | { readonly kind: "bytes"; readonly value: Uint8Array }
-  | { readonly kind: "procedure"; readonly value: ReadonlySet<string> };
+  | { readonly kind: "procedure"; readonly value: ReadonlySet<string>; readonly nonempty: boolean; readonly encodingInitializer: boolean };
 
 /**
- * Adobe Type 1 Font Format, chapters 6–8. This reads the declarative font
- * records, not arbitrary PostScript: procedures are never executed.
+ * Adobe Type 1 Font Format, chapters 6–8. Ordinary records use a declarative
+ * reader; computed dictionaries use the restricted font-local PS interpreter.
  * https://www.adobe.com/content/dam/acom/en/devnet/font/pdfs/T1_SPEC.pdf
  */
 export class NativeType1Font {
@@ -80,9 +88,13 @@ export class NativeType1Font {
   readonly numGlyphs: number;
   readonly glyphNames: readonly string[];
   readonly builtInGlyphNames: readonly (string | null)[];
+  readonly blendWeights: readonly number[] | null;
+  readonly paintType: 0 | 2;
+  readonly strokeWidth: number;
   private readonly glyphIds: ReadonlyMap<string, number>;
   private readonly rawCache = new Map<number, NativeType1RawOutline>();
   private readonly outlineCache = new Map<number, NativeGlyphOutline>();
+  private readonly pdfOutlineCache = new Map<number, NativeGlyphOutline>();
   private readonly unknownOtherSubrs = new Set<number>();
   private fontDiagnostics: readonly PdfDiagnostic[] = Object.freeze([]);
   private readonly charStrings: readonly Uint8Array[];
@@ -90,6 +102,7 @@ export class NativeType1Font {
   private readonly matrix: Type1Matrix;
   private readonly limits: Readonly<NativeType1ParserLimits>;
   private readonly signal?: AbortSignal;
+  private otherSubrExecutorFactory?: NativeFontPostScriptResult["createOtherSubrExecutor"];
 
   private constructor(
     charStrings: readonly Uint8Array[],
@@ -98,13 +111,19 @@ export class NativeType1Font {
     subrs: ReadonlyMap<number, Uint8Array>,
     matrix: Type1Matrix,
     limits: Readonly<NativeType1ParserLimits>,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    blendWeights: readonly number[] | null = null,
+    paintType: 0 | 2 = 0,
+    strokeWidth = 0
   ) {
     this.charStrings = charStrings;
     this.subrs = subrs;
     this.matrix = matrix;
     this.limits = limits;
     this.signal = signal;
+    this.blendWeights = blendWeights;
+    this.paintType = paintType;
+    this.strokeWidth = strokeWidth;
     this.numGlyphs = charStrings.length;
     this.glyphNames = Object.freeze([...glyphNames]);
     this.builtInGlyphNames = Object.freeze([...builtInGlyphNames]);
@@ -125,6 +144,8 @@ export class NativeType1Font {
     const header = scanProgram(bytes, limits, framing.signal, true);
     const eexec = header.eexecEnd;
     let privateTokens: readonly PsToken[] = [];
+    let privatePlaintext: Uint8Array | undefined;
+    let tokenError: unknown;
     if (eexec !== null) {
       let start = eexec;
       while (start < bytes.length && isWhite(bytes[start])) start++;
@@ -145,20 +166,25 @@ export class NativeType1Font {
       if (ciphertext.length >= 4 && ciphertext.subarray(0, 4).every(byte => hexValue(byte) >= 0)) {
         ciphertext = decodeEexecHex(ciphertext, framing.signal);
       }
-      privateTokens = scanProgram(decrypt(ciphertext, 55665, 4, framing.signal), limits, framing.signal).tokens;
+      privatePlaintext = decrypt(ciphertext, 55665, 4, framing.signal);
+      try { privateTokens = scanProgram(privatePlaintext, limits, framing.signal).tokens; }
+      catch (error) { if (!isUnsupported(error)) throw error; tokenError = error; }
     }
     const tokens = [...header.tokens, ...privateTokens];
+    const executeProgram = () => executeNativeFontPostScript(bytes.subarray(0, eexec ?? bytes.length), privatePlaintext, {
+      signal: framing.signal, maxOperations: limits.maxType1PostScriptOperations, maxStack: limits.maxType1PostScriptStack,
+      maxStringBytes: limits.maxType1StringBytes,
+      standardEncoding: Array.from({ length: 256 }, (_, code) => standardEncodingName(code)), expertEncoding: CFF_EXPERT_ENCODING
+    });
+    const declarative = (): NativeType1Font => {
+    if (tokenError) throw tokenError;
     const matrix = readMatrix(tokens);
     const paintType = readNumberRecord(tokens, "PaintType") ?? 0;
-    if (paintType !== 0) {
-      throw invalid("Stroked Type1 font programs require a stroke-outline adapter.", "paint-type");
-    }
+    if (paintType !== 0 && paintType !== 2) throw invalid("The Type1 PaintType must be 0 or 2.", "paint-type");
+    const strokeWidth = readNumberRecord(tokens, "StrokeWidth") ?? 0;
     const fontType = readNumberRecord(tokens, "FontType");
     if (fontType !== undefined && fontType !== 1) throw invalid("The font program is not Type1.", "font-type");
-    if (tokens.some(token => token.kind === "name" &&
-      ["BlendDesignPositions", "BlendDesignMap", "BlendAxisTypes", "WeightVector"].includes(token.value))) {
-      throw invalid("Multiple Master Type1 programs require a blend interpreter.", "multiple-master");
-    }
+    const blendWeights = readBlendMetadata(tokens, framing.signal);
     const lenIV = readNumberRecord(tokens, "lenIV") ?? 4;
     if (!Number.isSafeInteger(lenIV) || lenIV < -1) throw invalid("The Type1 lenIV is invalid.", "leniv");
     const glyphs = new Map<string, Uint8Array>();
@@ -220,28 +246,152 @@ export class NativeType1Font {
     const names = [".notdef", ...glyphs.keys()];
     ceiling(names.length, limits.maxType1Glyphs, "glyphs");
     return new NativeType1Font([notdef, ...glyphs.values()], names, readEncoding(tokens), subrs,
-      matrix, limits, framing.signal);
+      matrix, limits, framing.signal, blendWeights, paintType, strokeWidth);
+    };
+    let font: NativeType1Font;
+    try {
+      if (hasComputedFontRecords(tokens)) throw invalid("The Type1 dictionary requires PostScript evaluation.", "dictionary-expression");
+      font = declarative();
+    }
+    catch (error) {
+      if (!isUnsupported(error)) throw error;
+      try {
+        const computed = executeProgram();
+        font = NativeType1Font.fromComputed(computed.dictionary, limits, framing.signal);
+        font.otherSubrExecutorFactory = computed.createOtherSubrExecutor;
+        return font;
+      } catch (computedError) {
+        // Keep a precise malformed-font reason when the broader reader cannot
+        // recover it. Caller limits and cancellation always retain precedence.
+        if (!isUnsupported(computedError)) throw computedError;
+        throw error;
+      }
+    }
+    if (hasOpaqueLoadingCode(tokens)) {
+      try {
+        const computed = executeProgram();
+        font = NativeType1Font.fromComputed(computed.dictionary, limits, framing.signal);
+        font.otherSubrExecutorFactory = computed.createOtherSubrExecutor;
+        return font;
+      } catch (error) {
+        if (!isUnsupported(error)) throw error;
+        font.fontDiagnostics = Object.freeze([...font.fontDiagnostics, {
+          code: "font.type1-postscript-approximated", severity: "warning",
+          message: "The Type1 program uses unsupported loading procedures; its declarative font records are retained and may differ from the computed design.",
+          context: { reason: error.message }
+        }]);
+      }
+    }
+    if (hasCustomOtherSubrs(tokens, font.blendWeights !== null)) {
+      try { font.otherSubrExecutorFactory = executeProgram().createOtherSubrExecutor; }
+      catch (error) { if (!isUnsupported(error)) throw error; }
+    }
+    return font;
+  }
+
+  private static fromComputed(dictionary: ReadonlyMap<string, NativeFontPostScriptValue>,
+    limits: Readonly<NativeType1ParserLimits>, signal?: AbortSignal): NativeType1Font {
+    const privateValue = dictionary.get("Private");
+    const privateDictionary = privateValue instanceof Map ? privateValue : dictionary;
+    const numeric = (key: string, fallback: number): number => {
+      const value = dictionary.get(key) ?? privateDictionary.get(key) ?? fallback;
+      if (typeof value !== "number" || !Number.isFinite(value)) throw invalid(`Computed Type1 /${key} is not a finite number.`, "postscript-record");
+      return value;
+    };
+    if (numeric("FontType", 1) !== 1) throw invalid("The computed font program is not Type1.", "font-type");
+    const paintType = numeric("PaintType", 0);
+    if (paintType !== 0 && paintType !== 2) throw invalid("The Type1 PaintType must be 0 or 2.", "paint-type");
+    const strokeWidth = numeric("StrokeWidth", 0);
+    const matrixValue = dictionary.get("FontMatrix") ?? [0.001, 0, 0, 0.001, 0, 0];
+    if (!Array.isArray(matrixValue) || matrixValue.length !== 6 || matrixValue.some(value => typeof value !== "number" || !Number.isFinite(value))) {
+      throw invalid("The computed Type1 FontMatrix is invalid.", "font-matrix");
+    }
+    const matrix = matrixValue as unknown as Type1Matrix;
+    if (matrix[0] * matrix[3] === matrix[1] * matrix[2]) throw invalid("The computed Type1 FontMatrix is singular.", "font-matrix");
+    const lenIV = numeric("lenIV", 4);
+    if (!Number.isSafeInteger(lenIV) || lenIV < -1) throw invalid("The Type1 lenIV is invalid.", "leniv");
+    const glyphValues = dictionary.get("CharStrings");
+    if (!(glyphValues instanceof Map) || !glyphValues.size) throw invalid("The computed Type1 program has no CharStrings dictionary.", "charstrings-missing");
+    ceiling(glyphValues.size, limits.maxType1Glyphs, "glyphs");
+    let stringBytes = 0;
+    const string = (value: NativeFontPostScriptValue): Uint8Array => {
+      if (!(value instanceof Uint8Array)) throw invalid("A computed Type1 CharString or Subr is not a byte string.", "postscript-record");
+      stringBytes += value.length; ceiling(stringBytes, limits.maxType1StringBytes, "string-bytes");
+      return lenIV === -1 ? value.slice() : decrypt(value, 4330, lenIV, signal);
+    };
+    const glyphs = new Map<string, Uint8Array>();
+    for (const [name, value] of glyphValues) { throwIfAborted(signal); glyphs.set(name, string(value)); }
+    const subrs = new Map<number, Uint8Array>();
+    const subrValues = privateDictionary.get("Subrs");
+    if (subrValues !== undefined) {
+      if (!Array.isArray(subrValues)) throw invalid("The computed Type1 Subrs is not an array.", "postscript-record");
+      ceiling(subrValues.length, limits.maxType1Subrs, "subrs");
+      for (let i = 0; i < subrValues.length; i++) {
+        throwIfAborted(signal);
+        if (subrValues[i] !== null) subrs.set(i, string(subrValues[i]));
+      }
+    }
+    const encodingValue = dictionary.get("Encoding");
+    let encoding: readonly (string | null)[] = Array.from({ length: 256 }, (_, code) => standardEncodingName(code));
+    if (encodingValue !== undefined) {
+      if (!Array.isArray(encodingValue) || encodingValue.length > 256) throw invalid("The computed Type1 Encoding is invalid.", "encoding");
+      encoding = Array.from({ length: 256 }, (_, code) => {
+        const value = encodingValue[code];
+        if (value === null || value === undefined) return null;
+        if (typeof value !== "object" || !("kind" in value) || value.kind !== "name") throw invalid("A computed Type1 Encoding entry is not a name.", "encoding");
+        return value.value === ".notdef" ? null : value.value;
+      });
+    }
+    const fontInfo = dictionary.get("FontInfo");
+    const records = new Map<string, Type1Literal[]>();
+    for (const key of ["WeightVector", "BlendAxisTypes", "BlendDesignPositions", "BlendDesignMap"]) {
+      const value = dictionary.get(key) ?? privateDictionary.get(key) ?? (fontInfo instanceof Map ? fontInfo.get(key) : undefined);
+      if (value === undefined) continue;
+      if (!Array.isArray(value)) throw invalid(`Computed Type1 /${key} is not an array.`, "multiple-master-expression");
+      records.set(key, computedLiteralArray(value, signal));
+    }
+    const blendWeights = validateBlendMetadata(records);
+    const notdef = glyphs.get(".notdef") ?? Uint8Array.of(139, 139, 13, 14);
+    glyphs.delete(".notdef");
+    const names = [".notdef", ...glyphs.keys()];
+    ceiling(names.length, limits.maxType1Glyphs, "glyphs");
+    return new NativeType1Font([notdef, ...glyphs.values()], names, encoding, subrs, matrix, limits, signal,
+      blendWeights, paintType, strokeWidth);
   }
 
   glyphIdForName(name: string | null): number { return name === null ? 0 : this.glyphIds.get(name) ?? 0; }
 
   get diagnostics(): readonly PdfDiagnostic[] { return this.fontDiagnostics; }
 
-  getGlyphOutline(glyphId: number): NativeGlyphOutline {
+  getGlyphOutline(glyphId: number, applyIntrinsicPaint = true): NativeGlyphOutline {
     throwIfAborted(this.signal);
     if (!Number.isSafeInteger(glyphId) || glyphId < 0 || glyphId >= this.numGlyphs) {
       throw invalid(`Type1 glyph ${glyphId} is outside CharStrings.`, "glyph-index");
     }
-    const cached = this.outlineCache.get(glyphId);
+    const cache = applyIntrinsicPaint ? this.outlineCache : this.pdfOutlineCache;
+    const cached = cache.get(glyphId);
     if (cached) return cached;
     const raw = this.getRawOutline(glyphId);
-    const commands = Object.freeze(raw.commands.map(command => Object.freeze(transformCommand(command, this.matrix))));
-    const bounds = measureBounds(commands);
+    const transform = Object.freeze(this.matrix.map(value => value * 1000));
+    const paintType = applyIntrinsicPaint ? this.paintType : 0;
+    const painted = paintNativeGlyphCommands(raw.commands, paintType, this.strokeWidth, {
+      transform, signal: this.signal, maxPathCommands: this.limits.maxType1PathCommands
+    });
+    if (painted.approximated && !this.fontDiagnostics.some(diagnostic => diagnostic.code === "font.type1-stroke-approximated")) {
+      this.fontDiagnostics = Object.freeze([...this.fontDiagnostics, Object.freeze({
+        code: "font.type1-stroke-approximated", severity: "warning" as const,
+        message: "The Type1 stroked outline uses the native vector stroke approximation.",
+        details: Object.freeze({ reason: "type1-stroke-approximation", approximate: true })
+      })]);
+    }
+    const commands = painted.commands;
+    const bounds = painted.bounds ?? measureBounds(commands);
     const [leftSideBearing] = transformPoint(raw.leftSideBearing, raw.sideBearingY, this.matrix);
     const outline = Object.freeze({ glyphId, commands, bounds,
       advanceWidth: finite(this.matrix[0] * 1000 * raw.advanceWidth + this.matrix[2] * 1000 * raw.advanceY),
-      leftSideBearing });
-    this.outlineCache.set(glyphId, outline);
+      leftSideBearing,
+      ...(paintType === 2 ? { intrinsicStroke: Object.freeze({ width: this.strokeWidth, transform, commands: raw.commands }) } : {}) });
+    cache.set(glyphId, outline);
     return outline;
   }
 
@@ -260,8 +410,14 @@ export class NativeType1Font {
       let entry = evaluated.get(id);
       if (!entry) {
         const composite: { value?: Composite } = {};
+        const executeOtherSubr = this.otherSubrExecutorFactory?.(this.signal);
         const raw = evaluateNativeType1CharString(this.charStrings[id], {
           subrs: this.subrs, glyphId: id, limits: this.limits, signal: this.signal, budget,
+          ...(this.blendWeights ? { blendWeights: this.blendWeights } : {}),
+          executeOtherSubr: executeOtherSubr ? (index, args) => {
+            try { return executeOtherSubr(index, args); }
+            catch (error) { if (!isUnsupported(error)) throw error; return null; }
+          } : undefined,
           onUnknownOtherSubr: index => {
             if (this.unknownOtherSubrs.has(index)) return;
             this.unknownOtherSubrs.add(index);
@@ -309,6 +465,7 @@ export function evaluateNativeType1CharString(
   options: NativeType1CharStringOptions = {}
 ): NativeType1RawOutline {
   const limits = mergeType1Limits(options.limits ?? {});
+  const blendWeights = options.blendWeights ? validateBlendWeights(options.blendWeights) : null;
   const lenIV = options.lenIV ?? -1;
   if (!Number.isSafeInteger(lenIV) || lenIV < -1) throw invalid("The Type1 lenIV is invalid.", "leniv");
   const plain = (bytes: Uint8Array) => lenIV === -1 ? bytes : decrypt(bytes, 4330, lenIV, options.signal);
@@ -414,7 +571,26 @@ export function evaluateNativeType1CharString(
           } else if (other === 3) {
             if (count !== 1) fail("Invalid hint replacement OtherSubr.");
             results.push(values[0]);
+          } else if (other === 12 || other === 13) {
+            // Adobe 5015 counter-control data affects grid fitting, not paths.
+          } else if (other >= 14 && other <= 18 && blendWeights) {
+            // Adobe 5015 §3.12: all base values precede per-result blocks of
+            // deltas against master zero. $Blend uses the remaining weights
+            // directly; normalizing a rounded WeightVector would change it.
+            const outputs = other === 18 ? 6 : other - 13;
+            const masters = blendWeights.length;
+            if (count !== outputs * masters) fail(`MM OtherSubr ${other} requires ${outputs * masters} arguments.`);
+            for (let result = 0; result < outputs; result++) {
+              let value = values[result];
+              for (let master = 1; master < masters; master++) value = finite(value + blendWeights[master] * values[outputs + result * (masters - 1) + master - 1]);
+              results.push(value);
+            }
           } else {
+            const executed = options.executeOtherSubr?.(other, values);
+            if (executed !== null && executed !== undefined) {
+              for (const value of executed) results.push(finite(value));
+              break;
+            }
             // Adobe Type1 chapter 8 requires unknown extensions to pass their
             // arguments back to pop in source order; no PostScript is executed.
             results.push(...values);
@@ -480,16 +656,24 @@ class PsLexer {
     const first = this.nextFlat();
     if (first?.kind !== "mark" || first.value !== "{") return first;
     const words = new Set<string>();
-    let depth = 1;
+    let depth = 1, nonempty = false;
+    const initializer = [{ kind: "number", value: 1 }, { kind: "word", value: "index" },
+      { kind: "word", value: "exch" }, { kind: "name", value: ".notdef" }, { kind: "word", value: "put" }];
+    let initializerMatches = true, initializerIndex = 0;
     while (depth) {
       const token = this.nextFlat();
       if (!token) throw invalid("A Type1 procedure is unterminated.", "token");
+      if (!(token.kind === "mark" && token.value === "}" && depth === 1)) {
+        nonempty = true;
+        const expected = initializer[initializerIndex++];
+        if (!expected || token.kind !== expected.kind || token.value !== expected.value) initializerMatches = false;
+      }
       if (token.kind === "mark" && token.value === "{") depth++;
       else if (token.kind === "mark" && token.value === "}") depth--;
       else if (token.kind === "word") words.add(token.value);
       else if (token.kind === "name") words.add(`/${token.value}`);
     }
-    return { kind: "procedure", value: words };
+    return { kind: "procedure", value: words, nonempty, encodingInitializer: initializerMatches && initializerIndex === initializer.length };
   }
   private nextFlat(): PsToken | null {
     throwIfAborted(this.signal);
@@ -577,15 +761,221 @@ function scanProgram(bytes: Uint8Array, limits: Readonly<NativeType1ParserLimits
 
 function readNumberRecord(tokens: readonly PsToken[], name: string): number | undefined {
   for (let i = 0; i < tokens.length - 1; i++) {
-    if (tokens[i].kind === "name" && tokens[i].value === name && tokens[i + 1].kind === "number") return tokens[i + 1].value as number;
+    if (tokens[i].kind !== "name" || tokens[i].value !== name) continue;
+    const next = tokens[i + 2];
+    if (tokens[i + 1].kind !== "number" || next?.kind !== "word" || !["def", "ND", "|-", "readonly", "noaccess"].includes(next.value)) {
+      throw invalid(`Type1 /${name} requires a computed PostScript value.`, "number-expression");
+    }
+    return tokens[i + 1].value as number;
   }
   return undefined;
+}
+
+type Type1Literal = number | string | Type1Literal[];
+
+/** The selected default design is explicit; axis metadata never overrides it. */
+function readBlendMetadata(tokens: readonly PsToken[], signal?: AbortSignal): readonly number[] | null {
+  const keys = ["WeightVector", "BlendAxisTypes", "BlendDesignPositions", "BlendDesignMap"];
+  const records = new Map<string, Type1Literal[]>();
+  for (let i = 0; i < tokens.length; i++) {
+    throwIfAborted(signal);
+    const token = tokens[i];
+    if (token.kind !== "name" || !keys.includes(token.value)) continue;
+    if (tokens[i + 1]?.kind !== "mark" || tokens[i + 1].value !== "[") {
+      throw invalid(`Type1 /${token.value} requires a computed PostScript array.`, "multiple-master-expression");
+    }
+    const { values, end } = readLiteralArray(tokens, i + 1, signal);
+    if (!endsLiteralRecord(tokens[end + 1])) throw invalid(`Type1 /${token.value} requires a computed PostScript array.`, "multiple-master-expression");
+    records.set(token.value, values);
+    i = end;
+  }
+  return validateBlendMetadata(records);
+}
+
+function validateBlendMetadata(records: ReadonlyMap<string, Type1Literal[]>): readonly number[] | null {
+  if (!records.size) return null;
+  const weightRecord = records.get("WeightVector");
+  if (!weightRecord) throw invalid("A Type1 Multiple Master font has no default WeightVector.", "multiple-master-weights");
+  const weights = validateBlendWeights(weightRecord);
+  const axes = records.get("BlendAxisTypes");
+  if (axes && (axes.length < 1 || axes.length > 4 || axes.some(axis => typeof axis !== "string"))) {
+    throw invalid("The Type1 BlendAxisTypes array is invalid.", "multiple-master-axes");
+  }
+  const positions = records.get("BlendDesignPositions");
+  let axisCount = axes?.length;
+  if (positions) {
+    if (positions.length !== weights.length) throw invalid("Type1 master positions disagree with WeightVector.", "multiple-master-positions");
+    for (const position of positions) {
+      if (!Array.isArray(position)) throw invalid("A Type1 master position is not an array.", "multiple-master-positions");
+      axisCount ??= position.length;
+      if (axisCount < 1 || axisCount > 4 || position.length !== axisCount ||
+        position.some(value => typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1)) {
+        throw invalid("A Type1 master position is invalid.", "multiple-master-positions");
+      }
+    }
+  }
+  const maps = records.get("BlendDesignMap");
+  if (maps) {
+    axisCount ??= maps.length;
+    if (axisCount < 1 || axisCount > 4 || maps.length !== axisCount) throw invalid("The Type1 BlendDesignMap axis count is invalid.", "multiple-master-map");
+    for (const map of maps) {
+      if (!Array.isArray(map) || map.length < 2 || map.length > 12) throw invalid("A Type1 design map is invalid.", "multiple-master-map");
+      let previousDesign = -Infinity, previousBlend = -Infinity;
+      for (let point = 0; point < map.length; point++) {
+        const pair = map[point];
+        if (!Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== "number" || typeof pair[1] !== "number" ||
+          !Number.isFinite(pair[0]) || !Number.isFinite(pair[1]) || pair[0] <= previousDesign || pair[1] < previousBlend ||
+          pair[1] < 0 || pair[1] > 1 || (point === 0 && pair[1] !== 0) || (point === map.length - 1 && pair[1] !== 1)) {
+          throw invalid("A Type1 design-map point is invalid.", "multiple-master-map");
+        }
+        previousDesign = pair[0]; previousBlend = pair[1];
+      }
+    }
+  }
+  return weights;
+}
+
+function computedLiteralArray(source: NativeFontPostScriptValue[], signal?: AbortSignal): Type1Literal[] {
+  const values: Type1Literal[] = [];
+  const active = new Set<NativeFontPostScriptValue[]>();
+  const pending: { source: NativeFontPostScriptValue[]; values: Type1Literal[]; exit?: boolean }[] = [{ source, values }];
+  while (pending.length) {
+    throwIfAborted(signal);
+    const entry = pending.pop()!;
+    if (entry.exit) { active.delete(entry.source); continue; }
+    if (active.has(entry.source)) throw invalid("A computed Type1 Multiple Master array is cyclic.", "multiple-master-expression");
+    active.add(entry.source); pending.push({ ...entry, exit: true });
+    for (const value of entry.source) {
+      if (typeof value === "number") entry.values.push(value);
+      else if (Array.isArray(value)) {
+        const child: Type1Literal[] = [];
+        entry.values.push(child); pending.push({ source: value, values: child });
+      } else if (value && typeof value === "object" && "kind" in value && value.kind === "name") entry.values.push(value.value);
+      else throw invalid("A computed Type1 Multiple Master array has an invalid entry.", "multiple-master-expression");
+    }
+  }
+  return values;
+}
+
+function endsLiteralRecord(token: PsToken | undefined): boolean {
+  return token?.kind === "word" && ["def", "ND", "|-", "readonly", "noaccess", "put"].includes(token.value);
+}
+
+function hasComputedFontRecords(tokens: readonly PsToken[]): boolean {
+  const records = new Set(["FontMatrix", "FontType", "PaintType", "StrokeWidth", "Encoding", "CharStrings", "Subrs", "lenIV",
+    "WeightVector", "BlendAxisTypes", "BlendDesignPositions", "BlendDesignMap"]);
+  const procedures = new Set<string>();
+  const definitions = new Set<string>();
+  for (let i = 1; i < tokens.length; i++) {
+    const token = tokens[i], previous = tokens[i - 1];
+    if (token.kind === "word" && records.has(token.value)) return true;
+    if (token.kind === "name" && records.has(token.value)) {
+      if (definitions.has(token.value) || (tokens[i + 1]?.kind === "word" && ["get", "known", "put", "undef"].includes(tokens[i + 1].value as string))) return true;
+      definitions.add(token.value);
+    }
+    if (token.kind === "procedure" && previous.kind === "name") {
+      // RD, ND and NP are declaration helpers. Other font-local procedures
+      // called while loading can compute any of the records we depend on.
+      const declaration = [...token.value].every(word => ["string", "currentfile", "exch", "readstring", "pop", "noaccess", "readonly", "def", "put"].includes(word));
+      if (!declaration || (!token.value.size && token.nonempty)) procedures.add(previous.value);
+    }
+  }
+  return tokens.some(token => token.kind === "word" && procedures.has(token.value));
+}
+
+/** Loading code can mutate records without naming them, for example forall
+ * over currentdict. Procedures stored as metadata remain inert here. */
+function hasOpaqueLoadingCode(tokens: readonly PsToken[]): boolean {
+  const declarativeWords = new Set(["dict", "array", "string", "begin", "end", "dup", "exch", "index", "pop",
+    "get", "put", "def", "readonly", "noaccess", "executeonly", "bind", "currentdict", "currentfile", "definefont", "mark",
+    "FontName", "true", "false", "null", "StandardEncoding", "ExpertEncoding", "ND", "NP", "|-", "|", "-|"]);
+  for (let i = 1; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token.kind === "procedure" && tokens[i - 1].kind === "name" &&
+      [...token.value].every(word => ["string", "currentfile", "exch", "readstring", "pop", "noaccess", "readonly", "def", "put"].includes(word))) {
+      declarativeWords.add(tokens[i - 1].value as string);
+    }
+  }
+  let arrayDepth = 0;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token.kind === "mark") {
+      if (token.value === "[" || token.value === "<") arrayDepth++;
+      else if (token.value === "]" || token.value === ">") arrayDepth--;
+    }
+    if (token.kind !== "word" || arrayDepth > 0 || declarativeWords.has(token.value)) continue;
+    // The standard Encoding initializer is the one procedure executed by the
+    // declarative reader; any other control flow belongs to the interpreter.
+    const initializer = tokens[i - 1];
+    if (token.value === "for" && tokens[i - 4]?.kind === "number" && tokens[i - 4].value === 0 &&
+      tokens[i - 3]?.kind === "number" && tokens[i - 3].value === 1 &&
+      tokens[i - 2]?.kind === "number" && tokens[i - 2].value === 255 &&
+      initializer?.kind === "procedure" && initializer.encodingInitializer) continue;
+    return true;
+  }
+  return false;
+}
+
+function hasCustomOtherSubrs(tokens: readonly PsToken[], multipleMaster: boolean): boolean {
+  const index = tokens.findIndex(token => token.kind === "name" && token.value === "OtherSubrs");
+  if (index < 0) return false;
+  const builtin = (other: number) => other <= 3 || other === 12 || other === 13 || (multipleMaster && other >= 14 && other <= 18);
+  if (tokens[index + 1]?.kind === "mark" && tokens[index + 1].value === "[") {
+    let other = 0;
+    for (let i = index + 2; i < tokens.length; i++) {
+      const token = tokens[i];
+      if (token.kind === "mark" && token.value === "]") return false;
+      if (token.kind !== "procedure") return true;
+      if (!builtin(other++) && token.nonempty) return true;
+    }
+    return true;
+  }
+  if (tokens[index + 1]?.kind === "number" && tokens[index + 2]?.value === "array") {
+    for (let i = index + 3; i < tokens.length; i++) {
+      const token = tokens[i];
+      if (token.kind === "word" && ["def", "ND", "|-"].includes(token.value)) return false;
+      if (token.kind === "procedure") {
+        const other = tokens[i - 1];
+        if (other?.kind !== "number" || (!builtin(other.value) && token.nonempty)) return true;
+      }
+    }
+  }
+  return true;
+}
+
+function validateBlendWeights(values: readonly unknown[]): readonly number[] {
+  // Adobe 5015 permits 2–16 master designs and a .001 sum tolerance. The
+  // stored weights are used directly, including rounding and extrapolation.
+  if (values.length < 2 || values.length > 16 || values.some(value => typeof value !== "number" || !Number.isFinite(value))) {
+    throw invalid("The Type1 WeightVector must contain 2–16 finite weights.", "multiple-master-weights");
+  }
+  const weights = values as readonly number[];
+  const sum = weights.reduce((total, value) => total + value, 0);
+  if (!Number.isFinite(sum) || Math.abs(sum - 1) > 0.001) throw invalid("The Type1 WeightVector does not sum to one.", "multiple-master-weights");
+  return Object.freeze([...weights]);
+}
+
+function readLiteralArray(tokens: readonly PsToken[], start: number, signal?: AbortSignal): { values: Type1Literal[]; end: number } {
+  const values: Type1Literal[] = [], stack = [values];
+  for (let i = start + 1; i < tokens.length; i++) {
+    throwIfAborted(signal);
+    const token = tokens[i];
+    if (token.kind === "mark" && token.value === "[") {
+      const child: Type1Literal[] = [];
+      stack[stack.length - 1].push(child); stack.push(child);
+    } else if (token.kind === "mark" && token.value === "]") {
+      stack.pop(); if (!stack.length) return { values, end: i };
+    } else if (token.kind === "number" || token.kind === "name") stack[stack.length - 1].push(token.value);
+    else throw invalid("A Type1 Multiple Master array requires a PostScript expression.", "multiple-master-expression");
+  }
+  throw invalid("A Type1 Multiple Master array is unterminated.", "multiple-master-expression");
 }
 
 function readMatrix(tokens: readonly PsToken[]): Type1Matrix {
   const index = tokens.findIndex(token => token.kind === "name" && token.value === "FontMatrix");
   if (index < 0) return [0.001, 0, 0, 0.001, 0, 0];
   if (tokens[index + 1]?.value !== "[" || tokens[index + 8]?.value !== "]") throw invalid("The Type1 FontMatrix is malformed.", "font-matrix");
+  if (!endsLiteralRecord(tokens[index + 9])) throw invalid("The Type1 FontMatrix requires a PostScript expression.", "font-matrix");
   const values = tokens.slice(index + 2, index + 8).map(token => token.kind === "number" ? token.value : NaN);
   if (values.some(value => !Number.isFinite(value)) || values[0] * values[3] === values[1] * values[2]) throw invalid("The Type1 FontMatrix is invalid or singular.", "font-matrix");
   return values as unknown as Type1Matrix;
@@ -596,6 +986,7 @@ function readEncoding(tokens: readonly PsToken[]): readonly (string | null)[] {
   const index = tokens.findIndex(token => token.kind === "name" && token.value === "Encoding");
   if (index < 0) return names;
   const first = tokens[index + 1];
+  let cursor = index + 2;
   if (first?.kind === "word" && first.value === "ExpertEncoding") names.splice(0, 256, ...CFF_EXPERT_ENCODING);
   else if (!(first?.kind === "word" && first.value === "StandardEncoding")) {
     if (first?.kind !== "number" && !(first?.kind === "mark" && first.value === "[")) {
@@ -605,33 +996,42 @@ function readEncoding(tokens: readonly PsToken[]): readonly (string | null)[] {
       throw invalid("The Type1 Encoding array declaration is invalid.", "encoding");
     }
     names.fill(null);
+    if (first.kind === "number") cursor++;
   }
+  if (first?.kind === "word" && !endsLiteralRecord(tokens[cursor])) throw invalid("The Type1 Encoding copy requires PostScript evaluation.", "encoding-expression");
   if (first?.kind === "mark" && first.value === "[") {
     let code = 0;
-    for (let i = index + 2; i < tokens.length && tokens[i].value !== "]"; i++) {
-      if (tokens[i].kind !== "name" || code >= 256) throw invalid("A Type1 Encoding array is invalid.", "encoding");
-      names[code++] = tokens[i].value as string;
+    while (cursor < tokens.length && tokens[cursor].value !== "]") {
+      if (tokens[cursor].kind !== "name" || code >= 256) throw invalid("A Type1 Encoding array is invalid.", "encoding");
+      names[code++] = tokens[cursor++].value as string;
     }
+    if (tokens[cursor]?.value !== "]") throw invalid("A Type1 Encoding array is unterminated.", "encoding");
+    cursor++;
   }
-  for (let i = index + 1; i < tokens.length; i++) {
+  for (let i = cursor; i < tokens.length; i++) {
     const token = tokens[i];
-    if (token.kind === "word" && token.value === "def") break;
-    if (token.kind === "procedure") {
-      if (token.value.size !== 4 || [...token.value].some(value => !["index", "exch", "put", "/.notdef"].includes(value)) ||
-        tokens[i - 3]?.value !== 0 || tokens[i - 2]?.value !== 1 || tokens[i - 1]?.value !== 255 ||
-        tokens[i + 1]?.kind !== "word" || tokens[i + 1].value !== "for") {
+    if (token.kind === "word" && ["def", "ND", "|-"].includes(token.value)) return names.map(name => name === ".notdef" ? null : name);
+    if (token.kind === "word" && ["readonly", "noaccess"].includes(token.value)) continue;
+    if (token.kind === "number" && token.value === 0 && tokens[i + 1]?.value === 1 && tokens[i + 2]?.value === 255) {
+      const procedure = tokens[i + 3];
+      if (procedure?.kind !== "procedure" || !procedure.encodingInitializer || tokens[i + 4]?.value !== "for") {
         throw invalid("The Type1 Encoding initializer requires an unsupported PostScript expression.", "encoding-expression");
       }
       names.fill(null);
+      i += 4;
+      continue;
     }
     if (token.kind === "word" && token.value === "dup" && tokens[i + 1]?.kind === "number" && tokens[i + 2]?.kind === "name") {
       const code = nonnegativeInteger(tokens[i + 1], "Encoding code");
       if (code > 255) throw invalid("A Type1 Encoding code is outside its byte vector.", "encoding");
       if (tokens[i + 3]?.kind !== "word" || tokens[i + 3].value !== "put") throw invalid("A Type1 Encoding assignment is malformed.", "encoding");
       names[code] = tokens[i + 2].value as string;
+      i += 3;
+      continue;
     }
+    throw invalid("The Type1 Encoding assignment requires PostScript evaluation.", "encoding-expression");
   }
-  return names.map(name => name === ".notdef" ? null : name);
+  throw invalid("The Type1 Encoding definition is unterminated.", "encoding");
 }
 
 function unpackPfb(bytes: Uint8Array, framing: NativeType1Framing): { bytes: Uint8Array; length1?: number; length2?: number } {
@@ -748,7 +1148,11 @@ function cubicExtrema(p0: number, p1: number, p2: number, p3: number): number[] 
   if (a === 0) return b === 0 ? [] : [-c / b];
   const discriminant = b * b - 4 * a * c;
   if (discriminant < 0) return [];
-  const root = Math.sqrt(discriminant); return [(-b + root) / (2 * a), (-b - root) / (2 * a)];
+  // Avoid subtracting nearly equal values when a nominally quadratic curve
+  // acquires a tiny cubic coefficient through FontMatrix rounding.
+  const root = Math.sqrt(discriminant);
+  const q = -0.5 * (b + (b < 0 ? -root : root));
+  return q === 0 ? [0] : [q / a, c / q];
 }
 function quadraticExtremum(p0: number, p1: number, p2: number): number {
   const scale = Math.max(Math.abs(p0), Math.abs(p1), Math.abs(p2), 1);
@@ -769,6 +1173,7 @@ function ceiling(value: number, limit: number, reason: string): void {
 }
 function finite(value: number): number { if (!Number.isFinite(value)) throw invalid("Type1 arithmetic is not finite.", "numeric-overflow"); return value; }
 function invalid(message: string, reason: string): PdfError { return new PdfError("unsupported-font", message, { details: { reason: `type1-${reason}` } }); }
+function isUnsupported(error: unknown): error is PdfError { return error instanceof PdfError && error.code === "unsupported-font"; }
 function isWhite(byte: number): boolean { return byte === 0 || byte === 9 || byte === 10 || byte === 12 || byte === 13 || byte === 32; }
 function isDelimiter(byte: number): boolean { return byte === 40 || byte === 41 || byte === 60 || byte === 62 || byte === 91 || byte === 93 || byte === 123 || byte === 125 || byte === 47 || byte === 37; }
 function hexValue(byte: number): number { return byte >= 48 && byte <= 57 ? byte - 48 : byte >= 65 && byte <= 70 ? byte - 55 : byte >= 97 && byte <= 102 ? byte - 87 : -1; }

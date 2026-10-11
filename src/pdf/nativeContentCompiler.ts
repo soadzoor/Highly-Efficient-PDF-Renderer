@@ -614,6 +614,8 @@ export interface DensePdfVectorSceneData {
   /** One sRGB nonstroking RGBA tuple per glyph triple. */
   readonly glyphFillColors: Float32Array;
   readonly glyphStrokePaints?: readonly (DensePdfVectorGlyphStroke | null)[];
+  /** Live pen state for font-internal PaintType 2 strokes in ordinary fill mode. */
+  readonly glyphFontPaints?: readonly (DensePdfVectorGlyphStroke | null)[];
   /** Four exact page-space clip bounds per glyph run. */
   readonly glyphClipBounds?: Float32Array;
   /** Per-run DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_* bits. */
@@ -1548,6 +1550,7 @@ class DenseContentCompiler {
   readonly vectorGlyphFillColors: number[] = [];
 
   readonly vectorGlyphStrokePaints: (DensePdfVectorGlyphStroke | null)[] = [];
+  readonly vectorGlyphFontPaints: (DensePdfVectorGlyphStroke | null)[] = [];
 
   readonly vectorGlyphClipBounds: number[] = [];
 
@@ -2181,6 +2184,8 @@ class DenseContentCompiler {
           glyphFillColors: Float32Array.from(this.vectorGlyphFillColors),
           ...(this.vectorGlyphStrokePaints.some(paint => paint !== null)
             ? { glyphStrokePaints: Object.freeze(this.vectorGlyphStrokePaints) } : {}),
+          ...(this.vectorGlyphFontPaints.length
+            ? { glyphFontPaints: Object.freeze(this.vectorGlyphFontPaints) } : {}),
           glyphClipBounds: Float32Array.from(this.vectorGlyphClipBounds),
           glyphRunFlags: Uint8Array.from(this.vectorGlyphRunFlags),
           ...(textClips.length === 0 && !this.options.initialVectorClip ? {} : {
@@ -4286,6 +4291,16 @@ class DenseContentCompiler {
       dashArray: [...this.state.lineDash],
       dashPhase: this.state.dashPhase
     }) : null);
+    this.vectorGlyphFontPaints.push(renderingMode === 0 ? Object.freeze({
+      transform: [...this.state.matrix] as DensePdfMatrix,
+      color: [this.state.fillR, this.state.fillG, this.state.fillB, this.state.fillAlpha] as const,
+      width: this.state.lineWidth,
+      lineCap: this.state.lineCap as 0 | 1 | 2,
+      lineJoin: this.state.lineJoin,
+      miterLimit: this.state.miterLimit,
+      dashArray: [...this.state.lineDash],
+      dashPhase: this.state.dashPhase
+    }) : null);
     const clip = this.state.clipBounds ?? this.options.pageBounds;
     this.vectorGlyphClipBounds.push(clip.minX, clip.minY, clip.maxX, clip.maxY);
     this.vectorGlyphRunFlags.push(
@@ -4311,6 +4326,7 @@ class DenseContentCompiler {
     // complete glyph appearance into a bounded layer, without duplicate ink.
     this.vectorGlyphFillColors.push(0, 0, 0, 0);
     this.vectorGlyphStrokePaints.push(null);
+    this.vectorGlyphFontPaints.push(null);
     const clip = this.state.clipBounds ?? this.options.pageBounds;
     this.vectorGlyphClipBounds.push(clip.minX, clip.minY, clip.maxX, clip.maxY);
     this.vectorGlyphRunFlags.push(DENSE_PDF_VECTOR_SCENE_GLYPH_FLAG_CLIPPED |

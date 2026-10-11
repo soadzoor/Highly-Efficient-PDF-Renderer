@@ -44,6 +44,8 @@ import {
   type PdfPageInfo
 } from "./heprDocumentData";
 import type { NativePageTextResources } from "./pdf/nativePageText";
+import { paintNativeGlyphCommands } from "./pdf/nativeGlyphPaint";
+import { throwIfAborted } from "./pdf/nativeTypes";
 
 const commandPaintSourceIdentities = new WeakMap<
   HeprDisplayCommand,
@@ -58,6 +60,7 @@ export function getHeprCommandPaintSourceIdentity(
 }
 
 export interface DensePdfPageDataOptions {
+  readonly signal?: AbortSignal;
   /** Complete native glyph/text resources. Required when content contains text shows. */
   readonly text?: NativePageTextResources;
   /** Optional non-glyph text index, such as geometry-backed annotation text. */
@@ -951,6 +954,89 @@ export function createHeprPageDataFromDense(
       }) satisfies DensePdfCompositeState
     });
   };
+  const intrinsicPaths = new Map<string, number>();
+  const appendIntrinsicGlyphCommand = (
+    target: HeprDisplayCommand[], glyphIndex: number,
+    paint: DensePdfCompiledPage["glyphPaints"][number],
+    resources: ReturnType<typeof glyphPaintResources>,
+    commandState: { readonly transformIndex: number; readonly clipIndex: number;
+      readonly optionalContentIndex: number; readonly markedContentIndex: number;
+      readonly sourceOffset: number; readonly sourceLength: number }
+  ): boolean => {
+    if (paint.renderingMode !== 0 && paint.renderingMode !== 4) return false;
+    const fontIndex = stores.glyphs.fontIndices[glyphIndex], glyphId = stores.glyphs.glyphIds[glyphIndex];
+    const intrinsic = options.text?.intrinsicGlyphStrokes?.get(`${fontIndex}:${glyphId}`);
+    if (!intrinsic) return false;
+    throwIfAborted(options.signal);
+    if (intrinsic.commands.length === 0) return true;
+    const state = paint.initialGraphicsState;
+    const hairline = intrinsic.width === 0;
+    const key = `${fontIndex}:${glyphId}:${state.lineCap}:${state.lineJoin ?? 0}:${state.miterLimit ?? 10}:` +
+      `${state.lineDash.join(",")}:${state.dashPhase}`;
+    let pathIndex = intrinsicPaths.get(key);
+    if (pathIndex === undefined) {
+      const painted = hairline ? null : paintNativeGlyphCommands(intrinsic.commands, 2, intrinsic.width, {
+        transform: intrinsic.transform, lineCap: state.lineCap as 0 | 1 | 2, lineJoin: state.lineJoin ?? 0,
+        miterLimit: state.miterLimit ?? 10, dashArray: state.lineDash, dashPhase: state.dashPhase,
+        signal: options.signal, maxPathCommands: resourceLimits.maxPathVerbs - pathVerbs.length
+      });
+      if (painted?.approximated && !approximationDiagnostics.some(diagnostic => diagnostic.code === "glyph-stroke-curve-approximation")) {
+        approximationDiagnostics.push({ code: "glyph-stroke-curve-approximation", severity: "warning",
+          pageIndex: pageInfo.sourcePageIndex,
+          message: "Stroked glyph curves use a vector approximation within 0.01 raw font character-space units before FontMatrix and text placement." });
+      }
+      const commands = painted?.commands ?? intrinsic.commands;
+      const packed: number[] = [];
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      const point = (x: number, y: number): void => {
+        packed.push(x, y); minX = Math.min(minX, x); minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+      };
+      for (const command of commands) {
+        switch (command.kind) {
+          case "move": packed.push(0); point(command.x, command.y); break;
+          case "line": packed.push(1); point(command.x, command.y); break;
+          case "cubic": packed.push(2); point(command.control1X, command.control1Y); point(command.control2X, command.control2Y); point(command.x, command.y); break;
+          case "quadratic": packed.push(3); point(command.controlX, command.controlY); point(command.x, command.y); break;
+          case "close": packed.push(4); break;
+        }
+      }
+      if (commands.length === 0) return true;
+      pathIndex = appendRawPath(Float32Array.from(packed), { minX, minY, maxX, maxY });
+      intrinsicPaths.set(key, pathIndex);
+    }
+    const glyphTransformIndex = stores.glyphs.transformIndices[glyphIndex];
+    let transformIndex = glyphTransformIndex;
+    let strokeStyleIndex = -1;
+    if (hairline) {
+      const offset = glyphTransformIndex * 6;
+      const a = stores.transforms.values.subarray(offset, offset + 6), b = intrinsic.transform;
+      transformIndex = appendTransform([a[0] * b[0] + a[2] * b[1], a[1] * b[0] + a[3] * b[1],
+        a[0] * b[2] + a[2] * b[3], a[1] * b[2] + a[3] * b[3],
+        a[0] * b[4] + a[2] * b[5] + a[4], a[1] * b[4] + a[3] * b[5] + a[5]]);
+      strokeStyleIndex = appendGenericStrokeStyle({ lineWidth: 0, hairline: true,
+        lineCap: state.lineCap as 0 | 1 | 2, lineJoin: state.lineJoin ?? 0, miterLimit: state.miterLimit ?? 10,
+        dash: state.lineDash, dashPhase: state.dashPhase, strokeAdjust: state.strokeAdjustment ?? false });
+    }
+    // Device hairlines may overlap at joins. Render their coverage opaquely
+    // and apply the nonstroking alpha once to the complete glyph, matching
+    // the vector adapter's isolated hairline paint.
+    const isolateAlpha = hairline && state.fillAlpha !== 1 && paint.fillPaintInherited !== true;
+    const fontPaintIndex = isolateAlpha ? solidPaint([paint.fill[0], paint.fill[1], paint.fill[2], 1], {
+      alpha: 1, alphaIsShape: resources.wrapperComposite.alphaIsShape,
+      blendMode: resources.wrapperComposite.blendMode, softMaskIndex: resources.wrapperComposite.softMaskIndex,
+      overprint: state.fillOverprint ?? false, overprintMode: state.overprintMode ?? 0
+    }) : resources.fillPaintIndex;
+    appendPaintCommand(target, { kind: "draw", ...commandState, transformIndex, source: "paths", first: pathIndex, count: 1,
+      fillPaintIndex: hairline ? -1 : resources.fillPaintIndex,
+      strokePaintIndex: hairline ? fontPaintIndex : -1,
+      fillPaintInherited: !hairline && paint.fillPaintInherited === true,
+      strokePaintInherited: hairline && paint.fillPaintInherited === true,
+      strokeStyleIndex, fillRule: 0 }, isolateAlpha
+        ? { ...resources.wrapperComposite, alpha: state.fillAlpha }
+        : resources.wrapperComposite, true);
+    return true;
+  };
   const genericPathCommand = (
     source: DensePdfCompiledPage,
     paintIndex: number,
@@ -1286,6 +1372,12 @@ export function createHeprPageDataFromDense(
       for (let glyphIndex = first; glyphIndex < first + count; glyphIndex += 1) {
         const isType3 = (stores.glyphs.flags[glyphIndex] & HEPR_GLYPH_FLAG.Type3) !== 0;
         if (!isType3) {
+          if (options.text?.intrinsicGlyphStrokes?.has(`${stores.glyphs.fontIndices[glyphIndex]}:${stores.glyphs.glyphIds[glyphIndex]}`) &&
+              (textRun.renderingMode === 0 || textRun.renderingMode === 4)) {
+            flushOrdinary(glyphIndex);
+            appendIntrinsicGlyphCommand(commands, glyphIndex, paint, paintResources, commandState);
+            continue;
+          }
           if (ordinaryStart < 0) ordinaryStart = glyphIndex;
           continue;
         }
@@ -1528,6 +1620,12 @@ export function createHeprPageDataFromDense(
     };
     for (let glyphIndex = globalFirst; glyphIndex < globalFirst + count; glyphIndex += 1) {
       if ((stores.glyphs.flags[glyphIndex] & HEPR_GLYPH_FLAG.Type3) === 0) {
+        if (options.text?.intrinsicGlyphStrokes?.has(`${stores.glyphs.fontIndices[glyphIndex]}:${stores.glyphs.glyphIds[glyphIndex]}`) &&
+            (textRun.renderingMode === 0 || textRun.renderingMode === 4)) {
+          flushOrdinary(glyphIndex);
+          appendIntrinsicGlyphCommand(target, glyphIndex, paint, paintResources, commandState);
+          continue;
+        }
         if (ordinaryStart < 0) ordinaryStart = glyphIndex;
         continue;
       }

@@ -13,7 +13,7 @@ import {
 import type { PdfProgress } from "./heprDocumentData";
 import { validateIccEngine, type PdfIccOptions } from "./pdf/nativeIcc";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
-import type { NativeMissingFontResolver } from "./pdf/nativeFont";
+import type { NativeEmbeddedFontPaint, NativeMissingFontResolver } from "./pdf/nativeFont";
 import type { NativeImageCodecResolver } from "./pdf/nativeImage";
 import type { NativeVectorPdfSession, PdfSession } from "./pdfSession";
 import type { SceneOptionalContent } from "./optionalContentData";
@@ -235,6 +235,8 @@ export interface VectorScene {
 }
 
 export interface VectorExtractOptions extends PdfIccOptions {
+  /** Embedded font painting: PDF rules by default; `font` honors the font's PaintType. */
+  embeddedFontPaint?: NativeEmbeddedFontPaint;
   /**
    * Prepare bounded compact monochrome or eligible GPU-compressed color/grayscale
    * scan derivatives between page compiles. ocrTextOnly disables this option with
@@ -461,6 +463,7 @@ async function extractPdfPageScenesWithNative(
       missingFontResolver,
       iccTransformResolver: options.iccTransformResolver,
       iccEngine: options.iccEngine,
+      embeddedFontPaint: options.embeddedFontPaint,
       onDiagnostic: options.onDiagnostic,
       onProgress: reportProgress
     } as const;

@@ -6,6 +6,7 @@ import type { LoadProgressCallback } from "./loadProgress";
 import type { PdfIccOptions } from "./pdf/nativeIcc";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import type { NativeImageCodecResolver } from "./pdf/nativeImage";
+import type { NativeEmbeddedFontPaint } from "./pdf/nativeFont";
 import type { AnnotationAppearanceMode } from "./annotationData";
 import { waitForLoad } from "./loadCancellation";
 import { validateSourcePdfByteLength } from "./hepSizePolicy";
@@ -43,6 +44,8 @@ export interface HepEncodingOptions extends HepLodOptions {
  * HEP stores canonical image pixels; GPU display preparations are not serialized.
  */
 export interface BuildHepFromPdfOptions extends HepEncodingOptions, PdfIccOptions {
+  /** Honor embedded Type1/CFF PaintType for Ghostscript compatibility. @default "pdf" */
+  embeddedFontPaint?: NativeEmbeddedFontPaint;
   /** Optional raw-sample image decoder; omitted uses the bundled codecs. */
   imageCodecResolver?: NativeImageCodecResolver;
   /** Receives PDF diagnostics, including warnings when ICC fallback is used. */

@@ -159,8 +159,12 @@ export interface NativeFontSubstitution {
   readonly outlineFormat: "glyf";
 }
 
+export type NativeEmbeddedFontPaint = "pdf" | "font";
+
 export interface ParseNativePdfFontOptions {
   readonly signal?: AbortSignal;
+  /** PDF rendering modes control painting by default. "font" honors embedded PaintType for compatibility. */
+  readonly embeddedFontPaint?: NativeEmbeddedFontPaint;
   readonly missingFontResolver?: NativeMissingFontResolver;
   readonly onDiagnostic?: (diagnostic: Readonly<PdfDiagnostic>) => void;
   /** Parser ceilings may only lower the engine defaults. */
@@ -215,6 +219,12 @@ export interface NativeGlyphOutline {
   readonly bounds: readonly [number, number, number, number];
   readonly advanceWidth: number;
   readonly leftSideBearing: number;
+  /** PaintType 2 centerline and pen in the font's original character space. */
+  readonly intrinsicStroke?: {
+    readonly width: number;
+    readonly transform: readonly number[];
+    readonly commands: readonly NativeGlyphPathCommand[];
+  };
 }
 
 export interface NativePdfFont {
@@ -312,14 +322,7 @@ export const DEFAULT_NATIVE_PDF_FONT_PARSER_LIMITS: Readonly<NativePdfFontParser
   maxUseCMapDepth: Number.MAX_SAFE_INTEGER,
   maxCidMetricEntries: Number.MAX_SAFE_INTEGER,
   maxSimpleEncodingDifferences: Number.MAX_SAFE_INTEGER,
-  maxCffBytes: DEFAULT_NATIVE_CFF_PARSER_LIMITS.maxCffBytes,
-  maxCffIndexEntries: DEFAULT_NATIVE_CFF_PARSER_LIMITS.maxCffIndexEntries,
-  maxCffStringBytes: DEFAULT_NATIVE_CFF_PARSER_LIMITS.maxCffStringBytes,
-  maxType2CharStringBytes: DEFAULT_NATIVE_CFF_PARSER_LIMITS.maxType2CharStringBytes,
-  maxType2Operators: DEFAULT_NATIVE_CFF_PARSER_LIMITS.maxType2Operators,
-  maxType2SubrDepth: DEFAULT_NATIVE_CFF_PARSER_LIMITS.maxType2SubrDepth,
-  maxType2SubrCalls: DEFAULT_NATIVE_CFF_PARSER_LIMITS.maxType2SubrCalls,
-  maxType2PathCommands: DEFAULT_NATIVE_CFF_PARSER_LIMITS.maxType2PathCommands,
+  ...DEFAULT_NATIVE_CFF_PARSER_LIMITS,
   ...DEFAULT_NATIVE_TYPE1_PARSER_LIMITS,
   maxSfntFaces: Number.MAX_SAFE_INTEGER,
   maxSfntTables: Number.MAX_SAFE_INTEGER,
@@ -399,6 +402,9 @@ export async function parseNativePdfFont(
 ): Promise<NativePdfFont> {
   const signal = options.signal;
   throwIfAborted(signal);
+  if (options.embeddedFontPaint !== undefined && options.embeddedFontPaint !== "pdf" && options.embeddedFontPaint !== "font") {
+    throw new RangeError('embeddedFontPaint must be either "pdf" or "font".');
+  }
   const parserLimits = mergeFontParserLimits(options.parserLimits);
   const dictionary = await requireDictionary(dictionaryValue, resolver, signal, "font");
   const subtype = requireName(dictionary.get("Subtype"), "A PDF font has no supported /Subtype.");
@@ -432,6 +438,8 @@ class ParsedNativeFont implements NativePdfFont {
   private readonly decodeCharacter: (bytes: Uint8Array, offset: number) => NativeMappedCharacter;
   private readonly unsupportedOutlineReason: string | null;
   private readonly onDiagnostic: ParseNativePdfFontOptions["onDiagnostic"];
+  private readonly embeddedFontPaint: NativeEmbeddedFontPaint;
+  private intrinsicPaintReported = false;
 
   constructor(
     subtype: NativePdfFontSubtype,
@@ -447,7 +455,8 @@ class ParsedNativeFont implements NativePdfFont {
     decodeCharacter: (bytes: Uint8Array, offset: number) => NativeMappedCharacter,
     unsupportedOutlineReason: string | null,
     onDiagnostic?: ParseNativePdfFontOptions["onDiagnostic"],
-    type1: NativeType1Font | null = null
+    type1: NativeType1Font | null = null,
+    embeddedFontPaint: NativeEmbeddedFontPaint = "pdf"
   ) {
     this.subtype = subtype;
     this.baseFont = baseFont;
@@ -459,7 +468,8 @@ class ParsedNativeFont implements NativePdfFont {
     this.cff = cff;
     this.type1 = type1;
     this.substitution = substitution;
-    this.diagnosticData = diagnostics;
+    this.embeddedFontPaint = embeddedFontPaint;
+    this.diagnosticData = visibleFontDiagnostics(diagnostics, embeddedFontPaint);
     this.sfntDiagnosticCount = sfnt?.diagnostics.length ?? 0;
     this.cffDiagnosticCount = cff?.diagnostics.length ?? 0;
     this.type1DiagnosticCount = type1?.diagnostics.length ?? 0;
@@ -478,9 +488,9 @@ class ParsedNativeFont implements NativePdfFont {
         type1Diagnostics.length > this.type1DiagnosticCount) {
       this.diagnosticData = Object.freeze([
         ...this.diagnosticData,
-        ...sfntDiagnostics.slice(this.sfntDiagnosticCount),
-        ...cffDiagnostics.slice(this.cffDiagnosticCount),
-        ...type1Diagnostics.slice(this.type1DiagnosticCount)
+        ...visibleFontDiagnostics(sfntDiagnostics.slice(this.sfntDiagnosticCount), this.embeddedFontPaint),
+        ...visibleFontDiagnostics(cffDiagnostics.slice(this.cffDiagnosticCount), this.embeddedFontPaint),
+        ...visibleFontDiagnostics(type1Diagnostics.slice(this.type1DiagnosticCount), this.embeddedFontPaint)
       ]);
       this.sfntDiagnosticCount = sfntDiagnostics.length;
       this.cffDiagnosticCount = cffDiagnostics.length;
@@ -503,7 +513,20 @@ class ParsedNativeFont implements NativePdfFont {
     const provider = this.sfnt ?? this.cff ?? this.type1;
     if (provider) {
       const previousCount = this.diagnostics.length;
-      const outline = provider.getGlyphOutline(glyphId);
+      const applyIntrinsicPaint = this.embeddedFontPaint === "font";
+      const outline = this.sfnt
+        ? this.sfnt.getGlyphOutline(glyphId, applyIntrinsicPaint)
+        : this.cff
+          ? this.cff.getGlyphOutline(glyphId, undefined, applyIntrinsicPaint)
+          : this.type1!.getGlyphOutline(glyphId, applyIntrinsicPaint);
+      if (outline.intrinsicStroke && !this.intrinsicPaintReported) {
+        this.intrinsicPaintReported = true;
+        this.diagnosticData = Object.freeze([...this.diagnosticData, Object.freeze({
+          code: "font.intrinsic-paint-compatibility", severity: "warning" as const,
+          message: "Embedded font PaintType controls glyph painting in compatibility mode; PDF requires text rendering mode to control painting, so other viewers may differ.",
+          details: Object.freeze({ embeddedFontPaint: "font", baseFont: this.baseFont })
+        })]);
+      }
       this.reportNewDiagnostics(previousCount);
       return outline;
     }
@@ -575,7 +598,7 @@ async function parseSimpleFont(
       const glyphIds = new Set(encoding.glyphNames.map(name => type1.glyphIdForName(name)));
       for (const glyphId of glyphIds) {
         throwIfAborted(signal);
-        embeddedType1.getGlyphOutline(glyphId);
+        embeddedType1.getGlyphOutline(glyphId, options.embeddedFontPaint === "font");
       }
     } catch (error) {
       if (!(error instanceof PdfError) || error.code !== "unsupported-font") throw error;
@@ -636,7 +659,7 @@ async function parseSimpleFont(
   const outlineReason = subtype === "Type3"
     ? "Type3 glyphs must be compiled through their CharProc display programs."
     : descriptor.embeddedKind === "cff2"
-      ? "CFF2 outlines require the native CFF2 engine, which is not available."
+      ? "The embedded CFF2 outline program could not be retained."
       : descriptor.embeddedKind === "cff"
         ? "The embedded CFF outline program could not be retained."
         : descriptor.embeddedKind === "type1"
@@ -706,8 +729,8 @@ async function parseSimpleFont(
         width = sfnt
           ? sfnt.getHorizontalMetric(glyphId).advanceWidth * 1000 / sfnt.unitsPerEm
           : embeddedType1
-            ? embeddedType1.getGlyphOutline(glyphId).advanceWidth * 1000 / embeddedType1.unitsPerEm
-            : embeddedCff!.getGlyphOutline(glyphId).advanceWidth * 1000 / embeddedCff!.unitsPerEm;
+            ? embeddedType1.getGlyphOutline(glyphId, options.embeddedFontPaint === "font").advanceWidth * 1000 / embeddedType1.unitsPerEm
+            : embeddedCff!.getGlyphOutline(glyphId, signal, options.embeddedFontPaint === "font").advanceWidth * 1000 / embeddedCff!.unitsPerEm;
       }
       if (type3Widths && type3Matrix) {
         // Type3 widths are expressed through FontMatrix; normalize to the same
@@ -727,7 +750,8 @@ async function parseSimpleFont(
     },
     outlineReason,
     options.onDiagnostic,
-    embeddedType1
+    embeddedType1,
+    options.embeddedFontPaint
   );
 }
 
@@ -828,7 +852,7 @@ async function parseCompositeFont(
   const outlineReason = descendantSubtype === "CIDFontType0"
     ? "The CIDFontType0 font has no supported embedded CFF outline program."
     : descriptor.embeddedKind === "cff" || descriptor.embeddedKind === "cff2"
-      ? "CFF/CFF2 outlines require the native CFF kernel, which is not available."
+      ? "The embedded CFF/CFF2 outline program could not be retained."
       : null;
 
   return new ParsedNativeFont(
@@ -884,7 +908,9 @@ async function parseCompositeFont(
       };
     },
     outlineReason,
-    options.onDiagnostic
+    options.onDiagnostic,
+    null,
+    options.embeddedFontPaint
   );
 }
 
@@ -2821,11 +2847,11 @@ async function resolveMissingSfnt(
   if (!looksLikeSfnt(ownedBytes)) {
     throw unsupportedFont("The missing-font resolver returned bytes without a valid sfnt signature.");
   }
-  const sfnt = NativeSfntFont.parse(ownedBytes, faceIndex, options.parserLimits);
+  const sfnt = NativeSfntFont.parse(ownedBytes, faceIndex, options.parserLimits, "strict", options.signal);
   throwIfAborted(options.signal);
   if (sfnt.outlineFormat === "cff" || sfnt.outlineFormat === "cff2") {
     throw unsupportedFont(
-      "A caller-provided CFF/CFF2 substitute requires the native CFF kernel, which is not available."
+      "The missing-font resolver requires TrueType glyf outlines; this substitute contains CFF/CFF2 outlines."
     );
   }
   if (sfnt.outlineFormat !== "glyf") {
@@ -2935,7 +2961,7 @@ async function readEmbeddedSfnt(
   // those records participate in HEPR's glyph mapping, metrics, or outlines.
   // Keep every table we do consume fully bounds checked, while treating the
   // unused directory metadata as advisory at this PDF trust boundary.
-  return NativeSfntFont.parse(bytes, 0, limits, "pdf-embedded");
+  return NativeSfntFont.parse(bytes, 0, limits, "pdf-embedded", signal);
 }
 
 async function readEmbeddedType1(
@@ -2974,7 +3000,7 @@ async function readEmbeddedCff(
   limits: Readonly<NativeCffParserLimits>,
   signal?: AbortSignal
 ): Promise<NativeCffFont | null> {
-  if (descriptor.embeddedKind !== "cff") return null;
+  if (descriptor.embeddedKind !== "cff" && descriptor.embeddedKind !== "cff2") return null;
   const descriptorValue = fontDictionary.get("FontDescriptor");
   if (descriptorValue === undefined) return null;
   const descriptorDictionary = await requireDictionary(
@@ -2990,19 +3016,35 @@ async function readEmbeddedCff(
   const stream = await resolver.resolveValue(value, signal);
   if (!isPdfStream(stream)) throw unsupportedFont("An embedded CFF font file is not a stream.");
   const subtype = optionalName(await resolver.resolveValue(stream.dictionary.get("Subtype"), signal));
-  if (subtype !== "Type1C" && subtype !== "CIDFontType0C") {
+  if (subtype !== "Type1C" && subtype !== "CIDFontType0C" && subtype !== "CFF2") {
     throw unsupportedFont(`Embedded CFF stream subtype /${subtype ?? "(missing)"} is not supported.`);
   }
   const bytes = await resolver.decodeStream(stream, signal);
   throwIfAborted(signal);
-  return NativeCffFont.parse(bytes, limits, optionalName(fontDictionary.get("BaseFont")) ?? undefined, signal);
+  const font = NativeCffFont.parse(bytes, limits, optionalName(fontDictionary.get("BaseFont")) ?? undefined, signal);
+  if (font.formatVersion === 2 &&
+      !["CIDFontType0", "CIDFontType2"].includes(optionalName(fontDictionary.get("Subtype")) ?? "")) {
+    throw unsupportedFont("A raw CFF2 simple font has no glyph-name Encoding; an OpenType cmap or CID/GID mapping is required.");
+  }
+  return font;
 }
 
 function reportFontDiagnostics(
   diagnostics: readonly PdfDiagnostic[],
   options: ParseNativePdfFontOptions
 ): void {
-  for (const diagnostic of diagnostics) options.onDiagnostic?.(diagnostic);
+  for (const diagnostic of visibleFontDiagnostics(diagnostics, options.embeddedFontPaint)) options.onDiagnostic?.(diagnostic);
+}
+
+function visibleFontDiagnostics(
+  diagnostics: readonly PdfDiagnostic[], embeddedFontPaint: NativeEmbeddedFontPaint = "pdf"
+): readonly PdfDiagnostic[] {
+  if (embeddedFontPaint === "font") return diagnostics;
+  return Object.freeze(diagnostics.filter(diagnostic =>
+    diagnostic.code !== "font.type1-stroke-approximated" &&
+    diagnostic.code !== "font.cff-stroke-approximation" &&
+    diagnostic.code !== "font.cff-stroke-width-approximation" &&
+    diagnostic.code !== "font.cff-paint-type-approximation"));
 }
 
 function embeddedHmtxDiagnostic(
@@ -3134,8 +3176,10 @@ export class NativeSfntFont {
   private readonly glyphLocations: Uint32Array | null;
   private readonly maxpProfile: MaxpTrueTypeProfile | null;
   private readonly cffParserLimits: Readonly<Partial<NativeCffParserLimits>>;
+  private readonly signal?: AbortSignal;
   private cffFont: NativeCffFont | null = null;
   private readonly outlineCache = new Map<number, NativeGlyphOutline>();
+  private readonly pdfOutlineCache = new Map<number, NativeGlyphOutline>();
 
   private constructor(
     bytes: Uint8Array,
@@ -3143,12 +3187,14 @@ export class NativeSfntFont {
     limits: Readonly<NativeSfntParserLimits>,
     protectedRanges: readonly SfntProtectedRange[] = Object.freeze([]),
     validation: "strict" | "pdf-embedded" = "strict",
-    cffParserLimits: Readonly<Partial<NativeCffParserLimits>> = {}
+    cffParserLimits: Readonly<Partial<NativeCffParserLimits>> = {},
+    signal?: AbortSignal
   ) {
     this.view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     this.limits = limits;
     this.validation = validation;
     this.cffParserLimits = Object.freeze({ ...cffParserLimits });
+    this.signal = signal;
     this.tables = readSfntTables(
       this.view,
       faceOffset,
@@ -3321,8 +3367,10 @@ export class NativeSfntFont {
     bytes: Uint8Array,
     faceIndex = 0,
     limitOverrides?: Partial<NativeSfntParserLimits & NativeCffParserLimits>,
-    validation: "strict" | "pdf-embedded" = "strict"
+    validation: "strict" | "pdf-embedded" = "strict",
+    signal?: AbortSignal
   ): NativeSfntFont {
+    throwIfAborted(signal);
     if (!(bytes instanceof Uint8Array) || bytes.byteLength < 12) {
       throw unsupportedFont("The embedded sfnt font is truncated.");
     }
@@ -3427,7 +3475,7 @@ export class NativeSfntFont {
     } else if (faceIndex !== 0) {
       throw unsupportedFont("A non-collection sfnt has only face zero.");
     }
-    return new NativeSfntFont(bytes, faceOffset, limits, protectedRanges, validation, limitOverrides);
+    return new NativeSfntFont(bytes, faceOffset, limits, protectedRanges, validation, limitOverrides, signal);
   }
 
   mapCodePoint(codePoint: number, variationSelector?: number): number {
@@ -3485,17 +3533,19 @@ export class NativeSfntFont {
     return Object.freeze({ advanceWidth, leftSideBearing });
   }
 
-  getGlyphOutline(glyphId: number): NativeGlyphOutline {
+  getGlyphOutline(glyphId: number, applyIntrinsicPaint = true): NativeGlyphOutline {
+    throwIfAborted(this.signal);
     this.requireGlyphId(glyphId);
-    const cached = this.outlineCache.get(glyphId);
+    const cache = !applyIntrinsicPaint && this.outlineFormat !== "glyf" ? this.pdfOutlineCache : this.outlineCache;
+    const cached = cache.get(glyphId);
     if (cached) return cached;
-    if (this.outlineFormat === "cff") {
+    if (this.outlineFormat === "cff" || this.outlineFormat === "cff2") {
       if (this.cffFont === null) {
-        const table = this.requireTable("CFF ");
+        const table = this.requireTable(this.outlineFormat === "cff2" ? "CFF2" : "CFF ");
         const bytes = new Uint8Array(this.view.buffer, this.view.byteOffset + table.offset, table.length);
-        const cff = NativeCffFont.parse(bytes, this.cffParserLimits);
+        const cff = NativeCffFont.parse(bytes, this.cffParserLimits, undefined, this.signal);
         if (cff.numGlyphs !== this.numGlyphs) {
-          throw unsupportedFont("The OpenType CFF CharStrings count disagrees with maxp.numGlyphs.");
+          throw unsupportedFont("The OpenType CFF/CFF2 CharStrings count disagrees with maxp.numGlyphs.");
         }
         this.cffFont = cff;
         if (cff.diagnostics.length) {
@@ -3503,7 +3553,7 @@ export class NativeSfntFont {
         }
       }
       const previousDiagnosticCount = this.cffFont.diagnostics.length;
-      const source = this.cffFont.getGlyphOutline(glyphId);
+      const source = this.cffFont.getGlyphOutline(glyphId, this.signal, applyIntrinsicPaint);
       if (this.cffFont.diagnostics.length > previousDiagnosticCount) {
         this.diagnosticData = Object.freeze([
           ...this.diagnosticData,
@@ -3519,17 +3569,18 @@ export class NativeSfntFont {
         bounds: scale === 1 ? source.bounds
           : freezeBounds(source.bounds.map(value => value * scale), "OpenType CFF glyph"),
         advanceWidth: metric.advanceWidth,
-        leftSideBearing: metric.leftSideBearing
+        leftSideBearing: metric.leftSideBearing,
+        ...(source.intrinsicStroke ? {
+          intrinsicStroke: Object.freeze({ ...source.intrinsicStroke,
+            transform: scale === 1 ? source.intrinsicStroke.transform
+              : Object.freeze(source.intrinsicStroke.transform.map(value => value * scale)) })
+        } : {})
       });
-      this.outlineCache.set(glyphId, outline);
+      cache.set(glyphId, outline);
       return outline;
     }
     if (this.outlineFormat !== "glyf") {
-      throw unsupportedFont(
-        this.outlineFormat === "cff2"
-          ? "CFF2 outlines require the native CFF2 engine, which is not available."
-          : "The embedded sfnt has no supported outline table."
-      );
+      throw unsupportedFont("The embedded sfnt has no supported outline table.");
     }
     const geometry = this.readGlyphGeometry(
       glyphId,
@@ -3548,7 +3599,7 @@ export class NativeSfntFont {
       advanceWidth: metric.advanceWidth,
       leftSideBearing: metric.leftSideBearing
     });
-    this.outlineCache.set(glyphId, outline);
+    cache.set(glyphId, outline);
     return outline;
   }
 
@@ -5256,6 +5307,7 @@ function mergeFontParserLimits(
   const defaults = DEFAULT_NATIVE_PDF_FONT_PARSER_LIMITS;
   return Object.freeze({
     ...mergeType1ParserLimits(overrides),
+    ...mergeCffParserLimits(overrides),
     maxCMapBytes: boundedParserLimit(overrides?.maxCMapBytes, defaults.maxCMapBytes, "maxCMapBytes"),
     maxCMapMappings: boundedParserLimit(
       overrides?.maxCMapMappings,
@@ -5283,44 +5335,18 @@ function mergeFontParserLimits(
       defaults.maxSimpleEncodingDifferences,
       "maxSimpleEncodingDifferences"
     ),
-    maxCffBytes: boundedParserLimit(overrides?.maxCffBytes, defaults.maxCffBytes, "maxCffBytes"),
-    maxCffIndexEntries: boundedParserLimit(
-      overrides?.maxCffIndexEntries,
-      defaults.maxCffIndexEntries,
-      "maxCffIndexEntries"
-    ),
-    maxCffStringBytes: boundedParserLimit(
-      overrides?.maxCffStringBytes,
-      defaults.maxCffStringBytes,
-      "maxCffStringBytes"
-    ),
-    maxType2CharStringBytes: boundedParserLimit(
-      overrides?.maxType2CharStringBytes,
-      defaults.maxType2CharStringBytes,
-      "maxType2CharStringBytes"
-    ),
-    maxType2Operators: boundedParserLimit(
-      overrides?.maxType2Operators,
-      defaults.maxType2Operators,
-      "maxType2Operators"
-    ),
-    maxType2SubrDepth: boundedParserLimit(
-      overrides?.maxType2SubrDepth,
-      defaults.maxType2SubrDepth,
-      "maxType2SubrDepth"
-    ),
-    maxType2SubrCalls: boundedParserLimit(
-      overrides?.maxType2SubrCalls,
-      defaults.maxType2SubrCalls,
-      "maxType2SubrCalls"
-    ),
-    maxType2PathCommands: boundedParserLimit(
-      overrides?.maxType2PathCommands,
-      defaults.maxType2PathCommands,
-      "maxType2PathCommands"
-    ),
     ...mergeSfntParserLimits(overrides)
   });
+}
+
+function mergeCffParserLimits(
+  overrides: Partial<NativeCffParserLimits> | undefined
+): NativeCffParserLimits {
+  const limits = { ...DEFAULT_NATIVE_CFF_PARSER_LIMITS };
+  for (const key of Object.keys(limits) as (keyof NativeCffParserLimits)[]) {
+    limits[key] = boundedParserLimit(overrides?.[key], limits[key], key);
+  }
+  return limits;
 }
 
 function mergeType1ParserLimits(

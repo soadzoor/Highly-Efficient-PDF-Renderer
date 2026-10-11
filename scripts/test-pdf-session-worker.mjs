@@ -54,7 +54,11 @@ try {
   const [hostEndpoint, workerEndpoint] = linkedCloneEndpoints();
   let vectorTransferChecked = false;
   let vectorRequestOptions = null;
+  let openRequestOptions = null;
   hostEndpoint.onPost = (message) => {
+    if (message.type === "hepr-pdf-request" && message.operation === "open") {
+      openRequestOptions = message.options;
+    }
     if (message.type === "hepr-pdf-request" && message.operation === "compile-vector-page") {
       vectorRequestOptions = message.options;
     }
@@ -88,7 +92,7 @@ try {
     close() {
       rangeCloseCount += 1;
     }
-  }, {}, hostEndpoint, {
+  }, { embeddedFontPaint: "font" }, hostEndpoint, {
     onCrash: () => () => undefined,
     terminate() {
       terminationCount += 1;
@@ -96,6 +100,7 @@ try {
   });
 
   assert.equal(session.info.pageCount, 2);
+  assert.equal(openRequestOptions.embeddedFontPaint, "font", "worker open retains the explicit embedded font paint policy");
   const workerAnnotations = await session.getPageAnnotations(0);
   assert.equal(workerAnnotations.length, 1);
   assert.equal(workerAnnotations[0].contents, "Worker comment");

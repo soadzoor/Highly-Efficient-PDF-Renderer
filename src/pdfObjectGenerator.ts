@@ -13,6 +13,7 @@ import { waitForLoad } from "./loadCancellation";
 import type { PdfIccOptions } from "./pdf/nativeIcc";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import type { NativeImageCodecResolver } from "./pdf/nativeImage";
+import type { NativeEmbeddedFontPaint } from "./pdf/nativeFont";
 import { validateAnnotationAppearanceMode, type AnnotationAppearanceMode } from "./annotationData";
 import { openPdfPageDemand, type PdfPageDemandLoader } from "./pdfPageDemand";
 import { resolvePdfViewingOptions } from "./pdfViewingOptions";
@@ -32,6 +33,8 @@ export type PdfObjectSourceKind = "pdf" | "hep";
  * Options used while loading and parsing a source into HEPR scene data.
  */
 export interface PdfObjectGeneratorOptions extends PdfIccOptions {
+  /** Embedded font painting: PDF rules by default; `font` honors the font's PaintType. */
+  embeddedFontPaint?: NativeEmbeddedFontPaint;
   /** Override the human-readable source label (for example, when reopening retained bytes). */
   sourceLabel?: string;
   /** Optional raw-sample image decoder; omitted uses the bundled codecs. */
@@ -245,6 +248,7 @@ async function loadPdfSceneFromSourceInternal(
       iccTransformResolver: options.iccTransformResolver,
       iccEngine: options.iccEngine,
       annotationAppearances: options.annotationAppearances,
+      embeddedFontPaint: options.embeddedFontPaint,
       onDiagnostic: options.onDiagnostic,
       enableSegmentMerge: options.segmentMerge !== false,
       enableInvisibleCull: options.invisibleCull !== false,

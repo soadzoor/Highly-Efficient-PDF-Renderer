@@ -78,8 +78,16 @@ try {
   })).getGlyphOutline(1).commands, aCommands, "strings and comments do not redefine font dictionaries");
   expectPdf(() => parse(buildType1Fixture({ encoding: "SomeUnknownEncoding" })), "unsupported-font",
     /Encoding|PostScript/i);
-  expectPdf(() => parse(buildType1Fixture({ encoding: "256 array 0 1 255 {1 index exch /A put} for" })),
-    "unsupported-font", /Encoding|PostScript/i);
+  const computedEncoding = parse(buildType1Fixture({ encoding: "256 array 0 1 255 {1 index exch /A put} for" }));
+  assert.equal(computedEncoding.builtInGlyphNames[255], "A", "computed Encoding retains the PostScript-defined glyph vector");
+  const copiedEncoding = parse(buildType1Fixture({
+    encoding: "StandardEncoding 256 array copy dup 65 /A put dup 66 1 index 65 get put readonly"
+  }));
+  assert.equal(copiedEncoding.builtInGlyphNames[66], "A", "computed Encoding assignments are executed rather than partially ignored");
+  const mutatedMatrix = parse(buildType1Fixture({ clearExtra:
+    "/FontMatrix FontMatrix 6 array copy def currentdict /FontMatrix get 0 .002 put" }));
+  assert.equal(mutatedMatrix.getGlyphOutline(1).commands[0].x, 100,
+    "later FontMatrix mutations through dictionary lookup change the original outlines");
 
   const transformed = parse(buildType1Fixture({ fontMatrix: [0.002, 0.001, 0.0005, 0.003, 0.01, -0.02] })).getGlyphOutline(1);
   assert.deepEqual(transformed.commands, [
@@ -90,6 +98,24 @@ try {
     { kind: "close" }
   ], "FontMatrix applies scale, shear, rotation and translation in the shared 1000-unit ABI");
   assert.equal(transformed.advanceWidth, 1200, "translation does not affect the width vector");
+
+  const strokedFont = parse(buildType1Fixture({ paintType: 2, clearExtra: "/StrokeWidth 100 def" }));
+  const strokedGlyph = strokedFont.getGlyphOutline(1);
+  assert.deepEqual(strokedGlyph.bounds, [0, -50, 300, 350], "StrokeWidth expands both sides of the original character path");
+  assert.deepEqual(strokedGlyph.intrinsicStroke, { width: 100, transform: [1, 0, 0, 1, 0, 0], commands: aCommands },
+    "original character contours remain available for live stroke styles and PDF text rendering modes");
+  assert.equal(strokedGlyph.advanceWidth, 600, "intrinsic font strokes do not change PDF positioning metrics");
+  assert.ok(Object.isFrozen(strokedGlyph.intrinsicStroke));
+  assert.deepEqual(strokedFont.diagnostics, [], "straight original font strokes require no fidelity reduction");
+  const negativeStroke = parse(buildType1Fixture({ paintType: 2, clearExtra: "/StrokeWidth -100 def" })).getGlyphOutline(1);
+  assert.deepEqual(negativeStroke.commands, strokedGlyph.commands, "negative PostScript StrokeWidth has the same magnitude");
+  const hairlineGlyph = parse(buildType1Fixture({ paintType: 2 })).getGlyphOutline(1);
+  assert.equal(hairlineGlyph.intrinsicStroke.width, 0, "omitted StrokeWidth is an explicit device hairline");
+  assert.deepEqual(hairlineGlyph.commands, aCommands, "hairline centerlines are retained for the page painter");
+  const transformedStroke = parse(buildType1Fixture({ paintType: 2, fontMatrix: [0.002, 0, 0, 0.003, 0.01, -0.02],
+    clearExtra: "/StrokeWidth 100 def" })).getGlyphOutline(1);
+  assert.deepEqual(transformedStroke.bounds, [10, -170, 610, 1030], "FontMatrix scales the pen as well as the path");
+  assert.deepEqual(transformedStroke.intrinsicStroke.transform, [2, 0, 0, 3, 10, -20]);
 
   const curved = outline(cs(30, 40, 600, 0, "sbw", 10, 20, "rmoveto",
     20, 0, 30, 50, 40, -20, "rrcurveto", "closepath", "endchar"));
@@ -246,7 +272,7 @@ try {
     cs(0, 600, "hsbw", 9, "callsubr", "endchar"),
     concatType1Bytes(cs(0, 600, "hsbw"), Uint8Array.of(12, 99), cs("endchar"))
   ]) expectPdf(() => outline(program), "unsupported-font");
-  expectPdf(() => parse(buildType1Fixture({ paintType: 2 })), "unsupported-font");
+  expectPdf(() => parse(buildType1Fixture({ paintType: 1 })), "unsupported-font");
   expectPdf(() => parse(buildType1Fixture({ fontMatrix: [0.001, 0, 0, 0.001, 0] })), "unsupported-font");
   const pfb = buildType1Fixture({ container: "pfb" }).bytes.slice();
   new DataView(pfb.buffer).setUint32(2, pfb.length + 1, true);
@@ -264,8 +290,11 @@ try {
   const dynamicPrivate = concatType1Bytes(truncated.privatePlaintext.subarray(0, aOffset),
     "/A 20 string def\n", truncated.privatePlaintext.subarray(bOffset));
   const dynamicEncrypted = encryptType1Bytes(concatType1Bytes(new Uint8Array(4), dynamicPrivate), 55665);
-  expectPdf(() => NativeType1Font.parse(concatType1Bytes(truncated.cleartext, dynamicEncrypted), {},
-    { length1: truncated.length1, length2: dynamicEncrypted.length }), "unsupported-font", /CharString|expression/i);
+  const dynamicFont = NativeType1Font.parse(concatType1Bytes(truncated.cleartext, dynamicEncrypted), {},
+    { length1: truncated.length1, length2: dynamicEncrypted.length });
+  assert.notEqual(dynamicFont.glyphIdForName("A"), 0, "dynamic CharStrings remain present alongside ordinary glyph definitions");
+  expectPdf(() => dynamicFont.getGlyphOutline(dynamicFont.glyphIdForName("A")), "unsupported-font",
+    /operator|charstring/i);
 
   const abort = new AbortController();
   abort.abort();
