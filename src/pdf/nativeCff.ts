@@ -763,7 +763,7 @@ function materializeCffPostScriptPaintSequence(sequence: readonly CffPostScriptP
     const changed = state?.changedStrokeFields ?? [];
     return [Object.freeze({ kind: paintType === 2 ? "stroke" as const : "fill" as const,
       commands: item.commands, fillRule: 0 as const, clips: state?.clips ?? Object.freeze([]), color: state?.color ?? null,
-      ...(state?.pattern ? { pattern: state.pattern } : {}),
+      ...(state?.deviceColor ? { deviceColor: state.deviceColor } : {}), ...(state?.pattern ? { pattern: state.pattern } : {}),
       ...(paintType === 2 ? {
         stroke: Object.freeze({ width: changed.includes("width") ? state!.stroke!.width : Math.abs(strokeWidth),
           lineCap: state?.stroke?.lineCap ?? 0, lineJoin: state?.stroke?.lineJoin ?? 0,

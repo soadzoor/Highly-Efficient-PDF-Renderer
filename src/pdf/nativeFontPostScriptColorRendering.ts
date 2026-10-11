@@ -93,8 +93,9 @@ export function parseNativeFontPostScriptColorRendering(value: Value, options: N
     }
     const device = output.map((x, i) => Math.max(0, Math.min(1, options.call(table!.transforms[i], [x], 1)[0])));
     if (table.channels === 3) return { rgba: [device[0], device[1], device[2], 1] };
-    options.notice("font.postscript-crd-cmyk-display-approximated", "The PostScript color-rendering dictionary's CMYK output uses the canonical display conversion; physical printer inks and screening are unavailable.");
-    return { rgba: [1 - Math.min(1, device[0] + device[3]), 1 - Math.min(1, device[1] + device[3]), 1 - Math.min(1, device[2] + device[3]), 1] };
+    options.notice("font.postscript-crd-cmyk-display-approximated", "The PostScript VM preview uses unprofiled CMYK; vector paints preserve device values for the enclosing PDF's DefaultCMYK profile. Physical printer inks and screening remain unavailable.");
+    return { rgba: [1 - Math.min(1, device[0] + device[3]), 1 - Math.min(1, device[1] + device[3]), 1 - Math.min(1, device[2] + device[3]), 1],
+      deviceSpace: "DeviceCMYK", deviceValues: device };
   } });
 }
 

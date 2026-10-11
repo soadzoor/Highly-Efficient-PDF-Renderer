@@ -19,11 +19,43 @@ interface JpxKernel {
 }
 let assetPromise: Promise<Uint8Array<ArrayBuffer>> | undefined;
 const modules = new Map<number, Promise<WebAssembly.Module>>();
+const preparedModules = new Map<number, WebAssembly.Module>();
+let preparedAsset: Uint8Array<ArrayBuffer> | undefined;
 const WASM_PAGE_BYTES = 64 * 1024;
+
+/** Prepare only the shared asset/module; decoding heaps remain operation-local. */
+export async function prepareBundledJpxCodec(signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  try { await loadModule(65536); }
+  catch (cause) {
+    throwIfAborted(signal);
+    if (cause instanceof PdfError) throw cause;
+    throw codecError("Unable to prepare the bundled JPEG 2000 codec.", "codec-load-failed", cause);
+  }
+  throwIfAborted(signal);
+}
 
 /** Focused OpenJPEG kernel, loaded only for JPEG 2000 images. */
 export async function decodeBundledJpx(request: Readonly<NativeImageCodecRequest>, maxBytes: number,
   signal?: AbortSignal): Promise<NativeImageCodecResult> {
+  const { pages, outputBytes } = validateRequest(request, maxBytes, signal);
+  const module = await loadModule(pages);
+  return decodeWithModule(module, request, outputBytes, signal);
+}
+
+export function decodeBundledJpxSync(request: Readonly<NativeImageCodecRequest>, maxBytes: number,
+  signal?: AbortSignal): NativeImageCodecResult {
+  const { pages, outputBytes } = validateRequest(request, maxBytes, signal);
+  if (!preparedAsset) throw codecError("The JPEG 2000 codec must be prepared before synchronous font decoding.", "codec-not-prepared");
+  let module = preparedModules.get(pages);
+  if (!module) {
+    module = new WebAssembly.Module(capWasmMemory(preparedAsset, pages));
+    cachePreparedModule(pages, module);
+  }
+  return decodeWithModule(module, request, outputBytes, signal);
+}
+
+function validateRequest(request: Readonly<NativeImageCodecRequest>, maxBytes: number, signal?: AbortSignal) {
   throwIfAborted(signal);
   const metadata = readJpxProperties(request.encoded);
   if (metadata.width !== request.width || metadata.height !== request.height) {
@@ -46,22 +78,16 @@ export async function decodeBundledJpx(request: Readonly<NativeImageCodecRequest
       details: { codec: "jpeg2000", reason: "jpx-working-set", bytes: estimate, limit: maxBytes }
     });
   }
+  // Reserve JS output (including the Gray+alpha bridge) outside the WASM heap.
+  const jsBytes = request.encoded.length + outputBytes * (request.components === 2 ? 3 : 1) + 1024 * 1024;
+  return { outputBytes, pages: Math.min(65536, Math.floor((maxBytes - jsBytes) / WASM_PAGE_BYTES)) };
+}
+
+function decodeWithModule(module: WebAssembly.Module, request: Readonly<NativeImageCodecRequest>,
+  outputBytes: number, signal?: AbortSignal): NativeImageCodecResult {
+  throwIfAborted(signal);
   try {
-    // JS samples are outside WASM memory. Reserve them (including the temporary
-    // RGBA bridge for Gray+alpha) before capping the kernel's grow-only heap.
-    const jsBytes = request.encoded.length + outputBytes * (request.components === 2 ? 3 : 1) + 1024 * 1024;
-    const compiled = await loadModule(Math.min(65536, Math.floor((maxBytes - jsBytes) / WASM_PAGE_BYTES)));
-    throwIfAborted(signal);
-    // Fresh instances release grow-only memory after each decode. Instantiation
-    // is synchronous here so a failure rejects OpenJPEG's initialization promise.
-    const kernel = await OpenJPEG({
-      instantiateWasm(imports: WebAssembly.Imports, receive: (instance: WebAssembly.Instance) => void) {
-        const instance = new WebAssembly.Instance(compiled, imports);
-        receive(instance);
-        return instance.exports;
-      },
-      warn: (_message: string) => {}
-    }) as unknown as JpxKernel;
+    const kernel = OpenJPEG({ compiledModule: module, warn: (_message: string) => {} }) as unknown as JpxKernel;
     throwIfAborted(signal);
     const pointer = kernel._malloc(request.encoded.length) >>> 0;
     if (!pointer) throw new PdfError("resource-limit", "JPEG 2000 input allocation failed.");
@@ -95,7 +121,7 @@ export async function decodeBundledJpx(request: Readonly<NativeImageCodecRequest
 }
 
 /** Read the mandatory SIZ marker before allowing any decoder allocations. */
-function readJpxProperties(bytes: Uint8Array): { width: number; height: number; components: number; singleUnsignedByte: boolean } {
+export function readJpxProperties(bytes: Uint8Array): { width: number; height: number; components: number; singleUnsignedByte: boolean; unsignedBytes: boolean } {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let start = 0, end = bytes.length;
   if (bytes[0] !== 0xff || bytes[1] !== 0x4f) {
@@ -126,17 +152,27 @@ function readJpxProperties(bytes: Uint8Array): { width: number; height: number; 
       length !== 38 + components * 3 || start + 4 + length > end) {
     throw codecError("Invalid JPEG 2000 dimensions or SIZ length.", "invalid-jpx-header");
   }
-  return { width, height, components, singleUnsignedByte: components === 1 && bytes[start + 42] === 7 };
+  return { width, height, components, singleUnsignedByte: components === 1 && bytes[start + 42] === 7,
+    unsignedBytes: Array.from({ length: components }, (_, i) => bytes[start + 42 + i * 3]).every(value => value === 7) };
 }
 
 function loadModule(maximumPages: number): Promise<WebAssembly.Module> {
+  const ready = preparedModules.get(maximumPages);
+  if (ready) return Promise.resolve(ready);
   const cached = modules.get(maximumPages);
   if (cached) return cached;
-  const pending = loadAsset().then(bytes => WebAssembly.compile(capWasmMemory(bytes, maximumPages)));
+  const pending = loadAsset().then(bytes => WebAssembly.compile(capWasmMemory(bytes, maximumPages))).then(module => {
+    cachePreparedModule(maximumPages, module); return module;
+  });
   if (modules.size >= 4) modules.delete(modules.keys().next().value!);
   modules.set(maximumPages, pending);
   void pending.catch(() => { if (modules.get(maximumPages) === pending) modules.delete(maximumPages); });
   return pending;
+}
+
+function cachePreparedModule(pages: number, module: WebAssembly.Module): void {
+  if (preparedModules.size >= 4) preparedModules.delete(preparedModules.keys().next().value!);
+  preparedModules.set(pages, module);
 }
 
 function loadAsset(): Promise<Uint8Array<ArrayBuffer>> {
@@ -154,6 +190,7 @@ function loadAsset(): Promise<Uint8Array<ArrayBuffer>> {
       bytes = new Uint8Array(await response.arrayBuffer());
     }
     if (bytes.length !== BUNDLED_JPX_CODEC_ASSET.byteLength) throw new Error("Invalid bundled OpenJPEG asset length.");
+    preparedAsset = bytes;
     return bytes;
   })();
   assetPromise = pending;

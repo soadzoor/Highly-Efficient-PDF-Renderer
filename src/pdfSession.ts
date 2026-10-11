@@ -5471,10 +5471,10 @@ async function compileNativeType3Programs(
         };
       }
       paints.push({ kind: intrinsic ? "stroke" : "fill", commands, fillRule: 0,
-        clips: finalState.clips, color: finalState.color, ...(finalState.pattern ? { pattern: finalState.pattern } : {}),
+        clips: finalState.clips, color: finalState.color, ...(finalState.deviceColor ? { deviceColor: finalState.deviceColor } : {}), ...(finalState.pattern ? { pattern: finalState.pattern } : {}),
         ...(stroke ? { stroke } : {}) });
     }
-    const content = serializeNativeGlyphPostScriptPaints(paints, initialGraphicsState.fillAlpha, signal);
+    const content = serializeNativeGlyphPostScriptPaints(paints, initialGraphicsState.fillAlpha, signal, resources.colorSpaces);
     const imageXObjects = new Map<string, number>();
     for (const [name, image] of content.images) {
       let variants = postScriptImageIndices.get(image.rgba);
@@ -5493,16 +5493,21 @@ async function compileNativeType3Programs(
       }
       imageXObjects.set(name, await index);
     }
+    // A font can introduce CMYK even when the outer content never names it.
+    // Resolve against the enclosing PDF scope before lowering device paints.
+    if (paints.some(paint => paint.deviceColor)) await resources.loadColorSpace("DeviceCMYK");
     const patternResources = new Map<string, PdfValue>([
       ["Pattern", new Map(content.patterns)], ["ColorSpace", new Map<string, PdfValue>([
         ["PSPattern", { kind: "name", value: "Pattern" }],
-        ["PSPatternRGB", [{ kind: "name", value: "Pattern" }, { kind: "name", value: "DeviceRGB" }]]
+        ["PSPatternRGB", [{ kind: "name", value: "Pattern" }, { kind: "name", value: "DeviceRGB" }]],
+        ["PSPatternCMYK", [{ kind: "name", value: "Pattern" }, { kind: "name", value: "DeviceCMYK" }]],
+        ...(resources.colorSpaces?.has("DefaultCMYK") ? [["DefaultCMYK", resources.colorSpaces.get("DefaultCMYK")!] as [string, PdfValue]] : [])
       ])]
     ]);
     const patternDefinitions = await loadPatternDefinitions(resources.patterns, resources.extGStates,
       patternResources, [...content.patterns.keys()], signal);
     const patternColors = await loadScopedColorResolver(document, patternResources, resources.registry.colors,
-      resources.colorSpaceResolver, content.patterns.size ? ["PSPattern", "PSPatternRGB"] : [], pageIndex, signal);
+      resources.colorSpaceResolver, content.patterns.size ? ["PSPattern", "PSPatternRGB", "PSPatternCMYK"] : [], pageIndex, signal);
     const inheritedState: DensePdfInitialGraphicsState = {
       ...initialGraphicsState,
       // PostScript has a single current color. Its inherited strokes use

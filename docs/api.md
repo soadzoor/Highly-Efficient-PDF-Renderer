@@ -1163,11 +1163,15 @@ conversion, dictionary stacks, matrices, local/global resources and VM allocatio
 procedure sources support ASCIIHex, ASCII85, RunLength, LZW, Flate with predictors,
 JPEG DCT, CCITT Group 3/4 fax (including standard uncompressed mode), SubFile,
 reusable-stream and `eexec` decoding. The additional `JBIG2Decode` extension accepts
-self-contained sequential pages; a bounded SubFile source is required when font
-code follows the encoded data, since this filter consumes through source EOF.
-JPEG and JBIG2 reuse the bundled decoders, prepared asynchronously during PDF font
-loading; standalone synchronous font/VM callers must first await
-`prepareBundledJpegCodec` or `prepareBundledJbig2Codec`, respectively. Preparation
+self-contained sequential pages, and `JPXDecode` accepts boxed/raw eight-bit
+JPEG 2000 with color output or a separate `Alpha` plane. Both consume through
+source EOF; use a bounded SubFile source when executable font code follows the
+encoded data. JPX alpha must be an unassociated last channel; higher precision, signed samples, other alpha layouts and raw
+two-component streams without channel definitions retain a diagnosed fallback.
+JPEG, JBIG2 and JPX reuse the bundled decoders, prepared asynchronously during
+PDF font loading; standalone synchronous font/VM callers must first await
+`prepareBundledJpegCodec`, `prepareBundledJbig2Codec` or
+`prepareBundledJpxCodec`, respectively. Preparation
 caches compiled modules without allocating a persistent decoding heap.
 Unavailable preparation retains a diagnosed fallback.
 Retained streams preserve their
@@ -1193,15 +1197,25 @@ PQR white/black-point adaptation, LMN/ABC matrices and encode/range procedures,
 RGB/CMYK RenderTables and their channel transforms. `currentcolorrendering`,
 `setcolorrendering` and the ColorRendering resource/procedure-set lookup preserve
 VM and graphics-state identity. The default is a canonical sRGB CRD with source
-black-point compensation. Missing printer profiles/rendering intents and physical
-CMYK output still receive display-approximation diagnostics.
+black-point compensation. CMYK device values from vector paints and CRDs remain
+available to the PDF page's `DefaultCMYK` ICC profile, including final glyph
+paints, stencils and pattern/shading colors. This preserves supplied calibration
+rather than flattening it to unprofiled RGB. The standalone VM preview and sampled
+color images still use display approximations; missing profiles, physical inks,
+paper and screening cannot be reconstructed from font data.
 Colored and uncolored tiling patterns retain reusable vector cells, locked pattern
 matrices, clipping, strokes and implicit charstring paint. Shading patterns and
 `shfill` reuse ordinary PDF shading resources for device color spaces, standard
-function dictionaries (types 0, 2 and 3) and encoded meshes. Shading data files
-must have an EOF boundary; array-backed mesh data and CIE shading spaces remain
-unsupported. Without an explicit shading BBox, font-local `shfill` uses the font
-bounding box and diagnoses that finite-extent approximation.
+function dictionaries (types 0, 2 and 3), encoded meshes and numeric array meshes
+(types 4–7, including reused triangle/patch edges). Numeric meshes stay vector;
+32-bit coordinates and 16-bit components emit `font.postscript-mesh-quantized`.
+CIE and spot shading spaces with unit component ranges use a sampled source/CRD
+transform, with `font.postscript-shading-color-sampled` for nonlinear or sharp
+transition differences. The sampling grids have 257 points for one component,
+17 per axis for two/three components, and 9 per axis for four components. Nonunit
+ranges, transparent spot shadings and transforms with more than four inputs
+retain diagnosed fallback. Shading data files must have an EOF boundary. Without
+an explicit shading BBox, font-local `shfill` uses the font bounding box and diagnoses that finite-extent approximation.
 Sampled images retain reusable RGBA image assets, clipping and source transforms,
 with interpolation preserved through HEP save/reload and GPU texture sampling.
 Noninterpolated stencils retain coalesced vector runs; interpolated stencils retain
@@ -1212,13 +1226,17 @@ independent mask resolution and mask interpolation. ImageType 4 color keys compa
 raw samples before Decode. The retained page preserves separate mask assets;
 HEP folds coverage into the source image grid. Different mask resolutions or
 interpolation on either image emit `font.postscript-image-mask-resampled`, since
-this folding can change mask-edge sampling.
+this folding can change mask-edge sampling. Standard ImageType 3 requires
+coincident image/mask corners (PLRM 4.10.6); malformed, misaligned matrices now
+receive `font.postscript-image-mask-misaligned` and a compatibility rendering.
+Hard masks retain independently transformed vector clips. Interpolated masks
+resample coverage on the source image grid with the edge-approximation diagnostic.
 Access permissions, caller limits and cancellation
 remain enforced. Device-dependent matrix queries require an explicit execution context.
-Host filesystem access, printer/device control, arbitrary image/mask matrix
-misalignment, striped/random-access JBIG2 font streams and the nonstandard
-`JPXDecode` font filter remain unsupported; this is not a general PostScript
-engine. Ordinary PDF JPEG 2000 images remain supported by the asynchronous codec.
+Host filesystem access, printer/device control, striped/random-access JBIG2
+font streams and the JPX layouts listed above remain unsupported; this is not a
+general PostScript engine. Ordinary PDF JPEG 2000 images continue to use the
+asynchronous codec, including its existing normalized higher-precision output.
 Unsupported PostScript retains available geometry with diagnostics identifying
 the failing operator.
 Unsupported Type1 loader code that leaves readable declarative records uses

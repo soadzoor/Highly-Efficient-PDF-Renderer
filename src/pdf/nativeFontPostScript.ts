@@ -471,14 +471,15 @@ class FontPostScriptVm {
     if (!pattern) throw unsupported("PostScript patterns must first be instantiated by makepattern.", "setcolor", "rangecheck");
     const space = this.currentColorSpace(), entries = this.patternSpace(space)!;
     let values: readonly number[] = [], color: readonly [number, number, number, number] = [0, 0, 0, 1];
+    let converted: ReturnType<NativeFontPostScriptColorSpace["convert"]> | undefined;
     if (pattern.paintType === 2) {
       if (entries.length !== 2) throw unsupported("An uncolored pattern requires a base color space.", "setcolor", "rangecheck");
       const model = this.colorModel(entries[1]), components: number[] = [];
       for (let i = 0; i < model.components; i++) components.unshift(this.number());
-      values = model.normalize(components); color = model.convert(values).rgba;
+      values = model.normalize(components); converted = model.convert(values); color = converted.rgba;
     }
     const context = this.glyphContext("setcolor");
-    context.setColorSpaceColor("Pattern", values, color); context.setPattern(pattern);
+    context.setColorSpaceColor("Pattern", values, color, converted?.deviceSpace, converted?.deviceValues, converted?.deviceCmyk); context.setPattern(pattern);
     this.colorSpaces.set(context.sourceColorValues!, space); this.colorPatterns.set(context.sourceColorValues!, dictionary);
   }
   private makePattern(): void {
@@ -489,8 +490,14 @@ class FontPostScriptVm {
     if (source.get("PatternType") === 2) {
       const dictionary = new Map(source);
       dictionary.set("Implementation", reduceAccess([], 1)); this.register(dictionary, false); reduceAccess(dictionary, 2);
-      patternInstances.set(dictionary, Object.freeze({ paintType: 1, matrix: nativeFontPostScriptConcatMatrices(operand, this.matrix),
-        shading: this.shading(source.get("Shading") ?? null) }));
+      // Shading patterns can be built while the font loads, before a glyph
+      // context exists. Retain conversion diagnostics for each later use.
+      const previous = this.patternContext, context = this.currentGlyphContext ?? new NativeFontPostScriptGlyphContext({ signal: this.options.signal });
+      this.patternContext = context;
+      try {
+        patternInstances.set(dictionary, Object.freeze({ paintType: 1, matrix: nativeFontPostScriptConcatMatrices(operand, this.matrix),
+          shading: this.shading(source.get("Shading") ?? null), diagnostics: context.diagnostics }));
+      } finally { this.patternContext = previous; }
       this.push(dictionary); return;
     }
     if (source.get("PatternType") !== 1) throw unsupported("Invalid PostScript pattern type.", "makepattern", "rangecheck");
@@ -537,7 +544,7 @@ class FontPostScriptVm {
       }
       patternInstances.set(dictionary, Object.freeze({ paintType: paintType as 1 | 2, tilingType: tilingType as 1 | 2 | 3,
         bbox: Object.freeze(bbox) as unknown as readonly [number, number, number, number], xStep, yStep, matrix,
-        paints: transformNativeGlyphPostScriptPaints(context.paintRecords, inverse) }));
+        paints: transformNativeGlyphPostScriptPaints(context.paintRecords, inverse), diagnostics: context.diagnostics }));
       for (const diagnostic of context.diagnostics) parent?.noteColorApproximation(diagnostic.code, diagnostic.message);
     } finally {
       this.unwindTasks(depth); this.activeCommand = command; this.patternContext = previousContext;
@@ -548,7 +555,9 @@ class FontPostScriptVm {
   }
   private shading(value: Value) {
     return nativeFontPostScriptShading(value, { read: value => { if (isComposite(value)) requireAccess(value, 2); },
-      signal: this.options.signal,
+      signal: this.options.signal, maxBytes: this.options.maxStringBytes,
+      notice: (code, message) => this.glyphContext("shfill").noteColorApproximation(code, message),
+      colorModel: value => this.colorModel(value),
       data: value => {
         if (value instanceof Uint8Array) { requireAccess(value, 2); return value.slice(); }
         const source = this.imageSource(value), bytes: number[] = [];
@@ -754,17 +763,19 @@ class FontPostScriptVm {
       image = { width, height, bits, matrix, components, sources, interpolate: false, multiple: sources.length > 1 };
     }
     validate(image, name === "imagemask");
+    let misalignedMask = false;
     if (maskImage) {
       if ((image.width && image.height) && (!maskImage.width || !maskImage.height)) throw unsupported("A nonempty PostScript image requires a nonempty explicit mask.", name);
       const imageInverse = nativeFontPostScriptInvertMatrix(image.matrix), maskInverse = nativeFontPostScriptInvertMatrix(maskImage.matrix);
       for (const [x, y] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
         const a = nativeFontPostScriptTransform(image.width * x, image.height * y, imageInverse);
         const b = nativeFontPostScriptTransform(maskImage.width * x, maskImage.height * y, maskInverse);
-        if (a.some((value, axis) => Math.abs(value - b[axis]) > 1e-10 * Math.max(1, Math.abs(value), Math.abs(b[axis])))) throw unsupported("PostScript explicit image mask corners must coincide with the sampled image.", name);
+        if (a.some((value, axis) => Math.abs(value - b[axis]) > 1e-10 * Math.max(1, Math.abs(value), Math.abs(b[axis])))) misalignedMask = true;
       }
+      if (misalignedMask) context.noteColorApproximation("font.postscript-image-mask-misaligned", "PostScript ImageType 3 requires coincident image and mask corners; independently positioned coverage is used as a compatibility fallback.");
     }
     if (image.width === 0 || image.height === 0) return;
-    let data: Uint8Array, softMask: { width: number; height: number; data: Uint8Array; interpolate: boolean } | undefined;
+    let data: Uint8Array, softMask: { width: number; height: number; data: Uint8Array; interpolate: boolean; imageMatrix?: NativeFontPostScriptMatrix } | undefined;
     if (!maskImage) data = read(image);
     else {
       const maskData = allocate(maskImage); let maskUsed = 0;
@@ -823,7 +834,8 @@ class FontPostScriptVm {
         }
       }
       if (maskUsed < maskData.length) context.noteColorApproximation("font.postscript-image-truncated", "PostScript explicit image mask data ended early; missing mask samples remain transparent.");
-      softMask = { width: maskImage.width, height: maskImage.height, data: coverage, interpolate: maskImage.interpolate };
+      softMask = { width: maskImage.width, height: maskImage.height, data: coverage, interpolate: maskImage.interpolate,
+        ...(misalignedMask ? { imageMatrix: maskImage.matrix } : {}) };
     }
     context.image({ width: image.width, height: image.height, bitsPerComponent: image.bits as 1 | 2 | 4 | 8 | 12,
       components: image.components, data, imageMatrix: image.matrix, ctm, decode: image.decode,
@@ -1380,7 +1392,8 @@ function postScriptFilterParameters(dictionary: Dictionary | null): NativeFontPo
     else if (key === "EODCount") { if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw unsupported("PostScript EODCount requires a nonnegative integer."); parameters[key] = value; }
     else if (key === "EODString") { if (!(value instanceof Uint8Array)) throw unsupported("PostScript EODString requires a string."); requireAccess(value, 2); parameters[key] = value; }
     else if (["EarlyChange", "Predictor", "Colors", "BitsPerComponent", "Columns", "UnitLength", "K", "Rows", "DamagedRowsBeforeError", "ColorTransform"].includes(key)) { if (typeof value !== "number" || !Number.isSafeInteger(value)) throw unsupported(`PostScript ${key} requires an integer.`); parameters[key] = value; }
-    else if (["LowBitFirst", "EndOfLine", "EncodedByteAlign", "EndOfBlock", "BlackIs1", "Uncompressed"].includes(key)) { if (typeof value !== "boolean") throw unsupported(`PostScript ${key} requires a boolean.`); parameters[key] = value; }
+    else if (["LowBitFirst", "EndOfLine", "EncodedByteAlign", "EndOfBlock", "BlackIs1", "Uncompressed", "Alpha"].includes(key)) { if (typeof value !== "boolean") throw unsupported(`PostScript ${key} requires a boolean.`); parameters[key] = value; }
+    else if (key === "ColorSpace") { if (!isName(value)) throw unsupported("PostScript JPX ColorSpace requires a name."); parameters[key] = value.value; }
     else if (key === "Filter") { if (isName(value)) parameters[key] = value.value; else { requireAccess(value, 2); if (!Array.isArray(value)) throw unsupported("PostScript Filter requires a name or name array."); parameters[key] = value.map(item => { if (!isName(item)) throw unsupported("PostScript Filter array requires names."); return item.value; }); } }
     else if (key === "DecodeParms") { if (value instanceof Map) parameters[key] = postScriptFilterParameters(value); else { requireAccess(value, 2); if (!Array.isArray(value)) throw unsupported("PostScript DecodeParms requires a dictionary or array."); parameters[key] = value.map(item => item === null ? null : item instanceof Map ? postScriptFilterParameters(item) : (() => { throw unsupported("PostScript DecodeParms array requires dictionaries."); })()); } }
   }

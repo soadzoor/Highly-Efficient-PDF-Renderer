@@ -4,6 +4,7 @@ import type { NativeFontPostScriptByteDecoder, NativeFontPostScriptCompressionPa
 import { decodeNativeCcittFaxSource } from "./nativeCcitt";
 import type { NativeCcittParameters } from "./nativeCcitt";
 import { decodeBundledJpegSync } from "./nativeJpegCodec";
+import { decodeNativeFontPostScriptJpx } from "./nativeFontPostScriptJpx";
 import { decodeBundledJbig2Sync } from "./nativeJbig2Codec";
 import { stripJbig2FileHeader } from "./codecs/jbig2Preflight";
 
@@ -16,6 +17,8 @@ export interface NativeFontPostScriptFileOptions {
 export interface NativeFontPostScriptFilterParameters extends NativeFontPostScriptCompressionParameters, NativeCcittParameters {
   readonly CloseSource?: boolean;
   readonly ColorTransform?: number;
+  readonly Alpha?: boolean;
+  readonly ColorSpace?: string;
   readonly Uncompressed?: boolean;
   readonly EODCount?: number;
   readonly EODString?: Uint8Array;
@@ -443,9 +446,9 @@ class ImageCodecFile extends InputFile {
   private output: Uint8Array | undefined;
   private encoded: Uint8Array | undefined;
   private outputOffset = 0;
-  readonly filterName: "DCTDecode" | "CCITTFaxDecode" | "JBIG2Decode";
+  readonly filterName: "DCTDecode" | "CCITTFaxDecode" | "JBIG2Decode" | "JPXDecode";
   readonly parameters: NativeFontPostScriptFilterParameters;
-  constructor(source: NativeFontPostScriptFile, filterName: "DCTDecode" | "CCITTFaxDecode" | "JBIG2Decode",
+  constructor(source: NativeFontPostScriptFile, filterName: "DCTDecode" | "CCITTFaxDecode" | "JBIG2Decode" | "JPXDecode",
     parameters: NativeFontPostScriptFilterParameters, options: NativeFontPostScriptFileOptions) {
     super(options, source, parameters.CloseSource);
     this.filterName = filterName; this.parameters = parameters;
@@ -457,6 +460,9 @@ class ImageCodecFile extends InputFile {
           this.output = decodeNativeCcittFaxSource(() => this.source!.readByte(), this.parameters, {
             signal: this.options.signal, limits: { maxOutputBytes: this.options.maxDecodedBytes ?? Number.MAX_SAFE_INTEGER }
           }).bytes;
+        } else if (this.filterName === "JPXDecode") {
+          this.output = decodeNativeFontPostScriptJpx(this.encoded ??= readThroughSourceEof(this.source!, this.options.signal),
+            this.parameters, this.options.maxDecodedBytes ?? Number.MAX_SAFE_INTEGER, this.options.signal);
         } else if (this.filterName === "JBIG2Decode") {
           // The Ghostscript extension consumes through source EOF, unlike DCT.
           // A SubFileDecode source supplies a boundary within executable font data.
@@ -491,9 +497,21 @@ class ImageCodecFile extends InputFile {
 }
 
 function readThroughSourceEof(source: NativeFontPostScriptFile, signal?: AbortSignal): Uint8Array {
-  const bytes: number[] = [];
-  for (let value; (value = source.readByte()) >= 0;) { throwIfAborted(signal); bytes.push(value); }
-  return Uint8Array.from(bytes);
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  while (true) {
+    throwIfAborted(signal);
+    // Chunking bounds transient storage overhead, not the admitted input size.
+    const chunk = new Uint8Array(64 * 1024), used = source.readInto(chunk);
+    if (!used) break;
+    chunks.push(chunk.subarray(0, used)); length += used;
+    if (!Number.isSafeInteger(length)) throw limited();
+    if (used !== chunk.length) break;
+  }
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) { throwIfAborted(signal); bytes.set(chunk, offset); offset += chunk.length; }
+  return bytes;
 }
 
 /** JBIG2Decode is a nonstandard PostScript filter; self-contained sequential
@@ -591,7 +609,7 @@ export function createNativeFontPostScriptFilter(source: NativeFontPostScriptFil
     case "RunLengthDecode": return new RunLengthFile(options, input, parameters.CloseSource);
     case "SubFileDecode": return new SubFile(input, parameters, options);
     case "LZWDecode": case "FlateDecode": return new CompressionFile(input, name, parameters, options);
-    case "DCTDecode": case "CCITTFaxDecode": case "JBIG2Decode": return new ImageCodecFile(input, name, parameters, options);
+    case "DCTDecode": case "CCITTFaxDecode": case "JBIG2Decode": case "JPXDecode": return new ImageCodecFile(input, name, parameters, options);
     case "ReusableStreamDecode": {
       let decoded = input;
       const filters = typeof parameters.Filter === "string" ? [parameters.Filter] : parameters.Filter ?? [];

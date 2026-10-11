@@ -50,6 +50,7 @@ import {
 } from "./nativeType1";
 import { transformNativeGlyphPostScriptPaints, transformNativeGlyphPostScriptFinalState } from "./nativeFontPostScriptGraphics";
 import { prepareBundledJpegCodec } from "./nativeJpegCodec";
+import { prepareBundledJpxCodec } from "./nativeJpxCodec";
 import { prepareBundledJbig2Codec } from "./nativeJbig2Codec";
 
 /** Minimal resolver surface needed by the font engine. */
@@ -252,11 +253,13 @@ export interface NativeGlyphPostScriptTilingPattern {
   readonly yStep: number;
   readonly matrix: readonly [number, number, number, number, number, number];
   readonly paints: readonly NativeGlyphPostScriptPaint[];
+  readonly diagnostics?: readonly PdfDiagnostic[];
 }
 export interface NativeGlyphPostScriptShadingPattern {
   readonly paintType: 1;
   readonly matrix: readonly [number, number, number, number, number, number];
   readonly shading: PdfValue;
+  readonly diagnostics?: readonly PdfDiagnostic[];
 }
 export type NativeGlyphPostScriptPattern = NativeGlyphPostScriptTilingPattern | NativeGlyphPostScriptShadingPattern;
 
@@ -267,6 +270,9 @@ export interface NativeGlyphPostScriptPathPaint {
   readonly clips: readonly NativeGlyphPostScriptClip[];
   /** Null inherits the enclosing PDF glyph's paint. */
   readonly color: readonly [number, number, number, number] | null;
+  /** Preserve printer-device values until the enclosing PDF color resolver can
+   * apply its DefaultCMYK profile; color remains the unprofiled VM preview. */
+  readonly deviceColor?: { readonly space: "DeviceCMYK"; readonly values: readonly number[] };
   readonly pattern?: NativeGlyphPostScriptPattern;
   /** Present for promoted intrinsic component strokes; other fields inherit
    * the invoking PDF stroke style. Width is always explicitly supplied. */
@@ -294,6 +300,7 @@ export interface NativeGlyphPostScriptImagePaint {
   readonly clips: readonly NativeGlyphPostScriptClip[];
   /** Stencils use the current color; ordinary sampled images ignore this field. */
   readonly color: NativeGlyphPostScriptPathPaint["color"];
+  readonly deviceColor?: NativeGlyphPostScriptPathPaint["deviceColor"];
   readonly imageMask?: boolean;
   readonly pattern?: NativeGlyphPostScriptPattern;
   readonly softMask?: { readonly width: number; readonly height: number; readonly data: Uint8Array; readonly interpolate: boolean };
@@ -307,6 +314,7 @@ export type NativeGlyphPostScriptStrokeField = "width" | "lineCap" | "lineJoin" 
 export interface NativeGlyphPostScriptFinalState {
   readonly clips: readonly NativeGlyphPostScriptClip[];
   readonly color: NativeGlyphPostScriptPaint["color"];
+  readonly deviceColor?: NativeGlyphPostScriptPathPaint["deviceColor"];
   readonly pattern?: NativeGlyphPostScriptPattern;
   readonly stroke?: NonNullable<NativeGlyphPostScriptPaint["stroke"]>;
   /** Only these explicitly changed fields override the invoking PDF style. */
@@ -3124,11 +3132,11 @@ async function preparePostScriptFontCodecs<T extends { readonly usesPostScript: 
   try { font = parse(); }
   catch (error) {
     if (!(error instanceof PdfError) || error.code !== "unsupported-font" || error.details?.reason !== "font-postscript-codec-not-prepared") throw error;
-    await Promise.all([prepareBundledJpegCodec(signal), prepareBundledJbig2Codec(signal)]);
+    await Promise.all([prepareBundledJpegCodec(signal), prepareBundledJbig2Codec(signal), prepareBundledJpxCodec(signal)]);
     return parse();
   }
   if (!font.usesPostScript) return font;
-  try { await Promise.all([prepareBundledJpegCodec(signal), prepareBundledJbig2Codec(signal)]); }
+  try { await Promise.all([prepareBundledJpegCodec(signal), prepareBundledJbig2Codec(signal), prepareBundledJpxCodec(signal)]); }
   catch (error) {
     // An unavailable optional image codec must not prevent ordinary font-local
     // vector programs from opening. Actual DCT uses retain typed diagnostics.

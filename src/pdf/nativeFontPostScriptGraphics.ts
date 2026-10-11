@@ -51,7 +51,9 @@ export interface NativeFontPostScriptImageOptions {
   /** Raw-sample component ranges, tested before Decode (ImageType 4). */
   readonly colorKey?: readonly number[];
   /** Explicit coverage at its original, independently sampled resolution. */
-  readonly softMask?: { readonly width: number; readonly height: number; readonly data: Uint8Array; readonly interpolate: boolean };
+  readonly softMask?: { readonly width: number; readonly height: number; readonly data: Uint8Array; readonly interpolate: boolean;
+    /** Only present for the diagnosed, nonstandard misaligned-mask fallback. */
+    readonly imageMatrix?: NativeFontPostScriptMatrix };
   readonly convertColor?: (values: readonly number[]) => readonly [number, number, number, number];
 }
 
@@ -100,10 +102,17 @@ export class NativeFontPostScriptGlyphContext {
   createPatternContext(): NativeFontPostScriptGlyphContext { return new NativeFontPostScriptGlyphContext(this.options); }
   get strokeStyle(): Stroke { return this.stroke; }
   get color(): Color { return this.paintColor; }
+  private get deviceColor(): NativeGlyphPostScriptPaint["deviceColor"] {
+    const source = this.sourceColor;
+    if (source?.deviceSpace === "DeviceCMYK") return Object.freeze({ space: "DeviceCMYK", values: source.deviceValues! });
+    if (source?.space === "DeviceCMYK") return Object.freeze({ space: "DeviceCMYK", values: source.values });
+    return undefined;
+  }
   get finalState(): NativeGlyphPostScriptFinalState | undefined {
     const transformed = this.stroke.transform.some((value, index) => value !== (index === 0 || index === 3 ? 1 : 0));
     if (!this.clips.length && this.paintColor === null && !this.pattern && !this.changedStrokeFields.size && !transformed) return undefined;
     return Object.freeze({ clips: this.clips, color: this.paintColor,
+      ...(this.deviceColor ? { deviceColor: this.deviceColor } : {}),
       ...(this.pattern ? { pattern: this.pattern } : {}),
       ...(this.changedStrokeFields.size || transformed ? { stroke: this.stroke,
         changedStrokeFields: Object.freeze([...this.changedStrokeFields]) } : {}) });
@@ -344,7 +353,10 @@ export class NativeFontPostScriptGlyphContext {
       ...(deviceCmyk ? { deviceCmyk: Object.freeze([...deviceCmyk]) as SourceColor["deviceCmyk"] } : {}) });
   }
   noteColorApproximation(code: string, message: string): void { this.notice(code, message); }
-  setPattern(pattern: NativeGlyphPostScriptPattern | null): void { this.checkColor(); this.pattern = pattern; }
+  setPattern(pattern: NativeGlyphPostScriptPattern | null): void {
+    this.checkColor(); this.pattern = pattern;
+    for (const diagnostic of pattern?.diagnostics ?? []) this.notice(diagnostic.code, diagnostic.message);
+  }
   lockPatternColor(): void { this.colorLocked = true; }
   private checkColor(): void {
     if (this.colorLocked) throw unsupported("An uncolored pattern PaintProc cannot specify colors.", "undefined");
@@ -354,6 +366,7 @@ export class NativeFontPostScriptGlyphContext {
     if (this.commands.some(command => command.kind !== "move" && command.kind !== "close")) this.paints.push(Object.freeze({
       kind: kind === "stroke" ? "stroke" : "fill", commands: this.pathCommands, fillRule: kind === "eofill" ? 1 : 0,
       clips: this.clips, color: this.paintColor,
+      ...(this.deviceColor ? { deviceColor: this.deviceColor } : {}),
       ...(this.pattern ? { pattern: this.pattern } : {}),
       ...(kind === "stroke" ? { stroke: Object.freeze({ ...this.stroke, transform: Object.freeze([...matrix]) }),
         changedStrokeFields: Object.freeze([...this.changedStrokeFields]) } : {})
@@ -387,6 +400,49 @@ export class NativeFontPostScriptGlyphContext {
     const softMask = options.softMask;
     if (softMask && (!Number.isSafeInteger(softMask.width) || softMask.width <= 0 || !Number.isSafeInteger(softMask.height) || softMask.height <= 0 ||
       !Number.isSafeInteger(softMask.width * softMask.height) || softMask.data.length !== softMask.width * softMask.height)) throw unsupported("Invalid PostScript explicit image mask.", "rangecheck");
+    if (softMask?.imageMatrix) {
+      if (!softMask.interpolate) {
+        // Keep hard mask boundaries as vector clips, even when they cut through
+        // a source color pixel. The mask and color image retain their own CTMs.
+        const maskBytes = new Uint8Array(Math.ceil(softMask.width / 8) * softMask.height);
+        for (let y = 0; y < softMask.height; y++) {
+          throwIfAborted(this.options.signal);
+          for (let x = 0; x < softMask.width; x++) if (softMask.data[y * softMask.width + x]) maskBytes[y * Math.ceil(softMask.width / 8) + (x >>> 3)] |= 1 << (7 - (x & 7));
+        }
+        const context = this.createPatternContext();
+        context.image({ width: softMask.width, height: softMask.height, bitsPerComponent: 1, components: 1,
+          mask: true, data: maskBytes, imageMatrix: softMask.imageMatrix, ctm: options.ctm });
+        const commands: NativeGlyphPathCommand[] = [];
+        for (const paint of context.paintRecords) if (paint.kind === "fill") for (const command of paint.commands) {
+          this.checkCount(this.commands.length + commands.length + 1); commands.push(command);
+        }
+        this.retainedCommands += commands.length;
+        const previous = this.clips;
+        this.clips = Object.freeze([...previous, Object.freeze({ commands: Object.freeze(commands), fillRule: 0 as const })]);
+        try { this.image({ ...options, softMask: undefined }); } finally { this.clips = previous; }
+        return;
+      }
+      // Interpolated nonstandard masks need sampling on the image grid. Keep
+      // this separate from standard aligned masks, whose source is retained.
+      const byteLength = width * height * 5;
+      if (!Number.isSafeInteger(byteLength) || byteLength > (this.options.maxImageBytes ?? Number.MAX_SAFE_INTEGER) - this.retainedImageBytes) throw new PdfError("resource-limit", "Misaligned mask exceeds the configured image byte allowance.");
+      const coverage = new Uint8Array(width * height), imageInverse = inverse(options.imageMatrix);
+      for (let y = 0; y < height; y++) {
+        throwIfAborted(this.options.signal);
+        for (let x = 0; x < width; x++) {
+          if ((x & 255) === 0) throwIfAborted(this.options.signal);
+          const user = nativeFontPostScriptTransform(x + .5, y + .5, imageInverse);
+          const mask = nativeFontPostScriptTransform(user[0], user[1], softMask.imageMatrix);
+          if (mask[0] < 0 || mask[1] < 0 || mask[0] >= softMask.width || mask[1] >= softMask.height) continue;
+          const left = Math.floor(mask[0] - .5), top = Math.floor(mask[1] - .5), fx = mask[0] - .5 - left, fy = mask[1] - .5 - top;
+          const sample = (dx: number, dy: number) => softMask.data[Math.max(0, Math.min(softMask.height - 1, top + dy)) * softMask.width + Math.max(0, Math.min(softMask.width - 1, left + dx))];
+          coverage[y * width + x] = Math.round((sample(0, 0) * (1 - fx) + sample(1, 0) * fx) * (1 - fy) + (sample(0, 1) * (1 - fx) + sample(1, 1) * fx) * fy);
+        }
+      }
+      this.notice("font.postscript-image-mask-resampled", "The independently positioned, interpolated PostScript mask is sampled on the color image grid; mask edges may change.");
+      this.image({ ...options, softMask: { width, height, data: coverage, interpolate: true } });
+      return;
+    }
     if (softMask && (softMask.width !== width || softMask.height !== height || softMask.interpolate || options.interpolate === true)) {
       this.notice("font.postscript-image-mask-resampled", "The explicit PostScript image mask retains its own resolution and interpolation; HEP combines its coverage on the color image grid, which can change mask edges.");
     }
@@ -457,7 +513,8 @@ export class NativeFontPostScriptGlyphContext {
         this.paints.push(Object.freeze({ kind: "image", width: imageWidth, height: imageHeight,
           rgba, transform: Object.freeze([...placed]) as NativeFontPostScriptMatrix,
           interpolate: options.interpolate === true, clips: this.clips,
-          color: options.mask ? this.paintColor : null, ...(options.mask ? { imageMask: true, ...(this.pattern ? { pattern: this.pattern } : {}) } : {}),
+          color: options.mask ? this.paintColor : null, ...(options.mask ? { imageMask: true,
+            ...(this.deviceColor ? { deviceColor: this.deviceColor } : {}), ...(this.pattern ? { pattern: this.pattern } : {}) } : {}),
           ...(retainedMask ? { softMask: Object.freeze(retainedMask) } : {}) }));
         this.retainedCommands += 5; this.retainedImageBytes += byteLength;
       };
@@ -518,6 +575,7 @@ export class NativeFontPostScriptGlyphContext {
           Object.freeze({ kind: "line", x: c[0], y: c[1] }), Object.freeze({ kind: "line", x: d[0], y: d[1] }), Object.freeze({ kind: "close" }));
       }
       this.paints.push(Object.freeze({ kind: "fill", commands: Object.freeze(commands), fillRule: 0, clips: this.clips, color: group.color,
+        ...(this.deviceColor ? { deviceColor: this.deviceColor } : {}),
         ...(this.pattern ? { pattern: this.pattern } : {}) }));
     }
     this.retainedCommands += rectangleCount * 5;

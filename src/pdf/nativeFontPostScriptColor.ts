@@ -13,6 +13,7 @@ export interface NativeFontPostScriptColorSpace {
   readonly name: string;
   readonly components: number;
   readonly initial: readonly number[];
+  readonly range: readonly number[];
   normalize(values: readonly number[]): readonly number[];
   convert(values: readonly number[]): NativeFontPostScriptConvertedColor;
 }
@@ -73,7 +74,7 @@ export function parseNativeFontPostScriptColorSpace(value: Value, options: Color
         return round ? Math.round(clipped) : clipped;
       }));
     };
-    return Object.freeze({ name, components: range.length / 2, initial: normalize(initial), normalize,
+    return Object.freeze({ name, components: range.length / 2, range: Object.freeze([...range]), initial: normalize(initial), normalize,
       convert: (values: readonly number[]) => convert(normalize(values)) });
   };
   const rejectFamily = (value: Value, forbidden: readonly string[], message: string): void => {

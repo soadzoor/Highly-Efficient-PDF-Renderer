@@ -71,13 +71,30 @@ try{
     ["mask source prohibited",type3(1,goodData,dict(2,2,8,1,"<FFFF>",{decode:"[1 0]"}))],
     ["mask bits",type3(1,goodData,goodMask)],
     ["height ratio",type3(2,dict(2,3,8,3,"<00>"),goodMask)],
-    ["mask matrix",type3(2,goodData,dict(2,2,1,1,null,{decode:"[1 0]",matrix:"[2 0 0 -2 1 2]"}))],
+    ["singular mask matrix",type3(2,goodData,dict(2,2,1,1,null,{decode:"[1 0]",matrix:"[0 0 0 0 1 2]"}))],
     ["mask multiple",type3(3,goodData,dict(2,2,1,1,"[<80>]",{decode:"[1 0]",multiple:true}))],
     ["key length",dict(2,2,8,3,"<00>",{type:4,extra:"/MaskColor [0 0]"})+" image"],
     ["key type",dict(2,2,8,3,"<00>",{type:4,extra:"/MaskColor [.5 0 0]"})+" image"],
     ["unknown type",dict(2,2,8,3,"<00>",{type:2})+" image"]]){
     const {context,result}=evaluate(`/DeviceRGB setcolorspace /calls 0 def { ${code} } stopped /failed exch def`);
     assert.equal(result.dictionary.get("failed"),true,label);assert.equal(result.dictionary.get("calls"),0,label+" validates before source calls");assert.equal(context.paintRecords.length,0,label);
+  }
+  for (const interpolate of [false,true]) {
+    const code = `/DeviceRGB setcolorspace ${type3(3,dict(2,2,8,3,hex(rgb)),dict(2,2,1,1,"<8040>",{decode:"[1 0]",matrix:interpolate?"[2 0 0 -2 -.5 2]":"[2 0 0 -2 -1 2]",interpolate}))}`;
+    const {context}=evaluate(code); assert.equal(context.paintRecords.length,1);
+    const paint=context.paintRecords[0]; assert.equal(paint.kind,"image");
+    assert(context.diagnostics.some(d=>d.code==="font.postscript-image-mask-misaligned"));
+    if (!interpolate) {
+      assert.equal(paint.softMask,undefined);assert.equal(paint.clips.length,1);
+      const points=paint.clips[0].commands.filter(x=>x.kind!=="close");
+      assert.equal(Math.min(...points.map(x=>x.x)),.5,"hard mask boundaries retain independent placement");
+      assert.equal(Math.max(...points.map(x=>x.x)),1.5);assert.equal(context.finalState.clips.length,0,"compatibility clip does not leak");
+    } else {
+      assert.deepEqual([...paint.softMask.data],[255,128,0,128]);
+      assert(context.diagnostics.some(d=>d.code==="font.postscript-image-mask-resampled"));
+    }
+    assert.throws(()=>evaluate(code,{}, {maxImageBytes:15}),e=>e.code==="resource-limit");
+    if (!interpolate) assert.throws(()=>evaluate(code,{}, {maxPathCommands:4}),e=>e.code==="resource-limit");
   }
   assert.throws(()=>evaluate(`/DeviceRGB setcolorspace ${cases.find(x=>x.name==="separate-resolution").code}`,{maxStringBytes:15}),error=>error.code==="resource-limit");
   assert.throws(()=>evaluate(`/DeviceRGB setcolorspace ${cases.find(x=>x.name==="separate-resolution").code}`,{}, {maxImageBytes:31}),error=>error.code==="resource-limit");

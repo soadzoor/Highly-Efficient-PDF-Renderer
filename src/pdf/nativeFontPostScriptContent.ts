@@ -11,7 +11,8 @@ import { PdfError, throwIfAborted } from "./nativeTypes";
 export function serializeNativeGlyphPostScriptPaints(
   paints: readonly NativeGlyphPostScriptPaint[],
   inheritedAlpha: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  deviceColorSpaces?: ReadonlyMap<string, PdfValue>
 ): {
   readonly bytes: Uint8Array;
   readonly extGStates: ReadonlyMap<string, DensePdfExtGStateDefinition>;
@@ -34,7 +35,9 @@ export function serializeNativeGlyphPostScriptPaints(
       tokens.push(clip.fillRule === 1 ? "W* n" : "W n");
     }
     if (paint.color && (paint.kind !== "image" || paint.imageMask)) {
-      tokens.push(`${paint.color.slice(0, 3).map(number).join(" ")} ${paint.kind === "stroke" ? "RG" : "rg"}`);
+      tokens.push(paint.deviceColor
+        ? `${paint.deviceColor.values.map(number).join(" ")} ${paint.kind === "stroke" ? "K" : "k"}`
+        : `${paint.color.slice(0, 3).map(number).join(" ")} ${paint.kind === "stroke" ? "RG" : "rg"}`);
       if (paint.color[3] !== 1) {
         const resourceName = `PSAlpha${extGStates.size}`;
         const alpha = inheritedAlpha * paint.color[3];
@@ -46,11 +49,11 @@ export function serializeNativeGlyphPostScriptPaints(
       let name = patternNames.get(paint.pattern);
       if (!name) {
         name = `PSPattern${patterns.size}`; patternNames.set(paint.pattern, name);
-        patterns.set(name, nativeGlyphPostScriptPatternStream(paint.pattern, signal));
+        patterns.set(name, nativeGlyphPostScriptPatternStream(paint.pattern, signal, deviceColorSpaces));
       }
       const stroke = paint.kind === "stroke", uncolored = paint.pattern.paintType === 2;
-      tokens.push(`/${uncolored ? "PSPatternRGB" : "PSPattern"} ${stroke ? "CS" : "cs"}`,
-        `${uncolored ? (paint.color ?? [0, 0, 0]).slice(0, 3).map(number).join(" ") + " " : ""}/${name} ${stroke ? "SCN" : "scn"}`);
+      tokens.push(`/${uncolored ? paint.deviceColor ? "PSPatternCMYK" : "PSPatternRGB" : "PSPattern"} ${stroke ? "CS" : "cs"}`,
+        `${uncolored ? (paint.deviceColor?.values ?? (paint.color ?? [0, 0, 0]).slice(0, 3)).map(number).join(" ") + " " : ""}/${name} ${stroke ? "SCN" : "scn"}`);
     }
     if (paint.kind === "image") {
       const name = `PSImage${images.size}`, [a, b, c, d, e, f] = paint.transform;
@@ -80,17 +83,20 @@ export function serializeNativeGlyphPostScriptPaints(
 }
 
 /** Reuse the ordinary vector pattern compiler, including its cell cache. */
-function nativeGlyphPostScriptPatternStream(pattern: NativeGlyphPostScriptPattern, signal?: AbortSignal): PdfValue {
+function nativeGlyphPostScriptPatternStream(pattern: NativeGlyphPostScriptPattern, signal?: AbortSignal,
+  deviceColorSpaces?: ReadonlyMap<string, PdfValue>): PdfValue {
   if ("shading" in pattern) return new Map<string, PdfValue>([
     ["Type", { kind: "name", value: "Pattern" }], ["PatternType", 2], ["Matrix", [...pattern.matrix]], ["Shading", pattern.shading]
   ]);
-  const content = serializeNativeGlyphPostScriptPaints(pattern.paints, 1, signal), resources = new Map<string, PdfValue>();
+  const content = serializeNativeGlyphPostScriptPaints(pattern.paints, 1, signal, deviceColorSpaces), resources = new Map<string, PdfValue>();
   if (content.images.size) resources.set("XObject", new Map([...content.images].map(([name, image]) => [name, nativeGlyphPostScriptImageStream(image, signal)])));
   if (content.patterns.size) resources.set("Pattern", new Map(content.patterns));
   if (content.extGStates.size) resources.set("ExtGState", new Map([...content.extGStates].map(([name, state]) => [name,
     new Map<string, PdfValue>([["ca", state.fillAlpha ?? 1], ["CA", state.strokeAlpha ?? 1]])])));
   resources.set("ColorSpace", new Map<string, PdfValue>([["PSPattern", { kind: "name", value: "Pattern" }],
-    ["PSPatternRGB", [{ kind: "name", value: "Pattern" }, { kind: "name", value: "DeviceRGB" }]]]));
+    ["PSPatternRGB", [{ kind: "name", value: "Pattern" }, { kind: "name", value: "DeviceRGB" }]],
+    ["PSPatternCMYK", [{ kind: "name", value: "Pattern" }, { kind: "name", value: "DeviceCMYK" }]],
+    ...(deviceColorSpaces?.has("DefaultCMYK") ? [["DefaultCMYK", deviceColorSpaces.get("DefaultCMYK")!] as [string, PdfValue]] : [])]));
   return { kind: "stream", bytes: content.bytes, dictionary: new Map<string, PdfValue>([
     ["Type", { kind: "name", value: "Pattern" }], ["PatternType", 1], ["PaintType", pattern.paintType], ["TilingType", pattern.tilingType],
     ["BBox", [...pattern.bbox]], ["XStep", pattern.xStep], ["YStep", pattern.yStep], ["Matrix", [...pattern.matrix]], ["Resources", resources]
