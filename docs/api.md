@@ -1156,9 +1156,18 @@ WeightVector, including standard blending OtherSubrs. Computed font records and
 custom OtherSubrs can execute in a font-local PostScript interpreter; mutable
 private state is shared within each glyph and isolated between glyphs. Unknown
 custom OtherSubrs retain the Type1 format's argument-preserving fallback with
-`font.type1-othersubr-approximated` diagnostics. The interpreter supports font
-data and arithmetic/control-flow operations, without host file or device
-access; unsupported PostScript retains available geometry with diagnostics.
+`font.type1-othersubr-approximated` diagnostics. The interpreter's font-local
+subset supports font data, arithmetic and control flow, strings and token
+conversion, dictionary stacks, matrices, local Font resources, `stopped` error
+handling and local `save`/`restore`. Memory-backed font files and ASCIIHex,
+ASCII85, RunLength, SubFile, reusable-stream and `eexec` decoding can feed
+computed font records;
+access permissions, caller limits and cancellation remain enforced. Implicit
+device matrix queries require an explicit execution context. Host filesystem
+access, device imaging, global VM, procedure-backed streams and other decoding
+filters remain unsupported; this is not a general PostScript engine.
+Unsupported PostScript retains available geometry with diagnostics identifying
+the failing operator.
 Unsupported Type1 loader code that leaves readable declarative records uses
 `font.type1-postscript-approximated`; failures computing required records can
 still use the configured substitute resolver.

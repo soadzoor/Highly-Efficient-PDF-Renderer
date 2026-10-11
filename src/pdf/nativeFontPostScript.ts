@@ -1,12 +1,20 @@
 import { PdfError, throwIfAborted } from "./nativeTypes";
+import { nativeFontPostScriptIdentityMatrix, nativeFontPostScriptConcatMatrices,
+  nativeFontPostScriptInvertMatrix, nativeFontPostScriptTranslation, nativeFontPostScriptScaling,
+  nativeFontPostScriptRotation, nativeFontPostScriptTransform } from "./nativeFontPostScriptMatrix";
+import type { NativeFontPostScriptMatrix } from "./nativeFontPostScriptMatrix";
+import { createNativeFontPostScriptMemoryFile, createNativeFontPostScriptFilter,
+  createNativeFontPostScriptEexecFile } from "./nativeFontPostScriptFile";
+import type { NativeFontPostScriptFile, NativeFontPostScriptFilterParameters } from "./nativeFontPostScriptFile";
 
 export interface NativeFontPostScriptName { readonly kind: "name"; readonly value: string; readonly literal: boolean; }
 export interface NativeFontPostScriptProcedure { readonly kind: "procedure"; readonly tokens: readonly NativeFontPostScriptValue[]; }
 interface PsOperator { readonly kind: "operator"; readonly name: string; }
 interface PsFile { readonly kind: "file"; readonly reader: FontPostScriptLexer; }
 interface PsMark { readonly kind: "mark"; }
+interface PsSave { readonly kind: "save"; readonly owner: object; readonly snapshot: VmSnapshot; }
 export type NativeFontPostScriptValue = number | boolean | null | Uint8Array |
-  NativeFontPostScriptName | NativeFontPostScriptProcedure | PsOperator | PsFile | PsMark |
+  NativeFontPostScriptName | NativeFontPostScriptProcedure | PsOperator | PsFile | PsMark | PsSave |
   NativeFontPostScriptValue[] | Map<string, NativeFontPostScriptValue>;
 type Value = NativeFontPostScriptValue;
 type Dictionary = Map<string, Value>;
@@ -21,6 +29,8 @@ export interface NativeFontPostScriptOptions {
   readonly expertEncoding?: readonly (string | null)[];
   /** CFF Appendix F executes code with the completed font dictionary on top. */
   readonly initialDictionary?: Dictionary;
+  /** Device-dependent matrix reads require the caller's actual context. */
+  readonly initialMatrix?: NativeFontPostScriptMatrix;
 }
 
 export interface NativeFontPostScriptResult {
@@ -39,25 +49,24 @@ export interface NativeFontPostScriptResult {
  */
 export function executeNativeFontPostScript(cleartext: Uint8Array, privatePlaintext?: Uint8Array,
   options: NativeFontPostScriptOptions = {}): NativeFontPostScriptResult {
-  const vm = new FontPostScriptVm(options);
+  const vm = new FontPostScriptVm(options, privatePlaintext !== undefined);
   vm.runBytes(cleartext);
   if (privatePlaintext) vm.runBytes(privatePlaintext);
   const dictionary = vm.fontDictionary();
   const createOtherSubrExecutor = (signal: AbortSignal | undefined = options.signal) => {
     // Glyphs own their mutable state, while successive calls within one glyph
     // share Private variables and arrays as required by custom OtherSubrs.
-    const owned = cloneValue(dictionary, signal, options.maxStringBytes) as Dictionary;
-    const local = new FontPostScriptVm({ ...options, signal, initialDictionary: owned });
+    const { dictionary: owned, vm: local } = vmForGlyph(vm, dictionary, signal, options);
     const copiedPrivate = owned.get("Private");
     const copiedSubrs = copiedPrivate instanceof Map ? copiedPrivate.get("OtherSubrs") : owned.get("OtherSubrs");
     if (copiedPrivate instanceof Map) local.enterDictionary(copiedPrivate);
     return (index: number, args: readonly number[]): readonly number[] | null => {
       const procedure = Array.isArray(copiedSubrs) ? copiedSubrs[index] : undefined;
       if (!isProcedure(procedure)) return null;
-      local.runProcedure(procedure, [...args].reverse());
-      const results = Object.freeze([...local.stack].reverse().map(value => requireNumber(value)));
-      local.stack.length = 0;
-      return results;
+      try {
+        local.runProcedure(procedure, [...args].reverse());
+        return Object.freeze([...local.stack].reverse().map(value => requireNumber(value)));
+      } finally { local.stack.length = 0; }
     };
   };
   return Object.freeze({ dictionary, createOtherSubrExecutor,
@@ -66,12 +75,25 @@ export function executeNativeFontPostScript(cleartext: Uint8Array, privatePlaint
     } });
 }
 
-type Task = { kind: "input"; reader: FontPostScriptLexer } |
+type Task = { kind: "input"; reader: FontPostScriptLexer; sourceFile?: boolean } |
   { kind: "tokens"; tokens: readonly Value[]; index: number } |
   { kind: "repeat"; remaining: number; procedure: Procedure } |
   { kind: "for"; current: number; increment: number; limit: number; procedure: Procedure } |
-  { kind: "forall"; values: readonly (readonly Value[])[]; index: number; procedure: Procedure } |
-  { kind: "loop"; procedure: Procedure };
+  { kind: "forall"; values: readonly (readonly Value[])[]; source?: Value[] | Uint8Array; index: number; procedure: Procedure } |
+  { kind: "resourceforall"; keys: readonly string[]; scratch: Uint8Array; index: number; procedure: Procedure } |
+  { kind: "loop"; procedure: Procedure } | { kind: "stopped" } | { kind: "eexec-end"; dictionaryDepth: number };
+
+interface VmSnapshot {
+  readonly objects: Map<object, { readonly value: Value; readonly contents?: Value[] | Uint8Array | [string, Value][]; readonly access: Access; readonly capacity?: number }>;
+  readonly matrix: NativeFontPostScriptMatrix;
+  readonly matrixKnown: boolean;
+  readonly graphics: readonly { matrix: NativeFontPostScriptMatrix; known: boolean }[];
+  readonly definedFont: Dictionary | null;
+  readonly resources: readonly [string, Dictionary][];
+  readonly createdCount: number;
+  readonly packing: boolean;
+}
+class PostScriptStop extends Error {}
 
 class FontPostScriptVm {
   readonly stack: Value[] = [];
@@ -83,12 +105,24 @@ class FontPostScriptVm {
   private readonly system: Dictionary = new Map();
   private readonly user: Dictionary = new Map();
   private readonly directory: Dictionary = new Map();
+  private readonly resources = new Map<string, Dictionary>();
+  private readonly errors: Dictionary = new Map();
+  private readonly saves: PsSave[] = [];
+  private matrix: NativeFontPostScriptMatrix;
+  private matrixKnown: boolean;
+  private readonly graphics: { matrix: NativeFontPostScriptMatrix; known: boolean }[] = [];
+  private randomSeed = 1;
+  private packing = false;
+  private activeCommand: Value | undefined;
   private operations = 0;
   private definedFont: Dictionary | null = null;
-  private reader: FontPostScriptLexer | null = null;
+  private readonly splitEexec: boolean;
 
-  constructor(options: NativeFontPostScriptOptions) {
+  constructor(options: NativeFontPostScriptOptions, splitEexec = false) {
     this.options = options;
+    this.splitEexec = splitEexec;
+    this.matrix = options.initialMatrix ?? nativeFontPostScriptIdentityMatrix();
+    this.matrixKnown = options.initialMatrix !== undefined;
     for (const key of ["maxOperations", "maxStack", "maxStringBytes"] as const) {
       const value = options[key];
       if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) throw new RangeError(`Invalid PostScript ${key}.`);
@@ -97,6 +131,9 @@ class FontPostScriptVm {
     this.system.set("true", true); this.system.set("false", false); this.system.set("null", null);
     this.system.set("systemdict", this.system); this.system.set("userdict", this.user);
     this.system.set("FontDirectory", this.directory); this.system.set("globaldict", this.user);
+    this.system.set("$error", this.errors);
+    this.errors.set("newerror", false);
+    this.resources.set("Font", this.directory);
     this.system.set("StandardEncoding", reduceAccess(encoding(options.standardEncoding), 2));
     this.system.set("ExpertEncoding", reduceAccess(encoding(options.expertEncoding), 2));
     this.system.set("version", new TextEncoder().encode("3010"));
@@ -107,15 +144,30 @@ class FontPostScriptVm {
   }
 
   runBytes(bytes: Uint8Array): void {
-    this.reader = new FontPostScriptLexer(bytes, this.options.signal, this.options.maxStringBytes);
-    this.tasks.push({ kind: "input", reader: this.reader });
+    const reader = new FontPostScriptLexer(bytes, this.options.signal, this.options.maxStringBytes, name => this.lookup(name));
+    this.tasks.push({ kind: "input", reader });
     this.run();
   }
 
-  runProcedure(procedure: Procedure, args: readonly Value[] = []): void { for (const value of args) this.push(value); this.schedule(procedure); this.run(); }
+  runProcedure(procedure: Procedure, args: readonly Value[] = []): void {
+    const depth = this.dictionaries.length;
+    try { for (const value of args) this.push(value); this.schedule(procedure); this.run(); }
+    catch (error) { this.unwindTasks(0); this.stack.length = 0; this.dictionaries.splice(depth); throw error; }
+  }
   // Font engines can inspect an opaque Private dictionary while executing its
   // OtherSubrs. This does not grant explicit PS get/put/begin extra access.
   enterDictionary(dictionary: Dictionary): void { this.dictionaries.push(dictionary); this.privilegedDictionaries.add(dictionary); }
+
+  glyphEnvironment(dictionary: Dictionary): Dictionary {
+    return new Map<string, Value>([["font", dictionary], ["user", this.user], ["directory", this.directory], ["resources", new Map(this.resources)]]);
+  }
+  seedGlyphEnvironment(environment: Dictionary): void {
+    for (const [key, value] of environment.get("user") as Dictionary) this.user.set(key, value);
+    for (const [key, value] of environment.get("directory") as Dictionary) this.directory.set(key, value);
+    for (const [key, value] of environment.get("resources") as Dictionary) {
+      if (key !== "Font") this.resources.set(key, value as Dictionary);
+    }
+  }
 
   fontDictionary(): Dictionary {
     if (this.definedFont) return this.definedFont;
@@ -131,29 +183,59 @@ class FontPostScriptVm {
       throwIfAborted(this.options.signal);
       if (++this.operations > (this.options.maxOperations ?? Number.MAX_SAFE_INTEGER)) throw limited("operation");
       const task = this.tasks.at(-1)!;
+      const operands = this.tasks.some(item => item.kind === "stopped") ? this.stack.slice() : [];
       let value: Value | undefined;
-      if (task.kind === "input") {
-        this.reader = task.reader;
-        const token = task.reader.next();
-        if (token === undefined) { this.tasks.pop(); continue; }
-        value = token;
-      } else if (task.kind === "tokens") {
-        if (task.index === task.tokens.length) { this.tasks.pop(); continue; }
-        value = task.tokens[task.index++];
-      } else if (task.kind === "repeat") {
-        if (task.remaining-- <= 0) { this.tasks.pop(); continue; }
-        this.schedule(task.procedure); continue;
-      } else if (task.kind === "for") {
-        if (task.increment > 0 ? task.current > task.limit : task.current < task.limit) { this.tasks.pop(); continue; }
-        this.push(task.current); task.current = finite(task.current + task.increment); this.schedule(task.procedure); continue;
-      } else if (task.kind === "forall") {
-        if (task.index === task.values.length) { this.tasks.pop(); continue; }
-        for (const item of task.values[task.index++]) this.push(item);
-        this.schedule(task.procedure); continue;
-      } else { this.schedule(task.procedure); continue; }
-      if (isName(value) && !value.literal) this.execute(this.lookup(value.value), value.value);
-      else if (isOperator(value)) this.operator(value.name);
-      else this.push(value);
+      this.activeCommand = undefined;
+      try {
+        if (task.kind === "input") {
+          const token = task.reader.next();
+          if (token === undefined) { this.tasks.pop(); continue; }
+          value = token;
+        } else if (task.kind === "tokens") {
+          if (task.index === task.tokens.length) { this.tasks.pop(); continue; }
+          value = task.tokens[task.index++];
+        } else if (task.kind === "repeat") {
+          if (task.remaining-- <= 0) { this.tasks.pop(); continue; }
+          this.schedule(task.procedure); continue;
+        } else if (task.kind === "for") {
+          if (task.increment > 0 ? task.current > task.limit : task.current < task.limit) { this.tasks.pop(); continue; }
+          this.push(task.current); task.current = finite(task.current + task.increment); this.schedule(task.procedure); continue;
+        } else if (task.kind === "forall") {
+          if (task.index === task.values.length) { this.tasks.pop(); continue; }
+          const items = task.source ? [task.source[task.index++]] : task.values[task.index++];
+          for (const item of items) this.push(item);
+          this.schedule(task.procedure); continue;
+        } else if (task.kind === "resourceforall") {
+          if (task.index === task.keys.length) { this.tasks.pop(); continue; }
+          const name = task.keys[task.index++];
+          if (name.length > task.scratch.length) throw unsupported("PostScript resourceforall scratch string is too small.", "resourceforall", "rangecheck");
+          for (let i = 0; i < name.length; i++) task.scratch[i] = name.charCodeAt(i);
+          this.push(byteView(task.scratch, 0, name.length)); this.schedule(task.procedure); continue;
+        } else if (task.kind === "stopped") { this.tasks.pop(); this.push(false); continue; }
+        else if (task.kind === "eexec-end") { this.tasks.pop(); this.dictionaries.splice(task.dictionaryDepth); continue; }
+        else { this.schedule(task.procedure); continue; }
+        if (isName(value) && !value.literal) this.execute(this.lookup(value.value), value.value);
+        else if (isOperator(value)) { this.activeCommand = value; this.operator(value.name); }
+        else this.push(value);
+      } catch (error) {
+        const catchable = error instanceof PdfError && error.code === "unsupported-font" &&
+          (error.details?.reason === "font-postscript-unsupported" || error.details?.reason === "font-postscript-file");
+        const command = isName(value) ? value.value : isOperator(value) ? value.name : undefined;
+        const barrier = lastIndex(this.tasks, item => item.kind === "stopped");
+        if (barrier < 0 || (!(error instanceof PostScriptStop) && !catchable)) {
+          if (catchable && command && !error.details?.operator) throw new PdfError(error.code, error.message, { cause: error, details: { ...error.details, operator: command } });
+          if (error instanceof PostScriptStop) throw unsupported("PostScript stop occurs outside stopped.", "stop");
+          throw error;
+        }
+        if (!(error instanceof PostScriptStop)) {
+          this.stack.length = 0; for (const operand of operands) this.push(operand);
+          this.errors.set("newerror", true);
+          this.errors.set("errorname", literalName(postScriptErrorName(error)));
+          if (value !== undefined) this.errors.set("command", this.activeCommand ?? value);
+        }
+        this.unwindTasks(barrier);
+        this.push(true);
+      }
     }
   }
 
@@ -165,11 +247,11 @@ class FontPostScriptVm {
     }
     if (value === undefined) throw unsupported(`PostScript operator/name ${name ?? "(missing)"} is unavailable.`, name);
     if (isProcedure(value)) this.schedule(value);
-    else if (isOperator(value)) this.operator(value.name);
+    else if (isOperator(value)) { this.activeCommand = value; this.operator(value.name); }
     else if ((value instanceof Uint8Array || tagged(value, "file")) && isExecutable(value)) {
       requireAccess(value, 1);
       this.tasks.push({ kind: "input", reader: value instanceof Uint8Array
-        ? new FontPostScriptLexer(value, this.options.signal, this.options.maxStringBytes) : (value as PsFile).reader });
+        ? new FontPostScriptLexer(value, this.options.signal, this.options.maxStringBytes, name => this.lookup(name)) : (value as PsFile).reader, sourceFile: !(value instanceof Uint8Array) });
     }
     else this.push(value);
   }
@@ -186,7 +268,7 @@ class FontPostScriptVm {
   private pop(): Value { if (!this.stack.length) throw unsupported("PostScript operand stack underflow."); return this.stack.pop()!; }
   private number(): number { return requireNumber(this.pop()); }
   private integer(): number { const n = this.number(); if (!Number.isSafeInteger(n)) throw unsupported("An integer PostScript operand is required."); return n; }
-  private count(): number { const n = this.integer(); if (n < 0) throw unsupported("A nonnegative PostScript count is required."); return n; }
+  private count(): number { const n = this.integer(); if (n < 0) throw unsupported("A nonnegative PostScript count is required.", undefined, "rangecheck"); return n; }
   private procedure(): Procedure { const value = this.pop(); if (!isProcedure(value)) throw unsupported("A PostScript procedure is required."); return value; }
   private dictionary(): Dictionary { const value = this.pop(); if (!(value instanceof Map)) throw unsupported("A PostScript dictionary is required."); return value; }
   private name(): string { return key(this.pop()); }
@@ -204,6 +286,87 @@ class FontPostScriptVm {
     const index = lastIndex(this.stack, value => tagged(value, "mark"));
     if (index < 0) throw unsupported("A PostScript mark is missing.");
     return this.stack.splice(index).slice(1);
+  }
+
+  private readMatrix(value: Value): NativeFontPostScriptMatrix {
+    requireAccess(value, 2);
+    const items = arraySequence(value);
+    if (!items || items.length !== 6) throw unsupported("A six-element PostScript matrix is required.");
+    return items.map(requireNumber) as unknown as NativeFontPostScriptMatrix;
+  }
+  private writeMatrix(value: Value, matrix: NativeFontPostScriptMatrix): void {
+    requireAccess(value, 3);
+    if (arraySequence(value)?.length !== 6) throw unsupported("A six-element PostScript matrix is required.");
+    matrix.forEach((item, index) => put(value, index, item)); this.push(value);
+  }
+  private contextMatrix(operator: string): NativeFontPostScriptMatrix {
+    if (!this.matrixKnown) throw unsupported("Device-dependent PostScript matrix reads require an explicit font context.", operator);
+    return this.matrix;
+  }
+  private resource(category: string): Dictionary {
+    let directory = this.resources.get(category);
+    if (!directory) { directory = new Map(); this.resources.set(category, directory); }
+    return directory;
+  }
+  private unwindTasks(index: number): void {
+    for (let i = this.tasks.length - 1; i >= index; i--) {
+      const task = this.tasks[i]; if (task.kind === "eexec-end") this.dictionaries.splice(task.dictionaryDepth);
+    }
+    this.tasks.splice(index);
+  }
+  private file(value: Value): PsFile {
+    if (!tagged(value, "file")) throw unsupported("A font-local PostScript input file is required.");
+    requireAccess(value, 2); return value as PsFile;
+  }
+  private fileOptions() { return { signal: this.options.signal, maxDecodedBytes: this.options.maxStringBytes }; }
+  private save(): PsSave {
+    const objects: VmSnapshot["objects"] = new Map();
+    const pending: Value[] = [...this.dictionaries, this.directory, this.errors, ...this.resources.values(), ...this.stack];
+    for (const task of this.tasks) {
+      if (task.kind === "tokens") pending.push(task.tokens as Value[]);
+      if ("procedure" in task) pending.push(task.procedure);
+      if (task.kind === "forall") { if (task.source) pending.push(task.source); else for (const values of task.values) for (const value of values) pending.push(value); }
+      if (task.kind === "resourceforall") pending.push(task.scratch);
+    }
+    while (pending.length) {
+      throwIfAborted(this.options.signal);
+      const value = pending.pop()!;
+      if (!isComposite(value) || objects.has(value)) continue;
+      let contents: Value[] | Uint8Array | [string, Value][] | undefined;
+      if (value instanceof Map) { contents = [...value]; for (const item of value.values()) pending.push(item); }
+      else if (value instanceof Uint8Array) { contents = value.slice(); const parent = byteViews.get(value); if (parent) pending.push(parent.source); }
+      else if (Array.isArray(value)) { contents = [...value]; for (const item of value) pending.push(item); const parent = arrayViews.get(value); if (parent) pending.push(parent.source); }
+      else if (isProcedure(value)) pending.push(value.tokens as Value[]);
+      objects.set(value, { value, contents, access: accessOf(value), capacity: value instanceof Map ? dictionaryCapacities.get(value) : undefined });
+    }
+    const save: PsSave = { kind: "save", owner: this, snapshot: { objects, matrix: this.matrix, matrixKnown: this.matrixKnown, graphics: [...this.graphics], definedFont: this.definedFont, resources: [...this.resources], createdCount: this.created.length, packing: this.packing } };
+    this.saves.push(save); return save;
+  }
+  private restore(value: Value): void {
+    if (!tagged(value, "save")) throw unsupported("PostScript restore requires a save object.", "restore");
+    const save = value as PsSave, index = this.saves.indexOf(save);
+    if (save.owner !== this || index < 0) throw unsupported("The PostScript save object is no longer valid.", "invalidrestore");
+    const { objects } = save.snapshot;
+    for (const reference of [...this.stack, ...this.dictionaries]) {
+      if (isComposite(reference) && !objects.has(storageOf(reference))) throw unsupported("A newer composite object remains on a PostScript stack.", "invalidrestore");
+    }
+    for (const task of this.tasks) if (task.kind === "tokens" && !objects.has(storageOf(task.tokens as Value[]))) throw unsupported("A newer procedure remains on the PostScript execution stack.", "invalidrestore");
+    for (const { value: target, contents, access, capacity } of objects.values()) {
+      throwIfAborted(this.options.signal);
+      if (target instanceof Map) { target.clear(); for (const [key, item] of contents as [string, Value][]) target.set(key, item); }
+      else if (target instanceof Uint8Array) target.set(contents as Uint8Array);
+      else if (Array.isArray(target)) for (let i = 0; i < target.length; i++) target[i] = (contents as Value[])[i];
+      accessAttributes.set(target as object, access);
+      if (target instanceof Map) { if (capacity === undefined) dictionaryCapacities.delete(target); else dictionaryCapacities.set(target, capacity); }
+    }
+    this.matrix = save.snapshot.matrix;
+    this.matrixKnown = save.snapshot.matrixKnown;
+    this.graphics.splice(0, this.graphics.length, ...save.snapshot.graphics);
+    this.definedFont = save.snapshot.definedFont;
+    this.created.length = save.snapshot.createdCount;
+    this.packing = save.snapshot.packing;
+    this.resources.clear(); for (const [key, directory] of save.snapshot.resources) this.resources.set(key, directory);
+    this.saves.splice(index);
   }
 
   private operator(name: string): void {
@@ -230,10 +393,18 @@ class FontPostScriptVm {
       case "counttomark": { const i = lastIndex(this.stack, value => tagged(value, "mark")); if (i < 0) throw unsupported("A PostScript mark is missing."); this.push(this.stack.length - i - 1); break; }
       case "array": this.push(allocatedArray(this.count())); break;
       case "string": this.push(allocatedBytes(this.count(), this.options.maxStringBytes)); break;
-      case "dict": { this.count(); const dict = new Map<string, Value>(); this.created.push(dict); this.push(dict); break; }
+      case "dict": { const capacity = this.count(), dict = new Map<string, Value>(); dictionaryCapacities.set(dict, capacity); this.created.push(dict); this.push(dict); break; }
       case "begin": { const dict = this.dictionary(); requireAccess(dict, 2); this.dictionaries.push(dict); break; }
       case "end": if (this.dictionaries.length <= 2) throw unsupported("PostScript dictionary stack underflow."); else this.dictionaries.pop(); break;
       case "currentdict": this.push(this.dictionaries.at(-1)!); break;
+      case "countdictstack": this.push(this.dictionaries.length); break;
+      case "dictstack": {
+        const target = this.pop(); requireAccess(target, 3);
+        if (!arraySequence(target) || arraySequence(target)!.length < this.dictionaries.length) throw unsupported("PostScript dictstack destination is too small.");
+        this.dictionaries.forEach((dict, i) => put(target, i, dict)); this.push(sequenceView(target, 0, this.dictionaries.length)); break;
+      }
+      case "cleardictstack": this.dictionaries.splice(2); break;
+      case "maxlength": { const dict = this.dictionary(); requireAccess(dict, 2); this.push(Math.max(dictionaryCapacities.get(dict) ?? 0, dict.size)); break; }
       case "def": { const value = this.pop(), k = this.name(), dict = this.dictionaries.at(-1)!; requireAccess(dict, 3); dict.set(k, value); break; }
       case "store": { const value = this.pop(), k = this.name(); const dict = [...this.dictionaries].reverse().find(d => { this.requireDictionaryLookup(d); return d.has(k); }) ?? this.dictionaries.at(-1)!; requireAccess(dict, 3); dict.set(k, value); break; }
       case "load": { const k = this.name(), value = this.lookup(k); if (value === undefined) throw unsupported(`PostScript name ${k} is undefined.`, k); this.push(value); break; }
@@ -271,13 +442,43 @@ class FontPostScriptVm {
         if ((name === "idiv" || name === "mod") && (!Number.isInteger(a) || !Number.isInteger(b))) throw unsupported(`PostScript ${name} requires integer operands.`);
         this.push(name === "add" ? a + b : name === "sub" ? a - b : name === "mul" ? a * b : name === "div" ? a / b : name === "idiv" ? Math.trunc(a / b) : name === "mod" ? a % b : name === "exp" ? a ** b : ((Math.atan2(a, b) * 180 / Math.PI) + 360) % 360); break;
       }
-      case "neg": case "abs": case "sqrt": case "ln": case "log": case "sin": case "cos": case "floor": case "ceiling": case "round": case "truncate": case "cvi": case "cvr": {
-        const a = this.number(); this.push(name === "neg" ? -a : name === "abs" ? Math.abs(a) : name === "sqrt" ? Math.sqrt(a) : name === "ln" ? Math.log(a) : name === "log" ? Math.log10(a) : name === "sin" ? Math.sin(a * Math.PI / 180) : name === "cos" ? Math.cos(a * Math.PI / 180) : name === "floor" ? Math.floor(a) : name === "ceiling" ? Math.ceil(a) : name === "round" ? Math.floor(a + 0.5) : name === "cvr" ? a : Math.trunc(a)); break;
+      case "cvi": case "cvr": {
+        const value = this.pop(); let number: number;
+        if (value instanceof Uint8Array) {
+          requireAccess(value, 2); const lexer = new FontPostScriptLexer(value, this.options.signal, this.options.maxStringBytes);
+          const token = lexer.next(); if (typeof token !== "number") throw unsupported("The PostScript string is not a number."); number = token;
+        } else number = requireNumber(value);
+        this.push(name === "cvi" ? Math.trunc(number) : number); break;
+      }
+      case "cvs": case "cvrs": {
+        const target = this.pop(); const radix = name === "cvrs" ? this.integer() : 10; const value = this.pop();
+        if (!(target instanceof Uint8Array)) throw unsupported("PostScript string conversion requires a destination string.");
+        requireAccess(target, 3);
+        if (radix < 2 || radix > 36) throw unsupported("PostScript conversion radix must be between 2 and 36.");
+        if (name === "cvrs" && typeof value !== "number") throw unsupported("PostScript cvrs requires a numeric operand.");
+        const text = name === "cvrs" && radix !== 10 ? (Math.trunc(requireNumber(value)) >>> 0).toString(radix).toUpperCase() : postScriptString(value);
+        if (text.length > target.length) throw unsupported("PostScript conversion destination is too small.");
+        for (let i = 0; i < text.length; i++) target[i] = text.charCodeAt(i); this.push(byteView(target, 0, text.length)); break;
+      }
+      case "search": case "anchorsearch": {
+        const seek = this.pop(), source = this.pop();
+        if (!(seek instanceof Uint8Array) || !(source instanceof Uint8Array)) throw unsupported("PostScript search requires strings.");
+        requireAccess(seek, 2); requireAccess(source, 2);
+        const found = byteString(source).indexOf(byteString(seek));
+        if (found < 0 || (name === "anchorsearch" && found !== 0)) { this.push(source); this.push(false); }
+        else { this.push(byteView(source, found + seek.length, source.length - found - seek.length)); this.push(byteView(source, found, seek.length)); if (name === "search") this.push(byteView(source, 0, found)); this.push(true); } break;
+      }
+      case "neg": case "abs": case "sqrt": case "ln": case "log": case "sin": case "cos": case "floor": case "ceiling": case "round": case "truncate": {
+        const a = this.number(); this.push(name === "neg" ? -a : name === "abs" ? Math.abs(a) : name === "sqrt" ? Math.sqrt(a) : name === "ln" ? Math.log(a) : name === "log" ? Math.log10(a) : name === "sin" ? Math.sin(a * Math.PI / 180) : name === "cos" ? Math.cos(a * Math.PI / 180) : name === "floor" ? Math.floor(a) : name === "ceiling" ? Math.ceil(a) : name === "round" ? Math.floor(a + 0.5) : Math.trunc(a)); break;
       }
       case "eq": case "ne": case "lt": case "le": case "gt": case "ge": {
         const b = this.pop(), a = this.pop(); const equal = equalValue(a, b);
         if (name === "eq" || name === "ne") this.push(name === "eq" ? equal : !equal);
-        else { if (typeof a !== "number" || typeof b !== "number") throw unsupported("Ordered PostScript comparison requires numbers."); this.push(name === "lt" ? a < b : name === "le" ? a <= b : name === "gt" ? a > b : a >= b); } break;
+        else { let order: number;
+          if (typeof a === "number" && typeof b === "number") order = a - b;
+          else if (a instanceof Uint8Array && b instanceof Uint8Array) { requireAccess(a, 2); requireAccess(b, 2); const left = byteString(a), right = byteString(b); order = left < right ? -1 : left > right ? 1 : 0; }
+          else throw unsupported("Ordered PostScript comparison requires numbers or strings.");
+          this.push(name === "lt" ? order < 0 : name === "le" ? order <= 0 : name === "gt" ? order > 0 : order >= 0); } break;
       }
       case "and": case "or": case "xor": {
         const b = this.pop(), a = this.pop(); if (typeof a === "boolean" && typeof b === "boolean") this.push(name === "and" ? a && b : name === "or" ? a || b : a !== b);
@@ -296,117 +497,334 @@ class FontPostScriptVm {
         if (source instanceof Map) values = [...source].map(([k, value]) => [literalName(k), value]);
         else if (sequence(source)) values = Array.from(sequence(source)!, value => [value]);
         else throw unsupported("PostScript forall requires a composite value.");
-        this.tasks.push({ kind: "forall", values, index: 0, procedure }); break;
+        this.tasks.push({ kind: "forall", values, source: source instanceof Map ? undefined : sequence(source)!, index: 0, procedure }); break;
       }
       case "loop": this.tasks.push({ kind: "loop", procedure: this.procedure() }); break;
-      case "exit": { const i = lastIndex(this.tasks, task => ["for", "forall", "repeat", "loop"].includes(task.kind)); if (i < 0) throw unsupported("PostScript exit occurs outside a loop."); this.tasks.splice(i); break; }
+      case "exit": {
+        const i = lastIndex(this.tasks, task => ["for", "forall", "resourceforall", "repeat", "loop", "stopped"].includes(task.kind) || (task.kind === "input" && task.sourceFile !== false));
+        if (i < 0 || this.tasks[i].kind === "stopped" || this.tasks[i].kind === "input") throw unsupported("PostScript exit occurs outside an enclosing loop.", "invalidexit");
+        this.unwindTasks(i); break;
+      }
+      case "stopped": { const object = this.pop(); this.tasks.push({ kind: "stopped" }); this.execute(object); break; }
+      case "stop": throw new PostScriptStop();
+      case "save": this.push(this.save()); break;
+      case "restore": this.restore(this.pop()); break;
+      case "rand": this.randomSeed = (this.randomSeed * 16807) % 2147483647; this.push(this.randomSeed); break;
+      case "srand": { const seed = this.integer(); this.randomSeed = seed <= 0 ? 1 - seed : seed === 2147483647 ? 2147483646 : seed; break; }
+      case "rrand": this.push(this.randomSeed); break;
       case "exec": this.execute(this.pop()); break;
       case "bind": { const procedure = this.procedure(); this.push(bindProcedure(procedure, name => this.lookup(name), this.options.signal)); break; }
       case "readonly": case "executeonly": case "noaccess": this.push(reduceAccess(this.pop(), name === "readonly" ? 2 : name === "executeonly" ? 1 : 0)); break;
       case "cvlit": case "cvx": { const value = this.pop(); this.push(changeExecution(value, name === "cvx")); break; }
-      case "cvn": { const value = this.pop(); if (!(value instanceof Uint8Array)) throw unsupported("PostScript cvn requires a string."); requireAccess(value, 2); this.push(literalName(byteString(value))); break; }
+      case "cvn": { const value = this.pop(); if (!(value instanceof Uint8Array)) throw unsupported("PostScript cvn requires a string."); requireAccess(value, 2); this.push(isExecutable(value) ? executableName(byteString(value)) : literalName(byteString(value))); break; }
       case "type": { const value = this.pop(); this.push(literalName(typeof value === "number" ? Number.isInteger(value) ? "integertype" : "realtype" : typeof value === "boolean" ? "booleantype" : value === null ? "nulltype" : value instanceof Map ? "dicttype" : value instanceof Uint8Array ? "stringtype" : Array.isArray(value) || isProcedure(value) ? "arraytype" : isName(value) ? "nametype" : tagged(value, "file") ? "filetype" : "operatortype")); break; }
       case "xcheck": { const value = this.pop(); this.push(isExecutable(value)); break; }
       case "rcheck": case "wcheck": { const value = this.pop(); if (!isComposite(value)) throw unsupported("PostScript access checks require an array, dictionary, string or file."); this.push(accessOf(value) >= (name === "rcheck" ? 2 : 3)); break; }
-      case "currentfile": if (!this.reader) throw unsupported("No font input file is active."); else { const file: PsFile = { kind: "file", reader: this.reader }; accessAttributes.set(file, 2); this.push(file); } break;
-      case "readstring": {
-        const target = this.pop(), file = this.pop(); if (!(target instanceof Uint8Array) || !tagged(file, "file")) throw unsupported("PostScript readstring requires the font input and a string.");
-        requireAccess(file, 2); requireAccess(target, 3);
-        const source = (file as PsFile).reader.raw(target.length); target.set(source); this.push(byteView(target, 0, source.length)); this.push(source.length === target.length); break;
+      case "matrix": this.push([...nativeFontPostScriptIdentityMatrix()]); break;
+      case "identmatrix": this.writeMatrix(this.pop(), nativeFontPostScriptIdentityMatrix()); break;
+      case "currentmatrix": this.writeMatrix(this.pop(), this.contextMatrix(name)); break;
+      case "defaultmatrix": { if (!this.options.initialMatrix) throw unsupported("PostScript defaultmatrix requires an explicit device context.", name); this.writeMatrix(this.pop(), this.options.initialMatrix); break; }
+      case "setmatrix": this.matrix = this.readMatrix(this.pop()); this.matrixKnown = true; break;
+      case "initmatrix": if (!this.options.initialMatrix) throw unsupported("PostScript initmatrix requires an explicit device context.", name); else { this.matrix = this.options.initialMatrix; this.matrixKnown = true; } break;
+      case "concat": this.matrix = nativeFontPostScriptConcatMatrices(this.readMatrix(this.pop()), this.matrix); break;
+      case "concatmatrix": { const destination = this.pop(), second = this.readMatrix(this.pop()), first = this.readMatrix(this.pop()); this.writeMatrix(destination, nativeFontPostScriptConcatMatrices(first, second)); break; }
+      case "invertmatrix": { const destination = this.pop(), source = this.readMatrix(this.pop()); this.writeMatrix(destination, nativeFontPostScriptInvertMatrix(source)); break; }
+      case "translate": case "scale": case "rotate": {
+        const explicit = !!arraySequence(this.stack.at(-1) ?? null), destination = explicit ? this.pop() : null;
+        const b = this.number(), a = name === "rotate" ? 0 : this.number();
+        const matrix = name === "translate" ? nativeFontPostScriptTranslation(a, b) : name === "scale" ? nativeFontPostScriptScaling(a, b) : nativeFontPostScriptRotation(b);
+        if (destination) this.writeMatrix(destination, matrix); else this.matrix = nativeFontPostScriptConcatMatrices(matrix, this.matrix); break;
       }
-      case "closefile": case "eexec": { const file = this.pop(); if (!tagged(file, "file")) throw unsupported("A font input file is required."); requireAccess(file, 1); (file as PsFile).reader.close(); break; }
-      case "definefont": { const dict = this.dictionary(), fontName = this.name(); requireAccess(dict, 2); this.directory.set(fontName, dict); this.definedFont = dict; this.push(dict); break; }
+      case "transform": case "dtransform": case "itransform": case "idtransform": {
+        const matrix = arraySequence(this.stack.at(-1) ?? null) ? this.readMatrix(this.pop()) : this.contextMatrix(name);
+        const y = this.number(), x = this.number(); const [tx, ty] = nativeFontPostScriptTransform(x, y, matrix, name === "dtransform" || name === "idtransform", name === "itransform" || name === "idtransform");
+        this.push(tx); this.push(ty); break;
+      }
+      case "gsave": this.graphics.push({ matrix: this.matrix, known: this.matrixKnown }); break;
+      case "grestore": if (this.graphics.length) { const state = this.graphics.pop()!; this.matrix = state.matrix; this.matrixKnown = state.known; } break;
+      case "grestoreall": if (this.graphics.length) { this.matrix = this.graphics[0].matrix; this.matrixKnown = this.graphics[0].known; this.graphics.length = 0; } break;
+      case "currentfile": {
+        const active = [...this.tasks].reverse().find(task => task.kind === "input" && task.sourceFile !== false);
+        if (!active || active.kind !== "input") throw unsupported("No font input file is active.");
+        const file: PsFile = { kind: "file", reader: active.reader }; accessAttributes.set(file, 2); this.push(file); break;
+      }
+      case "read": { const byte = this.file(this.pop()).reader.file.readByte(); if (byte >= 0) this.push(byte); this.push(byte >= 0); break; }
+      case "readstring": case "readhexstring": case "readline": {
+        const target = this.pop(), file = this.file(this.pop());
+        if (!(target instanceof Uint8Array)) throw unsupported(`PostScript ${name} requires a destination string.`);
+        requireAccess(target, 3);
+        if (name === "readstring" && target.length === 0) throw unsupported("PostScript readstring requires a nonempty string.", name, "rangecheck");
+        const result = name === "readline" ? file.reader.file.readLineInto(target) : null;
+        const length = result?.length ?? (name === "readhexstring" ? file.reader.file.readHexInto(target) : file.reader.file.readInto(target));
+        this.push(byteView(target, 0, length)); this.push(result?.complete ?? length === target.length); break;
+      }
+      case "bytesavailable": this.push(this.file(this.pop()).reader.file.bytesAvailable()); break;
+      case "fileposition": this.push(this.file(this.pop()).reader.file.tell()); break;
+      case "setfileposition": { const position = this.count(), file = this.file(this.pop()); file.reader.file.seek(position); break; }
+      case "resetfile": this.file(this.pop()).reader.file.seek(0); break;
+      case "flushfile": this.file(this.pop()).reader.file.flush(); break;
+      case "status": { const file = this.file(this.pop()); this.push(!file.reader.file.closed); break; }
+      case "token": {
+        const source = this.pop();
+        if (source instanceof Uint8Array) {
+          requireAccess(source, 2); const reader = new FontPostScriptLexer(source, this.options.signal, this.options.maxStringBytes, name => this.lookup(name));
+          const token = reader.next();
+          if (token !== undefined) { const offset = reader.file.tell(); this.push(byteView(source, offset, source.length - offset)); this.push(token); this.push(true); } else this.push(false);
+        } else { const token = this.file(source).reader.next(); if (token !== undefined) this.push(token); this.push(token !== undefined); } break;
+      }
+      case "filter": {
+        const filter = this.name(); const parameters = this.stack.at(-1) instanceof Map ? this.dictionary() : null;
+        const source = this.pop(); let input;
+        if (source instanceof Uint8Array) { requireAccess(source, 2); input = createNativeFontPostScriptMemoryFile(source, { signal: this.options.signal }); }
+        else input = this.file(source).reader.file;
+        const decoded = createNativeFontPostScriptFilter(input, filter, postScriptFilterParameters(parameters), this.fileOptions());
+        const file: PsFile = { kind: "file", reader: new FontPostScriptLexer(decoded, this.options.signal, this.options.maxStringBytes, name => this.lookup(name)) };
+        accessAttributes.set(file, 2); this.push(file); break;
+      }
+      case "closefile": this.file(this.pop()).reader.close(); break;
+      case "eexec": {
+        const source = this.pop();
+        if (this.splitEexec) { this.file(source).reader.close(); break; }
+        const input = source instanceof Uint8Array ? (requireAccess(source, 2), createNativeFontPostScriptMemoryFile(source, { signal: this.options.signal })) : this.file(source).reader.file;
+        const decoded = createNativeFontPostScriptEexecFile(input, this.fileOptions());
+        this.tasks.push({ kind: "eexec-end", dictionaryDepth: this.dictionaries.length }); this.dictionaries.push(this.system);
+        this.tasks.push({ kind: "input", reader: new FontPostScriptLexer(decoded, this.options.signal, this.options.maxStringBytes, name => this.lookup(name)) }); break;
+      }
+      case "definefont": { const dict = this.dictionary(), fontName = this.name(); requireAccess(dict, 2); reduceAccess(dict, 2); this.directory.set(fontName, dict); this.definedFont = dict; this.push(dict); break; }
       case "findfont": { const fontName = this.name(), dict = this.directory.get(fontName); if (!(dict instanceof Map)) throw unsupported(`PostScript font ${fontName} is unavailable.`); this.push(dict); break; }
-      case "currentpacking": this.push(false); break;
-      case "setpacking": this.pop(); break;
+      case "defineresource": {
+        const category = this.name(); let instance = this.pop(); const key = this.name();
+        if (category === "Font") { if (!(instance instanceof Map)) throw unsupported("PostScript Font resources require a font dictionary."); requireAccess(instance, 2); this.definedFont = instance; }
+        if (isComposite(instance)) instance = reduceAccess(instance, 2);
+        this.resource(category).set(key, instance); this.push(instance); break;
+      }
+      case "findresource": { const category = this.name(), key = this.name(), instance = this.resource(category).get(key); if (instance === undefined) throw unsupported(`PostScript ${category} resource ${key} is unavailable.`, "undefinedresource"); this.push(instance); break; }
+      case "resourcestatus": { const category = this.name(), key = this.name(); if (this.resource(category).has(key)) { this.push(0); this.push(-1); this.push(true); } else this.push(false); break; }
+      case "undefineresource": { const category = this.name(), key = this.name(); this.resource(category).delete(key); break; }
+      case "resourceforall": {
+        const category = this.name(), scratch = this.pop(), procedure = this.procedure(), pattern = this.pop();
+        if (!(pattern instanceof Uint8Array) || !(scratch instanceof Uint8Array)) throw unsupported("PostScript resourceforall requires pattern and scratch strings.");
+        requireAccess(pattern, 2); requireAccess(scratch, 3);
+        const matcher = postScriptPattern(byteString(pattern), this.options.signal);
+        const keys = [...this.resource(category).keys()].filter(key => matcher.test(key));
+        this.tasks.push({ kind: "resourceforall", keys, scratch, index: 0, procedure }); break;
+      }
+      case "currentpacking": this.push(this.packing); break;
+      case "setpacking": { const value = this.pop(); if (typeof value !== "boolean") throw unsupported("PostScript setpacking requires a boolean."); this.packing = value; break; }
+      case "packedarray": { const count = this.count(); if (count > this.stack.length) throw unsupported("PostScript packedarray exceeds the operand stack."); this.push(reduceAccess(this.stack.splice(this.stack.length - count), 2)); break; }
       default: throw unsupported(`PostScript operator ${name} is unavailable in the font interpreter.`, name);
     }
   }
 }
 
 const OPERATOR_NAMES = (`[ ] << >> mark pop dup exch index roll clear count cleartomark counttomark
-array string dict begin end currentdict def store load where known undef get put length getinterval putinterval aload astore copy
-add sub mul div idiv mod exp atan neg abs sqrt ln log sin cos floor ceiling round truncate cvi cvr eq ne lt le gt ge
-and or xor not bitshift if ifelse repeat for forall loop exit exec bind readonly executeonly noaccess cvlit cvx cvn type xcheck rcheck wcheck
-currentfile readstring closefile eexec definefont findfont currentpacking setpacking`).split(/\s+/);
+array string dict begin end currentdict countdictstack dictstack cleardictstack maxlength def store load where known undef get put length getinterval putinterval aload astore copy
+add sub mul div idiv mod exp atan neg abs sqrt ln log sin cos floor ceiling round truncate cvi cvr cvs cvrs search anchorsearch eq ne lt le gt ge
+and or xor not bitshift if ifelse repeat for forall loop exit stopped stop save restore rand srand rrand exec bind readonly executeonly noaccess cvlit cvx cvn type xcheck rcheck wcheck
+matrix identmatrix currentmatrix defaultmatrix setmatrix initmatrix concat concatmatrix invertmatrix translate scale rotate transform dtransform itransform idtransform gsave grestore grestoreall
+currentfile read readstring readhexstring readline bytesavailable fileposition setfileposition resetfile flushfile status token filter closefile eexec definefont findfont defineresource findresource resourcestatus undefineresource resourceforall currentpacking setpacking packedarray`).split(/\s+/);
+
+function postScriptFilterParameters(dictionary: Dictionary | null): NativeFontPostScriptFilterParameters {
+  if (!dictionary) return {};
+  requireAccess(dictionary, 2);
+  const parameters: Record<string, unknown> = {};
+  for (const [key, value] of dictionary) {
+    if (key === "CloseSource") { if (typeof value !== "boolean") throw unsupported("PostScript CloseSource requires a boolean."); parameters[key] = value; }
+    else if (key === "EODCount") { if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw unsupported("PostScript EODCount requires a nonnegative integer."); parameters[key] = value; }
+    else if (key === "EODString") { if (!(value instanceof Uint8Array)) throw unsupported("PostScript EODString requires a string."); requireAccess(value, 2); parameters[key] = value; }
+    else if (key === "Filter") { if (isName(value)) parameters[key] = value.value; else { requireAccess(value, 2); if (!Array.isArray(value)) throw unsupported("PostScript Filter requires a name or name array."); parameters[key] = value.map(item => { if (!isName(item)) throw unsupported("PostScript Filter array requires names."); return item.value; }); } }
+    else if (key === "DecodeParms") { if (value instanceof Map) parameters[key] = postScriptFilterParameters(value); else { requireAccess(value, 2); if (!Array.isArray(value)) throw unsupported("PostScript DecodeParms requires a dictionary or array."); parameters[key] = value.map(item => item === null ? null : item instanceof Map ? postScriptFilterParameters(item) : (() => { throw unsupported("PostScript DecodeParms array requires dictionaries."); })()); } }
+  }
+  return parameters as NativeFontPostScriptFilterParameters;
+}
+
+function vmForGlyph(vm: FontPostScriptVm, dictionary: Dictionary, signal: AbortSignal | undefined, options: NativeFontPostScriptOptions): { dictionary: Dictionary; vm: FontPostScriptVm } {
+  const environment = cloneValue(vm.glyphEnvironment(dictionary), signal, options.maxStringBytes) as Dictionary;
+  const owned = environment.get("font") as Dictionary;
+  const local = new FontPostScriptVm({ ...options, signal, initialDictionary: owned });
+  local.seedGlyphEnvironment(environment);
+  return { dictionary: owned, vm: local };
+}
+function postScriptString(value: Value): string {
+  if (value instanceof Uint8Array) { requireAccess(value, 2); return byteString(value); }
+  if (isName(value)) return value.value;
+  if (typeof value === "number") return String(value);
+  if (typeof value === "boolean") return String(value);
+  if (value === null) return "--nostringval--";
+  return "--nostringval--";
+}
+function postScriptPattern(pattern: string, signal?: AbortSignal): { test(value: string): boolean } {
+  const star = Symbol("star"), any = Symbol("any");
+  const tokens: (string | typeof star | typeof any)[] = [];
+  for (let i = 0; i < pattern.length; i++) {
+    throwIfAborted(signal);
+    const char = pattern[i];
+    if (char === "*") { if (tokens.at(-1) !== star) tokens.push(star); }
+    else if (char === "?") tokens.push(any);
+    else tokens.push(char === "\\" && i + 1 < pattern.length ? pattern[++i] : char);
+  }
+  return { test(value) {
+    let input = 0, token = 0, lastStar = -1, restart = 0;
+    while (input < value.length) {
+      throwIfAborted(signal);
+      if (tokens[token] === any || tokens[token] === value[input]) { token++; input++; }
+      else if (tokens[token] === star) { lastStar = token++; restart = input; }
+      else if (lastStar >= 0) { token = lastStar + 1; input = ++restart; }
+      else return false;
+    }
+    while (tokens[token] === star) token++;
+    return token === tokens.length;
+  } };
+}
+function postScriptErrorName(error: PdfError): string {
+  if (typeof error.details?.postScriptError === "string") return error.details.postScriptError;
+  const operator = error.details?.operator;
+  if (typeof operator === "string" && ["invalidaccess", "invalidrestore", "invalidexit", "undefinedresource"].includes(operator)) return operator;
+  if (/underflow/.test(error.message)) return "stackunderflow";
+  if (/nonfinite|zero|arithmetic/.test(error.message)) return "undefinedresult";
+  if (/unavailable|undefined/.test(error.message)) return "undefined";
+  if (/outside|invalid|too small|between/.test(error.message)) return "rangecheck";
+  return "typecheck";
+}
 
 class FontPostScriptLexer {
-  private readonly bytes: Uint8Array;
+  readonly file: NativeFontPostScriptFile;
   private readonly signal?: AbortSignal;
   private readonly maxStringBytes?: number;
-  private offset = 0;
-  constructor(bytes: Uint8Array, signal?: AbortSignal, maxStringBytes?: number) { this.bytes = bytes; this.signal = signal; this.maxStringBytes = maxStringBytes; }
-  close(): void { this.offset = this.bytes.length; }
-  raw(length: number): Uint8Array { const end = Math.min(this.offset + length, this.bytes.length); const result = this.bytes.subarray(this.offset, end); this.offset = end; return result; }
+  private readonly resolveImmediate?: (name: string) => Value | undefined;
+  private readonly procedureDelimiters = new WeakSet<object>();
+
+  constructor(bytes: Uint8Array | NativeFontPostScriptFile, signal?: AbortSignal, maxStringBytes?: number,
+    resolveImmediate?: (name: string) => Value | undefined) {
+    this.file = bytes instanceof Uint8Array ? createNativeFontPostScriptMemoryFile(bytes, { signal }) : bytes;
+    this.signal = signal;
+    this.maxStringBytes = maxStringBytes;
+    this.resolveImmediate = resolveImmediate;
+  }
+  close(): void { this.file.close(); }
+  raw(length: number): Uint8Array {
+    const target = allocatedBytes(length, this.maxStringBytes);
+    return target.subarray(0, this.file.readInto(target));
+  }
   next(): Value | undefined {
     const first = this.token();
-    if (isName(first) && first.value === "{") {
+    if (this.isProcedureDelimiter(first, "{")) {
       const frames: Value[][] = [[]];
       while (frames.length) {
         const value = this.token(); if (value === undefined) throw unsupported("An unterminated PostScript procedure was encountered.");
-        if (isName(value) && value.value === "{") frames.push([]);
-        else if (isName(value) && value.value === "}") {
+        if (this.isProcedureDelimiter(value, "{")) frames.push([]);
+        else if (this.isProcedureDelimiter(value, "}")) {
           const procedure: Procedure = { kind: "procedure", tokens: frames.pop()! };
           if (!frames.length) return procedure;
           frames.at(-1)!.push(procedure);
         } else frames.at(-1)!.push(value);
       }
     }
-    if (isName(first) && first.value === "}") throw unsupported("An unmatched PostScript procedure delimiter was encountered.");
+    if (this.isProcedureDelimiter(first, "}")) throw unsupported("An unmatched PostScript procedure delimiter was encountered.");
     return first;
   }
+  private isProcedureDelimiter(value: Value | undefined, token: string): boolean {
+    return isName(value) && value.value === token && this.procedureDelimiters.has(value);
+  }
   private token(): Value | undefined {
-    const bytes = this.bytes;
-    while (this.offset < bytes.length) {
+    const file = this.file;
+    while (true) {
       throwIfAborted(this.signal);
-      if (white(bytes[this.offset])) { this.offset++; continue; }
-      if (bytes[this.offset] === 37) { while (this.offset < bytes.length && bytes[this.offset] !== 10 && bytes[this.offset] !== 13) this.offset++; continue; }
+      const value = file.peekByte();
+      if (value < 0) return undefined;
+      if (white(value)) { file.readByte(); continue; }
+      if (value === 37) { while (file.peekByte() >= 0 && file.peekByte() !== 10 && file.peekByte() !== 13) file.readByte(); continue; }
       break;
     }
-    if (this.offset === bytes.length) return undefined;
-    const byte = bytes[this.offset++];
+    const byte = file.readByte();
     if (byte === 40) {
       const output: number[] = []; let depth = 1;
-      while (this.offset < bytes.length) {
+      while (true) {
         throwIfAborted(this.signal);
-        let value = bytes[this.offset++];
+        let value = file.readByte();
+        if (value < 0) break;
         if (value === 92) {
-          if (this.offset === bytes.length) break;
-          value = bytes[this.offset++];
-          if (value === 10 || value === 13) { if (value === 13 && bytes[this.offset] === 10) this.offset++; continue; }
-          if (value >= 48 && value <= 55) { let octal = value - 48; for (let i = 0; i < 2 && bytes[this.offset] >= 48 && bytes[this.offset] <= 55; i++) octal = octal * 8 + bytes[this.offset++] - 48; checkStringLength(output.length + 1, this.maxStringBytes); output.push(octal & 255); continue; }
+          value = file.readByte();
+          if (value < 0) break;
+          if (value === 10 || value === 13) { if (value === 13 && file.peekByte() === 10) file.readByte(); continue; }
+          if (value >= 48 && value <= 55) {
+            let octal = value - 48;
+            for (let i = 0; i < 2 && file.peekByte() >= 48 && file.peekByte() <= 55; i++) octal = octal * 8 + file.readByte() - 48;
+            checkStringLength(output.length + 1, this.maxStringBytes); output.push(octal & 255); continue;
+          }
           value = ({ 110: 10, 114: 13, 116: 9, 98: 8, 102: 12 } as Record<number, number>)[value] ?? value;
         } else if (value === 40) depth++;
         else if (value === 41 && --depth === 0) return Uint8Array.from(output);
-        else if (value === 13) { if (bytes[this.offset] === 10) this.offset++; value = 10; }
+        else if (value === 13) { if (file.peekByte() === 10) file.readByte(); value = 10; }
         checkStringLength(output.length + 1, this.maxStringBytes); output.push(value);
       }
       throw unsupported("A PostScript literal string is truncated.");
     }
-    if (byte === 60 && bytes[this.offset] !== 60) {
+    if (byte === 60 && file.peekByte() === 126) { file.readByte(); return this.ascii85String(); }
+    if (byte === 60 && file.peekByte() !== 60) {
       const output: number[] = []; let high = -1;
-      while (this.offset < bytes.length) {
+      while (true) {
         throwIfAborted(this.signal);
-        const value = bytes[this.offset++]; if (value === 62) { if (high >= 0) { checkStringLength(output.length + 1, this.maxStringBytes); output.push(high * 16); } return Uint8Array.from(output); }
-        if (white(value)) continue; const digit = hex(value); if (digit < 0) throw unsupported("A PostScript hexadecimal string has an invalid digit.");
-        if (high < 0) high = digit; else { checkStringLength(output.length + 1, this.maxStringBytes); output.push(high * 16 + digit); high = -1; }
+        const value = file.readByte(); if (value < 0) break;
+        if (value === 62) { if (high >= 0) { checkStringLength(output.length + 1, this.maxStringBytes); output.push(high * 16); } return Uint8Array.from(output); }
+        if (white(value)) continue;
+        const digit = hex(value); if (digit < 0) throw unsupported("A PostScript hexadecimal string has an invalid digit.");
+        if (high < 0) high = digit;
+        else { checkStringLength(output.length + 1, this.maxStringBytes); output.push(high * 16 + digit); high = -1; }
       }
       throw unsupported("A PostScript hexadecimal string is truncated.");
     }
-    if ((byte === 60 || byte === 62) && bytes[this.offset] === byte) { this.offset++; return executableName(byte === 60 ? "<<" : ">>"); }
-    if ([91, 93, 123, 125].includes(byte)) return executableName(String.fromCharCode(byte));
-    const literal = byte === 47, start = literal ? this.offset : this.offset - 1;
-    while (this.offset < bytes.length && !delimiter(bytes[this.offset])) this.offset++;
-    if (this.offset === start) throw unsupported("An invalid PostScript token was encountered.");
-    const text = byteString(bytes.subarray(start, this.offset));
-    // The token scanner consumes its whitespace delimiter. RD/readstring sees
-    // the first binary byte immediately after that one separator.
-    if (white(bytes[this.offset])) { if (bytes[this.offset++] === 13 && bytes[this.offset] === 10) this.offset++; }
+    if ((byte === 60 || byte === 62) && file.peekByte() === byte) { file.readByte(); return executableName(byte === 60 ? "<<" : ">>"); }
+    if ([91, 93, 123, 125].includes(byte)) {
+      const name = executableName(String.fromCharCode(byte));
+      if (byte === 123 || byte === 125) this.procedureDelimiters.add(name);
+      return name;
+    }
+    const literal = byte === 47, immediate = literal && file.peekByte() === 47;
+    if (immediate) file.readByte();
+    const characters: number[] = literal ? [] : [byte];
+    while (file.peekByte() >= 0 && !delimiter(file.peekByte())) { throwIfAborted(this.signal); characters.push(file.readByte()); }
+    if (!literal && (characters.length === 0 || delimiter(byte))) throw unsupported("An invalid PostScript token was encountered.");
+    const text = byteString(Uint8Array.from(characters));
+    // RD/readstring sees the first binary byte immediately after one separator.
+    if (white(file.peekByte())) { if (file.readByte() === 13 && file.peekByte() === 10) file.readByte(); }
+    if (immediate) {
+      const value = this.resolveImmediate?.(text);
+      if (value === undefined) throw unsupported(`Immediately evaluated PostScript name ${text} is undefined.`, text);
+      return value;
+    }
     if (literal) return literalName(text);
     if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(text)) return finite(Number(text));
     const radix = /^(\d+)#([0-9a-z]+)$/i.exec(text);
     if (radix) { const base = Number(radix[1]); if (base < 2 || base > 36 || [...radix[2]].some(c => parseInt(c, 36) >= base)) throw unsupported("Invalid PostScript radix number."); return finite(parseInt(radix[2], base)); }
     return executableName(text);
+  }
+  private ascii85String(): Uint8Array {
+    const output: number[] = [], group: number[] = [];
+    const append = (length: number): void => {
+      while (group.length < 5) group.push(84);
+      let packed = 0; for (const digit of group) packed = packed * 85 + digit;
+      if (packed > 0xffff_ffff) throw unsupported("A PostScript ASCII85 string group overflows 32 bits.");
+      const decoded = [packed >>> 24, (packed >>> 16) & 255, (packed >>> 8) & 255, packed & 255];
+      checkStringLength(output.length + length, this.maxStringBytes); output.push(...decoded.slice(0, length)); group.length = 0;
+    };
+    while (true) {
+      throwIfAborted(this.signal);
+      const byte = this.file.readByte();
+      if (byte < 0) throw unsupported("A PostScript ASCII85 string is truncated.");
+      if (white(byte)) continue;
+      if (byte === 126) {
+        if (this.file.readByte() !== 62 || group.length === 1) throw unsupported("A PostScript ASCII85 string has an invalid terminator or final group.");
+        if (group.length) append(group.length - 1);
+        return Uint8Array.from(output);
+      }
+      if (byte === 122) {
+        if (group.length) throw unsupported("A PostScript ASCII85 z occurs inside a group.");
+        checkStringLength(output.length + 4, this.maxStringBytes); output.push(0, 0, 0, 0); continue;
+      }
+      if (byte < 33 || byte > 117) throw unsupported("A PostScript ASCII85 string contains an invalid character.");
+      group.push(byte - 33); if (group.length === 5) append(4);
+    }
   }
 }
 
@@ -416,6 +834,7 @@ class FontPostScriptLexer {
 type Access = 0 | 1 | 2 | 3;
 const accessAttributes = new WeakMap<object, Access>();
 const executableReferences = new WeakMap<object, boolean>();
+const dictionaryCapacities = new WeakMap<Dictionary, number>();
 function isComposite(value: Value): value is Value & object {
   return value instanceof Map || Array.isArray(value) || value instanceof Uint8Array || isProcedure(value) || tagged(value, "file");
 }
@@ -426,6 +845,7 @@ function requireAccess(value: Value, minimum: Access): void {
 }
 function copyAttributes(source: Value & object, target: Value & object): void {
   accessAttributes.set(target, accessOf(source));
+  if (source instanceof Map && target instanceof Map && dictionaryCapacities.has(source)) dictionaryCapacities.set(target, dictionaryCapacities.get(source)!);
   if (executableReferences.has(source)) executableReferences.set(target, executableReferences.get(source)!);
 }
 function arraySequence(value: Value): Value[] | null { return isProcedure(value) ? value.tokens as Value[] : Array.isArray(value) ? value : null; }
@@ -475,7 +895,8 @@ function get(source: Value, index: Value): Value {
   requireAccess(source, 2);
   if (source instanceof Map) { const value = source.get(key(index)); if (value === undefined) throw unsupported("A PostScript dictionary key is undefined."); return value; }
   const items = isProcedure(source) ? source.tokens : source;
-  if ((!Array.isArray(items) && !(items instanceof Uint8Array)) || typeof index !== "number" || !Number.isSafeInteger(index) || index < 0 || index >= items.length) throw unsupported("A PostScript get index is invalid.");
+  if ((!Array.isArray(items) && !(items instanceof Uint8Array)) || typeof index !== "number" || !Number.isSafeInteger(index)) throw unsupported("A PostScript get index requires an integer.", undefined, "typecheck");
+  if (index < 0 || index >= items.length) throw unsupported("A PostScript get index is invalid.", undefined, "rangecheck");
   return items[index];
 }
 function put(target: Value, index: Value, value: Value): void {
@@ -496,6 +917,7 @@ function isOperator(value: unknown): value is PsOperator { return tagged(value, 
 function requireNumber(value: Value): number { if (typeof value !== "number") throw unsupported("A numeric PostScript operand is required."); return finite(value); }
 function finite(value: number): number { if (!Number.isFinite(value)) throw unsupported("PostScript arithmetic produced a nonfinite value."); return value; }
 function equalValue(a: Value, b: Value): boolean {
+  if (tagged(a, "file") && tagged(b, "file")) return (a as PsFile).reader.file === (b as PsFile).reader.file;
   if (isName(a) && isName(b)) return a.value === b.value;
   if (isName(a) && b instanceof Uint8Array) { requireAccess(b, 2); return a.value === byteString(b); }
   if (a instanceof Uint8Array && isName(b)) { requireAccess(a, 2); return byteString(a) === b.value; }
@@ -518,6 +940,12 @@ function allocatedBytes(length: number, maximum?: number): Uint8Array { checkStr
 function lastIndex<T>(values: readonly T[], predicate: (value: T) => boolean): number { for (let i = values.length - 1; i >= 0; i--) if (predicate(values[i])) return i; return -1; }
 const arrayViews = new WeakMap<Value[], { source: Value[]; start: number }>();
 const byteViews = new WeakMap<Uint8Array, { source: Uint8Array; start: number }>();
+function storageOf(value: Value & object): object {
+  if (isProcedure(value)) return storageOf(value.tokens as Value[]);
+  if (Array.isArray(value)) return arrayViews.get(value)?.source ?? value;
+  if (value instanceof Uint8Array) return byteViews.get(value)?.source ?? value;
+  return value;
+}
 function byteView(source: Uint8Array, start: number, length: number): Uint8Array {
   const attributes = source;
   const parent = byteViews.get(source);
@@ -541,7 +969,7 @@ function arrayView(source: Value[], start: number, length: number): Value[] {
   });
   arrayViews.set(view, { source, start }); copyAttributes(attributes, view); return view;
 }
-function unsupported(message: string, operator?: string): PdfError { return new PdfError("unsupported-font", message, { details: { reason: "font-postscript-unsupported", ...(operator ? { operator } : {}) } }); }
+function unsupported(message: string, operator?: string, postScriptError?: string): PdfError { return new PdfError("unsupported-font", message, { details: { reason: "font-postscript-unsupported", ...(operator ? { operator } : {}), ...(postScriptError ? { postScriptError } : {}) } }); }
 function limited(kind: string): PdfError { return new PdfError("resource-limit", `Font PostScript exceeds the configured ${kind} limit.`, { details: { reason: `font-postscript-${kind}-limit` } }); }
 function bindProcedure(procedure: Procedure, lookup: (name: string) => Value | undefined, signal?: AbortSignal): Procedure {
   const seen = new Set<Procedure>();

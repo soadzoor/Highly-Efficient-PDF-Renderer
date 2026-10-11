@@ -2,6 +2,7 @@ import type { NativeGlyphOutline, NativeGlyphPathCommand } from "./nativeFont";
 import { PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
 import { CFF_EXPERT_ENCODING } from "./nativeCffExpertData";
 import { executeNativeFontPostScript, type NativeFontPostScriptResult, type NativeFontPostScriptValue } from "./nativeFontPostScript";
+import { createNativeFontPostScriptFilter, createNativeFontPostScriptMemoryFile } from "./nativeFontPostScriptFile";
 import { paintNativeGlyphCommands } from "./nativeGlyphPaint";
 
 /** Caller-selected ceilings; defaults do not impose machine-dependent limits. */
@@ -141,8 +142,17 @@ export class NativeType1Font {
     ceiling(sourceBytes.length, limits.maxType1Bytes, "byte");
     const unpacked = unpackPfb(sourceBytes, framing);
     const bytes = unpacked.bytes;
-    const header = scanProgram(bytes, limits, framing.signal, true);
-    const eexec = header.eexecEnd;
+    if (unpacked.length1 !== undefined && (!Number.isSafeInteger(unpacked.length1) ||
+      unpacked.length1 < 0 || unpacked.length1 > bytes.length)) {
+      throw invalid("The Type1 /Length1 is outside the cleartext section.", "framing");
+    }
+    // A loader may execute eexec from a procedure. Explicit PDF/PFB segment
+    // boundaries keep the declarative scanner out of its binary ciphertext.
+    const header = scanProgram(bytes.subarray(0, unpacked.length1 ?? bytes.length), limits, framing.signal, true);
+    const framedEexec = unpacked.length1 !== undefined && ((unpacked.length2 ?? 0) > 0 ||
+      header.tokens.some(token => token.kind === "procedure" && token.value.has("eexec")));
+    const eexec = header.eexecEnd ?? (framedEexec ? unpacked.length1! : null);
+    const cleartextEnd = eexec === null ? bytes.length : unpacked.length1 ?? eexec;
     let privateTokens: readonly PsToken[] = [];
     let privatePlaintext: Uint8Array | undefined;
     let tokenError: unknown;
@@ -171,7 +181,7 @@ export class NativeType1Font {
       catch (error) { if (!isUnsupported(error)) throw error; tokenError = error; }
     }
     const tokens = [...header.tokens, ...privateTokens];
-    const executeProgram = () => executeNativeFontPostScript(bytes.subarray(0, eexec ?? bytes.length), privatePlaintext, {
+    const executeProgram = () => executeNativeFontPostScript(bytes.subarray(0, cleartextEnd), privatePlaintext, {
       signal: framing.signal, maxOperations: limits.maxType1PostScriptOperations, maxStack: limits.maxType1PostScriptStack,
       maxStringBytes: limits.maxType1StringBytes,
       standardEncoding: Array.from({ length: 256 }, (_, code) => standardEncodingName(code)), expertEncoding: CFF_EXPERT_ENCODING
@@ -264,6 +274,7 @@ export class NativeType1Font {
         // Keep a precise malformed-font reason when the broader reader cannot
         // recover it. Caller limits and cancellation always retain precedence.
         if (!isUnsupported(computedError)) throw computedError;
+        if (String(error.details?.reason).endsWith("expression") && computedError.details?.operator) throw computedError;
         throw error;
       }
     }
@@ -275,11 +286,11 @@ export class NativeType1Font {
         return font;
       } catch (error) {
         if (!isUnsupported(error)) throw error;
-        font.fontDiagnostics = Object.freeze([...font.fontDiagnostics, {
+        font.fontDiagnostics = Object.freeze([...font.fontDiagnostics, Object.freeze({
           code: "font.type1-postscript-approximated", severity: "warning",
           message: "The Type1 program uses unsupported loading procedures; its declarative font records are retained and may differ from the computed design.",
-          context: { reason: error.message }
-        }]);
+          details: Object.freeze({ reason: "font-postscript-unsupported", ...type1PostScriptFailureDetails(error) })
+        })]);
       }
     }
     if (hasCustomOtherSubrs(tokens, font.blendWeights !== null)) {
@@ -411,12 +422,14 @@ export class NativeType1Font {
       if (!entry) {
         const composite: { value?: Composite } = {};
         const executeOtherSubr = this.otherSubrExecutorFactory?.(this.signal);
+        let otherSubrFailure: PdfError | undefined;
         const raw = evaluateNativeType1CharString(this.charStrings[id], {
           subrs: this.subrs, glyphId: id, limits: this.limits, signal: this.signal, budget,
           ...(this.blendWeights ? { blendWeights: this.blendWeights } : {}),
           executeOtherSubr: executeOtherSubr ? (index, args) => {
+            otherSubrFailure = undefined;
             try { return executeOtherSubr(index, args); }
-            catch (error) { if (!isUnsupported(error)) throw error; return null; }
+            catch (error) { if (!isUnsupported(error)) throw error; otherSubrFailure = error; return null; }
           } : undefined,
           onUnknownOtherSubr: index => {
             if (this.unknownOtherSubrs.has(index)) return;
@@ -424,7 +437,8 @@ export class NativeType1Font {
             this.fontDiagnostics = Object.freeze([...this.fontDiagnostics, Object.freeze({
               code: "font.type1-othersubr-approximated", severity: "warning" as const,
               message: `Type1 OtherSubr ${index} uses the format's argument-preserving compatibility fallback; extension-specific rendering may differ.`,
-              details: Object.freeze({ reason: "type1-unknown-othersubr", othersubr: index, approximate: true })
+              details: Object.freeze({ reason: "type1-unknown-othersubr", othersubr: index, approximate: true,
+                ...(otherSubrFailure ? type1PostScriptFailureDetails(otherSubrFailure) : {}) })
             })]);
           },
           resolveComposite: (baseCode, accentCode, x, y) => {
@@ -709,6 +723,21 @@ class PsLexer {
       if (depth) throw invalid("A Type1 string is unterminated.", "token");
       return { kind: "bytes", value: Uint8Array.from(values) };
     }
+    if (byte === 60 && this.bytes[this.offset] === 126) {
+      this.offset++;
+      const source = createNativeFontPostScriptMemoryFile(this.bytes.subarray(this.offset), { signal: this.signal });
+      const decoded = createNativeFontPostScriptFilter(source, "ASCII85Decode", {}, {
+        signal: this.signal, maxDecodedBytes: this.limits.maxType1StringBytes
+      });
+      const values: number[] = [];
+      for (let value = decoded.readByte(); value >= 0; value = decoded.readByte()) values.push(value);
+      const length = source.tell();
+      if (length < 2 || this.bytes[this.offset + length - 2] !== 126 || this.bytes[this.offset + length - 1] !== 62) {
+        throw invalid("A Type1 ASCII85 string is unterminated.", "token");
+      }
+      this.offset += length;
+      return { kind: "bytes", value: Uint8Array.from(values) };
+    }
     if (byte === 60 && this.bytes[this.offset] !== 60) {
       const values: number[] = []; let high = -1;
       while (this.offset < this.bytes.length && this.bytes[this.offset] !== 62) {
@@ -723,11 +752,14 @@ class PsLexer {
     }
     if ([91, 93, 123, 125, 60, 62].includes(byte)) return { kind: "mark", value: String.fromCharCode(byte) };
     const literal = byte === 47;
+    const immediate = literal && this.bytes[this.offset] === 47;
+    if (immediate) this.offset++;
     const start = literal ? this.offset : this.offset - 1;
     while (this.offset < this.bytes.length && !isWhite(this.bytes[this.offset]) && !isDelimiter(this.bytes[this.offset])) this.offset++;
     let value = "";
     for (let i = start; i < this.offset; i++) value += String.fromCharCode(this.bytes[i]);
-    if (!value) throw invalid("An empty Type1 token was encountered.", "token");
+    if (immediate) return { kind: "word", value: `//${value}` };
+    if (!value && !literal) throw invalid("An empty Type1 token was encountered.", "token");
     if (literal) return { kind: "name", value };
     const number = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:[Ee][-+]?\d+)?$/.test(value) ? Number(value) : NaN;
     return Number.isFinite(number) ? { kind: "number", value: number } : { kind: "word", value };
@@ -1174,6 +1206,10 @@ function ceiling(value: number, limit: number, reason: string): void {
 function finite(value: number): number { if (!Number.isFinite(value)) throw invalid("Type1 arithmetic is not finite.", "numeric-overflow"); return value; }
 function invalid(message: string, reason: string): PdfError { return new PdfError("unsupported-font", message, { details: { reason: `type1-${reason}` } }); }
 function isUnsupported(error: unknown): error is PdfError { return error instanceof PdfError && error.code === "unsupported-font"; }
+function type1PostScriptFailureDetails(error: PdfError): Readonly<Record<string, string | number | boolean | null>> {
+  return Object.freeze({ postScriptReason: error.details?.reason ?? "font-postscript-unsupported", fontProgramMessage: error.message,
+    ...(error.details?.operator !== undefined ? { operator: error.details.operator } : {}) });
+}
 function isWhite(byte: number): boolean { return byte === 0 || byte === 9 || byte === 10 || byte === 12 || byte === 13 || byte === 32; }
 function isDelimiter(byte: number): boolean { return byte === 40 || byte === 41 || byte === 60 || byte === 62 || byte === 91 || byte === 93 || byte === 123 || byte === 125 || byte === 47 || byte === 37; }
 function hexValue(byte: number): number { return byte >= 48 && byte <= 57 ? byte - 48 : byte >= 65 && byte <= 70 ? byte - 55 : byte >= 97 && byte <= 102 ? byte - 87 : -1; }

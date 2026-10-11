@@ -274,6 +274,7 @@ export class NativeCffFont {
     const topMatrix = readCffFontMatrix(top);
     let fontDictionaries: readonly CffFontDictionary[];
     let unappliedFontDictionaryPostScript = false;
+    let fontDictionaryPostScriptFailure: { error: PdfError; index: number } | undefined;
     let fdSelect: Uint16Array;
     let glyphIdsByCid: ReadonlyMap<number, number> | null = null;
     let glyphNames: readonly string[];
@@ -285,12 +286,13 @@ export class NativeCffFont {
       if (dictionaries.objects.length === 0 || dictionaries.objects.length > 256) {
         throw cffUnsupported("The CFF Font DICT count is invalid.", "cff-fd-count");
       }
-      fontDictionaries = Object.freeze(dictionaries.objects.map(bytes => {
+      fontDictionaries = Object.freeze(dictionaries.objects.map((bytes, index) => {
         const originalDictionary = parseCffDict(bytes, "Font DICT", TOP_DICT_OPERATORS, { legacy });
         const computed = applyCffFontDictionaryPostScript(originalDictionary, top, customStrings, limits, signal);
         const dictionary = computed.dictionary;
         if (!computed.executed && readCffApproximationDiagnostics(originalDictionary, customStrings)
           .some(diagnostic => diagnostic.code === "font.cff-postscript-approximation")) unappliedFontDictionaryPostScript = true;
+        if (computed.failure && !fontDictionaryPostScriptFailure) fontDictionaryPostScriptFailure = { error: computed.failure, index };
         const matrix = dictionary.has(dictOperator(12, 7))
           ? top.has(dictOperator(12, 7))
             ? multiplyCffMatrices(topMatrix, readCffFontMatrix(dictionary))
@@ -333,9 +335,25 @@ export class NativeCffFont {
       const index = diagnostics.findIndex(diagnostic => diagnostic.code === "font.cff-postscript-approximation");
       if (index >= 0) diagnostics.splice(index, 1);
     }
+    if (computed.failure) {
+      const index = diagnostics.findIndex(diagnostic => diagnostic.code === "font.cff-postscript-approximation");
+      if (index >= 0) diagnostics[index] = Object.freeze({ ...diagnostics[index], details: cffPostScriptFailureDetails(computed.failure) });
+    }
     if (unappliedFontDictionaryPostScript && !diagnostics.some(diagnostic => diagnostic.code === "font.cff-postscript-approximation")) {
       diagnostics.push(Object.freeze({ code: "font.cff-postscript-approximation", severity: "warning",
-        message: "Embedded CFF Font DICT PostScript could not be fully applied; ordinary glyph outlines are retained, but font behavior and appearance may differ." }));
+        message: "Embedded CFF Font DICT PostScript could not be fully applied; ordinary glyph outlines are retained, but font behavior and appearance may differ.",
+        ...(fontDictionaryPostScriptFailure ? { details: Object.freeze({
+          ...cffPostScriptFailureDetails(fontDictionaryPostScriptFailure.error), fontDictionaryIndex: fontDictionaryPostScriptFailure.index
+        }) } : {}) }));
+    }
+    if (fontDictionaryPostScriptFailure && computed.failure) {
+      const index = diagnostics.findIndex(diagnostic => diagnostic.code === "font.cff-postscript-approximation");
+      if (index >= 0) diagnostics[index] = Object.freeze({ ...diagnostics[index], details: Object.freeze({
+        ...diagnostics[index].details, fontDictionaryIndex: fontDictionaryPostScriptFailure.index,
+        fontDictionaryPostScriptMessage: fontDictionaryPostScriptFailure.error.message,
+        ...(fontDictionaryPostScriptFailure.error.details?.operator !== undefined
+          ? { fontDictionaryPostScriptOperator: fontDictionaryPostScriptFailure.error.details.operator } : {})
+      }) });
     }
     const unsupportedPaint = fontDictionaries.some(dictionary => dictionary.paintType !== 0 && dictionary.paintType !== 2);
     const paintDiagnostic = diagnostics.findIndex(diagnostic => diagnostic.code === "font.cff-paint-type-approximation");
@@ -482,6 +500,7 @@ export class NativeCffFont {
       const dictionary = this.fontDictionaries[this.fdSelect[glyphId]];
       if (this.charStringType === 1) {
         const executeOtherSubr = this.otherSubrExecutorFactory?.(budget.signal);
+        let otherSubrFailure: PdfError | undefined;
         const interpreted = evaluateNativeType1CharString(this.charStrings[glyphId], {
           glyphId,
           subrs: dictionary.localSubrs,
@@ -490,9 +509,11 @@ export class NativeCffFont {
           budget,
           blendWeights: this.legacyMasterState?.registers[0].slice(0, this.legacyMasterState.masterCount),
           executeOtherSubr: executeOtherSubr ? (index, args) => {
+            otherSubrFailure = undefined;
             try { return executeOtherSubr(index, args); }
             catch (error) {
-              if (error instanceof PdfError && (error.code === "aborted" || error.code === "resource-limit")) throw error;
+              if (!(error instanceof PdfError) || error.code !== "unsupported-font") throw error;
+              otherSubrFailure = error;
               return null;
             }
           } : undefined,
@@ -503,7 +524,8 @@ export class NativeCffFont {
               code: "font.type1-othersubr-approximated",
               severity: "warning" as const,
               message: `CFF Type 1 OtherSubr ${index} uses the required argument-preserving fallback; custom PostScript effects may differ.`,
-              details: Object.freeze({ reason: "type1-unknown-othersubr", othersubr: index, approximate: true })
+              details: Object.freeze({ reason: "type1-unknown-othersubr", othersubr: index, approximate: true,
+                ...(otherSubrFailure ? cffPostScriptFailureDetails(otherSubrFailure) : {}) })
             })]);
           },
           limits: type1LimitsFromCff(this.limits),
@@ -1530,6 +1552,7 @@ function applyCffPostScript(
   limits: Readonly<NativeCffParserLimits>, signal?: AbortSignal
 ): { readonly charStrings: readonly Uint8Array[]; readonly builtInGlyphNames: readonly (string | null)[];
   readonly fontDictionaries: readonly CffFontDictionary[]; readonly executed: boolean;
+  readonly failure?: PdfError;
   readonly otherSubrExecutorFactory?: NativeFontPostScriptResult["createOtherSubrExecutor"] } {
   const unchanged = { charStrings: originalCharStrings, builtInGlyphNames: originalEncoding,
     fontDictionaries: originalDictionaries, executed: false };
@@ -1608,8 +1631,8 @@ function applyCffPostScript(
         paintType: paintType === initialPaint ? value.paintType : paintType,
         strokeWidth: strokeWidth === initialStroke ? value.strokeWidth : strokeWidth }))) };
   } catch (error) {
-    if (error instanceof PdfError && (error.code === "aborted" || error.code === "resource-limit")) throw error;
-    return unchanged;
+    if (!(error instanceof PdfError) || error.code !== "unsupported-font") throw error;
+    return { ...unchanged, failure: error };
   }
 }
 
@@ -1618,7 +1641,7 @@ function applyCffPostScript(
 function applyCffFontDictionaryPostScript(
   original: CffDictionary, top: CffDictionary, strings: readonly string[],
   limits: Readonly<NativeCffParserLimits>, signal?: AbortSignal
-): { readonly dictionary: CffDictionary; readonly executed: boolean } {
+): { readonly dictionary: CffDictionary; readonly executed: boolean; readonly failure?: PdfError } {
   const unchanged = { dictionary: original, executed: false };
   const entry = original.get(dictOperator(12, 21));
   if (!entry) return { ...unchanged, executed: true };
@@ -1662,9 +1685,14 @@ function applyCffFontDictionaryPostScript(
     if (original.has(strokeOperator) || stroke !== initialStroke) dictionary.set(strokeOperator, [stroke]);
     return { dictionary, executed: true };
   } catch (error) {
-    if (error instanceof PdfError && (error.code === "aborted" || error.code === "resource-limit")) throw error;
-    return unchanged;
+    if (!(error instanceof PdfError) || error.code !== "unsupported-font") throw error;
+    return { ...unchanged, failure: error };
   }
+}
+
+function cffPostScriptFailureDetails(error: PdfError): Readonly<Record<string, string | number | boolean | null>> {
+  return Object.freeze({ postScriptReason: error.details?.reason ?? "font-postscript-unsupported", fontProgramMessage: error.message,
+    ...(error.details?.operator !== undefined ? { operator: error.details.operator } : {}) });
 }
 
 const TOP_DICT_OPERATORS = new Set([
