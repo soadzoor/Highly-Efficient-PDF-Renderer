@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-09T18:29:09.186Z",
+  "generatedAt": "2026-10-11T12:29:26.118Z",
   "examples": [
     {
       "id": "20260415_broschuere_leo_b2c_rz_online_reduz",
@@ -10,7 +10,7 @@
       },
       "hep": {
         "path": "examples/heps/20260415_Broschuere_Leo_B2C_RZ_online_reduz_-parsed-data.hep",
-        "sizeBytes": 1997548
+        "sizeBytes": 1998360
       }
     },
     {
@@ -202,7 +202,7 @@
       },
       "hep": {
         "path": "examples/heps/TIKA-2848-1-parsed-data.hep",
-        "sizeBytes": 74570960
+        "sizeBytes": 74571028
       }
     },
     {
@@ -214,7 +214,7 @@
       },
       "hep": {
         "path": "examples/heps/TIKA-2848-2-parsed-data.hep",
-        "sizeBytes": 7881188
+        "sizeBytes": 7881200
       }
     },
     {
