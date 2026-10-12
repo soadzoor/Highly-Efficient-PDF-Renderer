@@ -97,6 +97,7 @@ const context = vm.createContext({
   prepareSceneForHepRendering: (value) => value,
   listSceneRasterLayers: () => [], resolveSceneFitBounds: () => ({}),
   hasStoredVectorStrokeLod: () => false,
+  reuseTextLodForPageTranslation: () => false,
   prebuildVectorLodForScene: async () => timing, prebuildTextLodForScene: async () => {},
   consumeVectorStrokeLodBuildTiming: () => timing, combineVectorLodTimings: () => timing,
   yieldToBrowserPaint: async () => {}, yieldAfterPaint: async (signal) => signal?.throwIfAborted(),
@@ -137,6 +138,7 @@ for (const name of [
 ]) vm.runInContext(sourceFunction(source, name), context);
 
 await testNativeVectorLodProgress();
+await testNativeTextLodProgress();
 await context.loadPdfFile(file("A.pdf", 65));
 assertDocument(65, "A.pdf");
 const originalCache = context.parsedPdfPageCache;
@@ -404,6 +406,54 @@ async function testNativeVectorLodProgress() {
     controller.abort();
     assert.equal(options.shouldCancel(), true, "source cancellation reaches Vector LOD preparation");
   }
+}
+
+async function testNativeTextLodProgress() {
+  const events = [], builds = [];
+  const value = { textInstanceCount: 1000 };
+  let cached = null, mode = "auto";
+  const host = vm.createContext({
+    loadToken: 7,
+    getCachedTextLod: scene => { assert.equal(scene, value); return cached; },
+    uiControlManager: { readTextLodModeInput: () => mode },
+    prebuildTextLod: async (...args) => builds.push(args),
+    LOAD_PROGRESS_TEXT_LOD_START: .75, LOAD_PROGRESS_TEXT_LOD_END: .875
+  });
+  vm.runInContext(sourceFunction(source, "prebuildTextLodForScene"), host);
+  const progress = { report: (value, detail) => events.push({ value, ...detail }) };
+  for (const result of [{ data: {} }, { data: null, fallbackReason: "no eligible text" }]) {
+    cached = result;
+    await host.prebuildTextLodForScene(value, progress, "hep", 7);
+    assert.equal(events.length, 0, "cached Text LOD does not announce a new build stage");
+    assert.equal(builds.length, 0, "cached successful and fallback results skip Text LOD preparation");
+  }
+
+  cached = null;
+  const controller = new AbortController();
+  await host.prebuildTextLodForScene(value, progress, "pdf", 7, controller.signal);
+  assert.deepEqual(events, [{ value: .75, stage: "text-lod", sourceType: "pdf" }]);
+  assert.equal(builds.length, 1, "uncached Text LOD still builds");
+  const [builtScene, options] = builds[0];
+  assert.equal(builtScene, value);
+  assert.equal(options.signal, controller.signal);
+  assert.equal(options.shouldCancel(), false);
+  options.onProgress({ value: .5 });
+  assert.deepEqual(events.at(-1), { value: .8125, stage: "text-lod", sourceType: "pdf" },
+    "Text LOD progress retains its source metadata");
+  host.loadToken++;
+  assert.equal(options.shouldCancel(), true, "superseded loads cancel Text LOD preparation");
+  options.onProgress({ value: 1 });
+  assert.equal(events.length, 2, "superseded Text LOD builds cannot update loader progress");
+
+  host.loadToken = 7;
+  mode = "off";
+  events.length = builds.length = 0;
+  await host.prebuildTextLodForScene(value, progress, "hep", 7);
+  assert.equal(builds.length, 0, "disabled Text LOD does not build");
+  assert.deepEqual(events, [
+    { value: .75, stage: "text-lod", sourceType: "hep" },
+    { value: .875, stage: "text-lod", sourceType: "hep" }
+  ], "uncached disabled Text LOD preserves the existing completed-stage progress");
 }
 
 async function testScanCompressionPreferences() {
@@ -695,8 +745,9 @@ async function assertExport(id, label) {
 
 async function testNativeReaderExports() {
   const prior = { nextParse, grid: context.composeVectorScenesInGrid, column: context.composeVectorScenesInColumn,
-    auto: context.computeAutoPagesPerRow };
-  const canonical = { ...scene(94), pageCount: 2, pagesPerRow: 2 };
+    auto: context.computeAutoPagesPerRow, reuseTextLod: context.reuseTextLodForPageTranslation,
+    prebuildTextLod: context.prebuildTextLodForScene };
+  const canonical = { ...scene(94), pageCount: 2, pagesPerRow: 2, textInstanceCount: 12 };
   const reader = { ...canonical, pagesPerRow: 1, presentation: "reader" };
   try {
     nextParse = async () => [scene(94), scene(94)];
@@ -725,15 +776,25 @@ async function testNativeReaderExports() {
       "OCR completion exports the canonical row count instead of Reader's one column");
     context.loadedOcrTextOnly = false;
 
+    const hepLodEvents = [];
+    context.reuseTextLodForPageTranslation = (source, target) => {
+      hepLodEvents.push({ event: "reuse", source, target });
+      return true;
+    };
+    context.prebuildTextLodForScene = async scene => hepLodEvents.push({ event: "prebuild", scene });
     nextParse = async () => [canonical];
     await context.loadHepFile(file("reader-book.hep", 94));
     assert.equal(context.nativeLayout, "reader", "multi-page HEP opens in Reader");
     assert.equal(context.lastCanonicalScene, canonical, "HEP retains its exact decoded scene");
+    assert.deepEqual(hepLodEvents, [
+      { event: "reuse", source: canonical, target: reader },
+      { event: "prebuild", scene: reader }
+    ], "Reader inherits the HEP's stored Text LOD before prebuild checks its cache");
     await context.downloadHep();
     assert.equal(exports.at(-1).scene, canonical, "HEP export reuses its exact saved layout");
 
     const readerState = { view: { centerX: 0, centerY: -900, zoom: 2 }, fit: "width", sidebarOpen: true };
-    const restored = [], uploads = [], cameraViews = [];
+    const restored = [], uploads = [], cameraViews = [], layoutLodEvents = [];
     const controls = { snapshot: () => readerState, restore: state => restored.push(state), setLayout: noop,
       goToPage: () => assert.fail("returning to Reader must restore its saved scroll and fit state") };
     const host = vm.createContext({
@@ -748,7 +809,12 @@ async function testNativeReaderExports() {
       resolveSceneFitBounds: () => ({}),
       readerCaptureAnchor: () => ({}), readerRestoreAnchor: (_rects, _anchor, zoom) => ({ centerX: 0, centerY: 0, zoom }),
       uiControlManager: { readVectorLodModeInput: () => "auto" }, prebuildVectorStrokeLodRuntime: async () => {},
-      prebuildTextLod: async () => {}, updateBackendSelectDisabledState: noop,
+      reuseTextLodForPageTranslation: (source, target) => {
+        layoutLodEvents.push({ event: "reuse", source, target });
+        return true;
+      },
+      prebuildTextLod: async scene => layoutLodEvents.push({ event: "prebuild", scene }),
+      updateBackendSelectDisabledState: noop,
       composeVectorScenesInColumn: () => reader,
       uploadSceneWithRollback: (_renderer, value) => { uploads.push(value); return stats; },
       updateNativePresentation: layout => { host.nativeLayout = layout; },
@@ -759,18 +825,36 @@ async function testNativeReaderExports() {
     await host.changeNativeLayout("grid");
     assert.equal(host.lastParsedScene, canonical, "switching HEP to Grid restores the original scene object");
     assert.equal(host.nativeLayout, "grid");
+    assert.deepEqual(layoutLodEvents.splice(0), [
+      { event: "reuse", source: reader, target: canonical },
+      { event: "prebuild", scene: canonical }
+    ], "switching to Grid transfers Reader's Text LOD before prebuild");
     await host.changeNativeLayout("reader");
     assert.equal(host.lastParsedScene, reader);
     assert.equal(restored.at(-1), readerState, "returning to Reader restores its scroll, fit and sidebar state");
+    assert.deepEqual(layoutLodEvents.splice(0), [
+      { event: "reuse", source: canonical, target: reader },
+      { event: "prebuild", scene: reader }
+    ], "switching to Reader transfers the canonical Text LOD before prebuild");
     const gridState = host.gridViewState;
     await host.changeNativeLayout("grid");
     assert.equal(cameraViews.at(-1), gridState, "returning to Grid restores its saved camera");
     assert.deepEqual(uploads, [canonical, reader, canonical]);
+    layoutLodEvents.length = 0;
+    let streamedBindings = 0;
+    host.activePdfPageLoader = { displayPageScenes: [scene(94), scene(94)],
+      bindDisplayScene: () => { streamedBindings++; } };
+    await host.changeNativeLayout("reader");
+    assert.deepEqual(layoutLodEvents, [{ event: "prebuild", scene: reader }],
+      "streamed layouts build Text LOD from their current page window without reusing stale caches");
+    assert.equal(streamedBindings, 1);
   } finally {
     nextParse = prior.nextParse;
     context.composeVectorScenesInGrid = prior.grid;
     context.composeVectorScenesInColumn = prior.column;
     context.computeAutoPagesPerRow = prior.auto;
+    context.reuseTextLodForPageTranslation = prior.reuseTextLod;
+    context.prebuildTextLodForScene = prior.prebuildTextLod;
   }
 }
 

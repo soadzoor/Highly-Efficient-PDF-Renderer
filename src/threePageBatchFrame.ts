@@ -46,6 +46,10 @@ export function updateThreePageBatchFrame(table: ThreePageTransforms, pages: rea
   const corners = new Float64Array(pages.length * 12);
   let minUnits = Infinity, maxUnits = 0, reason: string | null = null, approximated = false;
   pages.forEach((page, index) => {
+    if (!page.visible) {
+      table.setPage(index, page.dataToDocument, page.dataToClip, false, 1);
+      return;
+    }
     const coarseBounds = table.coarseBounds[index], paint = page.paintBounds;
     const ink = { minX: Math.min(paint.minX, coarseBounds.minX), minY: Math.min(paint.minY, coarseBounds.minY),
       maxX: Math.max(paint.maxX, coarseBounds.maxX), maxY: Math.max(paint.maxY, coarseBounds.maxY) };

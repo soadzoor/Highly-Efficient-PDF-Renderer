@@ -20,6 +20,12 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   toolbar, including the Three demo's light toolbar.
 - Skip the native demo's Vector LOD loading stage when no stroke LOD work is
   needed, including the bundled WarAndPeace example.
+- Reuse stored Text LOD when opening HEPs in native Reader mode and switching
+  between Reader and Grid, translating the cached hierarchy with the pages
+  instead of rebuilding it.
+- Reduce Three Reader frame preparation by sharing viewport calculations across
+  flat pages, skipping offscreen page projections, and reusing unchanged page
+  matrices and frame results. Preserve the general path for 3D page layouts.
 
 ## [0.1.60] - 2026-10-11
 

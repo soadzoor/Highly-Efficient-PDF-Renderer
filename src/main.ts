@@ -62,7 +62,7 @@ import {
 } from "./vectorStrokeLodCore";
 import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 import { formatTextLodStats } from "./textLodStatsFormat";
-import { prebuildTextLod, type TextLodMode } from "./textLodCore";
+import { getCachedTextLod, prebuildTextLod, reuseTextLodForPageTranslation, type TextLodMode } from "./textLodCore";
 import {
   createSearchHighlightSet,
   createTextSearchController,
@@ -732,6 +732,11 @@ async function changeNativeLayout(value: string): Promise<void> {
     const scene = nextLayout === "reader" ? composeVectorScenesInColumn(pages)
       : activePdfPageLoader ? prepareSceneForHepRendering(composeVectorScenesInGrid(pages, canonicalPagesPerRow))
         : lastCanonicalScene!;
+    if (!activePdfPageLoader) {
+      if (!reuseTextLodForPageTranslation(previousScene, scene) && lastCanonicalScene) {
+        reuseTextLodForPageTranslation(lastCanonicalScene, scene);
+      }
+    }
     await prebuildVectorStrokeLodRuntime(scene, uiControlManager.readVectorLodModeInput(),
       backendSwitcher?.getActiveBackend() ?? "webgl", { shouldCancel: () => lastLoadedSource !== source || pendingSourceLoadCount > 0 });
     await prebuildTextLod(scene);
@@ -1532,6 +1537,7 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     const pageScenes = Array.from({ length: partition.pageCount }, (_, index) => partition.extract(index).scene);
     const nextLayout = options.preserveView ? nativeLayout : pageScenes.length > 1 ? "reader" : "grid";
     const scene = nextLayout === "reader" ? composeVectorScenesInColumn(pageScenes) : canonicalScene;
+    if (nextLayout === "reader") reuseTextLodForPageTranslation(canonicalScene, scene);
     const parseEnd = performance.now();
 
     if (activeLoadToken !== loadToken) {
@@ -2005,6 +2011,7 @@ async function prebuildTextLodForScene(
   activeLoadToken: number,
   signal?: AbortSignal
 ): Promise<void> {
+  if (getCachedTextLod(scene)) return;
   progress.report(LOAD_PROGRESS_TEXT_LOD_START, { stage: "text-lod", sourceType });
   if (uiControlManager.readTextLodModeInput() === "off") {
     progress.report(LOAD_PROGRESS_TEXT_LOD_END, { stage: "text-lod", sourceType });

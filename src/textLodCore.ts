@@ -160,6 +160,87 @@ export function storePrebuiltTextLod(scene: VectorScene, result: TextLodBuildRes
 }
 
 /**
+ * Reuse a completed hierarchy after translating its pages. The caller must
+ * preserve text, paint boundaries and instance order (for example, composing
+ * the same canonical ScenePageViews into a Reader column).
+ */
+export function reuseTextLodForPageTranslation(source: VectorScene, target: VectorScene): boolean {
+  if (cachedBuilds.has(target)) return true;
+  if (pendingBuilds.has(target)) return false;
+  const data = cachedBuilds.get(source)?.data;
+  const pageCount = source.pageRects.length / 4;
+  if (!data || !Number.isInteger(pageCount) || pageCount < 1 || data.pages.length !== pageCount ||
+      target.pageRects.length !== source.pageRects.length || source.textInstanceCount !== target.textInstanceCount ||
+      data.exactInstanceCount !== target.textInstanceCount || source.textGlyphCount !== target.textGlyphCount ||
+      source.textGlyphMetaA !== target.textGlyphMetaA || source.textGlyphMetaB !== target.textGlyphMetaB ||
+      source.textGlyphSegmentsA !== target.textGlyphSegmentsA || source.textGlyphSegmentsB !== target.textGlyphSegmentsB ||
+      source.pageTextRanges.length < pageCount * 2 || target.pageTextRanges.length < pageCount * 2) return false;
+
+  const sourceMatrices = new Map(source.pdfPages?.map(page => [page.pageIndex, page.pdfToScene]));
+  const targetMatrices = new Map(target.pdfPages?.map(page => [page.pageIndex, page.pdfToScene]));
+  const translations: { dx: number; dy: number; paddingX: number; paddingY: number }[] = [];
+  let cursor = 0;
+  for (let page = 0; page < pageCount; page++) {
+    const range = page * 2, rect = page * 4;
+    const count = source.pageTextRanges[range + 1];
+    if (source.pageTextRanges[range] !== cursor || target.pageTextRanges[range] !== cursor ||
+        target.pageTextRanges[range + 1] !== count || count > target.textInstanceCount - cursor) return false;
+    cursor += count;
+    const from = source.pageRects.subarray(rect, rect + 4), to = target.pageRects.subarray(rect, rect + 4);
+    if (![...from, ...to].every(Number.isFinite)) return false;
+    const paddingX = Math.max(1, Math.abs(from[0]), Math.abs(from[2]), Math.abs(to[0]), Math.abs(to[2])) * 2 ** -22;
+    const paddingY = Math.max(1, Math.abs(from[1]), Math.abs(from[3]), Math.abs(to[1]), Math.abs(to[3])) * 2 ** -22;
+    let dx = to[0] - from[0], dy = to[1] - from[1];
+    const fromMatrix = sourceMatrices.get(page), toMatrix = targetMatrices.get(page);
+    if (fromMatrix && toMatrix) {
+      if (fromMatrix.slice(0, 4).some((value, index) => value !== toMatrix[index])) return false;
+      // PDF transforms retain double-precision placement. Float32 page rects
+      // can lose a fraction of a point near the end of a long Reader column.
+      dx = toMatrix[4] - fromMatrix[4];
+      dy = toMatrix[5] - fromMatrix[5];
+    }
+    if (!Number.isFinite(dx) || !Number.isFinite(dy) ||
+        Math.abs(to[0] - from[0] - dx) > paddingX || Math.abs(to[2] - from[2] - dx) > paddingX ||
+        Math.abs(to[1] - from[1] - dy) > paddingY || Math.abs(to[3] - from[3] - dy) > paddingY) return false;
+    translations.push({ dx, dy, paddingX, paddingY });
+  }
+  if (cursor !== target.textInstanceCount) return false;
+
+  const translateNode = <T extends { readonly pageIndex: number; readonly bounds: Readonly<Bounds> }>(node: T): T => {
+    const { dx, dy, paddingX, paddingY } = translations[node.pageIndex];
+    const bounds = node.bounds;
+    // Include Float32 rounding of translated exact/coarse instance origins in
+    // every culling level, including glyphs extending beyond the page rect.
+    const x = Math.max(paddingX, Math.abs(bounds.minX + dx) * 2 ** -22, Math.abs(bounds.maxX + dx) * 2 ** -22);
+    const y = Math.max(paddingY, Math.abs(bounds.minY + dy) * 2 ** -22, Math.abs(bounds.maxY + dy) * 2 ** -22);
+    return Object.freeze({ ...node, bounds: Object.freeze({
+      minX: bounds.minX + dx - x, minY: bounds.minY + dy - y,
+      maxX: bounds.maxX + dx + x, maxY: bounds.maxY + dy + y
+    }) });
+  };
+  const coarseInstanceB = data.coarseInstanceB.slice();
+  const runs = data.runs.map(run => {
+    const { dx, dy } = translations[run.pageIndex];
+    const [a, b, c, d, e, f] = run.transform;
+    const transform: [number, number, number, number, number, number] = [a, b, c, d, e + dx, f + dy];
+    if (run.coarseIndex >= 0) {
+      const offset = run.coarseIndex * 4;
+      coarseInstanceB[offset] += dx;
+      coarseInstanceB[offset + 1] += dy;
+    }
+    return Object.freeze({ ...translateNode(run), transform: Object.freeze(transform) });
+  });
+  storePrebuiltTextLod(target, Object.freeze({
+    data: Object.freeze({ ...data, runs: Object.freeze(runs),
+      clusters: Object.freeze(data.clusters.map(translateNode)), pages: Object.freeze(data.pages.map(translateNode)),
+      coarseInstanceB }),
+    fallbackReason: null,
+    buildTimeMs: 0
+  }));
+  return true;
+}
+
+/**
  * Per-renderer mutable selection state. Build data is never mutated and may be
  * shared by native WebGL/WebGPU and Three WebGL/WebGPU simultaneously.
  */

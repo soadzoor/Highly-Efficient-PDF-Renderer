@@ -14,6 +14,9 @@ try {
   const {buildStrokeScene}=await import('../src/strokeSceneBuilder.ts');
   const {composeVectorScenesInGrid}=await import('../src/pdfVectorExtractor.ts');
   const {createThreePdfObject}=await import('../src/threePdfObject.ts');
+  const {ScenePageViews}=await import('../src/scenePageViews.ts');
+  const {ThreePageTransforms}=await import('../src/threePageTransforms.ts');
+  const {updateThreePageBatchFrame}=await import('../src/threePageBatchFrame.ts');
   const f=values=>Float32Array.from(values);
   const page=buildStrokeScene([{points:[[2,2],[8,8]],width:.25,color:'red'}]);
   page.pageRects=f([0,0,20,20]);page.pageBounds=page.bounds={minX:0,minY:0,maxX:20,maxY:20};
@@ -74,6 +77,88 @@ try {
     pdf.setSearchHighlights(pdf.searchText('page'),{currentIndex:0});frame();
     assert.equal(pdf.getPageBatchingStats().mode,'document','page overlays follow document drawing');
     pdf.setSearchHighlights(null);
+    {
+      // A Reader column has one plane and one orientation. Camera movement
+      // should not repeat a plane/frustum intersection for every sheet.
+      const table=pdf.pageBatch.pageTransforms,derive=pages.map(p=>p.deriveViewStateFromThreeCamera.bind(p));
+      const matrices=[],setPage=table.setPage.bind(table),initialCameraX=camera.position.x,initialCameraY=camera.position.y,initialZoom=camera.zoom;
+      let derivations=0,projections=0;
+      pages.forEach(p=>{
+        const original=p.deriveViewStateFromThreeCamera;
+        p.deriveViewStateFromThreeCamera=function(...args) {derivations++;return original.apply(this,args);};
+      });
+      table.setPage=function(index,dataToDocument,dataToClip,...args) {
+        projections++;
+        if (matrices[index]) {
+          assert.equal(dataToDocument,matrices[index][0],'page/document matrices persist across frames');
+          assert.equal(dataToClip,matrices[index][1],'page/clip matrices persist across frames');
+        } else matrices[index]=[dataToDocument,dataToClip];
+        return setPage(index,dataToDocument,dataToClip,...args);
+      };
+      const referenceTable=new ThreePageTransforms(new ScenePageViews(source));
+      const close=(actual,expected,message)=>assert(Math.abs(actual-expected)<=1e-6*Math.max(1,Math.abs(expected)),`${message}: ${actual} vs ${expected}`);
+      const assertGenericFrame=message=>{
+        const origin=new THREE.Matrix4().makeTranslation(pdf.sceneCenterX,pdf.sceneCenterY,0);
+        const worldToClip=new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
+        table.coarseBounds.forEach((bounds,i)=>Object.assign(referenceTable.coarseBounds[i],bounds));
+        const frames=pdf.pageViews.map(({object,view},i)=>({scene:view.scene,paintBounds:view.paintBounds,
+          dataToDocument:origin.clone().multiply(object.matrix).multiply(object.dataToLocalMatrix),
+          dataToClip:worldToClip.clone().multiply(object.matrixWorld).multiply(object.dataToLocalMatrix),
+          visible:object.visible && !object.isDisposed,opaque:object.rendererConfig.pageBackground[3]>=1,
+          cullingBounds:object.visible && !object.isDisposed?derive[i](camera,viewport)?.cullingBounds:undefined}));
+        const expected=updateThreePageBatchFrame(referenceTable,frames,viewport,backend==='webgpu'?0:-1);
+        assert.equal(expected.reason,null,`${message}: generic projection remains batchable`);
+        assert.equal(pdf.getPageBatchingStats().mode,'pages-batched',message);
+        assert.deepEqual(table.visibility,referenceTable.visibility,`${message}: page culling matches generic projection`);
+        for (const key of ['minX','minY','maxX','maxY']) close(pdf.pageBatch.pageBatchView.cullingBounds[key],expected.view.cullingBounds[key],`${message}: ${key}`);
+        close(table.minUnitsPerPixel,referenceTable.minUnitsPerPixel,`${message}: minimum pixel scale`);
+        close(table.maxUnitsPerPixel,referenceTable.maxUnitsPerPixel,`${message}: maximum pixel scale`);
+        table.projections.forEach((matrix,i)=>{
+          if (referenceTable.visibility[i]) matrix.elements.forEach((value,j)=>close(value,referenceTable.projections[i].elements[j],`${message}: page ${i} clip matrix ${j}`));
+        });
+      };
+      const readerFrame=message=>{
+        derivations=projections=0;frame();
+        assert(derivations<=1,`${message}: Reader shares viewport derivation across ${pages.length} pages, got ${derivations}`);
+        assertGenericFrame(message);
+      };
+      for(const [i,p] of pages.entries()) p.position.set(0,-i*24,0);
+      readerFrame('Reader column');
+      derivations=projections=0;frame();
+      assert.equal(derivations,0,'unchanged Reader frame reuses viewport derivation');
+      assert.equal(projections,0,'unchanged Reader frame skips page projection updates');
+      camera.position.x+=.75;readerFrame('Reader pan');
+      camera.position.y-=190;readerFrame('Reader scroll to previously offscreen pages');
+      camera.position.y=initialCameraY;readerFrame('Reader scroll back');
+      camera.zoom*=1.15;camera.updateProjectionMatrix();readerFrame('Reader zoom');
+      viewport.width+=32;readerFrame('Reader viewport resize');viewport.width-=32;
+      pages[2].position.x+=.5;readerFrame('direct page position edit');
+      pages[0].visible=false;readerFrame('direct page visibility edit');pages[0].visible=true;
+      pages[2].updateMatrix();pages[2].matrixAutoUpdate=false;pages[2].matrix.elements[13]-=1;
+      readerFrame('direct page matrix edit');
+      const fallbackBounds={...pages[1].sceneBounds};
+      pages[1].rotation.y=Math.PI/2;frame();
+      assert.deepEqual(pages[1].sceneBounds,fallbackBounds,'edge-on viewport fallback preserves page bounds');
+      pages[1].rotation.y=0;frame();
+      assert.deepEqual(pages[1].sceneBounds,fallbackBounds,'returning from viewport fallback to flat Reader preserves page bounds');
+      pages[1].rotation.y=.1;derivations=0;frame();
+      assert(derivations>0,'a tilted sheet retains the general viewport derivation');
+      assertGenericFrame('tilted page fallback');
+      pages[1].rotation.set(0,0,0);pages[1].scale.set(.85,.9,1);derivations=0;frame();
+      assert(derivations>0,'a scaled sheet retains the general viewport derivation');
+      assertGenericFrame('nonuniform page scale fallback');
+      pages[1].scale.x=-.85;derivations=0;frame();
+      assert(derivations>0,'a reflected sheet retains the general viewport derivation');
+      assertGenericFrame('reflected page fallback');
+      pages[1].matrix.makeShear(.1,.05,.1,0,0,0).setPosition(pages[1].position);pages[1].matrixAutoUpdate=false;
+      derivations=0;frame();
+      assert(derivations>0,'a sheared sheet retains the general viewport derivation');
+      assertGenericFrame('sheared page fallback');
+      referenceTable.dispose();
+      pages.forEach((p,i)=>{p.deriveViewStateFromThreeCamera=derive[i];p.matrixAutoUpdate=true;p.position.copy(loaded[i]);p.rotation.set(0,0,0);p.scale.set(1,1,1);});
+      table.setPage=setPage;camera.position.x=initialCameraX;camera.position.y=initialCameraY;camera.zoom=initialZoom;camera.updateProjectionMatrix();frame();
+      assert.equal(pdf.getPageBatchingStats().mode,'document','leaving Reader restores document drawing');
+    }
     for(const [i,p] of pages.entries()) {p.rotation.set(.06*(i%3),-.04*(i%4),.02*(i%2));p.scale.set(i%2?-0.85:0.85,.9,1);p.position.z=i*.4;}
     frame();
     assert.equal(pdf.getPageBatchingStats().mode,'pages-batched',JSON.stringify(pdf.getPageBatchingStats()));
@@ -174,14 +259,11 @@ try {
     let freed=0;table.matrices.addEventListener('dispose',()=>freed++);pdf.dispose();
     assert.equal(freed,1);assert.equal(disposals,1);
     assert.deepEqual(source,canonical);
-    console.log(`${backend}: independent transforms, 12 pages in four draws, shader generation, reuse, picking, visibility and overlap fallback passed.`);
+    console.log(`${backend}: Reader frame reuse, independent transforms, 12 pages in four draws, shader generation, picking, visibility and overlap fallback passed.`);
   }
 
-  const {ScenePageViews}=await import('../src/scenePageViews.ts');
-  const {ThreePageTransforms}=await import('../src/threePageTransforms.ts');
   const {ThreeMaterialRasterLayer}=await import('../src/threeMaterialRasterLayer.ts');
   const {ThreeMaterialGradientLayer}=await import('../src/threeMaterialGradientLayer.ts');
-  const {updateThreePageBatchFrame}=await import('../src/threePageBatchFrame.ts');
   for(const meshGradient of [false,true]) {
     const auxiliary=structuredClone(page);
     Object.assign(auxiliary,{

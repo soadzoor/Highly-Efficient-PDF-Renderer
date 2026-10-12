@@ -1,6 +1,7 @@
 import type { ThreeWebGpuBackend } from "./threeMaterialBackend";
 import { ThreePageTransforms } from "./threePageTransforms";
 import { updateThreePageBatchFrame } from "./threePageBatchFrame";
+import { ThreePageBatchFrameCache, type ThreePageBatchSource } from "./threePageBatchCache";
 import { PAGE_PRIMITIVE_KINDS, ScenePageViews, type ScenePageView } from "./scenePageViews";
 import { SharedPageRenderer } from "./sharedPageRenderer";
 import { createLoadYielder, yieldAfterPaint } from "./loadCancellation";
@@ -354,6 +355,12 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   private pageOverlapMode: HeprPageOverlapMode = "exact";
   private pageTransforms!: ThreePageTransforms | undefined;
   private pageBatchView: DerivedThreeCameraView | null = null;
+  private pageBatchFrameCache: ThreePageBatchFrameCache | null = null;
+  private pageBatchFrameSources: ThreePageBatchSource[] = [];
+  private pageBatchFrameSourceViews: typeof this.pageViews = null;
+  private pageBatchFrameResult: ReturnType<typeof updateThreePageBatchFrame> | null = null;
+  private readonly pageBatchDocumentOrigin = new THREE.Matrix4();
+  private readonly pageBatchDocumentToClip = new THREE.Matrix4();
   private pagePreparation: Promise<readonly HeprThreePdfObject[]> | null = null;
   private readonly pagePreparationAbort = new AbortController();
   private pendingLayerUpdate: Promise<void> | null = null;
@@ -598,17 +605,29 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
       }
     }
     const viewport = readThreeRendererViewportPixels(renderer);
-    const documentOrigin = new THREE.Matrix4().makeTranslation(this.sceneCenterX, this.sceneCenterY, 0);
-    const worldToClip = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
-    const frames = this.pageViews!.map(({ object, view }) => {
-      const derived = object.visible && !object.isDisposed ? object.deriveViewStateFromThreeCamera(camera,viewport) : null;
-      return { scene: view.scene, paintBounds: view.paintBounds, dataToDocument: documentOrigin.clone().multiply(object.matrix).multiply(object.dataToLocalMatrix),
-        dataToClip: worldToClip.clone().multiply(object.matrixWorld).multiply(object.dataToLocalMatrix),
-        visible: object.visible && !object.isDisposed, opaque: object.rendererConfig.pageBackground[3] >= 1,
-        cullingBounds: derived?.cullingBounds };
-    });
-    const frame = updateThreePageBatchFrame(table, frames, viewport, camera.coordinateSystem === THREE.WebGPUCoordinateSystem ? 0 : -1,
-      this.pageOverlapMode === "fast");
+    if (this.pageBatchFrameSourceViews !== this.pageViews) {
+      this.pageBatchFrameSourceViews = this.pageViews;
+      this.pageBatchFrameSources = this.pageViews!.map(page => ({
+        get view() { return page.view; },
+        object: {
+          get matrix() { return page.object.matrix; },
+          get dataToLocalMatrix() { return page.object.dataToLocalMatrix; },
+          get visible() { return page.object.visible; },
+          get isDisposed() { return page.object.isDisposed; },
+          get rendererConfig() { return page.object.rendererConfig; },
+          deriveViewStateFromThreeCamera: (nextCamera, nextViewport) => page.object.deriveViewStateFromThreeCamera(nextCamera, nextViewport)
+        }
+      }));
+    }
+    const documentOrigin = this.pageBatchDocumentOrigin.makeTranslation(this.sceneCenterX, this.sceneCenterY, 0);
+    const documentToClip = this.pageBatchDocumentToClip.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
+      .multiply(this.matrixWorld).multiply(this.dataToLocalMatrix);
+    this.pageBatchFrameCache ??= new ThreePageBatchFrameCache();
+    const prepared = this.pageBatchFrameCache.update(this.pageBatchFrameSources, table, documentOrigin, documentToClip,
+      camera, viewport, this.pageOverlapMode === "fast");
+    const frame = !prepared.changed && this.pageBatchFrameResult ? this.pageBatchFrameResult
+      : this.pageBatchFrameResult = updateThreePageBatchFrame(table, prepared.frames, viewport,
+        camera.coordinateSystem === THREE.WebGPUCoordinateSystem ? 0 : -1, this.pageOverlapMode === "fast");
     this.pageBatchReason = frame.reason;
     this.pageBatchFringesApproximated = frame.approximated;
     return frame.reason ? null : frame;
@@ -1299,6 +1318,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
       if (partition && this.pageViews) {
         this.pagePartition = partition;
         this.pageViews.forEach((page,index) => { page.view = partition!.extract(index); });
+        this.pageBatchFrameCache = null; this.pageBatchFrameResult = null;
         if (this.pageBatch && !table) {
           this.pageBatch.removeFromParent(); this.pageBatch.dispose(); this.pageBatch = null;
           this.pageBatchReason = "pdf-compositing";
@@ -2717,6 +2737,8 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     this.pageBatch?.removeFromParent(); this.pageBatch?.dispose(); this.pageBatch = null; this.pageBatchActive = false;
     this.pageTransforms?.dispose();
     this.pageViews = null; this.pagePartition = null; this.previewPagePartition = null; this.pagePreparation = null;
+    this.pageBatchFrameCache = null; this.pageBatchFrameResult = null;
+    this.pageBatchFrameSources = []; this.pageBatchFrameSourceViews = null;
     this.searchHighlightMatches = []; this.textSelectionHighlightRects = [];
     this.primitivePicker?.dispose();
     this.annotationIndex?.dispose(); this.annotationIndex = null;
