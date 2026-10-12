@@ -5,7 +5,7 @@ import type { ViewState } from "./webGlFloorplanRenderer";
 const CONFIG_METHODS = new Set([
   "setFrameListener", "setInteractionViewportProvider", "setRasterRenderingEnabled",
   "setRasterTextureResidency", "setFillRenderingEnabled", "setStrokeRenderingEnabled",
-  "setTextRenderingEnabled", "setVectorLodMode", "setTextLodMode", "setStrokeCurveEnabled",
+  "setTextRenderingEnabled", "setMixedVectorBatchingEnabled", "setVectorLodMode", "setTextLodMode", "setStrokeCurveEnabled",
   "setTextVectorOnly", "setPageBackgroundColor", "setVectorColorOverride",
   "setPrimitiveHighlights", "setSearchHighlights", "setTextSelectionHighlights",
   "setOptionalContentVisibility", "setPageRasterVisibility"
@@ -80,6 +80,8 @@ export function deferRendererInitialization(
     getPresentedFrameSerial: () => 0,
     getOptionalContentVisibility: () => config.get("setOptionalContentVisibility")?.[0] ?? null,
     getVectorColorOverride: () => config.get("setVectorColorOverride")?.map(value => clamp(Number(value), 0, 1)) ?? [0, 0, 0, 0],
+    getMixedVectorBatchingEnabled: () => config.has("setMixedVectorBatchingEnabled")
+      ? Boolean(config.get("setMixedVectorBatchingEnabled")![0]) : true,
     getRasterLayerUpdates: () => new Map(),
     resize: () => {},
     setViewState: (next: ViewState, _options?: ViewStateUpdateOptions) => {

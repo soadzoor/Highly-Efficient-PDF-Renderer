@@ -40,6 +40,10 @@ import { coalescePrimitiveColorTexels, NativePrimitiveColors, WebGpuPrimitiveGra
 import { WebGpuPrimitiveHighlights } from "./nativePrimitiveHighlights";
 import { multiplyBlendState, multiplyFragmentWgsl } from "./vectorMultiply";
 import { VectorOrderedBatches } from "./vectorOrderedBatches";
+import { MixedVectorBatches } from "./mixedVectorBatches";
+import { buildNativeWebGpuMixedVectorShader, MIXED_VECTOR_WGPU_VERTEX_TEXTURES,
+  MIXED_VECTOR_WGPU_FRAGMENT_TEXTURES, MIXED_VECTOR_WGPU_VARYING_VARIABLES,
+  MIXED_VECTOR_WGPU_VARYING_COMPONENTS } from "./nativeWebGpuMixedVectorShaders";
 import { OrderedTextLodSelection } from "./orderedTextLod";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
 import { RASTER_CLIP_WGSL } from "./rasterClipShaders";
@@ -1374,6 +1378,21 @@ export class WebGpuFloorplanRenderer {
   private runLookup: CanonicalRunLookup | null = null;
   private orderedInstanceBuffer: any = null;
   private orderedInstanceCapacityBytes = 0;
+  private mixedVectorBatchingEnabled = true;
+  private mixedVectorBatchingUnavailable = false;
+  private mixedVectorPipelinePending = false;
+  private mixedVectorPipeline: any = null;
+  private mixedVectorBindGroupLayout: any = null;
+  private mixedVectorBindGroup: any = null;
+  private mixedVectorClipBindGroup: any = null;
+  private mixedVectorTextures: any[] = [];
+  private mixedVectorBatches: MixedVectorBatches | null = null;
+  private mixedVectorInstanceBuffer: any = null;
+  private mixedVectorInstanceCapacityBytes = 0;
+  private mixedVectorUploadedRevision = -1;
+  private mixedVectorResourceValidationPending = false;
+  private mixedVectorResourceEpoch = 0;
+  private mixedVectorStorageLimitReported = false;
   private scene: VectorScene | null = null;
   private readonly rasterLayerUpdates = new Map<number, RasterLayer>();
   private paintCompositor: WebGpuPaintCompositor | null = null;
@@ -2213,6 +2232,15 @@ export class WebGpuFloorplanRenderer {
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
+
+  setMixedVectorBatchingEnabled(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.mixedVectorBatchingEnabled === nextEnabled || this.isDisposed) return;
+    this.mixedVectorBatchingEnabled = nextEnabled;
+    this.requestFrame();
+  }
+
+  getMixedVectorBatchingEnabled(): boolean { return this.mixedVectorBatchingEnabled; }
 
   setStrokeRenderingEnabled(enabled: boolean): void {
     const nextEnabled = Boolean(enabled);
@@ -3180,6 +3208,8 @@ export class WebGpuFloorplanRenderer {
 
   dispose(): void {
     this.paintCompositor?.dispose(); this.paintCompositor = null;
+    this.destroyMixedVectorInstances();
+    this.mixedVectorPipeline = null;
     this.orderedInstanceBuffer?.destroy();
     this.orderedInstanceBuffer = null;
     this.orderedBatches = null;
@@ -3974,6 +4004,164 @@ export class WebGpuFloorplanRenderer {
     pass.setBindGroup(1, this.vectorClipBindGroups[this.vectorClipIndex + 2]);
   }
 
+  /** Compile only when a visible ordered range can use both vector kinds. */
+  private prepareMixedVectorPipeline(): void {
+    if (this.mixedVectorPipeline || this.mixedVectorPipelinePending || this.mixedVectorBatchingUnavailable) return;
+    const device = this.gpuDevice, limits = device.limits;
+    if ((limits?.maxSampledTexturesPerShaderStage ?? 16) < Math.max(MIXED_VECTOR_WGPU_VERTEX_TEXTURES, MIXED_VECTOR_WGPU_FRAGMENT_TEXTURES) ||
+        (limits?.maxInterStageShaderVariables ?? 16) < MIXED_VECTOR_WGPU_VARYING_VARIABLES ||
+        (limits?.maxInterStageShaderComponents ?? 60) < MIXED_VECTOR_WGPU_VARYING_COMPONENTS ||
+        typeof device.createRenderPipelineAsync !== "function") {
+      this.mixedVectorBatchingUnavailable = true;
+      console.warn("[HEPR] Mixed WebGPU vector batching is unavailable on this device; using separate vector draws.");
+      return;
+    }
+    this.mixedVectorPipelinePending = true;
+    let pipelinePromise: Promise<any>, validationPromise: Promise<any>;
+    const scoped = typeof device.pushErrorScope === "function";
+    if (scoped) device.pushErrorScope("validation");
+    try {
+      const stage = (globalThis as any).GPUShaderStage;
+      this.mixedVectorBindGroupLayout = device.createBindGroupLayout({ entries: [
+        { binding: 0, visibility: stage.VERTEX | stage.FRAGMENT,
+          buffer: { type: "uniform", minBindingSize: CAMERA_UNIFORM_BUFFER_BYTES } },
+        ...Array.from({ length: 9 }, (_, index) => ({ binding: index + 1,
+          visibility: index === 7 ? stage.VERTEX | stage.FRAGMENT : index === 8 ? stage.FRAGMENT : stage.VERTEX,
+          texture: { sampleType: "unfilterable-float" } }))
+      ] });
+      const layout = device.createPipelineLayout({ bindGroupLayouts: [this.mixedVectorBindGroupLayout, this.vectorClipBindGroupLayout] });
+      const module = device.createShaderModule({ code: buildNativeWebGpuMixedVectorShader(STROKE_SHADER_SOURCE, FILL_SHADER_SOURCE) });
+      pipelinePromise = device.createRenderPipelineAsync({ layout,
+        vertex: { module, entryPoint: "vsMain" },
+        fragment: { module, entryPoint: "fsMain", targets: [{ format: this.presentationFormat, blend: {
+          color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+          alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" }
+        } }] }, primitive: { topology: "triangle-strip" }
+      });
+    } catch (error) {
+      pipelinePromise = Promise.reject(error);
+    } finally {
+      validationPromise = scoped ? device.popErrorScope() : Promise.resolve(null);
+    }
+    void Promise.all([pipelinePromise, validationPromise]).then(([pipeline, validation]) => {
+      if (validation) throw validation;
+      if (!this.isDisposed) { this.mixedVectorPipeline = pipeline; this.requestFrame(); }
+    }).catch(error => {
+      if (!this.isDisposed) {
+        this.mixedVectorBatchingUnavailable = true;
+        console.warn("[HEPR] Mixed WebGPU vector batching could not initialize; using separate vector draws.", error);
+      }
+    }).finally(() => { this.mixedVectorPipelinePending = false; });
+  }
+
+  private prepareMixedVectorBatches(plan: VectorOrderedBatches): MixedVectorBatches | null {
+    let batches: MixedVectorBatches;
+    try {
+      batches = this.mixedVectorBatches ??= new MixedVectorBatches();
+      batches.update(plan);
+    } catch (error) {
+      this.destroyMixedVectorInstances();
+      this.mixedVectorBatchingUnavailable = true;
+      console.warn("[HEPR] Mixed WebGPU vector batching could not prepare its instance store; using separate vector draws.", error);
+      return null;
+    }
+    if (!batches.instanceCount) return null;
+    this.prepareMixedVectorPipeline();
+    if (!this.mixedVectorPipeline || this.mixedVectorResourceValidationPending) return null;
+    const bytes = batches.instanceCount * 12;
+    if (bytes > (this.gpuDevice.limits?.maxStorageBufferBindingSize ?? Infinity) ||
+        bytes > (this.gpuDevice.limits?.maxBufferSize ?? Infinity)) {
+      if (!this.mixedVectorStorageLimitReported) {
+        this.mixedVectorStorageLimitReported = true;
+        console.warn("[HEPR] Mixed WebGPU vector instances exceed this device's buffer limits; using separate vector draws.");
+      }
+      return null;
+    }
+    const textures = [this.segmentTextureA, this.segmentTextureB, this.segmentTextureC, this.segmentTextureD,
+      this.fillPathMetaTextureA, this.fillPathMetaTextureB, this.fillPathMetaTextureC,
+      this.fillSegmentTextureA, this.fillSegmentTextureB, this.vectorClipTexture];
+    const texturesChanged = textures.some((texture, index) => texture !== this.mixedVectorTextures[index]);
+    const validateResources = typeof this.gpuDevice.pushErrorScope === "function" &&
+      (bytes > this.mixedVectorInstanceCapacityBytes || texturesChanged || !this.mixedVectorBindGroup || !this.mixedVectorClipBindGroup);
+    const epoch = this.mixedVectorResourceEpoch;
+    if (validateResources) {
+      this.mixedVectorResourceValidationPending = true;
+      this.gpuDevice.pushErrorScope("out-of-memory");
+      this.gpuDevice.pushErrorScope("validation");
+    }
+    try {
+      if (bytes > this.mixedVectorInstanceCapacityBytes) {
+        const usage = (globalThis as any).GPUBufferUsage;
+        const buffer = this.gpuDevice.createBuffer({ size: bytes, usage: usage.STORAGE | usage.COPY_DST });
+        this.mixedVectorInstanceBuffer?.destroy();
+        this.mixedVectorInstanceBuffer = buffer;
+        this.mixedVectorInstanceCapacityBytes = bytes;
+        this.mixedVectorClipBindGroup = null;
+        this.mixedVectorUploadedRevision = -1;
+      }
+      if (this.mixedVectorUploadedRevision !== batches.revision) {
+        this.gpuDevice.queue.writeBuffer(this.mixedVectorInstanceBuffer, 0,
+          batches.uintInstances.subarray(0, batches.instanceCount * 3));
+        this.mixedVectorUploadedRevision = batches.revision;
+        this.performanceProfiler?.add("mixedVectorInstanceUploadBytes", bytes);
+      }
+      if (texturesChanged) {
+        this.mixedVectorBindGroup = null;
+        this.mixedVectorClipBindGroup = null;
+        this.mixedVectorTextures = textures;
+      }
+      this.mixedVectorBindGroup ??= this.gpuDevice.createBindGroup({ layout: this.mixedVectorBindGroupLayout, entries: [
+        { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+        ...textures.slice(0, 9).map((texture, index) => ({ binding: index + 1, resource: texture.createView() }))
+      ] });
+      this.mixedVectorClipBindGroup ??= this.gpuDevice.createBindGroup({ layout: this.vectorClipBindGroupLayout, entries: [
+        { binding: 0, resource: this.vectorClipTexture.createView() },
+        { binding: 1, resource: { buffer: this.vectorClipBuffers[0] } },
+        { binding: 2, resource: { buffer: this.mixedVectorInstanceBuffer } }
+      ] });
+      return validateResources ? null : batches;
+    } catch (error) {
+      this.destroyMixedVectorInstances();
+      this.mixedVectorBatchingUnavailable = true;
+      console.warn("[HEPR] Mixed WebGPU vector batching could not allocate its instance store; using separate vector draws.", error);
+      return null;
+    } finally {
+      if (validateResources) {
+        const validation = this.gpuDevice.popErrorScope(), memory = this.gpuDevice.popErrorScope();
+        void Promise.all([validation, memory]).then(errors => {
+          if (this.isDisposed || epoch !== this.mixedVectorResourceEpoch) return;
+          const error = errors.find(Boolean);
+          if (error) {
+            this.destroyMixedVectorInstances();
+            this.mixedVectorBatchingUnavailable = true;
+            console.warn("[HEPR] Mixed WebGPU vector resources failed validation; using separate vector draws.", error);
+          } else this.mixedVectorResourceValidationPending = false;
+          this.requestFrame();
+        }).catch(error => {
+          if (this.isDisposed || epoch !== this.mixedVectorResourceEpoch) return;
+          this.destroyMixedVectorInstances();
+          this.mixedVectorBatchingUnavailable = true;
+          console.warn("[HEPR] Mixed WebGPU vector resources failed validation; using separate vector draws.", error);
+          this.requestFrame();
+        });
+      }
+    }
+  }
+
+  private destroyMixedVectorInstances(): void {
+    this.mixedVectorResourceEpoch++;
+    this.mixedVectorResourceValidationPending = false;
+    this.mixedVectorInstanceBuffer?.destroy();
+    this.mixedVectorInstanceBuffer = null;
+    this.mixedVectorInstanceCapacityBytes = 0;
+    this.mixedVectorUploadedRevision = -1;
+    this.mixedVectorBatches = null;
+    this.mixedVectorBindGroup = null;
+    this.mixedVectorClipBindGroup = null;
+    this.mixedVectorTextures = [];
+    this.mixedVectorStorageLimitReported = false;
+  }
+
   private drawSourceOrderedContentIntoPass(pass: any): number {
     this.vectorClipIndex = -1;
     let strokes = 0;
@@ -4080,7 +4268,19 @@ export class WebGpuFloorplanRenderer {
       } finally { pass = parentPass; this.vectorClipIndex = -1; }
       return strokes;
     }
-    for (const run of plan?.batches ?? runs) {
+    const mixed = plan && this.mixedVectorBatchingEnabled && this.fillRenderingEnabled && this.strokeRenderingEnabled &&
+      !this.mixedVectorBatchingUnavailable ? this.prepareMixedVectorBatches(plan) : null;
+    for (const run of mixed?.batches ?? plan?.batches ?? runs) {
+      if (run.kind === "mixed-vector") {
+        pass.setPipeline(this.mixedVectorPipeline);
+        pass.setBindGroup(0, this.mixedVectorBindGroup);
+        pass.setBindGroup(1, this.mixedVectorClipBindGroup);
+        pass.draw(4, run.count, 0, run.first);
+        this.frameDrawCalls++;
+        strokes += run.strokeCount;
+        this.performanceProfiler?.add("mixedVectorBatches");
+        continue;
+      }
       if (!run.blendMode) { draw(run); continue; }
       for (let first = run.first; first < run.first + run.count; first++) {
         const primitive = { ...run, first, count: 1 };
@@ -4515,6 +4715,7 @@ export class WebGpuFloorplanRenderer {
   }
 
   private prepareVectorLod(scene: VectorScene): boolean {
+    this.destroyMixedVectorInstances();
     if (shouldUseVectorStrokeLod(this.vectorLodMode, "webgpu", scene.segmentCount)) {
       this.vectorLodRuntime = takePrebuiltVectorStrokeLodRuntime(scene) ?? new VectorStrokeLodRuntime(scene);
       this.vectorLodRuntime.setForceExact(this.primitiveColors?.has("stroke") ?? false);

@@ -507,6 +507,64 @@ starting again clears the previous capture. The report includes the starting vie
 drawing label, settings, per-frame averages/percentiles for CPU phases, batch and
 upload counters, and sampled GPU command-span timing when supported.
 
+Ordinary captures omit the per-instance fill, image and gradient quad-area
+estimates. Enable them separately when investigating geometry or clipping:
+
+```js
+heprPerf.start({ maxFrames: 1200, geometryDiagnostics: true });
+```
+
+These native WebGL diagnostics scan submitted instances and add CPU work to
+captured frames, including the `drawSubmission` section. Compare ordinary
+captures when assessing frame rate or submission cost. The report's
+`geometryDiagnostics` field records whether they were requested; omitted
+estimate counters do not mean that their area was zero. `gpuOperations` does
+not enable geometry diagnostics.
+
+Native WebGL, native WebGPU and the Three.js material paths can submit
+consecutive ordinary fills and strokes in a shared vector batch while retaining
+their paint order. Both viewers expose the `heprPerf.mixedVectors` debug switch
+to compare this path with separate fill and stroke draws:
+
+```js
+heprPerf.mixedVectors(false);
+heprPerf.start({ maxFrames: 1200 });
+// Pan at a fixed zoom, then stop and save the baseline.
+heprPerf.stop();
+copy(heprPerf.json());
+
+heprPerf.mixedVectors(true);
+heprPerf.start({ maxFrames: 1200 });
+// Repeat the same pan, then stop and save the batched capture.
+heprPerf.stop();
+copy(heprPerf.json());
+```
+
+Warm up each path before recording and use the same document, viewport, DPR,
+zoom and visible layers. Leave `geometryDiagnostics` disabled in both captures.
+The report context records the requested `mixedVectorBatching` setting.
+Composited draws keep their existing paths. In Three.js, the switch applies to
+the loaded PDF object, including its page views and native texture fallback;
+library hosts can call `pdfObject.setMixedVectorBatchingEnabled(enabled)` and
+read `pdfObject.getMixedVectorBatchingEnabled()` directly.
+
+Native `mixedVectorBatches` and Three.js `three.mixedVectorBatches` count combined
+submissions. Three.js `three.mixedVectorInstances` counts their primitives.
+Native `mixedVectorInstanceUploadBytes` and Three.js
+`three.mixedVectorInstanceUploadBytes` record changed instance data. Unchanged
+plans reuse the mixed instance buffer. The Three.js layer borrows the existing
+fill and stroke textures, including the split stroke-LOD store, and retains
+per-instance page transforms and clips. Other paint kinds and blend modes end
+a mixed batch. `three.mixedVectors` times collection, ordering and preparation
+of the shared Three.js batches.
+
+Optional shader preparation keeps the original draws available. WebGPU may
+continue using them until asynchronous pipeline preparation finishes, so warm
+up before recording and check the mixed-batch counters to confirm activation.
+Unsupported contexts or shader failures use separate draws and emit a
+diagnostic. WebGPU queue submission batching is separate from this optimization:
+combining command buffers alone still retains every draw inside them.
+
 `transitionSections` measures work between frames, including `pageSwap.decode`,
 `pageSwap.rasterPreparation`, `pageSwap.total`, `rasterRefinement.prepare` and
 `rasterUpload.submit`. `rasterUpload.cacheHit` identifies texture reuse, and
@@ -548,6 +606,9 @@ Native WebGL fill and gradient-fill operations also include `source`: up to 32
 canonical path IDs (`ids`), their clip roots (`clips`, with -1 meaning no clip),
 and `truncated` when more instances were submitted. For indirect fill draws,
 `first` is an instance-buffer offset; use `ids` to locate the source paths.
+Mixed vector operations include `source.kind: "mixed-vector"` and parallel
+`kinds` entries identifying each fill or stroke ID. Fill IDs remain canonical;
+stroke IDs address the combined canonical/LOD stroke store.
 Position summaries describe the first sampled draw at that position; later
 frames can select different paths as visibility and scheduling change.
 
@@ -567,7 +628,7 @@ motion. Images fall back to individual draws if batch resources are unavailable.
 
 Native WebGL also bounds ordinary fill quads by each instance's clip-chain
 bounds in the orthographic view. The original path coverage, cell-index origin,
-clip tests, masks and paint order remain intact. During a capture,
+clip tests, masks and paint order remain intact. With `geometryDiagnostics: true`,
 `fillUnclippedQuadPixelsEstimate` counts their original expanded quad areas and
 `fillQuadPixelsEstimate` counts the bounded areas, both intersected with the
 viewport and rounded outward. Overlapping instances count again; these are
@@ -595,14 +656,14 @@ including those whose path bounds already fit inside it. These diagnostics
 distinguish disabled bounds from clips that remove no area. Allocation failure
 warns and retains the original quads and exact clip tests. Projected views
 retain their original expansion and omit the area estimates. The area
-calculation runs only while a capture is active.
+calculation runs only while a capture with geometry diagnostics is active.
 
 Native WebGL original-texture image batches also bound their quads by each
 image's clip chain in the orthographic view. Inverse transforms are cached per
 image and clip; the vertex shader expands them for the live antialiasing
 footprint. Mirrored, rotated and sheared images retain their UV interpolation,
 mip filtering, masks and paint order. Projected views and unstable inverses
-retain the original image quad. During a capture,
+retain the original image quad. With `geometryDiagnostics: true`,
 `rasterTextureUnclippedQuadPixelsEstimate` and `rasterTextureQuadPixelsEstimate`
 estimate the original and bounded image areas. They count outward-rounded
 world bounding boxes intersected with the viewport, including overlaps, so
@@ -610,7 +671,7 @@ rotated image estimates can exceed actual quad area. They cover texture
 batches; standalone images and atlases are excluded.
 `rasterTextureClipBoundsTestedInstances`, `rasterTextureClipBoundedInstances`,
 and `rasterTextureClipCulledInstances` report tested, smaller and empty image
-quads. These diagnostics omit projected views and add no area scans outside
+quads. These diagnostics omit projected views and add no area scans to ordinary
 captures. Compare GPU spans without operation timing as well as a separate
 capture with operation timing, since individual timer queries add overhead.
 
@@ -930,7 +991,7 @@ pixel's time is the latency of its reads, and a draw takes as long as its
 slowest pixels. A fill cell's line pieces take one texel each, read four at a
 time; only the few cells holding a curve read a second texel per piece.
 
-For analytic fills in the main orthographic view,
+With `geometryDiagnostics: true`, for analytic fills in the main orthographic view,
 `gradientAnalyticFillBBoxPixelsEstimate` sums viewport-clipped bounding-quad
 areas in framebuffer pixels, rounded outward. It includes overlap and ignores
 geometric clips, scissor rectangles, transparent pixels, and early exits;
@@ -942,7 +1003,8 @@ instruction count, and should not fall merely because clip indexing is enabled.
 Compare sampled GPU time and corresponding `frameRecords` before and after the
 change at the same zoom, viewport, DPR, and visible layers. Diagnostics
 do not scan fill segments or clip edges in the render loop and remain off
-unless a capture is active.
+unless a capture with geometry diagnostics is active. Draw, segment and
+clip-header counters remain available in ordinary captures.
 
 Both native renderers clamp each analytic gradient fill's quad to its clip
 chain's bounds, widened by the one-pixel coverage margin; nothing outside them

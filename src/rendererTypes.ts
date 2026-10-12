@@ -69,6 +69,10 @@ export interface RendererApi {
   /** Enable or disable native stroke rendering. */
   setStrokeRenderingEnabled?(enabled: boolean): void;
 
+  /** Combine compatible ordered fills and strokes in one draw. */
+  setMixedVectorBatchingEnabled?(enabled: boolean): void;
+  getMixedVectorBatchingEnabled?(): boolean;
+
   /** Enable or disable native text rendering. */
   setTextRenderingEnabled?(enabled: boolean): void;
 

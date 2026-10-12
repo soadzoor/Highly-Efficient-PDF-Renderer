@@ -13,10 +13,13 @@ for (let index = 0; index < 10; index++) {
 assert.equal(clockCalls, 0, "disabled profiling never reads a clock");
 assert.deepEqual(unavailable.calls, [], "disabled profiling never probes GL or allocates queries");
 assert.equal(profiler.enabled, false);
+assert.equal(profiler.geometryDiagnostics, false);
+assert.equal(profiler.getReport().geometryDiagnostics, false);
 assert.equal(profiler.getReport().gpu.status, "disabled");
 assert.equal(clockCalls, 0);
 
 profiler.start({ maxFrames: 3, gpu: false });
+assert.equal(profiler.geometryDiagnostics, false, "ordinary captures do not request geometry scans");
 assert.deepEqual(unavailable.calls, [], "CPU-only profiling leaves GL untouched");
 profiler.beginFrame(100);
 profiler.beginSection("draw"); time = 2; profiler.endSection("draw");
@@ -64,6 +67,7 @@ assert.throws(() => profiler.start({ maxFrames: 0 }), /maxFrames/);
 assert.throws(() => profiler.start({ maxFrames: 10001 }), /maxFrames/);
 assert.throws(() => profiler.start({ maxFrames: 2.5 }), /maxFrames/);
 assert.throws(() => profiler.start({ gpu: "true" }), /gpu/);
+assert.throws(() => profiler.start({ geometryDiagnostics: "true" }), /geometryDiagnostics/);
 assert.throws(() => profiler.start({ maxFrameRecords: -1 }), /maxFrameRecords/);
 assert.throws(() => profiler.start({ maxFrameRecords: 1001 }), /maxFrameRecords/);
 assert.throws(() => profiler.start({ maxFrameRecords: 3.5 }), /maxFrameRecords/);
@@ -74,6 +78,22 @@ assert.equal(profiler.getReport().frames, 0, "stopping during a frame does not r
 profiler.reset();
 assert.equal(profiler.getReport().elapsedMs, 0);
 assert.equal(profiler.getReport().gpu.status, "disabled");
+profiler.start({ gpu: false, maxFrames: 1, geometryDiagnostics: true });
+assert.equal(profiler.geometryDiagnostics, true, "geometry diagnostics can be enabled without GPU timing");
+assert.throws(() => profiler.start({ geometryDiagnostics: 1 }), /geometryDiagnostics/);
+assert.equal(profiler.geometryDiagnostics, true, "invalid options preserve the active diagnostic setting");
+profiler.beginFrame(); profiler.endFrame();
+assert.equal(profiler.geometryDiagnostics, false, "automatic stop disables geometry scans");
+assert.equal(profiler.getReport().geometryDiagnostics, true, "stopped reports retain their diagnostic setting");
+profiler.start({ gpu: false });
+assert.equal(profiler.geometryDiagnostics, false, "new captures default to no geometry diagnostics");
+assert.equal(profiler.getReport().geometryDiagnostics, false);
+profiler.start({ gpu: false, geometryDiagnostics: true });
+profiler.stop();
+assert.equal(profiler.geometryDiagnostics, false, "manual stop disables geometry scans");
+assert.equal(profiler.getReport().geometryDiagnostics, true);
+profiler.reset();
+assert.equal(profiler.getReport().geometryDiagnostics, false, "reset clears the capture's diagnostic setting");
 profiler.start({ gpu: false });
 profiler.beginFrame();
 for (let index = 0; index < 100; index++) { profiler.add(`counter-${index}`); profiler.beginSection(`section-${index}`); }
@@ -181,13 +201,13 @@ assert(occupied.current, "the host query remains active");
 // Source descriptions run only for individually timed draws and reports keep
 // their source IDs detached from both the caller and subsequent report readers.
 {
-  const operations = operationGl(), fill = {}, source = { kind: "fill", first: 3, indirect: true,
-    ids: [12, 7], clips: [0, -1], truncated: false };
+  const operations = operationGl(), fill = {}, source = { kind: "mixed-vector", first: 3, indirect: true,
+    ids: [12, 7], clips: [0, -1], kinds: ["fill", "stroke"], truncated: false };
   let descriptions = 0;
   const profiler = new RenderPerformanceProfiler({ gl: operations.gl, now,
     describeDraw(program, instances) {
       descriptions++; assert.equal(program, fill); assert.equal(instances, 2);
-      return { ...source, ids: [...source.ids], clips: [...source.clips] };
+      return { ...source, ids: [...source.ids], clips: [...source.clips], kinds: [...source.kinds] };
     } });
   profiler.start({ maxFrames: 4, gpuOperations: true });
   for (let frame = 0; frame < 4; frame++) {
@@ -202,10 +222,13 @@ assert(occupied.current, "the host query remains active");
   assert.equal(report.byPosition[1].source, undefined, "a clear cannot inherit a paint's source identifiers");
   report.byPosition[0].source.ids[0] = 999;
   report.typical[0].source.clips[0] = 999;
+  report.byPosition[0].source.kinds[0] = "stroke";
   source.ids[0] = 888;
+  source.kinds[0] = "stroke";
   const fresh = profiler.getReport().gpu.operations;
   assert.deepEqual(fresh.byPosition[0].source.ids, [12, 7]);
   assert.deepEqual(fresh.typical[0].source.clips, [0, -1]);
+  assert.deepEqual(fresh.byPosition[0].source.kinds, ["fill", "stroke"]);
 }
 
 // Operation timing: every draw, clear and blit of one frame in eight gets its
@@ -222,6 +245,7 @@ assert(occupied.current, "the host query remains active");
   assert(!Object.hasOwn(operations.gl, "drawArrays"), "operation timing is opt-in");
   described.stop();
   described.start({ maxFrames: 20, gpuOperations: true });
+  assert.equal(described.geometryDiagnostics, false, "operation timing does not implicitly enable geometry scans");
   assert(Object.hasOwn(operations.gl, "drawArrays"));
   const gl = operations.gl;
   for (let frame = 0; frame < 20; frame++) {

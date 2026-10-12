@@ -18,8 +18,11 @@ let creations = 0, unusedReleases = 0;
 class NativeRenderer {
   view = { cameraCenterX: 0, cameraCenterY: 0, zoom: 1 };
   stats = null;
+  mixedVectorBatching = true;
   setExternalFrameDriver(value) { calls.push(["external", value]); }
   setStrokeCurveEnabled(value) { calls.push(["curve", value]); }
+  setMixedVectorBatchingEnabled(value) { this.mixedVectorBatching = Boolean(value); calls.push(["mixed", value]); }
+  getMixedVectorBatchingEnabled() { return this.mixedVectorBatching; }
   setVectorColorOverride(...rgba) { calls.push(["color", ...rgba]); }
   setInteractionViewportProvider(value) { calls.push(["viewport", value]); }
   setFrameListener(value) { calls.push(["listener", value]); }
@@ -52,6 +55,10 @@ try {
   renderer.setExternalFrameDriver(true);
   renderer.setStrokeCurveEnabled(true);
   renderer.setStrokeCurveEnabled(false);
+  assert.equal(renderer.getMixedVectorBatchingEnabled(), true);
+  renderer.setMixedVectorBatchingEnabled(true);
+  renderer.setMixedVectorBatchingEnabled(false);
+  assert.equal(renderer.getMixedVectorBatchingEnabled(), false);
   renderer.setVectorColorOverride(-1, 0.3, 2, 0.5);
   renderer.fitToBounds({ minX: 0, minY: 0, maxX: 400, maxY: 300 }, 0);
   renderer.setViewState(initialView, { scheduleFrame: false });
@@ -73,7 +80,11 @@ try {
   assert.equal(creations, 1);
   assert.deepEqual(calls[0], ["external", true], "configuration replay must not schedule unseen frames");
   assert.deepEqual(calls.filter(([name]) => name === "curve"), [["curve", false]], "only current config is replayed");
+  assert.deepEqual(calls.filter(([name]) => name === "mixed"), [["mixed", false]], "the comparison switch stays dormant until fallback and replays its current value");
+  assert.equal(renderer.getMixedVectorBatchingEnabled(), false);
   assert.deepEqual(calls.slice(-2), [["scene", scene], ["render", 123]]);
+  renderer.setMixedVectorBatchingEnabled(true);
+  assert.equal(renderer.getMixedVectorBatchingEnabled(), true, "initialized queries use the actual backend setting");
   assert.deepEqual(native.getViewState(), initialView);
   assert.equal(native.getPresentedFrameSerial(), 12, "initialized queries use actual backend state");
   render(124);
@@ -93,6 +104,8 @@ try {
   const shared = new SharedPageRenderer(deferRendererSceneUpload(sharedNative, scene), canvas);
   const page = shared.createView(scene, canvas);
   page.setStrokeCurveEnabled(false); page.setViewState(initialView);
+  page.setMixedVectorBatchingEnabled(false);
+  assert.equal(page.getMixedVectorBatchingEnabled(), false);
   page.setFrameListener(null); page.resize();
   assert.equal(creations, 1, "independent page capability probes keep the shared fallback dormant");
   assert.deepEqual(page.getViewState(), initialView);

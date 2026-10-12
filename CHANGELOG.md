@@ -6,6 +6,21 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Changed
+
+- Batch consecutive fills and strokes in one ordered vector draw across native
+  WebGL/WebGPU and Three.js WebGL/WebGPU, reducing submissions for densely
+  interleaved technical drawings while preserving
+  analytic coverage, clipping and stroke LOD. Reuse unchanged instance buffers,
+  retain separate draws for composited or incompatible paints, and fall back when
+  the combined shader is unavailable. Three.js borrows existing geometry textures
+  and retains page transforms and split stroke-LOD stores. Add a console switch
+  in both viewers for same-view comparisons without waking dormant native fallbacks.
+- Make native WebGL geometry-area diagnostics separately opt-in with
+  `geometryDiagnostics: true`, so ordinary performance captures avoid scanning
+  every submitted fill and image instance. Identify mixed vector draws and their
+  source kinds in GPU operation reports.
+
 ## [0.1.61] - 2026-10-12
 
 ### Fixed

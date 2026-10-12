@@ -11,6 +11,11 @@ export interface RenderPerformanceOptions {
    * eight with its own GPU query; requires `gpu`. Those frames run slower.
    */
   gpuOperations?: boolean;
+  /**
+   * Defaults to false. Collects native WebGL fill, image and gradient quad-area
+   * estimates. Scanning submitted instances adds CPU work to captured frames.
+   */
+  geometryDiagnostics?: boolean;
 }
 
 /**
@@ -114,6 +119,8 @@ export interface RenderPerformanceReport {
   active: boolean;
   frames: number;
   maxFrames: number;
+  /** Whether this capture requested the additional geometry estimates. */
+  geometryDiagnostics: boolean;
   elapsedMs: number;
   frameIntervalMs: RenderPerformanceSummary;
   frameCpuMs: RenderPerformanceSummary;
@@ -176,7 +183,8 @@ const NOTES = [
   "Frame context frameGapMs preserves gaps omitted from interval summaries. Events retain up to eight longest instrumented calls per frame.",
   "Frame records are a bounded subset of slow CPU/GPU, high-batch and timeline frames; their selection is not a representative performance distribution.",
   "GPU operation timings put each draw, clear and blit between its own timer queries, so the GPU cannot overlap it with neighbours; their sum can exceed an untimed span. A sum far below the frame span means the GPU spent that time waiting for commands.",
-  "Source identifiers at an operation position describe its first sampled draw; visibility and scheduling can change them on later frames."
+  "Source identifiers at an operation position describe its first sampled draw; visibility and scheduling can change them on later frames.",
+  "Geometry area estimates are omitted unless geometryDiagnostics is enabled; their per-instance scans add CPU work to captured frames."
 ] as const;
 
 export class RenderPerformanceProfiler {
@@ -188,6 +196,7 @@ export class RenderPerformanceProfiler {
   private disposed = false;
   private maxFrames = 600;
   private maxFrameRecords = 120;
+  private captureGeometryDiagnostics = false;
   private startedAt = 0;
   private endedAt = 0;
   private frameStart: number | null = null;
@@ -240,6 +249,7 @@ export class RenderPerformanceProfiler {
   }
 
   get enabled(): boolean { return this.active; }
+  get geometryDiagnostics(): boolean { return this.active && this.captureGeometryDiagnostics; }
 
   start(options: RenderPerformanceOptions = {}): void {
     if (this.disposed) throw new Error("Render performance profiler is disposed.");
@@ -255,10 +265,14 @@ export class RenderPerformanceProfiler {
     if (options.gpuOperations !== undefined && typeof options.gpuOperations !== "boolean") {
       throw new TypeError("gpuOperations must be a boolean.");
     }
+    if (options.geometryDiagnostics !== undefined && typeof options.geometryDiagnostics !== "boolean") {
+      throw new TypeError("geometryDiagnostics must be a boolean.");
+    }
     if (options.gpuOperations && options.gpu === false) throw new TypeError("gpuOperations requires gpu timing.");
     this.reset();
     this.maxFrames = maxFrames;
     this.maxFrameRecords = maxFrameRecords;
+    this.captureGeometryDiagnostics = options.geometryDiagnostics ?? false;
     this.startedAt = this.now();
     this.endedAt = this.startedAt;
     this.active = true;
@@ -423,6 +437,7 @@ export class RenderPerformanceProfiler {
     this.previousFrame = null;
     this.frameInterval = null;
     this.frameContext = null;
+    this.captureGeometryDiagnostics = false;
     this.ignoredFrameGaps = this.discardedMetricNames = this.droppedGpuSamples = 0;
     this.frameIntervals.length = this.frameCpu.length = this.gpuTimes.length = 0;
     this.frameStarts.length = this.recordedIntervals.length = this.frameContexts.length = this.frameEvents.length = 0;
@@ -441,6 +456,7 @@ export class RenderPerformanceProfiler {
   getReport(): RenderPerformanceReport {
     return {
       active: this.active, frames: this.frameCpu.length, maxFrames: this.maxFrames,
+      geometryDiagnostics: this.captureGeometryDiagnostics,
       transitions: this.transitions.map(event => ({ ...event })),
       transitionSections: Object.fromEntries([...this.transitionSamples].map(([name, samples]) => [name, summarize(samples)])),
       elapsedMs: Math.max(0, (this.active ? this.now() : this.endedAt) - this.startedAt),
@@ -666,15 +682,17 @@ function median(samples: readonly number[]): number {
   return summarize(samples).p50 ?? 0;
 }
 
-/** Bounded canonical source IDs for locating expensive native fill/gradient draws. */
+/** Bounded source IDs for locating expensive native vector draws. */
 export interface GpuOperationSource {
-  kind: "fill" | "gradient-fill";
+  kind: "fill" | "gradient-fill" | "mixed-vector";
   /** Offset in the draw's instance buffer; indirect buffers contain canonical IDs. */
   first: number;
   indirect: boolean;
-  /** Up to 32 canonical path IDs and their geometric clip roots, in submitted order. */
+  /** Up to 32 path or stroke-store IDs and their geometric clip roots, in submitted order. */
   ids: number[];
   clips: number[];
+  /** Mixed draws identify each ID's primitive store; strokes may address LOD records. */
+  kinds?: ("stroke" | "fill")[];
   truncated: boolean;
 }
 
@@ -797,7 +815,8 @@ export class GpuOperationStats {
     const copy = <T extends GpuOperationDetail>(detail: T): T => ({ ...detail,
       viewport: [...detail.viewport] as [number, number],
       scissor: detail.scissor ? [...detail.scissor] as [number, number, number, number] : null,
-      ...(detail.source ? { source: { ...detail.source, ids: [...detail.source.ids], clips: [...detail.source.clips] } } : {}) });
+      ...(detail.source ? { source: { ...detail.source, ids: [...detail.source.ids], clips: [...detail.source.clips],
+        ...(detail.source.kinds ? { kinds: [...detail.source.kinds] } : {}) } } : {}) });
     // Frames without a label count as zero; positions reached by under half the
     // frames are not typical of them.
     const byLabel = [...this.labels].map(([label, entry]) => {

@@ -85,7 +85,7 @@ try {
   const mixedSource = structuredClone(mixed), reuse = fixture(Renderer, mixed, VectorOrderedBatches);
   const mixedProfile = new RenderPerformanceProfiler({ now: () => 0 });
   reuse.renderer.performanceProfiler = mixedProfile;
-  mixedProfile.start({ gpu: false, maxFrames: 1 }); mixedProfile.beginFrame();
+  mixedProfile.start({ gpu: false, maxFrames: 1, geometryDiagnostics: true }); mixedProfile.beginFrame();
   reuse.renderer.drawSourceOrderedContent(1920, 945, 50, 40, 0.126); mixedProfile.endFrame();
   const mixedReport = mixedProfile.getReport(), texturePaints = reuse.mock.paints.filter(p => p.label === "rasterTextureBatch");
   assert.equal(texturePaints.length, 225, "3142 non-atlas images share fourteen-texture draws despite different clip roots");
@@ -142,7 +142,7 @@ try {
   const bounded = fixture(Renderer, boundedScene, VectorOrderedBatches);
   const boundsProfile = new RenderPerformanceProfiler({ now: () => 0 });
   bounded.renderer.performanceProfiler = boundsProfile;
-  boundsProfile.start({ gpu: false }); boundsProfile.beginFrame();
+  boundsProfile.start({ gpu: false, geometryDiagnostics: true }); boundsProfile.beginFrame();
   bounded.renderer.drawSourceOrderedContent(1000, 1000, 500, 500, 1); boundsProfile.endFrame();
   const boundedCounters = boundsProfile.getReport().frameRecords[0].counters;
   assert.equal(boundedCounters.rasterTextureUnclippedQuadPixelsEstimate, 2_000_000);
@@ -153,6 +153,11 @@ try {
   boundsProfile.stop();
   bounded.renderer.profileRasterTextureQuadAreas = () => { throw new Error("ordinary draws do not scan image areas for diagnostics"); };
   bounded.renderer.drawSourceOrderedContent(1000, 1000, 505, 505, 0.5);
+  boundsProfile.start({ gpu: false }); boundsProfile.beginFrame();
+  bounded.renderer.drawSourceOrderedContent(1000, 1000, 505, 505, 0.5); boundsProfile.endFrame();
+  assert.equal(boundsProfile.getReport().counters.rasterTextureQuadPixelsEstimate, undefined,
+    "ordinary captures omit image geometry estimates and never scan image areas");
+  boundsProfile.stop();
   assert.equal(bounded.renderer.rasterTextureClipBounds.get(boundedLayer).get(0), cachedBounds,
     "camera motion reuses the cached inverse clip transform");
   bounded.renderer.localToClipRenderingEnabled = true;

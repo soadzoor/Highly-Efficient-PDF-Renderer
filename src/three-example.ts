@@ -1570,6 +1570,11 @@ let captureProfiler: RenderPerformanceProfiler | null = null;
 let captureGlCalls: ReturnType<typeof instrumentThreeWebGlCalls> | null = null;
 let captureContext: Record<string, unknown> | null = null;
 const performanceCapture = {
+  mixedVectors(enabled: boolean): void {
+    if (!currentPdfObject) throw new Error("Load a PDF or HEP before changing mixed vector batching.");
+    currentPdfObject.setMixedVectorBatchingEnabled(enabled);
+    requestRender();
+  },
   start(options: RenderPerformanceOptions & { webglCalls?: boolean } = {}): string {
     if (options.webglCalls !== undefined && typeof options.webglCalls !== "boolean") throw new TypeError("webglCalls must be a boolean.");
     captureGlCalls?.dispose(); captureGlCalls = null;
@@ -1589,6 +1594,7 @@ const performanceCapture = {
       document: currentPdfObject?.sourceLabel ?? null, sourceKind: currentPdfObject?.sourceKind ?? null,
       scene: currentPdfObject ? describeThreePerformanceScene(currentPdfObject.sceneData) : null,
       backend: `three-${activeThreeRendererBackend}`,
+      mixedVectorBatching: currentPdfObject?.getMixedVectorBatchingEnabled() ?? null,
       canvasPixels: [canvasElement.width, canvasElement.height], dpr: window.devicePixelRatio,
       vectorLod: vectorLodSelectElement.value, textLod: textLodSelectElement.value,
       drawingSelection: drawingSelection.isEnabled(),
@@ -1614,6 +1620,7 @@ const performanceCapture = {
       captureContext.scene = currentPdfObject ? describeThreePerformanceScene(currentPdfObject.sceneData) : null;
       captureContext.sourceSegments = currentPdfObject?.sceneData.segmentCount ?? 0;
       captureContext.sourcePaints = currentPdfObject?.sceneData.drawRuns?.length ?? 0;
+      captureContext.mixedVectorBatching = currentPdfObject?.getMixedVectorBatchingEnabled() ?? null;
     }
     return { context: captureContext, ...captureProfiler.getReport() };
   },

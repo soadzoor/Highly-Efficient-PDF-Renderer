@@ -29,7 +29,7 @@ export interface ThreeWebGpuStrokeMaterialState {
   curveUniform: MutableUniform<number>;
 }
 
-interface ThreeWebGpuStrokeMaterialOptions {
+export interface ThreeWebGpuStrokeMaterialOptions {
   colorCompositing: ThreeColorCompositing;
   segmentTextureA: THREE.DataTexture;
   segmentTextureB: THREE.DataTexture;
@@ -208,7 +208,7 @@ const distanceToQuadraticBezierFn = TSL.wgslFn(
   [includeNode(distanceToLineSegmentFn)]
 );
 
-const fragmentFns = createThreeWebGpuOutputFragmentFns(`
+const fragmentSource = `
 fn heprStrokeFragment(
   local: vec2<f32>,
   primitiveA: vec4<f32>,
@@ -270,13 +270,20 @@ fn heprStrokeFragment(
   let color = baseColor * (1.0 - mixAmount) + vectorOverride.rgb * mixAmount;
   return vec4<f32>(heprThreeOutputColor(color), alpha);
 }
-`, [
+`;
+const fragmentDependencies = [
   includeNode(floatModFn),
   includeNode(strokeCoverageFn),
   includeNode(strokeDensityFn),
   includeNode(distanceToLineSegmentFn),
   includeNode(distanceToQuadraticBezierFn)
-]);
+];
+const fragmentFns = createThreeWebGpuOutputFragmentFns(fragmentSource, fragmentDependencies);
+
+/** Shared exact paint math; mixed materials provide derivatives before branching. */
+export const threeWebGpuStrokeShader: {
+  vertex: unknown; clip: unknown; fragmentSource: string; fragmentDependencies: readonly unknown[];
+} = { vertex: worldPackFn, clip: clipPositionFn, fragmentSource, fragmentDependencies };
 
 export function createThreeWebGpuStrokeMaterial(
   options: ThreeWebGpuStrokeMaterialOptions

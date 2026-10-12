@@ -109,7 +109,7 @@ try {
   let time = 0;
   const profile = new RenderPerformanceProfiler({ now: () => time++ });
   gl.performanceProfiler = profile;
-  profile.start({ gpu: false });
+  profile.start({ gpu: false, geometryDiagnostics: true });
   profile.beginFrame();
   gl.drawSourceOrderedContent(100, 100, 75, 50, 1);
   profile.endFrame();
@@ -166,12 +166,22 @@ try {
   assert.equal(record.counters.gradientAnalyticFillBBoxPixelsEstimate, 0,
     "projected views are excluded and fully offscreen quads contribute zero pixels");
   profile.stop();
+  assert.equal(profile.getReport().frames, 3);
+  gl.gradientData = { ...scene,
+    get gradientFillPathMetaB() { throw Error("ordinary captures must not read gradient bounds for diagnostics"); } };
+  profile.start({ gpu: false }); profile.beginFrame();
+  gl.drawGradientFillPath(0, 100, 100, 50, 50, 1); profile.endFrame();
+  const ordinary = profile.getReport().counters;
+  assert.equal(ordinary.gradientAnalyticFillDraws.total, 1, "ordinary captures retain draw counters");
+  assert.equal(ordinary.gradientAnalyticFillBBoxPixelsEstimate, undefined,
+    "ordinary captures omit gradient geometry estimates");
+  profile.stop();
   Object.defineProperty(gl, "vectorClipHeaders", { get() { throw Error("disabled profiling must not read clip headers"); } });
   gl.gradientData = { ...scene,
     get gradientFillPathMetaA() { throw Error("disabled profiling must not read path metadata"); } };
   gl.drawGradientFillPath(0, 100, 100, 50, 50, 1);
   gl.drawGradientStrokeRun(0, 100, 100, 50, 50, 1);
-  assert.equal(profile.getReport().frames, 3);
+  assert.equal(profile.getReport().frames, 1);
   calls.length = 0;
   const gpu = Object.assign(Object.create(WebGpuFloorplanRenderer.prototype), flags, {
     drawPageBackgroundContentIntoPass() {}, gradientFillPipeline: "fill", gradientStrokePipeline: "stroke",

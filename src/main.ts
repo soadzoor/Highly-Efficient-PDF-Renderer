@@ -801,6 +801,10 @@ let lastParsedSceneLabel: string | null = null;
 let captureProfiler: RenderPerformanceProfiler | null = null;
 let captureContext: Record<string, unknown> | null = null;
 const performanceCapture = {
+  mixedVectors(enabled: boolean): void {
+    if (!renderer.setMixedVectorBatchingEnabled) throw new Error("This renderer does not support mixed vector batching.");
+    renderer.setMixedVectorBatchingEnabled(enabled);
+  },
   start(options: RenderPerformanceOptions = {}): string {
     if (!(renderer instanceof WebGlFloorplanRenderer) && !(webGpuRendererClass && renderer instanceof webGpuRendererClass)) {
       throw new Error("This performance capture supports the native WebGL and WebGPU renderers.");
@@ -809,6 +813,7 @@ const performanceCapture = {
     captureProfiler = renderer.getPerformanceProfiler();
     captureContext = {
       document: lastParsedSceneLabel, backend: renderer instanceof WebGlFloorplanRenderer ? "webgl" : "webgpu",
+      mixedVectorBatching: renderer.getMixedVectorBatchingEnabled?.() ?? null,
       canvasPixels: [canvasElement.width, canvasElement.height], dpr: window.devicePixelRatio,
       viewAtStart: renderer.getViewState(),
       vectorLod: uiControlManager.readVectorLodModeInput(), textLod: uiControlManager.readTextLodModeInput(),

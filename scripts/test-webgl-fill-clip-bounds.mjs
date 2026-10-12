@@ -143,7 +143,7 @@ try {
   r.orderedBatches = { uintInstances: instances }; r.vectorClipIndex = -2;
   const profile = new RenderPerformanceProfiler({ now: () => 0 });
   r.performanceProfiler = profile;
-  profile.start({ gpu: false }); profile.beginFrame();
+  profile.start({ gpu: false, geometryDiagnostics: true }); profile.beginFrame();
   assert.equal(r.drawFilledPaths(100, 100, 50, 50, 1, 1, entries.length), entries.length);
   profile.endFrame();
   const counts = profile.getReport().frameRecords[0].counters;
@@ -183,6 +183,11 @@ try {
   const diagnostics = r.profileFillQuadAreas;
   r.profileFillQuadAreas = () => { throw new Error("ordinary rendering must not scan fill instances for diagnostics"); };
   r.drawFilledPaths(100, 100, 50, 50, 1);
+  profile.start({ gpu: false }); profile.beginFrame();
+  r.drawFilledPaths(100, 100, 50, 50, 1); profile.endFrame();
+  assert.equal(profile.getReport().counters.fillQuadPixelsEstimate, undefined,
+    "ordinary captures omit geometry estimates and never scan fill instances");
+  profile.stop();
   r.profileFillQuadAreas = diagnostics;
 
   // Reproduce the previous failure: the clip store consumes its entire GPU
@@ -195,7 +200,7 @@ try {
   assert.deepEqual(mock.uploads.at(-2).data, packVectorClips(smallClips, undefined, { cells: true }));
   assert.deepEqual(mock.uploads.at(-1).data, vectorClipChainBounds(smallClips));
   r.vectorClipIndex = 1;
-  profile.start({ gpu: false }); profile.beginFrame();
+  profile.start({ gpu: false, geometryDiagnostics: true }); profile.beginFrame();
   r.drawFilledPaths(100, 100, 50, 50, 1, 2, 1); profile.endFrame();
   const fullStore = profile.getReport().frameRecords[0].counters;
   assert.equal(fullStore.fillQuadPixelsEstimate, 62 * 62);
@@ -211,7 +216,7 @@ try {
   assert.equal(r.vectorClipBoundsTexture, null);
   assert.equal(warnings.length, 1);
   assert.match(warnings[0][0], /drawing original fill quads/);
-  profile.start({ gpu: false }); profile.beginFrame();
+  profile.start({ gpu: false, geometryDiagnostics: true }); profile.beginFrame();
   r.drawFilledPaths(100, 100, 50, 50, 1, 2, 1); profile.endFrame();
   const fallback = profile.getReport().frameRecords[0].counters;
   assert.equal(fallback.fillQuadPixelsEstimate, fallback.fillUnclippedQuadPixelsEstimate);

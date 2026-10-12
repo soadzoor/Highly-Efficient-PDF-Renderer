@@ -53,6 +53,9 @@ import { coalescePrimitiveColorTexels, NativePrimitiveColors } from "./nativePri
 import { WebGlPrimitiveHighlights } from "./nativePrimitiveHighlights";
 import { multiplyFragmentGlsl } from "./vectorMultiply";
 import { VectorOrderedBatches } from "./vectorOrderedBatches";
+import { MixedVectorBatches, type MixedVectorDrawRun } from "./mixedVectorBatches";
+import { MIXED_VECTOR_VERTEX_SHADER_SOURCE, MIXED_VECTOR_FRAGMENT_SHADER_SOURCE,
+  MIXED_VECTOR_KIND_ATTRIBUTE, MIXED_VECTOR_VARYING_VECTORS } from "./nativeWebGlMixedVectorShaders";
 import { OrderedTextLodSelection } from "./orderedTextLod";
 import { buildVectorFillBandIndex, vectorFillBandIndex, vectorSceneFillStore } from "./vectorFillBands";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
@@ -281,6 +284,8 @@ export interface ViewStateUpdateOptions {
 export interface WebGlFloorplanRendererOptions {
   /** Preserve the WebGL drawing buffer after presentation. */
   preserveDrawingBuffer?: boolean;
+  /** Combine compatible ordered fill/stroke draws; defaults to true. */
+  mixedVectorBatching?: boolean;
 }
 
 type FrameListener = (stats: DrawStats) => void;
@@ -676,6 +681,12 @@ export class WebGlFloorplanRenderer {
   /** Per kind, canonical run indices sorted by their first primitive. */
   private runLookup: CanonicalRunLookup | null = null;
   private orderedInstanceBuffer: WebGLBuffer | null = null;
+  private mixedVectorBatchingEnabled = true;
+  private mixedVectorBatchingUnavailable = false;
+  private mixedVectorBatches: MixedVectorBatches | null = null;
+  private mixedVectorGpu: { program: WebGLProgram; uniforms: Record<string, WebGLUniformLocation>;
+    buffer: WebGLBuffer; vao: WebGLVertexArrayObject; revision: number } | null = null;
+  private lastMixedVectorDrawFirst = 0;
   private readonly orderedUniformPrograms = new Set<WebGLProgram>();
   private readonly orderedTextureBindings: (WebGLTexture | null | undefined)[] = [];
   private readonly orderedDedicatedTextureUnits: boolean;
@@ -984,6 +995,7 @@ export class WebGlFloorplanRenderer {
     }
 
     this.gl = context;
+    this.mixedVectorBatchingEnabled = options.mixedVectorBatching !== false;
     // Separate sampler slots prevent stroke/fill/text switches from rebinding
     // one another's textures. Other rendering paths retain their existing slots.
     const textureUnits = context.getParameter(context.MAX_COMBINED_TEXTURE_IMAGE_UNITS) as number;
@@ -1233,6 +1245,15 @@ export class WebGlFloorplanRenderer {
   /** Canonical IDs are copied only for individually timed GPU draws. */
   private describeDrawSource(program: WebGLProgram | null, instances: number): GpuOperationSource | undefined {
     if (!program) return undefined;
+    if (program === this.mixedVectorGpu?.program && this.mixedVectorBatches) {
+      const first = this.lastMixedVectorDrawFirst, data = this.mixedVectorBatches.floatInstances;
+      const ids: number[] = [], clips: number[] = [], kinds: ("stroke" | "fill")[] = [];
+      for (let index = first; index < first + Math.min(instances, 32); index++) {
+        ids.push(data[index * 3]); clips.push(data[index * 3 + 1] - 1);
+        kinds.push(data[index * 3 + 2] === 1 ? "fill" : "stroke");
+      }
+      return { kind: "mixed-vector", first, indirect: true, ids, clips, kinds, truncated: instances > ids.length };
+    }
     if (program === this.gradientFillProgram || program === this.gradientMeshProgram) {
       return { kind: "gradient-fill", first: this.lastGradientFillDrawIndex, indirect: false,
         ids: [this.lastGradientFillDrawIndex], clips: [this.vectorClipIndex], truncated: false };
@@ -1255,6 +1276,7 @@ export class WebGlFloorplanRenderer {
     if (compositor && program === compositor.program) return `composite:${compositor.lastPassName}`;
     const names: [WebGLProgram | null | undefined, string][] = [
       [this.segmentProgram, "stroke"], [this.fillProgram, "fill"], [this.gradientFillProgram, "gradientFill"],
+      [this.mixedVectorGpu?.program, "mixedVector"],
       [this.gradientMeshProgram, "gradientMesh"], [this.gradientStrokeProgram, "gradientStroke"],
       [this.textProgram, "text"], [this.rasterProgram, "raster"], [this.rasterStripProgram?.program, "rasterStrip"],
       [this.rasterAtlasProgram?.program, "rasterAtlas"],
@@ -1483,6 +1505,16 @@ export class WebGlFloorplanRenderer {
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
+
+  /** Allows the ordinary and mixed shaders to be compared on the same view. */
+  setMixedVectorBatchingEnabled(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.mixedVectorBatchingEnabled === nextEnabled || this.isDisposed) return;
+    this.mixedVectorBatchingEnabled = nextEnabled;
+    this.requestFrame();
+  }
+
+  getMixedVectorBatchingEnabled(): boolean { return this.mixedVectorBatchingEnabled; }
 
   setFillRenderingEnabled(enabled: boolean): void {
     const nextEnabled = Boolean(enabled);
@@ -2177,6 +2209,7 @@ export class WebGlFloorplanRenderer {
     this.paintFoldNeutralTexture = null;
     gl.deleteBuffer(this.orderedInstanceBuffer);
     this.orderedInstanceBuffer = null;
+    this.destroyMixedVectorResources();
     this.orderedBatches = null;
     this.runLookup = null;
     gl.deleteTexture(this.vectorClipTexture);
@@ -2877,7 +2910,7 @@ export class WebGlFloorplanRenderer {
       } else {
         profile.add("gradientAnalyticFillDraws");
         profile.add("gradientAnalyticFillSegments", segmentCount);
-        if (!this.localToClipRenderingEnabled) {
+        if (profile.geometryDiagnostics && !this.localToClipRenderingEnabled) {
           // Estimate rasterized quad pixels, before clipping or fragment discard.
           // Round outward and clip to this pass's viewport; overlaps count again.
           const minX = Math.max(0, Math.floor((data.gradientFillPathMetaA[offset + 2] - cameraCenterX) * zoomValue + viewportWidth / 2));
@@ -3258,7 +3291,7 @@ export class WebGlFloorplanRenderer {
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
     this.frameDrawCalls++;
     const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
-    if (profile) this.profileRasterTextureQuadAreas(profile, width, height, x, y, zoom, count);
+    if (profile?.geometryDiagnostics) this.profileRasterTextureQuadAreas(profile, width, height, x, y, zoom, count);
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     return true;
   }
@@ -3761,6 +3794,15 @@ export class WebGlFloorplanRenderer {
       this.gl.bufferData(this.gl.ARRAY_BUFFER, plan.floatInstances.subarray(0, plan.instanceCount * 2), this.gl.DYNAMIC_DRAW);
       profile?.endSection("instanceUpload");
     }
+    // Mixed paints keep the existing scheduled instance order. Composited spans
+    // retain their individual programs and surface/fold state.
+    let mixed: MixedVectorBatches | null = null;
+    if (plan && !paintVisibility.requiresCompositing && this.mixedVectorBatchingEnabled &&
+        this.fillRenderingEnabled && this.strokeRenderingEnabled && !this.mixedVectorBatchingUnavailable) {
+      profile?.beginSection("batchPreparation");
+      mixed = this.prepareMixedVectorBatches(plan);
+      profile?.endSection("batchPreparation");
+    }
     const rasterIndices: number[] = [], rasterTextures: WebGLTexture[] = [];
     const drawSingleRaster = (index: number, allowAtlas = true): void => {
       profile?.add("drawBatches"); profile?.add("rasterInstances");
@@ -3941,7 +3983,18 @@ export class WebGlFloorplanRenderer {
       }
       return strokes;
     }
-    for (const run of plan?.batches ?? runs) {
+    for (const run of mixed?.batches ?? plan?.batches ?? runs) {
+      if (run.kind === "mixed-vector") {
+        flushRaster();
+        this.vectorClipIndex = -2;
+        this.drawMixedVectorBatch(run, width, height, x, y, zoom);
+        strokes += run.strokeCount;
+        profile?.add("drawBatches");
+        profile?.add("mixedVectorBatches");
+        profile?.add("fillInstances", run.fillCount);
+        profile?.add("strokeInstances", run.strokeCount);
+        continue;
+      }
       if (!run.blendMode) { draw(run); continue; }
       flushRaster();
       // Pair both passes for each instance so overlapping instances observe
@@ -3961,6 +4014,120 @@ export class WebGlFloorplanRenderer {
     this.vectorClipIndex = -1;
     profile?.endSection("drawSubmission");
     return strokes;
+  }
+
+  private prepareMixedVectorBatches(plan: VectorOrderedBatches): MixedVectorBatches | null {
+    try {
+      const batches = this.mixedVectorBatches ??= new MixedVectorBatches();
+      batches.update(plan);
+      if (!batches.instanceCount) return null;
+      let gpu = this.mixedVectorGpu;
+      if (!gpu) {
+        const gl = this.gl;
+        if (gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS) < 9 ||
+            gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS) < 3 ||
+            gl.getParameter(gl.MAX_VARYING_VECTORS) < MIXED_VECTOR_VARYING_VECTORS ||
+            gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS) < (this.orderedDedicatedTextureUnits ? 19 : 16)) {
+          throw new Error("The context cannot bind the mixed vector shader's textures and varyings.");
+        }
+        let program: WebGLProgram | null = null, buffer: WebGLBuffer | null = null, vao: WebGLVertexArrayObject | null = null;
+        try {
+          program = this.createProgram(MIXED_VECTOR_VERTEX_SHADER_SOURCE, MIXED_VECTOR_FRAGMENT_SHADER_SOURCE);
+          const uniforms = this.mustGetUniformMap(program, ["uSegmentTexA", "uSegmentTexB", "uSegmentStyleTex", "uSegmentBoundsTex",
+            "uSegmentTexSize", "uFillPathMetaTexA", "uFillPathMetaTexB", "uFillPathMetaTexC", "uFillSegmentTexA", "uFillSegmentTexB",
+            "uFillPathMetaTexSize", "uFillSegmentTexSize", "uFillBandBase", "uFillCellHeaders", "uFillBandEntries",
+            "uFillClipBoundsEnabled", "uFillClipBoundsTex", "uViewport", "uCameraCenter", "uZoom", "uAAScreenPx", "uFillAAScreenPx",
+            "uUseLocalToClip", "uLocalToClip", "uLocalUnitsPerPixel", "uStrokeCurveEnabled", "uVectorOverride"]);
+          buffer = this.mustCreateBuffer(); vao = this.createVertexArray();
+          gl.bindVertexArray(vao);
+          gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuffer);
+          gl.enableVertexAttribArray(0);
+          gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+          gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+          for (const location of [1, 4, MIXED_VECTOR_KIND_ATTRIBUTE]) {
+            gl.enableVertexAttribArray(location); gl.vertexAttribDivisor(location, 1);
+          }
+          gpu = this.mixedVectorGpu = { program, uniforms, buffer, vao, revision: -1 };
+        } catch (error) {
+          gl.deleteVertexArray(vao); gl.deleteBuffer(buffer); gl.deleteProgram(program);
+          throw error;
+        }
+      }
+      if (gpu.revision !== batches.revision) {
+        const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
+        profile?.beginSection("instanceUpload");
+        try {
+          this.gl.bindBuffer(this.gl.ARRAY_BUFFER, gpu.buffer);
+          this.gl.bufferData(this.gl.ARRAY_BUFFER, batches.floatInstances.subarray(0, batches.instanceCount * 3), this.gl.DYNAMIC_DRAW);
+          gpu.revision = batches.revision;
+          profile?.add("mixedVectorInstanceUploadBytes", batches.instanceCount * 12);
+        } finally { profile?.endSection("instanceUpload"); }
+      }
+      return batches;
+    } catch (error) {
+      this.mixedVectorBatchingUnavailable = true;
+      this.destroyMixedVectorResources();
+      console.warn("Mixed vector batching unavailable; using separate fill/stroke draws.", error);
+      return null;
+    }
+  }
+
+  private destroyMixedVectorResources(): void {
+    const gpu = this.mixedVectorGpu;
+    if (gpu) {
+      this.gl.deleteProgram(gpu.program); this.gl.deleteBuffer(gpu.buffer); this.gl.deleteVertexArray(gpu.vao);
+      this.orderedUniformPrograms.delete(gpu.program);
+      this.orderedClipStates?.delete(gpu.program);
+      this.orderedPaintUniformStates.delete(gpu.program);
+      this.multiplyUniforms.delete(gpu.program);
+      this.paintShapeUniforms.delete(gpu.program);
+      this.vectorClipUniforms.delete(gpu.program);
+    }
+    this.mixedVectorGpu = null;
+    this.mixedVectorBatches = null;
+  }
+
+  private drawMixedVectorBatch(run: MixedVectorDrawRun, width: number, height: number,
+    x: number, y: number, zoom: number): void {
+    const gpu = this.mixedVectorGpu!, gl = this.gl, u = gpu.uniforms;
+    gl.useProgram(gpu.program);
+    this.bindVectorClip(gpu.program);
+    gl.bindVertexArray(gpu.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gpu.buffer);
+    gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 12, run.first * 12);
+    gl.vertexAttribPointer(4, 1, gl.FLOAT, false, 12, run.first * 12 + 4);
+    gl.vertexAttribPointer(MIXED_VECTOR_KIND_ATTRIBUTE, 1, gl.FLOAT, false, 12, run.first * 12 + 8);
+    for (const [unit, texture] of [this.segmentTextureA, this.segmentTextureB, this.segmentTextureC, this.segmentTextureD,
+      this.fillPathMetaTextureA, this.fillPathMetaTextureB, this.fillPathMetaTextureC,
+      this.fillSegmentTextureA, this.fillSegmentTextureB].entries()) this.bindOrderedTexture(unit, texture);
+    this.bindOrderedTexture(this.fillClipBoundsUnit, this.vectorClipBoundsTexture ?? this.vectorClipTexture);
+    if (this.prepareOrderedProgram(gpu.program)) {
+      for (const [unit, name] of ["uSegmentTexA", "uSegmentTexB", "uSegmentStyleTex", "uSegmentBoundsTex",
+        "uFillPathMetaTexA", "uFillPathMetaTexB", "uFillPathMetaTexC", "uFillSegmentTexA", "uFillSegmentTexB"].entries()) {
+        gl.uniform1i(u[name], unit);
+      }
+      gl.uniform2i(u.uSegmentTexSize, this.segmentTextureWidth, this.segmentTextureHeight);
+      gl.uniform2i(u.uFillPathMetaTexSize, this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight);
+      gl.uniform2i(u.uFillSegmentTexSize, this.fillSegmentTextureWidth, this.fillSegmentTextureHeight);
+      gl.uniform1i(u.uFillBandBase, this.fillBandBase);
+      gl.uniform1i(u.uFillCellHeaders, this.fillCellBase + 1);
+      gl.uniform1i(u.uFillBandEntries, this.fillBandEntries);
+      gl.uniform1i(u.uFillClipBoundsEnabled, this.vectorClipBoundsTexture ? 1 : 0);
+      gl.uniform1i(u.uFillClipBoundsTex, this.fillClipBoundsUnit);
+      gl.uniform2f(u.uViewport, width, height); gl.uniform2f(u.uCameraCenter, x, y);
+      gl.uniform1f(u.uZoom, zoom); gl.uniform1f(u.uAAScreenPx, 1); gl.uniform1f(u.uFillAAScreenPx, 1);
+      gl.uniform1f(u.uUseLocalToClip, this.localToClipRenderingEnabled ? 1 : 0);
+      if (this.localToClipRenderingEnabled) gl.uniformMatrix4fv(u.uLocalToClip, false, this.localToClipMatrix);
+      gl.uniform1f(u.uLocalUnitsPerPixel, this.localUnitsPerPixel);
+      gl.uniform1f(u.uStrokeCurveEnabled, this.strokeCurveEnabled ? 1 : 0);
+      gl.uniform4f(u.uVectorOverride, ...this.vectorOverrideColor, this.vectorOverrideOpacity);
+    }
+    this.lastMixedVectorDrawFirst = run.first;
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, run.count);
+    this.frameDrawCalls++;
+    const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
+    if (profile?.geometryDiagnostics) this.profileFillQuadAreas(profile, width, height, x, y, zoom,
+      run.first, run.count, this.mixedVectorBatches!.floatInstances);
   }
 
   private drawFilledPaths(
@@ -4029,19 +4196,19 @@ export class WebGlFloorplanRenderer {
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
     this.frameDrawCalls++;
     const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
-    if (profile) this.profileFillQuadAreas(profile, viewportWidth, viewportHeight,
+    if (profile?.geometryDiagnostics) this.profileFillQuadAreas(profile, viewportWidth, viewportHeight,
       cameraCenterX, cameraCenterY, zoomValue, first, count);
     return count;
   }
 
   /** Opt-in area estimates resolve exactly the IDs and clips used by this draw. */
   private profileFillQuadAreas(profile: RenderPerformanceProfiler, width: number, height: number,
-    cameraX: number, cameraY: number, zoom: number, first: number, count: number): void {
+    cameraX: number, cameraY: number, zoom: number, first: number, count: number, mixedInstances?: Float32Array): void {
     if (this.localToClipRenderingEnabled || !(zoom > 0) || !Number.isFinite(zoom)) return;
     const scene = this.scene;
     if (!scene?.fillPathMetaA || !scene.fillPathMetaB || !scene.fillPathMetaC) return;
     const indirect = this.vectorClipIndex === -2;
-    const instances = indirect ? this.orderedBatches?.uintInstances : null;
+    const instances = mixedInstances ?? (indirect ? this.orderedBatches?.uintInstances : null);
     if (indirect && !instances) return;
     const bounds = this.vectorClipBounds;
     const margin = 1 / zoom;
@@ -4052,7 +4219,9 @@ export class WebGlFloorplanRenderer {
         Math.max(0, Math.floor((minY - cameraY) * zoom + height / 2)));
     let originalPixels = 0, quadPixels = 0, tested = 0, bounded = 0, culled = 0;
     for (let instance = first; instance < first + count; instance++) {
-      const id = indirect ? instances![instance * 2] : instance;
+      if (mixedInstances && mixedInstances[instance * 3 + 2] !== 1) continue;
+      const stride = mixedInstances ? 3 : 2;
+      const id = indirect ? instances![instance * stride] : instance;
       const offset = id * 4;
       if (offset + 3 >= scene.fillPathMetaA.length || !(scene.fillPathMetaA[offset + 1] > 0) ||
         (!this.paintShapeOnly && !(scene.fillPathMetaC[offset + 3] > 0.001))) continue;
@@ -4061,7 +4230,7 @@ export class WebGlFloorplanRenderer {
       let lowX = minX - margin, lowY = minY - margin;
       let highX = maxX + margin, highY = maxY + margin;
       originalPixels += pixels(lowX, lowY, highX, highY);
-      const clip = indirect ? instances![instance * 2 + 1] - 1 : this.vectorClipIndex;
+      const clip = indirect ? instances![instance * stride + 1] - 1 : this.vectorClipIndex;
       if (this.vectorClipBoundsTexture && clip >= 0 && bounds && clip * 4 + 3 < bounds.length) {
         tested++;
         const start = clip * 4;
@@ -5541,6 +5710,9 @@ export class WebGlFloorplanRenderer {
   }
 
   private rebuildVectorLod(scene: VectorScene): boolean {
+    // Do not retain the previous scene through a dormant mixed plan.
+    this.mixedVectorBatches = null;
+    if (this.mixedVectorGpu) this.mixedVectorGpu.revision = -1;
     if (shouldUseVectorStrokeLod(this.vectorLodMode, "webgl", scene.segmentCount)) {
       this.vectorLodRuntime = takePrebuiltVectorStrokeLodRuntime(scene) ?? new VectorStrokeLodRuntime(scene);
       this.vectorLodRuntime.setForceExact(this.primitiveColors?.has("stroke") ?? false);
@@ -6217,30 +6389,26 @@ export class WebGlFloorplanRenderer {
 
   private createProgram(vertexSource: string, fragmentSource: string): WebGLProgram {
     const gl = this.gl;
-
     const vertexShader = this.compileShader(gl.VERTEX_SHADER, pdfShapeCoverageGlsl(vertexSource));
-    const fragmentShader = this.compileShader(gl.FRAGMENT_SHADER, pdfShapeCoverageGlsl(fragmentSource));
-
-    const program = gl.createProgram();
-    if (!program) {
-      throw new Error("Unable to create WebGL program.");
-    }
-
-    gl.attachShader(program, vertexShader);
-    gl.attachShader(program, fragmentShader);
-    gl.linkProgram(program);
-
-    const linkStatus = gl.getProgramParameter(program, gl.LINK_STATUS);
-    if (!linkStatus) {
-      const error = gl.getProgramInfoLog(program) || "Unknown linker error.";
+    let fragmentShader: WebGLShader | null = null, program: WebGLProgram | null = null;
+    try {
+      fragmentShader = this.compileShader(gl.FRAGMENT_SHADER, pdfShapeCoverageGlsl(fragmentSource));
+      program = gl.createProgram();
+      if (!program) throw new Error("Unable to create WebGL program.");
+      gl.attachShader(program, vertexShader);
+      gl.attachShader(program, fragmentShader);
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        throw new Error(`Program link failed: ${gl.getProgramInfoLog(program) || "Unknown linker error."}`);
+      }
+      return program;
+    } catch (error) {
       gl.deleteProgram(program);
-      throw new Error(`Program link failed: ${error}`);
+      throw error;
+    } finally {
+      gl.deleteShader(vertexShader);
+      if (fragmentShader) gl.deleteShader(fragmentShader);
     }
-
-    gl.deleteShader(vertexShader);
-    gl.deleteShader(fragmentShader);
-
-    return program;
   }
 
   private compileShader(type: number, source: string): WebGLShader {

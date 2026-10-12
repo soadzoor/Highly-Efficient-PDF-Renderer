@@ -1,3 +1,5 @@
+import type { ThreeWebGpuFillMaterialOptions } from "./threeWebGpuFillMaterial";
+import type { ThreePageBinding } from "./threePageTransforms";
 import { requireThreeWebGpuBackend, type ThreeWebGpuBackend } from "./threeMaterialBackend";
 import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTransforms";
 import type { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
@@ -45,6 +47,8 @@ interface CullingBounds {
 }
 
 export class ThreeMaterialFillLayer {
+  private readonly mixedOptions: ThreeWebGpuFillMaterialOptions;
+  private readonly mixedPageBinding: ThreePageBinding | undefined;
   private readonly vectorClipTexture: THREE.DataTexture;
   private readonly releaseVectorClipTexture: () => void;
   private readonly orderedRuns: ThreeVectorDrawRuns | null;
@@ -151,26 +155,28 @@ export class ThreeMaterialFillLayer {
     );
 
     const pageBinding = options.pageTransforms?.instances("fill", scene);
+    this.mixedPageBinding = pageBinding;
+    this.mixedOptions = {
+      colorCompositing: options.colorCompositing ?? "linear",
+      fillPathMetaTextureA: this.fillPathMetaTextureA,
+      fillPathMetaTextureB: this.fillPathMetaTextureB,
+      fillPathMetaTextureC: this.fillPathMetaTextureC,
+      fillSegmentTextureA: this.fillSegmentTextureA,
+      fillSegmentTextureB: this.fillSegmentTextureB,
+      fillPathTextureWidth: pathTextureSize.width,
+      fillSegmentTextureWidth: segmentTextureSize.width,
+      fillBandBase: store.bandBase,
+      fillBandEntries: store.bandEntries,
+      fillCellBase: store.cellBase,
+      viewport: this.viewportUniform,
+      cameraCenter: this.cameraCenterUniform,
+      localToClip: this.localToClipUniform,
+      pageBinding,
+      vectorOverride: this.vectorOverrideUniform
+    };
     let material: THREE.Material;
     if ((options.materialBackend ?? "webgl") === "webgpu") {
-      const state = requireThreeWebGpuBackend(options.webGpu).createThreeWebGpuFillMaterial({
-        colorCompositing: options.colorCompositing ?? "linear",
-        fillPathMetaTextureA: this.fillPathMetaTextureA,
-        fillPathMetaTextureB: this.fillPathMetaTextureB,
-        fillPathMetaTextureC: this.fillPathMetaTextureC,
-        fillSegmentTextureA: this.fillSegmentTextureA,
-        fillSegmentTextureB: this.fillSegmentTextureB,
-        fillPathTextureWidth: pathTextureSize.width,
-        fillSegmentTextureWidth: segmentTextureSize.width,
-        fillBandBase: store.bandBase,
-        fillBandEntries: store.bandEntries,
-        fillCellBase: store.cellBase,
-        viewport: this.viewportUniform,
-        cameraCenter: this.cameraCenterUniform,
-        localToClip: this.localToClipUniform,
-        pageBinding,
-        vectorOverride: this.vectorOverrideUniform
-      });
+      const state = requireThreeWebGpuBackend(options.webGpu).createThreeWebGpuFillMaterial(this.mixedOptions);
       state.zoomUniform.value = this.zoomUniform.value;
       state.useLocalToClipUniform.value = this.useLocalToClipUniform.value;
       this.webGpuState = state;
@@ -232,6 +238,13 @@ export class ThreeMaterialFillLayer {
       clips.release();
       throw error;
     }
+  }
+
+  /** Borrow immutable texture stores and live view state; the layer retains ownership. */
+  getMixedVectorResources() {
+    return { options: this.mixedOptions, pageBinding: this.mixedPageBinding,
+      clipTexture: this.vectorClipTexture, zoomUniform: this.zoomUniform,
+      useLocalToClipUniform: this.useLocalToClipUniform };
   }
 
   setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {

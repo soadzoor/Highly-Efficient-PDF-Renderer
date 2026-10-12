@@ -11,7 +11,8 @@ try {
 
   for (const capacity of [16, 19, 26, 27, 32]) {
     const mock = mockGl(capacity);
-    const r = new WebGlFloorplanRenderer({ getContext: () => mock.gl });
+    // This fixture exercises the separate programs' shared binding cache.
+    const r = new WebGlFloorplanRenderer({ getContext: () => mock.gl }, { mixedVectorBatching: false });
     assert.equal(mock.calls.filter(([name, key]) => name === "getParameter" && key === 1).length, 1,
       "sampler capacity is queried once at construction");
     assert.equal(r.orderedDedicatedTextureUnits, capacity >= 19);

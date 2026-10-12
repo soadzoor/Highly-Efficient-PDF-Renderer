@@ -2,6 +2,7 @@
 // explicitly, so WebGL imports never initialize the optional node material graph.
 export { createThreeWebGpuFillMaterial } from "./threeWebGpuFillMaterial";
 export { createThreeWebGpuStrokeMaterial } from "./threeWebGpuStrokeMaterial";
+export { createThreeWebGpuMixedVectorMaterial } from "./threeWebGpuMixedVectorMaterial";
 export { createThreeWebGpuTextMaterial } from "./threeWebGpuTextMaterial";
 export { createThreeWebGpuRasterMaterial } from "./threeWebGpuRasterMaterial";
 export { createThreeWebGpuRasterStripMaterial } from "./threeWebGpuRasterStripMaterial";

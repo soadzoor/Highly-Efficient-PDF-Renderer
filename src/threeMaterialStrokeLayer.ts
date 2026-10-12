@@ -1,3 +1,5 @@
+import type { ThreeWebGpuStrokeMaterialOptions } from "./threeWebGpuStrokeMaterial";
+import type { ThreePageBinding } from "./threePageTransforms";
 import { requireThreeWebGpuBackend, type ThreeWebGpuBackend } from "./threeMaterialBackend";
 import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTransforms";
 import type { OptionalContentSnapshot } from "./optionalContent";
@@ -55,6 +57,8 @@ interface CullingBounds {
 }
 
 export class ThreeMaterialStrokeLayer {
+  private readonly mixedOptions: ThreeWebGpuStrokeMaterialOptions;
+  private readonly mixedPageBinding: ThreePageBinding | undefined;
   private readonly vectorClipTexture: THREE.DataTexture;
   private readonly releaseVectorClipTexture: () => void;
   private readonly orderedRuns: ThreeVectorDrawRuns | null;
@@ -145,31 +149,33 @@ export class ThreeMaterialStrokeLayer {
 
     this.pageTransforms = options.pageTransforms;
     const pageBinding = options.pageTransforms?.instances("stroke", scene, options.strokeOrigins);
+    this.mixedPageBinding = pageBinding;
+    this.mixedOptions = {
+      colorCompositing: options.colorCompositing ?? "linear",
+      segmentTextureA: this.segmentTextureA,
+      segmentTextureB: this.segmentTextureB,
+      segmentStyleTexture: this.segmentStyleTexture,
+      segmentBoundsTexture: this.segmentBoundsTexture,
+      segmentTextureWidth: head.width,
+      segmentTail: {
+        textureA: this.segmentTailTextureA,
+        textureB: this.segmentTailTextureB,
+        styleTexture: this.segmentTailStyleTexture,
+        boundsTexture: this.segmentTailBoundsTexture,
+        width: tail.width,
+        split: textures.split
+      },
+      viewport: this.viewportUniform,
+      cameraCenter: this.cameraCenterUniform,
+      localToClip: this.localToClipUniform,
+      pageBinding,
+      vectorOverride: this.vectorOverrideUniform,
+      strokeCurveEnabled: options.strokeCurveEnabled
+    };
     const materialBackend = options.materialBackend ?? "webgl";
     let material: THREE.Material;
     if (materialBackend === "webgpu") {
-      const webGpuMaterial = requireThreeWebGpuBackend(options.webGpu).createThreeWebGpuStrokeMaterial({
-        colorCompositing: options.colorCompositing ?? "linear",
-        segmentTextureA: this.segmentTextureA,
-        segmentTextureB: this.segmentTextureB,
-        segmentStyleTexture: this.segmentStyleTexture,
-        segmentBoundsTexture: this.segmentBoundsTexture,
-        segmentTextureWidth: head.width,
-        segmentTail: {
-          textureA: this.segmentTailTextureA,
-          textureB: this.segmentTailTextureB,
-          styleTexture: this.segmentTailStyleTexture,
-          boundsTexture: this.segmentTailBoundsTexture,
-          width: tail.width,
-          split: textures.split
-        },
-        viewport: this.viewportUniform,
-        cameraCenter: this.cameraCenterUniform,
-        localToClip: this.localToClipUniform,
-        pageBinding,
-        vectorOverride: this.vectorOverrideUniform,
-        strokeCurveEnabled: options.strokeCurveEnabled
-      });
+      const webGpuMaterial = requireThreeWebGpuBackend(options.webGpu).createThreeWebGpuStrokeMaterial(this.mixedOptions);
       this.zoomUniform = webGpuMaterial.zoomUniform;
       this.useLocalToClipUniform = webGpuMaterial.useLocalToClipUniform;
       this.localUnitsPerPixelUniform = webGpuMaterial.localUnitsPerPixelUniform;
@@ -232,6 +238,14 @@ export class ThreeMaterialStrokeLayer {
       clips.release();
       throw error;
     }
+  }
+
+  /** Borrow immutable texture stores and live view state; the layer retains ownership. */
+  getMixedVectorResources() {
+    return { options: this.mixedOptions, pageBinding: this.mixedPageBinding,
+      clipTexture: this.vectorClipTexture, zoomUniform: this.zoomUniform,
+      useLocalToClipUniform: this.useLocalToClipUniform, localUnitsPerPixelUniform: this.localUnitsPerPixelUniform,
+      curveUniform: this.curveUniform };
   }
 
   setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {

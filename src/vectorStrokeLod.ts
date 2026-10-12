@@ -108,6 +108,11 @@ export class ThreeVectorLodStrokeLayer {
     for (const layer of this.layers) layer.setOptionalContentVisibility(snapshot);
   }
 
+  /** Ordered LOD already uses one shared store with stable primitive IDs. */
+  getMixedVectorStrokeLayer(): ThreeMaterialStrokeLayer | null {
+    return this.scene.drawRuns && this.layers.length === 1 ? this.layers[0] : null;
+  }
+
   setVisible(visible: boolean): void {
     this.requestedVisible = visible;
     this.updateGroupVisibility();

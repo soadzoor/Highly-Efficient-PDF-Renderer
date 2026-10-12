@@ -24,7 +24,7 @@ export interface ThreeWebGpuFillMaterialState {
   useLocalToClipUniform: MutableUniform<number>;
 }
 
-interface ThreeWebGpuFillMaterialOptions {
+export interface ThreeWebGpuFillMaterialOptions {
   colorCompositing: ThreeColorCompositing;
   fillPathMetaTextureA: THREE.DataTexture;
   fillPathMetaTextureB: THREE.DataTexture;
@@ -138,7 +138,7 @@ fn heprFillClipPosition(
 }
 `);
 
-const fillFragmentFns = createThreeWebGpuOutputFragmentFns(`
+const fillFragmentSource = `
 fn heprFillFragment(
   local: vec2<f32>,
   metaA: vec4<f32>,
@@ -204,7 +204,14 @@ ${vectorFillBandLoopWgsl({
 
   return vec4<f32>(heprThreeOutputColor(color), alpha);
 }
-`, [includeNode(fillCoverageFn), includeNode(cellCoverageFn)]);
+`;
+const fillFragmentDependencies = [includeNode(fillCoverageFn), includeNode(cellCoverageFn)];
+const fillFragmentFns = createThreeWebGpuOutputFragmentFns(fillFragmentSource, fillFragmentDependencies);
+
+/** Shared exact paint math; mixed materials provide derivatives before branching. */
+export const threeWebGpuFillShader: {
+  vertex: unknown; fragmentSource: string; fragmentDependencies: readonly unknown[];
+} = { vertex: fillVertexPackFn, fragmentSource: fillFragmentSource, fragmentDependencies: fillFragmentDependencies };
 
 export function createThreeWebGpuFillMaterial(
   options: ThreeWebGpuFillMaterialOptions
