@@ -4,7 +4,7 @@ import type {
   NativeImageCodecResolver,
   NativeImageCodecResult
 } from "./nativeImage";
-import { PdfError, throwIfAborted } from "./nativeTypes";
+import { PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
 
 export interface BundledJpegCodecAsset {
   readonly url: URL;
@@ -92,8 +92,7 @@ const TJCS_GRAY = 2;
 const TJCS_CMYK = 3;
 const TJCS_YCCK = 4;
 const TJFLAG_ACCURATEDCT = 4096;
-const TJFLAG_STOPONWARNING = 8192;
-const JPEG_DECODE_FLAGS = TJFLAG_ACCURATEDCT | TJFLAG_STOPONWARNING;
+const JPEG_DECODE_FLAGS = TJFLAG_ACCURATEDCT;
 const MAX_JPEG_INPUT_BYTES = 0xffff_ffff; // WASM32 size_t.
 const MAX_JPEG_OUTPUT_BYTES = 0xffff_ffff;
 const WASM_PAGE_BYTES = 64 * 1024;
@@ -279,7 +278,7 @@ function decodeJpeg(
       : request.components === 3
         ? TJPF_RGB
         : TJPF_CMYK;
-    const decodeStatus = exports.tjDecompress2(
+    const decodeToOutput = () => exports.tjDecompress2(
       decoderHandle,
       inputPointer,
       request.encoded.byteLength,
@@ -290,13 +289,41 @@ function decodeJpeg(
       pixelFormat,
       JPEG_DECODE_FLAGS
     );
-    if (decodeStatus !== 0) {
-      throw jpegError("The JPEG sample payload is malformed.", "invalid-jpeg-payload");
+    new Uint8Array(exports.memory.buffer, outputPointer, outputByteLength).fill(0);
+    const decodeStatus = decodeToOutput();
+    if (decodeStatus !== 0 && decodeStatus !== -1) {
+      throw jpegError("The bundled JPEG decoder returned an invalid status.", "jpeg-decoder-failed");
     }
-    throwIfAborted(signal);
-
     const samples = new Uint8Array(outputByteLength);
     samples.set(new Uint8Array(exports.memory.buffer, outputPointer, outputByteLength));
+    // This pinned module does not export tjGetErrorCode. Besides recoverable
+    // entropy warnings, -1 can mean its scanline-pointer allocation failed
+    // before writing pixels. Decode again over a different initial value and
+    // require every sample to agree, proving that the output was fully written.
+    // Fatal libjpeg errors still throw through the longjmp runtime bridge.
+    const diagnostics: PdfDiagnostic[] = [];
+    if (decodeStatus === -1) {
+      throwIfAborted(signal);
+      new Uint8Array(exports.memory.buffer, outputPointer, outputByteLength).fill(255);
+      const verificationStatus = decodeToOutput();
+      if (verificationStatus !== 0 && verificationStatus !== -1) {
+        throw jpegError("The bundled JPEG decoder returned an invalid status.", "jpeg-decoder-failed");
+      }
+      const verification = new Uint8Array(exports.memory.buffer, outputPointer, outputByteLength);
+      for (let index = 0; index < samples.length; index += 1) {
+        if ((index & 0xffff) === 0) throwIfAborted(signal);
+        if (samples[index] !== verification[index]) {
+          throw jpegError("The bundled JPEG decoder did not produce complete samples.", "jpeg-decoder-failed");
+        }
+      }
+      diagnostics.push({
+        code: "image.jpeg-recovered-data",
+        severity: "warning",
+        message: "JPEG decoding completed with recoverable data warnings; the decoder's reconstructed samples were retained and some pixels may differ.",
+        details: { width, height }
+      });
+    }
+    throwIfAborted(signal);
     if (decodePlan.invertCmyk) {
       // Adobe APP14 CMYK/YCCK uses complemented ink polarity. PDF DeviceCMYK
       // and HEPR's codec contract use 0 for no ink; an explicit PDF `/Decode`
@@ -305,12 +332,20 @@ function decodeJpeg(
         samples[index] = 255 - samples[index];
       }
     }
+    if (request.components === 1 && decodePlan.markers.adobeTransform !== null &&
+        decodePlan.markers.adobeTransform !== 0) diagnostics.push({
+      code: "image.jpeg-grayscale-transform-ignored",
+      severity: "warning",
+      message: "A grayscale JPEG specifies an Adobe chroma transform; the redundant transform was ignored and its grayscale samples were retained.",
+      details: Object.freeze({ adobeTransform: decodePlan.markers.adobeTransform })
+    });
     return Object.freeze({
       samples,
       width,
       height,
       components: request.components,
-      bitsPerComponent: 8
+      bitsPerComponent: 8,
+      ...(diagnostics.length ? { diagnostics: Object.freeze(diagnostics.map(diagnostic => Object.freeze(diagnostic))) } : {})
     });
   } catch (cause) {
     if (cause instanceof PdfError) throw cause;
@@ -873,8 +908,10 @@ function effectivePdfColorTransform(
   markers: Readonly<JpegMarkerMetadata>
 ): 0 | 1 {
   if (markers.adobeTransform !== null) {
+    // A grayscale JPEG has no chroma channels to transform. Some encoders
+    // retain an RGB APP14 transform marker when writing grayscale samples.
+    if (request.components === 1) return 0;
     if (
-      (request.components === 1 && markers.adobeTransform !== 0) ||
       (request.components === 3 && markers.adobeTransform === 2) ||
       (request.components === 4 && markers.adobeTransform === 1)
     ) {

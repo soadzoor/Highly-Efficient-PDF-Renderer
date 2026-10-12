@@ -124,13 +124,20 @@ try {
       [...rgbaBits([1, 1, 0, 0, 0, 0, 1, 1]), ...rgbaBits(Array(8).fill(1))],
       "a missing encoded row is padded with white"
     );
+    for (const objectNumber of [45, 46]) {
+      const extraRow = adjusted.describe(await adjusted.add(ref(objectNumber)));
+      assert.equal(extraRow.height, 1);
+      assert.deepEqual([...extraRow.data], rgbaBits(Array(8).fill(1)),
+        "fax end marker can follow extra encoded rows beyond /Height or /Rows");
+    }
     assert.deepEqual(
       sizeDiagnostics.map((diagnostic) => [
         diagnostic.code,
         diagnostic.details.decodedColumns,
         diagnostic.details.decodedRows
       ]),
-      [["image.ccitt-size-adjusted", 1728, 1], ["image.ccitt-size-adjusted", 8, 1]]
+      [["image.ccitt-size-adjusted", 1728, 1], ["image.ccitt-size-adjusted", 8, 1],
+        ["image.ccitt-size-adjusted", 8, 2], ["image.ccitt-size-adjusted", 8, 2]]
     );
     sizeDiagnostics.length = 0;
     for (const objectNumber of [41, 42, 43]) {
@@ -213,6 +220,7 @@ try {
   for (const [limits, objectNumber] of [
     [{ maxDecodedStreamBytes: 512 }, 36],
     [{ maxImagePixels: 7 }, 10],
+    [{ maxImagePixels: 8 }, 45],
     [{ maxImageDimension: 7 }, 10]
   ]) {
     const limited = await openNativePdfDocument({ kind: "bytes", bytes: fixture }, { limits });
@@ -393,6 +401,14 @@ function ccittImageFixture() {
       )
     },
     { number: 40, body: "<< /K 0 /Columns 8 /Rows 1 /EndOfBlock false >>" },
+    ...[0, 1].map((rows, index) => ({
+      number: 45 + index,
+      body: image(
+        "/Width 8 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode " +
+        `/DecodeParms << /K -1 /Columns 8 /Rows ${rows} /EndOfBlock true >>`,
+        packBits(`1 001 00110101 000101 ${eofb}`)
+      )
+    })),
     ...["1 00000 " + eofb, "1 " + "0".repeat(69), "1"].map((encoded, index) => ({
       number: 41 + index,
       body: image(

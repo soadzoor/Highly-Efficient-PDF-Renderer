@@ -126,10 +126,12 @@ export interface RetainedVectorPageOptions {
  * The mask's gray samples are the image's alpha, and the two are independent
  * rasters that need not share a size, so the mask is sampled at base pixel
  * centers using its own interpolation policy. Existing source alpha multiplies,
- * as a mask and a source-alpha do when both apply.
+ * as a mask and a source-alpha do when both apply. A matte, when present, was
+ * preblended into the stored color and is removed using that same mask sample.
  */
 function applyHeprImageSoftMask(base: Uint8Array, width: number, height: number,
-  mask: Uint8Array, maskWidth: number, maskHeight: number, interpolate: boolean, signal?: AbortSignal): Uint8Array {
+  mask: Uint8Array, maskWidth: number, maskHeight: number, interpolate: boolean, signal?: AbortSignal,
+  matte?: readonly [number, number, number]): Uint8Array {
   if (maskWidth <= 0 || maskHeight <= 0 || width <= 0 || height <= 0) return base;
   const clampX = (x: number) => Math.max(0, Math.min(maskWidth - 1, x));
   const clampY = (y: number) => Math.max(0, Math.min(maskHeight - 1, y));
@@ -150,6 +152,15 @@ function applyHeprImageSoftMask(base: Uint8Array, width: number, height: number,
           (coverage(left, top + 1) * (1 - tx) + coverage(left + 1, top + 1) * tx) * ty;
       }
       const offset = (y * width + x) * 4;
+      if (matte && factor > 0) {
+        const alpha = factor / 255;
+        for (let channel = 0; channel < 3; channel++) {
+          base[offset + channel] = Math.round(Math.max(0, Math.min(1,
+            (base[offset + channel] / 255 - matte[channel] * (1 - alpha)) / alpha)) * 255);
+        }
+      } else if (matte) {
+        base[offset] = 0; base[offset + 1] = 0; base[offset + 2] = 0;
+      }
       base[offset + 3] = Math.round(base[offset + 3] * factor / 255);
     }
   }
@@ -978,9 +989,6 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     } else if (command.source === "images") {
       const images = page.stores.images;
       for (let index = command.first; index < command.first + command.count; index++) {
-        // Each of these needs a different preparation, and which one it is
-        // decides whether a page keeps its vectors, so name them apart.
-        if (images.matteOffsets[index + 1] > images.matteOffsets[index]) return fail("a pre-multiplied image matte requires preparation.");
         // A stencil mask paints coverage in the current fill color. Matching
         // opaque plates share a raster; other masks retain their own color.
         const stencil = images.imageMask[index] ? color(command.paintIndex, execution.state) : undefined;
@@ -1037,10 +1045,16 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
             const mask = expandHeprImageToRgba8(images.data.subarray(images.dataOffsets[maskIndex], images.dataOffsets[maskIndex + 1]),
               images.formats[maskIndex], images.widths[maskIndex], images.heights[maskIndex], signal);
             if (!mask) return fail(`an image soft mask stored as format ${images.formats[maskIndex]} requires a codec.`);
+            const matteValues = images.matteValues.subarray(images.matteOffsets[index], images.matteOffsets[index + 1]);
+            // Image samples are already canonical sRGB. Remove their prepared
+            // matte in that same space before applying the mask's alpha, as in
+            // the native VectorScene image adapter.
+            const matte = matteValues.length ? colors.convert(images.colorSpaceIndices[index], matteValues,
+              `stores.images.matteOffsets[${index}]`) : undefined;
             // An Rgba8 store widens to itself, so the alpha is written into a
             // copy rather than back into the page's own image bytes.
             data = applyHeprImageSoftMask(owned ? data : Uint8Array.from(data), width, height,
-              mask, images.widths[maskIndex], images.heights[maskIndex], images.interpolate[maskIndex] !== 0, signal);
+              mask, images.widths[maskIndex], images.heights[maskIndex], images.interpolate[maskIndex] !== 0, signal, matte);
           }
           imagePixels.set(key, pixels = { data, width, height });
         }

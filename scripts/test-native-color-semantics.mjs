@@ -560,10 +560,19 @@ async function testIndexedSpaces() {
   const streamIndex = await colors.add(indexed(name("DeviceRGB"), 0, lookupStream));
   assert.deepEqual(colors.convertToSrgb(streamIndex, [0]), [0, 0, 1]);
 
-  await rejectsCode(
-    () => colors.add(indexed(name("DeviceRGB"), 1, pdfString([0, 0, 0]))),
-    "unsupported-color"
-  );
+  const paletteDiagnostics = [];
+  const compatible = new NativePdfColorRegistry(document, undefined, {
+    onDiagnostic(diagnostic) { paletteDiagnostics.push(diagnostic); }
+  });
+  const shortPalette = await compatible.add(indexed(name("DeviceRGB"), 2, pdfString([255, 0, 0, 0, 255, 0])));
+  assert.deepEqual([...compatible.describe(shortPalette).lookup], [255, 0, 0, 0, 255, 0, 0, 0, 0]);
+  assert.deepEqual(compatible.defaultDecode(shortPalette), [0, 2], "truncated palettes retain the declared index range");
+  assert.deepEqual(compatible.convertToSrgb(shortPalette, [0]), [1, 0, 0]);
+  assert.deepEqual(compatible.convertToSrgb(shortPalette, [1]), [0, 1, 0]);
+  assert.deepEqual(compatible.convertToSrgb(shortPalette, [2]), [0, 0, 0], "only missing palette components are approximated");
+  assert.equal(paletteDiagnostics.length, 1);
+  assert.equal(paletteDiagnostics[0].code, "color.indexed-lookup-truncated");
+  assert.deepEqual(paletteDiagnostics[0].details, { expectedBytes: 9, actualBytes: 6, highValue: 2, missingEntryCount: 1 });
   for (const highValue of [-1, 0.5, 256]) {
     await rejectsCode(
       () => colors.add(indexed(name("DeviceGray"), highValue, pdfString([0]))),

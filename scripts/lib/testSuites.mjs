@@ -173,6 +173,7 @@ export const fastTests = [
   "native-cff-postscript-graphics",
   "native-cff2-semantics",
   "pdf-actual-text",
+  "pdf-production-compatibility",
   "pdf-session-ext-gstate-font",
   "native-image-codecs",
   "native-ccitt",

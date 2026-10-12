@@ -7,6 +7,8 @@
  * callers can then apply bounded fallback without silently omitting content.
  */
 
+import type { PdfDiagnostic } from "./nativeTypes";
+
 export type DensePdfMatrix = [number, number, number, number, number, number];
 
 export interface DensePdfBounds {
@@ -381,6 +383,8 @@ export interface DensePdfContentCompileOptions {
   signal?: AbortSignal;
   yieldIntervalMs?: number;
   onProgress?: (progress: DensePdfCompileProgress) => void;
+  /** Reports recoverable malformed content while preserving its visible paint. */
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
 }
 
 /** Shared inputs for compilation contexts whose output is fixed. @internal */
@@ -2087,7 +2091,20 @@ class DenseContentCompiler {
       }
     }
     if (this.markedContentStack.length > 0) {
-      throw new DensePdfSyntaxError("PDF content ends inside an unterminated BMC/BDC scope.");
+      this.options.onDiagnostic?.({
+        code: "marked-content.unclosed-scope", severity: "warning",
+        message: "Unterminated BMC/BDC scopes were closed at the end of their content program; their painted content was retained."
+      });
+      while (this.markedContentStack.length > 0) {
+        this.markedContentStack.pop();
+        this.syncActiveMarkedContent();
+        this.textSink?.applyOperator("EMC", [], {
+          outputEnabled: this.contentVisible,
+          optionalContentIndex: this.activeOptionalContentIndex,
+          markedContentIndex: this.activeMarkedContentIndex
+        });
+        if ((this.markedContentStack.length & 0x1fff) === 0) await checkpoint();
+      }
     }
 
     // Uniform opaque, stroke-only pages can retain the established containment
@@ -2449,7 +2466,17 @@ class DenseContentCompiler {
         this.assertCurrentPathLimits(operator);
         return;
       case "h":
-        this.requireArgs(operator, args, 0);
+        // A few appearance producers repeat the subpath's starting point
+        // before h. Closing already draws that exact segment; retain the
+        // vector path while diagnosing these redundant operands.
+        if (this.operandCount === 2 && this.path.isSubpathStart(numberArg(args, 0), numberArg(args, 1))) {
+          this.options.onDiagnostic?.({
+            code: "path.close-operands-recovered", severity: "warning",
+            message: "Redundant coordinates matching the subpath start before h were ignored; the path was closed normally."
+          });
+        } else {
+          this.requireArgs(operator, args, 0);
+        }
         this.path.closePath(this.policy.displayProgram === true);
         this.assertCurrentPathLimits(operator);
         return;
@@ -2996,10 +3023,10 @@ class DenseContentCompiler {
         this.requireArgs(operator, args, 1);
         const tag = nameArg(args, 0);
         if (tag === "OC") {
-          throw new DensePdfUnsupportedError(
-            "An /OC BMC scope has no membership property and cannot be evaluated.",
-            operator
-          );
+          this.options.onDiagnostic?.({
+            code: "optional-content.missing-membership", severity: "warning",
+            message: "An /OC BMC scope has no membership property; its content remains visible and layer visibility may differ."
+          });
         }
         this.beginMarkedContent(tag, null, -1, -1, true, operator);
         this.textSink?.applyOperator(operator, [tag], {
@@ -3078,7 +3105,11 @@ class DenseContentCompiler {
       case "EMC":
         this.requireArgs(operator, args, 0);
         if (!this.markedContentStack.pop()) {
-          throw new DensePdfSyntaxError("EMC has no matching BMC or BDC scope.");
+          this.options.onDiagnostic?.({
+            code: "marked-content.unmatched-end", severity: "warning",
+            message: "An EMC operator without a matching BMC/BDC scope was ignored; painted content was retained."
+          });
+          return;
         }
         this.syncActiveMarkedContent();
         this.textSink?.applyOperator(operator, [], {
@@ -5379,6 +5410,10 @@ class ReusablePathBuilder {
 
   isSingleLine(): boolean {
     return this.used === 6 && this.data[0] === DRAW_MOVE_TO && this.data[3] === DRAW_LINE_TO;
+  }
+
+  isSubpathStart(x: number, y: number): boolean {
+    return this.used > 0 && x === this.subpathStartX && y === this.subpathStartY;
   }
 
   moveTo(x: number, y: number): void {

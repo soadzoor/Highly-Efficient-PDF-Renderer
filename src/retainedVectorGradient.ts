@@ -26,7 +26,7 @@ export async function buildHeprVectorGradient(page: HeprPageData, gradientIndex:
   } else {
     const mesh = await buildHeprVectorShadingMesh(page, gradientIndex, options);
     const [a, b, c, d, e, f] = matrix, det = a * d - b * c;
-    if (!Number.isFinite(det) || Math.abs(det) < 1e-12) throw new PdfError("unsupported-content", "A shading has a singular paint transform.");
+    if (!Number.isFinite(det) || det === 0) throw new PdfError("unsupported-content", "A shading has a singular paint transform.");
     const { minX: x0, minY: y0, maxX: x1, maxY: y1 } = clipBounds;
     data = { ...createEmptyVectorScene(), gradientCount: 1,
       gradientMetaA: Float32Array.of(2, description.bbox ? 1 : 0, 0, 0),

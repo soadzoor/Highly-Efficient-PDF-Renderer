@@ -53,9 +53,41 @@ await testMergeCullAndFillBoundaries();
 await testLosslessExtremeCoordinateKeys();
 await testLargeVectorPaths();
 await testDeepMarkedContent();
+await testRecoveredMarkedContent();
+await testRedundantCloseCoordinates();
 await testGroupedSelectiveImageCheckpoints();
 
 console.log("Dense PDF content compiler tests passed.");
+
+async function testRedundantCloseCoordinates() {
+  const path = "93.946 213.813 m 160.428 213.813 l 160.428 205.032 l 93.946 205.032 l ";
+  const diagnostics = [];
+  const expected = await compile(path + "h f");
+  const actual = await compile(path + "93.946 213.813 h f", { onDiagnostic: d => diagnostics.push(d) });
+  assertSceneGeometryEqual(actual, expected);
+  assert.equal(actual.fillPathCount, 1);
+  assert.deepEqual(diagnostics.map(d => d.code), ["path.close-operands-recovered"]);
+  await assert.rejects(() => compile(path + "1 2 h f"), DensePdfSyntaxError);
+}
+
+async function testRecoveredMarkedContent() {
+  for (const [content, code] of [
+    ["/Span BMC 0 0 10 10 re f", "marked-content.unclosed-scope"],
+    ["EMC 0 0 10 10 re f", "marked-content.unmatched-end"],
+    ["/OC BMC 0 0 10 10 re f EMC", "optional-content.missing-membership"]
+  ]) {
+    const diagnostics = [];
+    const page = await compile(content, { onDiagnostic: d => diagnostics.push(d) });
+    assert.equal(page.fillPathCount, 1, "malformed scopes retain visible vector paint");
+    assert.deepEqual(diagnostics.map(d => d.code), [code]);
+  }
+  const hidden = await compile("/OC /Hidden BDC 0 0 10 10 re f", {
+    markedContentProperties: new Map([["Hidden", {
+      resourceName: "Hidden", optionalContentIndex: 0, defaultVisible: false, mcid: -1
+    }]])
+  });
+  assert.equal(hidden.fillPathCount, 0, "closing an incomplete hidden scope never exposes its paint");
+}
 
 async function compile(content, options = {}, compiler = compileDensePdfContent) {
   const source = typeof content === "string" ? encoder.encode(content) : content;
@@ -1047,7 +1079,6 @@ async function testUnsupportedAndMalformedContent() {
     await expectUnsupported(`${mode} Tr`, "Tr");
   }
   for (const content of [
-    "/OC BMC",
     "/Span << /OC /Layer >> BDC",
     "/Span << /Nested << /OCGs [] >> >> BDC",
     "/Span << /Nested << /Type /OCG >> >> BDC",

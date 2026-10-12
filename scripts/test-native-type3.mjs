@@ -142,10 +142,12 @@ try {
     () => parseLeadingType3Metrics(encoder.encode("500 1 d0"), "Vertical"),
     hasPdfError("unsupported-font", "type3-charproc-vertical-width")
   );
-  assert.throws(
-    () => parseLeadingType3Metrics(encoder.encode("500 0 10 0 -10 20 d1"), "Reversed"),
-    hasPdfError("unsupported-font", "type3-charproc-bbox-reversed")
-  );
+  const reversedDiagnostics = [];
+  const reversedMetrics = parseLeadingType3Metrics(encoder.encode("500 0 10 20 -10 0 d1"), "Reversed", reversedDiagnostics);
+  assert.deepEqual(reversedMetrics.boundingBox, [-10, 0, 10, 20]);
+  assert.equal(reversedMetrics.widthX, 500);
+  assert.equal(reversedDiagnostics[0].code, "font.type3-charproc-bbox-normalized");
+  await testReversedCharProcBBoxRecovery(document, localDictionary);
 
   const controller = new AbortController();
   controller.abort("Type3 fixture cancellation");
@@ -162,6 +164,24 @@ try {
 }
 
 console.log("native Type3 preparation tests passed");
+
+async function testReversedCharProcBBoxRecovery(document, validDictionary) {
+  const dictionary = new Map(validDictionary);
+  const charProcs = new Map(await document.resolveDictionary(dictionary.get("CharProcs")));
+  const bytes = encoder.encode("600 0 600 700 -5 -10 d1\n0 0 600 700 re f\n");
+  charProcs.set("Uncolored", { kind: "stream", dictionary: new Map(), bytes });
+  dictionary.set("CharProcs", charProcs);
+  const registry = new NativePdfType3Registry(document);
+  const font = await registry.prepareFont(dictionary);
+  assert.equal(font.diagnostics.length, 0, "unused CharProcs remain lazy");
+  const glyph = await font.resolveGlyph(66);
+  assert.deepEqual(glyph.charProc.metrics.boundingBox, [-5, -10, 600, 700]);
+  assert.equal(glyph.width, 600);
+  assert.deepEqual(glyph.charProc.decodedBytes, bytes, "normalization does not rewrite glyph painting");
+  assert.equal(font.diagnostics[0].code, "font.type3-charproc-bbox-normalized");
+  await font.resolveGlyph(66);
+  assert.equal(font.diagnostics.length, 1, "reused glyphs report normalization once");
+}
 
 async function testReversedFontBBoxRecovery(document, validDictionary) {
   const dictionary = new Map(validDictionary);

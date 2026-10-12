@@ -1155,18 +1155,27 @@ export class NativePdfAppearanceSynthesizer {
     }
     if (raw.length === 0) return null;
     const components: number[] = [];
+    let clamped = false;
     for (const item of raw) {
       const component = await this.document.resolveValue(item, signal);
-      if (
-        typeof component !== "number" || !Number.isFinite(component) ||
-        component < 0 || component > 1
-      ) {
+      if (typeof component !== "number" || !Number.isFinite(component)) {
         throw new PdfError("invalid-object", `${label} /${key} contains an invalid component.`, {
           pageIndex: annotation.pageIndex,
           details: { annotationIndex: annotation.annotationIndex, feature: "appearance-synthesis" }
         });
       }
-      components.push(component);
+      const normalized = Math.max(0, Math.min(1, component));
+      clamped ||= normalized !== component;
+      components.push(normalized);
+    }
+    if (clamped) {
+      const diagnostic: PdfDiagnostic = {
+        code: "annotation.color-clamped", severity: "warning", pageIndex: annotation.pageIndex,
+        message: `${label} /${key} components outside 0 through 1 were clamped; its vector appearance was retained.`,
+        details: { annotationIndex: annotation.annotationIndex }
+      };
+      this.diagnostics.push(diagnostic);
+      this.onDiagnostic?.(diagnostic);
     }
     return Object.freeze({ components: Object.freeze(components) });
   }
@@ -1206,10 +1215,13 @@ export class NativePdfAppearanceSynthesizer {
         });
       }
       if (name !== "S" && name !== "D" && name !== "U") {
-        throw synthesisError(annotation, `${label} border style /${name} is unsupported.`, {
-          reason: "appearance-border-style-unsupported",
-          borderStyle: name
-        });
+        const diagnostic: PdfDiagnostic = {
+          code: "annotation.appearance-approximated", severity: "warning", pageIndex: annotation.pageIndex,
+          message: `${label} border style /${name} was approximated with a solid vector border.`,
+          details: { annotationIndex: annotation.annotationIndex, borderStyle: name }
+        };
+        this.diagnostics.push(diagnostic);
+        this.onDiagnostic?.(diagnostic);
       }
       const dash = name === "D"
         ? await readDashArray(this.document, dictionary.get("D"), [3], signal, annotation, true)

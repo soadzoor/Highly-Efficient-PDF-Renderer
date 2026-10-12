@@ -1468,7 +1468,8 @@ class NativePdfSession implements NativeVectorPdfSession {
         this.document,
         decoded,
         signal,
-        options.limits?.maxCommandsPerPage
+        options.limits?.maxCommandsPerPage,
+        diagnostic => this.appendDiagnostics([{ ...diagnostic, pageIndex: sourcePageIndex }])
       );
       if (timings) {
         timings.inlinePreparationMs += nativeVectorTimingNow() - inlineStartedAt;
@@ -1665,7 +1666,10 @@ class NativePdfSession implements NativeVectorPdfSession {
       options.limits?.maxCommandsPerPage ?? this.document.limits.maxCommandsPerPage);
     const content = new StreamedPageContent(this.document, streams, signal, async (bytes, sourceOffset) => {
       const prepared = prepareNativeInlineImages(bytes, {
-        sourceOffset, signal, limits: inlineImageLimits(this.document, maxInlineImages)
+        sourceOffset, signal, limits: inlineImageLimits(this.document, maxInlineImages),
+        allowIncompleteContentTail: true,
+        recoverMissingRawEi: true,
+        onDiagnostic: imageResources.onDiagnostic
       });
       inlineImageCount += prepared.images.length;
       if (inlineImageCount > maxInlineImages) {
@@ -1824,6 +1828,7 @@ class NativePdfSession implements NativeVectorPdfSession {
     let finalizeStartedAt: number | null = null;
     const retainOptionalContent = (options as NativeVectorCompileOptions).retainOptionalContent === true;
     const compileOptions: DensePdfContentInputOptions = {
+      onDiagnostic: imageResources.onDiagnostic,
       retainOptionalContent,
       ...(retainOptionalContent ? { combineOptionalContent: (parent: number, own: number) => this.optionalContent.combineMemberships(parent, own) } : {}),
       pageMatrix,
@@ -2705,6 +2710,7 @@ interface NativePagePreparationReuse {
 }
 
 interface LoadedPageImages {
+  readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   readonly registry: NativePdfImageRegistry;
   readonly xObjectReferences: readonly NativePdfXObjectReference[];
   /** Exact page `/ColorSpace` dictionary used for image resource lookup. */
@@ -3068,6 +3074,7 @@ async function flattenNativeVectorFormOccurrences(
       textCompiler.setFontResource(fontRegistry.resources[fontIndex], size);
     }
     const compiled = await compileVectorFormContent(await scopedContent(definition), {
+      onDiagnostic: imageResources.onDiagnostic,
       pageMatrix: transform,
       pageBounds: clipBounds,
       initialGraphicsState: singlePaintGroup ? {
@@ -4810,6 +4817,7 @@ async function compileNativeFormPrograms(
       signal
     );
     const compiled = await compileDensePdfContent(await scopedInlineContent(definition), {
+      onDiagnostic: imageResources.onDiagnostic,
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: bounds,
       initialGraphicsState: formInitialGraphicsState,
@@ -5245,6 +5253,7 @@ async function compileNativeType3Programs(
       maxY: glyphBounds[3]
     };
     const compiled = await compileDensePdfContent(contentSegments, {
+      onDiagnostic: resources.onDiagnostic,
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: bounds,
       initialGraphicsState,
@@ -5529,6 +5538,7 @@ async function compileNativeType3Programs(
     ]) as readonly [number, number, number, number] : outline.bounds;
     const [minX, minY, maxX, maxY] = glyphBounds;
     const compiled = await compileDensePdfContent(content.bytes, {
+      onDiagnostic: resources.onDiagnostic,
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: { minX, minY, maxX, maxY },
       initialGraphicsState: inheritedState,
@@ -5841,6 +5851,7 @@ async function compileNativeSoftMaskProgram(
   const root = await compileDensePdfContent(
     new TextEncoder().encode(`/${resourceName} Do\n`),
     {
+      onDiagnostic: resources.onDiagnostic,
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: bounds,
       formXObjects: graph.pageForms,
@@ -6578,6 +6589,7 @@ async function compileNativePatternPrograms(
       maxY: pattern.boundingBox[3]
     };
     const compiled = await compileDensePdfContent(contentSegments, {
+      onDiagnostic: resources.onDiagnostic,
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: bounds,
       textOperatorSink,
@@ -7237,6 +7249,7 @@ async function loadPageImages(
     }
   }
   return {
+    onDiagnostic: diagnostic => onDiagnostic?.({ ...diagnostic, pageIndex: diagnostic.pageIndex ?? page.sourcePageIndex }),
     registry,
     xObjectReferences,
     colorSpaces,
@@ -7408,52 +7421,40 @@ function prepareDecodedInlineContentStreams(
   document: NativePdfDocument,
   chunks: readonly Uint8Array[],
   signal: AbortSignal,
-  maxImagesOverride?: number
+  maxImagesOverride?: number,
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void
 ): PreparedInlineContentSource {
-  const segments: DensePdfContentSegment[] = [];
-  const images: NativeInlineImageRecord[] = [];
-  const newline = Uint8Array.of(0x0a);
-  let sourceOffset = 0;
   const maxImages = Math.min(
     DEFAULT_NATIVE_INLINE_IMAGE_LIMITS.maxImages,
     maxImagesOverride ?? document.limits.maxCommandsPerPage
   );
-  for (let streamIndex = 0; streamIndex < chunks.length; streamIndex += 1) {
+  // /Contents is one logical program: ordinary values can span streams.
+  // Join only on the inline-image preparation path, retaining stream ends
+  // so a truncated BI payload cannot consume the next stream's bytes.
+  const length = chunks.reduce((sum, chunk) => sum + chunk.length, Math.max(0, chunks.length - 1));
+  const bytes = chunks.length === 1 ? chunks[0] : new Uint8Array(length);
+  const streamEndOffsets: number[] = [];
+  let offset = 0;
+  for (let index = 0; index < chunks.length; index++) {
     signal.throwIfAborted();
-    const prepared = prepareNativeInlineImages(chunks[streamIndex], {
-      sourceOffset,
-      signal,
-      limits: inlineImageLimits(document, maxImages)
-    });
-    for (const segment of prepared.segments) {
-      if (segment.kind === "content") {
-        segments.push(segment);
-        continue;
-      }
-      if (images.length >= maxImages) {
-        throw new PdfError("resource-limit", "Inline image count exceeds the page limit.", {
-          details: { reason: "inline-image-count", count: images.length + 1, limit: maxImages }
-        });
-      }
-      const image = Object.freeze({ ...segment, imageIndex: images.length });
-      images.push(image);
-      segments.push(image);
-    }
-    sourceOffset += chunks[streamIndex].length;
-    if (streamIndex + 1 < chunks.length) {
-      segments.push(Object.freeze({
-        kind: "content",
-        bytes: newline,
-        sourceOffset,
-        sourceLength: 1
-      }));
-      sourceOffset += 1;
-    }
+    if (chunks.length !== 1) bytes.set(chunks[index], offset);
+    offset += chunks[index].length;
+    streamEndOffsets.push(offset);
+    if (index + 1 < chunks.length) bytes[offset++] = 0x0a;
   }
+  const limits = inlineImageLimits(document, maxImages);
+  // The decoded-byte limit applies to each source stream. Joining their
+  // programs must retain the scan allowance each stream had separately.
+  const maxScanBytes = Math.min(Number.MAX_SAFE_INTEGER,
+    limits.maxScanBytes * Math.max(1, chunks.length) + Math.max(0, chunks.length - 1));
+  const prepared = prepareNativeInlineImages(bytes, {
+    signal, streamEndOffsets, limits: { ...limits, maxScanBytes },
+    recoverMissingRawEi: true, onDiagnostic
+  });
   return Object.freeze({
-    segments: Object.freeze(segments),
-    images: Object.freeze(images),
-    sourceLength: sourceOffset
+    segments: prepared.segments,
+    images: prepared.images,
+    sourceLength: prepared.sourceLength
   });
 }
 

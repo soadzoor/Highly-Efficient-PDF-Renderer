@@ -156,6 +156,7 @@ export class NativeTextCompiler {
   private readonly runs: NativeTextDrawRun[] = [];
   private readonly diagnostics: PdfDiagnostic[] = [];
   private readonly missingUnicodeCodes = new Set<string>();
+  private readonly graphicsInTextOperators = new Set<string>();
   private pendingSeparator: " " | "\n" | null = null;
   private explicitGapCandidatePending = false;
   private previousPenEndX = 0;
@@ -197,7 +198,7 @@ export class NativeTextCompiler {
   }
 
   saveGraphicsState(): void {
-    this.requireOutsideTextObject("q");
+    this.reportGraphicsInsideTextObject("q");
     this.checkCancellation();
     if (this.graphicsStack.length >= this.maxGraphicsStateDepth) {
       throw new PdfError("resource-limit", "PDF text graphics-state nesting exceeds its configured limit.", {
@@ -208,7 +209,7 @@ export class NativeTextCompiler {
   }
 
   restoreGraphicsState(): void {
-    this.requireOutsideTextObject("Q");
+    this.reportGraphicsInsideTextObject("Q");
     this.checkCancellation();
     const snapshot = this.graphicsStack.pop();
     if (!snapshot) throw invalidText("PDF text graphics-state stack underflow.");
@@ -218,7 +219,7 @@ export class NativeTextCompiler {
 
   /** Concatenate a page-space transform after the current CTM. */
   concatTransform(matrix: PdfMatrix): void {
-    this.requireOutsideTextObject("cm");
+    this.reportGraphicsInsideTextObject("cm");
     this.checkCancellation();
     this.ctm = multiply(this.ctm, validateMatrix(matrix, "text CTM"));
   }
@@ -892,10 +893,17 @@ export class NativeTextCompiler {
     if (!this.inTextObject) throw invalidText(`Text operator ${operator} occurs outside BT/ET.`);
   }
 
-  private requireOutsideTextObject(operator: string): void {
+  private reportGraphicsInsideTextObject(operator: string): void {
     this.checkCancellation();
-    if (this.inTextObject) {
-      throw invalidText(`Graphics operator ${operator} is not legal inside BT/ET.`);
+    if (this.inTextObject && !this.graphicsInTextOperators.has(operator)) {
+      this.graphicsInTextOperators.add(operator);
+      const diagnostic: PdfDiagnostic = {
+        code: "text.graphics-inside-text", severity: "warning",
+        message: `Graphics operator ${operator} inside BT/ET was applied to the graphics state; text positions and vector paint were retained.`,
+        details: { operator }
+      };
+      this.diagnostics.push(diagnostic);
+      this.onDiagnostic?.(diagnostic);
     }
   }
 

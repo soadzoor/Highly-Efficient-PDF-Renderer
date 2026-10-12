@@ -33,6 +33,9 @@ try {
 
   await assertNoInlinePreparationBypass(openPdf);
   await assertConsecutiveInlineImages(openPdf, validateHeprPageData);
+  await assertValuesAcrossContentStreams(openPdf, validateHeprPageData);
+  await assertPerStreamInlineScanLimit(openPdf, validateHeprPageData);
+  await assertMissingRawEi(openPdf, validateHeprPageData);
 
   const session = await openPdf({
     kind: "bytes",
@@ -283,6 +286,51 @@ async function assertNestedInlineImage(openPdf, validate, bytes, expectedKind) {
   }
 }
 
+async function assertPerStreamInlineScanLimit(openPdf, validate) {
+  const inline = rawInline("/W 1 /H 1 /BPC 8 /CS /G", Uint8Array.of(96));
+  const content = concat(" ".repeat(800 - inline.length), inline);
+  const bytes = writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+    { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents [4 0 R 5 0 R] >>" },
+    { number: 4, body: tinyPdfStream("", content) },
+    { number: 5, body: tinyPdfStream("", content) }
+  ] });
+  const session = await openPdf({ kind: "bytes", bytes }, {
+    limits: { maxDecodedStreamBytes: 1024 }
+  });
+  try {
+    const page = await session.compilePage(0, { optimization: "none" });
+    validate(page);
+    assert.equal(page.stores.images.widths.length, 2,
+      "a joined page retains each stream's own inline-image scan allowance");
+    const scene = await session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" });
+    assert.equal(scene.rasterLayers.length, 2);
+  } finally {
+    await session.close();
+  }
+}
+
+async function assertMissingRawEi(openPdf, validate) {
+  const bytes = onePagePdf("q BI /W 2 /H 1 /BPC 8 /CS /G ID EI Q 0 0 2 2 re f");
+  for (const method of ["compilePage", "compileVectorPage"]) {
+    const session = await openPdf({ kind: "bytes", bytes });
+    try {
+      const result = await session[method](0, { optimization: "none", vectorFallback: "error" });
+      if (method === "compilePage") {
+        validate(result);
+        const images = result.stores.images;
+        assert.deepEqual([...images.data.subarray(images.dataOffsets[0], images.dataOffsets[1])],
+          [69, 69, 69, 255, 73, 73, 73, 255]);
+      } else {
+        assert.equal(result.rasterLayers.length, 1);
+        assert.equal(result.fillPathCount, 1, "Q and subsequent vector content remain intact");
+      }
+      assert(session.getDiagnostics().some(d => d.code === "image.inline-missing-ei-recovered"));
+    } finally { await session.close(); }
+  }
+}
+
 async function assertType3InlineImage(openPdf, validate, execute) {
   const session = await openPdf({ kind: "bytes", bytes: type3InlineFixture() });
   try {
@@ -417,6 +465,33 @@ function softMaskInlineFixture() {
     { number: 5, body: "<< /Type /ExtGState /SMask << /S /Alpha /G 6 0 R >> >>" },
     { number: 6, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << >> /Group << /S /Transparency /I true /CS /DeviceGray >>", rawInline("/W 1 /H 1 /BPC 8 /CS /G", Uint8Array.of(128))) }
   ] });
+}
+
+async function assertValuesAcrossContentStreams(openPdf, validateHeprPageData) {
+  for (const [prefix, suffix] of [
+    ["/Span <<", "/MCID 2 >> BDC 5 5 5 5 re f EMC"],
+    ["/Point << /Extra [1", "2] >> DP 5 5 5 5 re f"],
+    ["/Span << /ActualText (BI", "is text) >> BDC 5 5 5 5 re f EMC"]
+  ]) {
+    const bytes = writeTinyPdf({ objects: [
+      { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+      { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+      { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Contents [4 0 R 5 0 R] >>" },
+      { number: 4, body: tinyPdfStream("", concat(rawInline("/W 1 /H 1 /BPC 8 /CS /G", Uint8Array.of(0)), ` ${prefix}`)) },
+      { number: 5, body: tinyPdfStream("", concat(`${suffix} `, rawInline("/W 1 /H 1 /BPC 8 /CS /G", Uint8Array.of(255)))) }
+    ] });
+    // Exercise the streamed compiler before its prepared retained counterpart.
+    const session = await openPdf({ kind: "bytes", bytes });
+    try {
+      const scene = await session.compileVectorPage(0, { vectorFallback: "error" });
+      assert.equal(scene.fillPathCount, 1);
+      assert.equal(scene.rasterLayers.length, 2, "both original inline images keep their own identities");
+      const page = await session.compilePage(0);
+      validateHeprPageData(page);
+      assert.equal(page.stores.images.widths.length, 2);
+      assert(!session.getDiagnostics().some(d => d.code.endsWith("raster-fallback")));
+    } finally { await session.close(); }
+  }
 }
 
 function crossStreamFixture() {

@@ -74,9 +74,11 @@ function testTextObjectLegalityAndPersistentState() {
   const nested = compilerFor([["F1", fontA]]);
   nested.beginText();
   expectPdfError(() => nested.beginText(), "unsupported-content");
-  expectPdfError(() => nested.saveGraphicsState(), "unsupported-content");
-  expectPdfError(() => nested.restoreGraphicsState(), "unsupported-content");
-  expectPdfError(() => nested.concatTransform([1, 0, 0, 1, 0, 0]), "unsupported-content");
+  nested.saveGraphicsState();
+  nested.restoreGraphicsState();
+  nested.concatTransform([1, 0, 0, 1, 0, 0]);
+  nested.endText();
+  assert.deepEqual(nested.build().diagnostics.map(d => d.details.operator), ["q", "Q", "cm"]);
 
   const openText = compilerFor([]);
   openText.beginText();

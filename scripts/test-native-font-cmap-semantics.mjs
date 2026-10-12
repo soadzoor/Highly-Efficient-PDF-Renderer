@@ -48,6 +48,7 @@ try {
   await testSimpleEncodingAndUnicodeSeparation();
   await testCidToGidBounds();
   await testToUnicodeSurrogateRecovery();
+  await testToUnicodeMetadataCompatibility();
   await testCidMappingRecovery();
   testDirectCMapValidation();
   await testUnsupportedAssetsAndLimits();
@@ -60,6 +61,44 @@ try {
 }
 
 console.log("native font CMap/encoding semantics tests passed");
+
+async function testToUnicodeMetadataCompatibility() {
+  for (const identityName of ["Identity-H", "Identity-V"]) {
+    const simple = simpleFont(name("WinAnsiEncoding"));
+    simple.set("ToUnicode", name(identityName));
+    const simpleParsed = await parseNativePdfFont(simple, identityResolver);
+    assert.equal(simpleParsed.decode(Uint8Array.of(0x41)).unicode, "A");
+    assert.equal(simpleParsed.diagnostics[0].code, "font.to-unicode-identity-name-ignored");
+
+    const composite = compositeFont(name("Identity-H"));
+    composite.set("ToUnicode", name(identityName));
+    const compositeParsed = await parseNativePdfFont(composite, identityResolver);
+    const character = compositeParsed.decode(Uint8Array.of(0x02, 0x79));
+    assert.equal(character.cid, 633);
+    assert.equal(character.glyphId, 633);
+    assert.equal(character.unicode, "\u3000", "invalid ToUnicode names retain canonical CID fallback");
+    assert.ok(compositeParsed.diagnostics.some(diagnostic => diagnostic.code === "font.to-unicode-identity-name-ignored"));
+  }
+
+  const understated = `
+    1 begincodespacerange <00> <ff> endcodespacerange
+    1 beginbfchar <41> <0042> <42> <0043> endbfchar
+  `;
+  assert.throws(() => parseToUnicodeCMap(encoder.encode(understated)),
+    hasPdfError("unsupported-font", /not terminated by endbfchar/i));
+  const dictionary = simpleFont(name("WinAnsiEncoding"));
+  dictionary.set("ToUnicode", stream(understated));
+  const font = await parseNativePdfFont(dictionary, identityResolver);
+  assert.equal(font.decode(Uint8Array.of(0x41)).unicode, "B");
+  assert.equal(font.decode(Uint8Array.of(0x42)).unicode, "C");
+  assert.equal(font.diagnostics[0].code, "font.to-unicode-block-count-recovered");
+  await assert.rejects(parseNativePdfFont(dictionary, identityResolver, { parserLimits: { maxCMapMappings: 1 } }),
+    hasPdfError("resource-limit", /mapping limit/i));
+
+  dictionary.set("ToUnicode", stream(understated.replace("<42> <0043> endbfchar", "<42> endbfchar")));
+  await assert.rejects(parseNativePdfFont(dictionary, identityResolver),
+    hasPdfError("unsupported-font", /not terminated by endbfchar/i));
+}
 
 async function testInheritedCompositeFont() {
   const font = await loadFont(10);
@@ -718,13 +757,18 @@ function testDirectCMapValidation() {
     `)),
     hasPdfError("unsupported-font", /overlap/i)
   );
-  assert.throws(
-    () => parseToUnicodeCMap(encoder.encode(`
+  const overlappingUnicode = parseToUnicodeCMap(encoder.encode(`
       1 begincodespacerange <00> <ff> endcodespacerange
       2 beginbfrange <40> <42> <0040> <42> <43> <0062> endbfrange
-    `)),
-    hasPdfError("unsupported-font", /overlapping local Unicode mappings/i)
-  );
+      1 beginbfchar <40> <00a0> endbfchar
+      1 beginbfrange <43> <43> [<0063>] endbfrange
+    `));
+  assert.equal(overlappingUnicode.decode(Uint8Array.of(0x40)).unicode, "\u00a0");
+  assert.equal(overlappingUnicode.decode(Uint8Array.of(0x41)).unicode, "A");
+  assert.equal(overlappingUnicode.decode(Uint8Array.of(0x42)).unicode, "b");
+  assert.equal(overlappingUnicode.decode(Uint8Array.of(0x43)).unicode, "c");
+  assert.equal(overlappingUnicode.diagnostics[0].code, "font.to-unicode-overrides");
+  assert.equal(overlappingUnicode.diagnostics[0].details.overriddenMappingCount, 3);
   const genericCodespace = parseToUnicodeCMap(encoder.encode(`
     1 begincodespacerange <0000> <ffff> endcodespacerange
     1 beginbfchar <20> <0020> endbfchar

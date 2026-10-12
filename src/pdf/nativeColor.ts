@@ -981,11 +981,29 @@ export class NativePdfColorRegistry {
         : null;
     if (!lookup) throw new PdfError("unsupported-color", "Indexed color-space lookup is not a string or stream.");
     const expected = (highValueRaw + 1) * base.componentCount;
-    if (lookup.length < expected) throw new PdfError("unsupported-color", "Indexed color-space lookup is truncated.");
+    let ownedLookup: Uint8Array;
+    if (lookup.length < expected) {
+      // Keep every supplied component and the declared index range. Missing
+      // suffix bytes are approximated with zero, so images referencing only
+      // the available palette entries retain their exact colors.
+      ownedLookup = new Uint8Array(expected);
+      ownedLookup.set(lookup);
+      this.onDiagnostic?.({
+        code: "color.indexed-lookup-truncated",
+        severity: "warning",
+        message: "An Indexed color palette is shorter than its declared range; missing palette components were approximated with zero. Colors using supplied entries are unchanged.",
+        details: {
+          expectedBytes: expected, actualBytes: lookup.length, highValue: highValueRaw,
+          missingEntryCount: highValueRaw + 1 - Math.floor(lookup.length / base.componentCount)
+        }
+      });
+    } else {
+      ownedLookup = lookup.slice(0, expected);
+    }
     return {
       ...colorRecord("Indexed", 1, [highValueRaw]),
       alternateSpaceIndex,
-      lookup: lookup.slice(0, expected),
+      lookup: ownedLookup,
       highValue: highValueRaw
     };
   }

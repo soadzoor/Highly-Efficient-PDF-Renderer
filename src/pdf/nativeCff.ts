@@ -238,7 +238,8 @@ export class NativeCffFont {
         "cff-font-count"
       );
     }
-    const fontNames = names.objects.map(bytes => readCffName(bytes, "CFF font name"));
+    const diagnostics: PdfDiagnostic[] = [];
+    const fontNames = names.objects.map(bytes => readCffName(bytes, "CFF font name", diagnostics));
     const fontIndex = selectCffFont(fontNames, fontName);
     const topIndexes = reader.readIndex(names.end, "Top DICT INDEX");
     if (topIndexes.objects.length !== names.objects.length) {
@@ -262,7 +263,7 @@ export class NativeCffFont {
       budget: { executedBytes: 0, operators: 0, subrCalls: 0, signal }, options };
     const selectedTop = parseCffDict(topIndexes.objects[fontIndex], "Top DICT", TOP_DICT_OPERATORS, { legacy });
     const top = resolveCffSyntheticBase(selectedTop, topIndexes.objects, fontIndex, legacy);
-    const diagnostics = [...readCffApproximationDiagnostics(top, customStrings)];
+    diagnostics.push(...readCffApproximationDiagnostics(top, customStrings));
 
     const ros = top.get(dictOperator(12, 30));
     const cidKeyed = ros !== undefined;
@@ -315,7 +316,7 @@ export class NativeCffFont {
             ? multiplyCffMatrices(topMatrix, readCffFontMatrix(dictionary))
             : readCffFontMatrix(dictionary)
           : topMatrix;
-        return readCffPrivateDictionary(reader, dictionary, matrix, { paintDictionary: top, legacy });
+        return readCffPrivateDictionary(reader, dictionary, matrix, { paintDictionary: top, legacy, diagnostics });
       }));
       fdSelect = readCffFdSelect(reader,
         readRequiredOffset(top, dictOperator(12, 37), "FDSelect"), glyphCount, fontDictionaries.length);
@@ -335,13 +336,13 @@ export class NativeCffFont {
       glyphNames = Object.freeze([]);
       builtInGlyphNames = Object.freeze(Array<string | null>(256).fill(null));
     } else {
-      fontDictionaries = Object.freeze([readCffPrivateDictionary(reader, top, topMatrix, { legacy })]);
+      fontDictionaries = Object.freeze([readCffPrivateDictionary(reader, top, topMatrix, { legacy, diagnostics })]);
       fdSelect = new Uint16Array(glyphCount);
       glyphNames = readCffCharset(reader,
         readOptionalOffset(top, dictOperator(15), 0, "charset"), glyphCount, customStrings);
       const glyphIds = new Map(glyphNames.map((name, glyphId) => [name, glyphId] as const));
       builtInGlyphNames = readCffEncoding(reader,
-        readOptionalOffset(top, dictOperator(16), 0, "Encoding"), glyphNames, glyphIds, customStrings);
+        readOptionalOffset(top, dictOperator(16), 0, "Encoding"), glyphNames, glyphIds, customStrings, diagnostics);
     }
 
     const computed = applyCffPostScript(top, customStrings, fontNames[fontIndex],
@@ -1883,6 +1884,7 @@ const PRIVATE_DICT_OPERATORS = new Set([
   6, 7, 8, 9, 10, 11, 19, 20, 21,
   dictOperator(12, 9), dictOperator(12, 10), dictOperator(12, 11),
   dictOperator(12, 12), dictOperator(12, 13), dictOperator(12, 14),
+  dictOperator(12, 15),
   dictOperator(12, 17), dictOperator(12, 18), dictOperator(12, 19)
 ]);
 
@@ -1899,6 +1901,7 @@ interface CffDictOptions {
   readonly variationStore?: NativeCffVariationStore | null;
   readonly paintDictionary?: CffDictionary;
   readonly legacy?: CffLegacyContext;
+  readonly diagnostics?: PdfDiagnostic[];
 }
 
 // Adobe Technical Note #5176, Appendix A. These names are format constants,
@@ -2076,6 +2079,13 @@ function readCffPrivateDictionary(
     reader.slice(offset, size, "Private DICT"), "Private DICT",
     options.cff2 ? CFF2_PRIVATE_DICT_OPERATORS : PRIVATE_DICT_OPERATORS, options
   );
+  // ForceBoldThreshold is an obsolete hinting parameter removed from CFF in
+  // March 2000 (Adobe TN 5176, Appendix I). Like other stem hints it does not
+  // affect the unhinted contours extracted here.
+  if (privateDictionary.has(dictOperator(12, 15))) options.diagnostics?.push(Object.freeze({
+    code: "font.cff-obsolete-hint-ignored", severity: "info",
+    message: "An obsolete CFF ForceBoldThreshold hint was ignored; vector glyph outlines were preserved."
+  }));
   const subrs = privateDictionary.get(dictOperator(19));
   let localSubrs: readonly Uint8Array[] = Object.freeze([]);
   if (subrs) {
@@ -2245,7 +2255,8 @@ function readCffEncoding(
   encodingOffset: number,
   glyphNames: readonly string[],
   glyphIds: ReadonlyMap<string, number>,
-  customStrings: readonly string[]
+  customStrings: readonly string[],
+  diagnostics: PdfDiagnostic[]
 ): readonly (string | null)[] {
   const names = new Array<string | null>(256).fill(null);
   if (encodingOffset === 0) {
@@ -2263,11 +2274,12 @@ function readCffEncoding(
   const format = rawFormat & 0x7f;
   let offset = encodingOffset + 1;
   let glyphId = 1;
+  let duplicateCodes = 0;
   const assign = (code: number, name: string): void => {
-    if (code < 0 || code > 255 || names[code] !== null) {
-      throw cffUnsupported("The CFF Encoding assigns a character code more than once.",
-        "cff-encoding-code");
-    }
+    // Some subsetters emit overlapping ranges or repeat a base code in a
+    // supplement. All glyphs remain usable by their charset names; retain the
+    // final assignment for the ambiguous built-in byte encoding.
+    if (names[code] !== null && names[code] !== name) duplicateCodes += 1;
     names[code] = name;
   };
   if (format === 0) {
@@ -2309,6 +2321,11 @@ function readCffEncoding(
       assign(code, name);
     }
   }
+  if (duplicateCodes > 0) diagnostics.push(Object.freeze({
+    code: "font.cff-encoding-normalized", severity: "warning",
+    message: "An embedded CFF Encoding assigned character codes more than once; final assignments were retained and all vector glyph outlines remain available.",
+    details: Object.freeze({ duplicateCodes })
+  }));
   return Object.freeze(names);
 }
 
@@ -2668,19 +2685,27 @@ function resolveCffTextSid(sid: number, customStrings: readonly string[]): strin
   return text;
 }
 
-function readCffName(bytes: Uint8Array, label: string): string {
+function readCffName(bytes: Uint8Array, label: string, diagnostics: PdfDiagnostic[]): string {
   if (bytes.length === 0 || bytes.length > 127) {
     throw cffUnsupported(`${label} has an invalid length.`, "cff-name");
   }
   let result = "";
+  let invalidBytes = false;
   for (const byte of bytes) {
     if (byte < 33 || byte > 126 || byte === 0x28 || byte === 0x29 || byte === 0x3c ||
         byte === 0x3e || byte === 0x5b || byte === 0x5d || byte === 0x7b || byte === 0x7d ||
         byte === 0x2f || byte === 0x25) {
-      throw cffUnsupported(`${label} contains an invalid PostScript name byte.`, "cff-name");
+      invalidBytes = true;
     }
     result += String.fromCharCode(byte);
   }
+  // Name INDEX entries identify programs; they are never executed as source.
+  // Preserve their exact bytes for FontSet selection even when a producer uses
+  // spaces or non-ASCII characters forbidden in a PostScript font name.
+  if (invalidBytes) diagnostics.push(Object.freeze({
+    code: "font.cff-name-recovered", severity: "warning",
+    message: "An embedded CFF font name contains nonstandard bytes; its original identity and vector glyph outlines were retained."
+  }));
   return result;
 }
 

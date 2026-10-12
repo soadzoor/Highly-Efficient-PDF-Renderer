@@ -19,7 +19,7 @@ try {
    * such image cost the whole page its vectors, the Form included.
    */
   const image = Uint8Array.from([255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0]); // 2x2 RGB
-  const fixture = (softMask, maskSize = 2) => writeTinyPdf({ objects: [
+  const fixture = (softMask, maskSize = 2, matte = false) => writeTinyPdf({ objects: [
     { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
     { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
     { number: 3, body: [
@@ -30,10 +30,10 @@ try {
     { number: 5, body: tinyPdfStream([
       "/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB",
       `/BitsPerComponent 8${softMask ? " /SMask 6 0 R" : ""}`
-    ].join(" "), image) },
+    ].join(" "), matte ? Uint8Array.from([255, 255, 255, 170, 255, 170, 85, 85, 255, 255, 255, 0]) : image) },
     { number: 6, body: tinyPdfStream([
       `/Type /XObject /Subtype /Image /Width ${maskSize} /Height ${maskSize}`,
-      "/ColorSpace /DeviceGray /BitsPerComponent 8"
+      `/ColorSpace /DeviceGray /BitsPerComponent 8${matte ? " /Matte [1 1 1]" : ""}`
     ].join(" "), Uint8Array.from({ length: maskSize * maskSize }, (_, i) => i * (255 / (maskSize * maskSize - 1)))) },
     { number: 7, body: tinyPdfStream([
       "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
@@ -74,6 +74,25 @@ try {
   const plainLayer = plain.scene.rasterLayers.find(entry => entry.width === 2 && entry.height === 2);
   assert.deepEqual([...plainLayer.data].filter((_, index) => index % 4 === 3), [255, 255, 255, 255],
     "an image without a soft mask is unchanged");
+
+  // One matte image used to reject retained lowering for the entire page,
+  // rasterizing nearby transparency groups, patterns and page soft masks.
+  const unmatted = await compile(fixture(true, 2, true));
+  assert.equal(unmatted.diagnostics.find(d => d.code.endsWith("-fallback")), undefined,
+    "a premultiplied image matte preserves the page's vector compositing graph");
+  assert(unmatted.scene.paintGraph);
+  assert.deepEqual([...unmatted.scene.rasterLayers[0].data],
+    [0, 0, 0, 0, 0, 255, 0, 85, 0, 0, 255, 170, 255, 255, 0, 255],
+    "the white matte is removed before mask alpha is applied, including fully transparent samples");
+  const matteSession = await openPdf({ kind: "bytes", bytes: fixture(true, 2, true) });
+  try {
+    const page = await matteSession.compilePage(0), original = Uint8Array.from(page.stores.images.data);
+    const first = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal });
+    const second = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal });
+    assert.deepEqual(page.stores.images.data, original, "matte removal leaves retained image bytes immutable");
+    assert.deepEqual(first.rasterLayers[0].data, second.rasterLayers[0].data,
+      "replaying the retained image removes its matte exactly once per output");
+  } finally { await matteSession.close(); }
 
   // A stencil mask is coverage painted in the current fill colour. Beside the
   // same transparency-group Form it used to cost the page its vectors, too.
@@ -123,5 +142,5 @@ try {
     assert.equal(diagnostics.find(d => d.code === "image.stencil-resolution-reduced")?.details.pixels, 4);
   } finally { await session.close(); }
 
-  console.log("Retained images: soft-mask alpha folded in, foreign mask sizes sampled, stencil masks tinted, pages keep their vectors");
+  console.log("Retained images: soft-mask alpha and mattes prepared, foreign mask sizes sampled, stencil masks tinted, pages keep their vectors");
 } finally { hooks.deregister(); }

@@ -390,6 +390,27 @@ async function testObjectStreamBoundaries() {
     await repaired.close();
   }
 
+  const missingEolFixture = objectStreamPageFixture("missing-stream-end-eol");
+  await assert.rejects(
+    openStrict(missingEolFixture),
+    hasPdfError("invalid-object", /end-of-line marker/),
+    "strict opening must reject malformed stream framing"
+  );
+  const missingEolRepaired = await openNativePdfDocument(
+    { kind: "bytes", bytes: missingEolFixture },
+    { repair: "safe" }
+  );
+  try {
+    assert.equal(missingEolRepaired.info.repaired, true);
+    assert.equal(missingEolRepaired.info.pageCount, 1,
+      "structural repair must retain compressed page-tree objects with exact stream boundaries");
+    assert.ok(missingEolRepaired.getDiagnostics().some((diagnostic) =>
+      diagnostic.code === "object.stream-end-eol-repaired" && diagnostic.objectNumber === 1
+    ));
+  } finally {
+    await missingEolRepaired.close();
+  }
+
   const referenceDocument = await openStrict(objectStreamReferenceFixture());
   try {
     await assert.rejects(
@@ -906,7 +927,7 @@ function objectStreamPageFixture(mode) {
   offsets.set(1, builder.length);
   builder.append(`1 0 obj\n<< /Type /ObjStm /N 3 /First ${bytes(header).length} /Length ${objectStreamData.length} >>\nstream\n`);
   builder.append(objectStreamData);
-  builder.append("\nendstream\nendobj\n");
+  builder.append(`${mode === "missing-stream-end-eol" ? "" : "\n"}endstream\nendobj\n`);
   const xrefOffset = builder.length;
   offsets.set(6, xrefOffset);
   const data = concatenate([
@@ -920,7 +941,7 @@ function objectStreamPageFixture(mode) {
   ]);
   builder.append(`6 0 obj\n<< /Type /XRef /Size 7 /Root 2 0 R /W [1 4 2] /Length ${data.length} >>\nstream\n`);
   builder.append(data);
-  builder.append(`\nendstream\nendobj\nstartxref\n${xrefOffset}\n%%EOF\n`);
+  builder.append(`${mode === "missing-stream-end-eol" ? "" : "\n"}endstream\nendobj\nstartxref\n${xrefOffset}\n%%EOF\n`);
   return builder.build();
 }
 

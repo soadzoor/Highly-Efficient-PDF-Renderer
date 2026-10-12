@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import { deflateRawSync, deflateSync, inflateSync } from "node:zlib";
+import { constants, deflateRawSync, deflateSync, inflateSync } from "node:zlib";
 
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
 
@@ -28,6 +28,7 @@ try {
   await testFlate();
   await testFlateEolRecovery();
   await testFlateMissingChecksumEol();
+  await testFlateCompatibilityRecovery();
   await testStreamingFlateChunks();
   await testLzw();
   await testAscii85();
@@ -328,7 +329,7 @@ async function testFlateMissingChecksumEol() {
   }
   const ordinaryChecksum = bytesOf(deflateSync(Uint8Array.of(1)));
   for (const decode of decodeModes) {
-    await assert.rejects(decode(ordinaryChecksum.subarray(0, -1)), hasPdfError("invalid-object", /FlateDecode/));
+    assert.deepEqual(await decode(ordinaryChecksum.subarray(0, -1)), Uint8Array.of(1));
   }
 
   // Reproduce a declared /Length that puts its final checksum LF outside the
@@ -345,6 +346,57 @@ async function testFlateMissingChecksumEol() {
     assert.ok(document.getDiagnostics().some(diagnostic => diagnostic.code === "filter.flate-eol-recovered"));
   } finally {
     await document.close();
+  }
+}
+
+async function testFlateCompatibilityRecovery() {
+  const decodeModes = [
+    (input, options) => decodePdfFilterChain(input, ["FlateDecode"], [null], options),
+    async (input, options) => (await collectFilterChunks(input, ["FlateDecode"], [null], {
+      chunkSize: 4093, ...options
+    })).bytes
+  ];
+  const payload = Uint8Array.from({ length: 200003 }, (_, index) => (index * 37 + 91) & 255);
+  const encoded = bytesOf(deflateSync(payload));
+  const syncFlushed = bytesOf(deflateSync(payload, { finishFlush: constants.Z_SYNC_FLUSH }));
+  assert.deepEqual([...syncFlushed.subarray(-4)], [0, 0, 255, 255]);
+  // The advertised 8K window cannot hold these 16K backreferences.
+  let seed = 173;
+  const block = Uint8Array.from({ length: 16000 }, () => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed >>> 24;
+  });
+  const distantPayload = concat(block, block, block);
+  const smallWindow = bytesOf(deflateSync(distantPayload));
+  smallWindow[0] = 0x58;
+  smallWindow[1] = 0x85;
+  for (const decode of decodeModes) {
+    for (const [input, expected, code, appendedByteCount] of [
+      [concat(encoded, encoded.subarray(-1)), payload, "filter.flate-trailing-data", undefined],
+      [smallWindow, distantPayload, "filter.flate-window-recovered", undefined],
+      ...[1, 2, 3, 4].map(missing => [
+        encoded.subarray(0, -missing), payload, "filter.flate-checksum-recovered", missing
+      ]),
+      [syncFlushed, payload, "filter.flate-sync-flush-recovered", 6]
+    ]) {
+      const diagnostics = [];
+      const snapshot = input.slice();
+      assert.deepEqual(await decode(input, { onDiagnostic(diagnostic) { diagnostics.push(diagnostic); } }), expected);
+      assert.deepEqual(input, snapshot, "Flate compatibility repairs preserve borrowed input bytes");
+      assert.equal(diagnostics.length, 1);
+      assert.equal(diagnostics[0].code, code);
+      if (appendedByteCount !== undefined) assert.equal(diagnostics[0].details.appendedByteCount, appendedByteCount);
+      await assert.rejects(decode(input, { limits: { maxDecodedStreamBytes: expected.length - 1 } }),
+        hasPdfError("resource-limit", /configured byte limit/));
+    }
+    const damagedChecksum = encoded.slice();
+    damagedChecksum[damagedChecksum.length - 2] ^= 1;
+    const wrongPartialChecksum = damagedChecksum.subarray(0, -1);
+    const damagedDeflate = encoded.subarray(0, Math.floor(encoded.length / 2));
+    for (const input of [damagedChecksum, wrongPartialChecksum, damagedDeflate, syncFlushed.subarray(0, -1)]) {
+      await assert.rejects(decode(input), hasPdfError("invalid-object", /FlateDecode/),
+        "present checksum corruption and incomplete DEFLATE payloads remain errors");
+    }
   }
 }
 

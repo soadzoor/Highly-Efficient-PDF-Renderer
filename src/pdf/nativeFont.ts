@@ -346,6 +346,8 @@ interface ParsedCMap {
   readonly codeSpaces: readonly NativeCodeSpaceRange[];
   readonly unicode: ReadonlyMap<string, string>;
   readonly invalidUnicodeMappingCount: number;
+  readonly overriddenUnicodeMappingCount: number;
+  readonly recoveredUnicodeBlockCount: number;
   readonly overriddenCidMappingCount: number;
   readonly cids: ReadonlyMap<string, number>;
   /** Aggregate retained program bytes across the /UseCMap chain. */
@@ -701,13 +703,15 @@ async function parseSimpleFont(
     }
   }
   reportFontDiagnostics(embeddedType1?.diagnostics ?? EMPTY_DIAGNOSTICS, options);
+  const toUnicodeRepairDiagnostics: PdfDiagnostic[] = [];
   const toUnicode = await readToUnicode(
     dictionary.get("ToUnicode"),
     resolver,
     parserLimits,
-    signal
+    signal,
+    toUnicodeRepairDiagnostics
   );
-  reportFontDiagnostics(toUnicode?.diagnostics ?? EMPTY_DIAGNOSTICS, options);
+  reportFontDiagnostics([...toUnicodeRepairDiagnostics, ...(toUnicode?.diagnostics ?? EMPTY_DIAGNOSTICS)], options);
   const firstChar = integerOr(dictionary.get("FirstChar"), 0);
   const widthValues = await resolveArray(dictionary.get("Widths"), resolver, signal);
   const widths = new Map<number, number>();
@@ -777,6 +781,7 @@ async function parseSimpleFont(
       ...(embeddedCff?.diagnostics ?? EMPTY_DIAGNOSTICS),
       ...(embeddedType1?.diagnostics ?? EMPTY_DIAGNOSTICS),
       ...(replacement?.diagnostics ?? EMPTY_DIAGNOSTICS),
+      ...toUnicodeRepairDiagnostics,
       ...(toUnicode?.diagnostics ?? EMPTY_DIAGNOSTICS)
     ]),
     (bytes, offset) => {
@@ -882,13 +887,15 @@ async function parseCompositeFont(
     ...cidOverrideDiagnostics(encoding.overriddenCidMappingCount)
   ]);
   reportFontDiagnostics(encodingDiagnostics, options);
+  const toUnicodeRepairDiagnostics: PdfDiagnostic[] = [];
   const toUnicode = await readToUnicode(
     dictionary.get("ToUnicode"),
     resolver,
     parserLimits,
-    signal
+    signal,
+    toUnicodeRepairDiagnostics
   );
-  reportFontDiagnostics(toUnicode?.diagnostics ?? EMPTY_DIAGNOSTICS, options);
+  reportFontDiagnostics([...toUnicodeRepairDiagnostics, ...(toUnicode?.diagnostics ?? EMPTY_DIAGNOSTICS)], options);
   const useCidUnicodeFallback = toUnicode === null ||
     (toUnicode.discardedNonUnicodeMappings && toUnicode.mappings.size === 0);
   const cidUnicode = useCidUnicodeFallback
@@ -963,6 +970,7 @@ async function parseCompositeFont(
       ...(embeddedSfnt?.diagnostics ?? EMPTY_DIAGNOSTICS),
       ...(embeddedCff?.diagnostics ?? EMPTY_DIAGNOSTICS),
       ...(replacement?.diagnostics ?? EMPTY_DIAGNOSTICS),
+      ...toUnicodeRepairDiagnostics,
       ...(toUnicode?.diagnostics ?? EMPTY_DIAGNOSTICS),
       ...encodingDiagnostics,
       ...cidUnicode.diagnostics
@@ -1497,9 +1505,21 @@ async function readToUnicode(
   value: PdfValue | undefined,
   resolver: NativePdfFontResolver,
   limits: Readonly<NativePdfFontParserLimits>,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  diagnostics?: PdfDiagnostic[]
 ): Promise<ReturnType<typeof parseToUnicodeCMap> | null> {
   if (value === undefined || value === null) return null;
+  const resolved = await resolver.resolveValue(value, signal);
+  if (isPdfName(resolved) && (resolved.value === "Identity-H" || resolved.value === "Identity-V")) {
+    // Identity encodings map codes to CIDs, not Unicode. They cannot provide
+    // the semantic mapping promised by /ToUnicode; retain ordinary fallbacks.
+    diagnostics?.push(Object.freeze({
+      code: "font.to-unicode-identity-name-ignored", severity: "warning",
+      message: "A font used an Identity encoding name as /ToUnicode; available font Unicode fallbacks were retained and text extraction may be incomplete.",
+      details: Object.freeze({ name: resolved.value })
+    }));
+    return null;
+  }
   const parsed = await resolveCMap(
     value,
     resolver,
@@ -1516,6 +1536,16 @@ function prepareToUnicodeCMap(parsed: ParsedCMap): ReturnType<typeof parseToUnic
   const discardedNonUnicodeMappings = parsed.cids.size > 0 ||
     parsed.cidRangeMappingCount > 0 || parsed.notdefRangeMappingCount > 0;
   const diagnostics = [...toUnicodeDiagnostics(parsed.invalidUnicodeMappingCount)];
+  if (parsed.overriddenUnicodeMappingCount > 0) diagnostics.push(Object.freeze({
+    code: "font.to-unicode-overrides", severity: "warning" as const,
+    message: "Recovered overlapping local ToUnicode mappings using their final definitions; text extraction may differ, while glyph selection is unchanged.",
+    details: Object.freeze({ overriddenMappingCount: parsed.overriddenUnicodeMappingCount })
+  }));
+  if (parsed.recoveredUnicodeBlockCount > 0) diagnostics.push(Object.freeze({
+    code: "font.to-unicode-block-count-recovered", severity: "warning" as const,
+    message: "A ToUnicode bfchar block understated its entry count; complete extra pairs up to endbfchar were retained.",
+    details: Object.freeze({ recoveredBlockCount: parsed.recoveredUnicodeBlockCount })
+  }));
   if (discardedNonUnicodeMappings) {
     diagnostics.push(Object.freeze({
       code: "font.to-unicode-non-unicode-mappings",
@@ -1650,7 +1680,7 @@ async function resolveCMap(
       signal
     );
   }
-  let parsed = parseCMap(bytes, limits, inherited, tokens, inlineBase);
+  let parsed = parseCMap(bytes, limits, inherited, tokens, inlineBase, label.includes("ToUnicode"));
   const dictionarySystemInfo = await readOptionalCMapSystemInfo(value.dictionary, resolver, signal);
   if (dictionarySystemInfo !== null) {
     parsed = Object.freeze({
@@ -1730,6 +1760,8 @@ async function predefinedCMap(
     codeSpaces: Object.freeze(codeSpaces),
     unicode: new Map(),
     invalidUnicodeMappingCount: inherited?.invalidUnicodeMappingCount ?? 0,
+    overriddenUnicodeMappingCount: inherited?.overriddenUnicodeMappingCount ?? 0,
+    recoveredUnicodeBlockCount: inherited?.recoveredUnicodeBlockCount ?? 0,
     overriddenCidMappingCount: inherited?.overriddenCidMappingCount ?? 0,
     cids: new Map(),
     sourceByteCount: inherited?.sourceByteCount ?? 0,
@@ -1752,6 +1784,8 @@ function identityCMap(name: "Identity-H" | "Identity-V"): ParsedCMap {
     codeSpaces: Object.freeze([{ byteLength: 2, start: 0, end: 0xffff }]),
     unicode: new Map(),
     invalidUnicodeMappingCount: 0,
+    overriddenUnicodeMappingCount: 0,
+    recoveredUnicodeBlockCount: 0,
     overriddenCidMappingCount: 0,
     cids: new Map(),
     sourceByteCount: 0,
@@ -1819,7 +1853,8 @@ function parseCMap(
   limits: Readonly<NativePdfFontParserLimits>,
   externalBase: ParsedCMap | null = null,
   preparedTokens?: readonly CMapToken[],
-  resolvedInlineBase?: ParsedCMap
+  resolvedInlineBase?: ParsedCMap,
+  recoverUnicodeBlockCounts = false
 ): ParsedCMap {
   const preliminaryBase = externalBase ?? resolvedInlineBase ?? null;
   const inheritedByteCount = preliminaryBase?.sourceByteCount ?? 0;
@@ -1854,6 +1889,8 @@ function parseCMap(
   const codeSpaces: NativeCodeSpaceRange[] = inherited ? [...inherited.codeSpaces] : [];
   const localUnicode = new Map<string, string>();
   let invalidUnicodeMappingCount = inherited?.invalidUnicodeMappingCount ?? 0;
+  let overriddenUnicodeMappingCount = inherited?.overriddenUnicodeMappingCount ?? 0;
+  let recoveredUnicodeBlockCount = inherited?.recoveredUnicodeBlockCount ?? 0;
   const decodeUnicodeTarget = (target: Uint8Array): string => {
     const decoded = decodeUtf16Be(target);
     if (decoded.repaired) invalidUnicodeMappingCount += 1;
@@ -1958,15 +1995,25 @@ function parseCMap(
       for (let item = 0; item < count; item += 1) {
         const source = requireCMapSource(tokens[++index], "bfchar source");
         const target = requireCMapTarget(tokens[++index], "bfchar target");
-        setLocalCMapMapping(
+        if (setLocalCMapMapping(
           localUnicode,
           localUnicodeKeys,
           cmapKey(bytesToCode(source), source.length),
           decodeUnicodeTarget(target),
           "Unicode"
-        );
+        )) overriddenUnicodeMappingCount += 1;
+      }
+      let extraPairs = 0;
+      while (recoverUnicodeBlockCounts && tokens[index + 1]?.kind === "hex" && tokens[index + 2]?.kind === "hex") {
+        mappingOperations = reserveCMapMappings(mappingOperations, 1, limits.maxCMapMappings);
+        const source = requireCMapSource(tokens[++index], "bfchar source");
+        const target = requireCMapTarget(tokens[++index], "bfchar target");
+        if (setLocalCMapMapping(localUnicode, localUnicodeKeys, cmapKey(bytesToCode(source), source.length),
+          decodeUnicodeTarget(target), "Unicode")) overriddenUnicodeMappingCount += 1;
+        extraPairs += 1;
       }
       requireCMapBlockEnd(tokens[++index], "endbfchar");
+      if (extraPairs > 0) recoveredUnicodeBlockCount += 1;
     } else if (token.value === "beginbfrange") {
       const count = requireCMapBlockCount(tokens[index - 1], token.value);
       for (let item = 0; item < count; item += 1) {
@@ -1987,25 +2034,25 @@ function parseCMap(
         if (target?.kind === "hex") {
           const initialTarget = requireCMapTarget(target, "bfrange target");
           for (let code = start; code <= end; code += 1) {
-            setLocalCMapMapping(
+            if (setLocalCMapMapping(
               localUnicode,
               localUnicodeKeys,
               cmapKey(code, startBytes.length),
               decodeUnicodeTarget(incrementBigEndian(initialTarget, code - start)),
               "Unicode"
-            );
+            )) overriddenUnicodeMappingCount += 1;
           }
         } else if (target?.kind === "array-start") {
           let code = start;
           while (code <= end) {
             const mapped = requireCMapTarget(tokens[++index], "bfrange array target");
-            setLocalCMapMapping(
+            if (setLocalCMapMapping(
               localUnicode,
               localUnicodeKeys,
               cmapKey(code, startBytes.length),
               decodeUnicodeTarget(mapped),
               "Unicode"
-            );
+            )) overriddenUnicodeMappingCount += 1;
             code += 1;
           }
           if (tokens[++index]?.kind !== "array-end") {
@@ -2091,6 +2138,8 @@ function parseCMap(
     codeSpaces: Object.freeze(codeSpaces),
     unicode: overlayCMapMappings(inherited?.unicode, localUnicode),
     invalidUnicodeMappingCount,
+    overriddenUnicodeMappingCount,
+    recoveredUnicodeBlockCount,
     overriddenCidMappingCount,
     cids: overlayCMapMappings(inherited?.cids, localCids),
     sourceByteCount,
@@ -2469,12 +2518,9 @@ function setLocalCMapMapping<T>(
   localKeys: Set<string>,
   key: string,
   value: T,
-  kind: "Unicode" | "CID"
+  _kind: "Unicode" | "CID"
 ): boolean {
   const overridden = localKeys.has(key);
-  if (overridden && kind === "Unicode") {
-    throw unsupportedFont(`CMap contains overlapping local ${kind} mappings.`);
-  }
   localKeys.add(key);
   // A local definition intentionally overrides the inherited /UseCMap value.
   mappings.set(key, value);
@@ -3277,6 +3323,7 @@ export class NativeSfntFont {
   readonly outlineFormat: "glyf" | "cff" | "cff2" | "unknown";
   private diagnosticData: readonly PdfDiagnostic[];
   private obsoleteCompoundFlagReported = false;
+  private emptyGlyphInstructionLengthReported = false;
 
   get diagnostics(): readonly PdfDiagnostic[] { return this.diagnosticData; }
 
@@ -3326,7 +3373,8 @@ export class NativeSfntFont {
     requireSfntTableLength(head, 54, "head");
     requireSfntTableLength(maxp, 6, "maxp");
     requireSfntTableLength(hhea, 36, "hhea");
-    if (head.length !== 54 || hhea.length !== 36) {
+    const extendedHeaders = head.length !== 54 || hhea.length !== 36;
+    if (extendedHeaders && validation !== "pdf-embedded") {
       throw unsupportedFont("The sfnt head or hhea table has an invalid length.");
     }
     const hasDeclaredChecksums = [...this.tables.values()]
@@ -3417,6 +3465,17 @@ export class NativeSfntFont {
           this.firstRecoveredHorizontalBearingGlyph,
           recoveredBearingsExact
         )]);
+    // PDF subsetters sometimes include alignment padding in the declared
+    // table lengths. The required fields above remain fully bounds checked;
+    // a trailing suffix cannot affect glyph coordinates or metrics.
+    if (extendedHeaders) this.diagnosticData = Object.freeze([
+      ...this.diagnosticData,
+      Object.freeze({
+        code: "font.sfnt-header-padding-ignored", severity: "warning" as const,
+        message: "An embedded sfnt included extra head or hhea bytes; their unused suffixes were ignored and vector glyph outlines were preserved.",
+        details: Object.freeze({ headLength: head.length, hheaLength: hhea.length })
+      })
+    ]);
     const maxpVersion = this.u32(maxp.offset, maxp);
     if (maxpVersion !== 0x00005000 && maxpVersion !== 0x00010000) {
       throw unsupportedFont("The sfnt maxp table has an unsupported version.");
@@ -3448,9 +3507,20 @@ export class NativeSfntFont {
       this.maxpProfile !== null &&
       (this.u16(maxp.offset + 14, maxp) < 1 || this.u16(maxp.offset + 14, maxp) > 2)
     ) {
-      throw unsupportedFont("The TrueType maxp maxZones value is invalid.");
+      if (validation !== "pdf-embedded") {
+        throw unsupportedFont("The TrueType maxp maxZones value is invalid.");
+      }
+      // maxZones describes the hinting VM, which is not used for vector
+      // outline extraction. Its invalid value cannot change glyf geometry.
+      this.diagnosticData = Object.freeze([...this.diagnosticData, Object.freeze({
+        code: "font.sfnt-max-zones-ignored", severity: "warning" as const,
+        message: "An embedded TrueType font declared invalid hinting zones; unhinted vector glyph outlines were preserved.",
+        details: Object.freeze({ maxZones: this.u16(maxp.offset + 14, maxp) })
+      })]);
     }
-    const cmaps = readSfntCmaps(this.view, this.tables.get("cmap"), limits);
+    const cmapDiagnostics: PdfDiagnostic[] = [];
+    const cmaps = readSfntCmaps(this.view, this.tables.get("cmap"), limits, validation, cmapDiagnostics);
+    if (cmapDiagnostics.length > 0) this.diagnosticData = Object.freeze([...this.diagnosticData, ...cmapDiagnostics]);
     // (1,0) Macintosh subtables map single-byte codes, never Unicode scalar values.
     this.unicodeCmap = cmaps.base.find((cmap) => cmap.platform !== 1 && (cmap.platform !== 3 || cmap.encoding !== 0)) ?? null;
     this.symbolCmap = cmaps.base.find((cmap) => cmap.platform === 3 && cmap.encoding === 0) ??
@@ -3781,6 +3851,18 @@ export class NativeSfntFont {
     bounds: readonly [number, number, number, number],
     budget: GlyphReadBudget
   ): ParsedGlyphGeometry {
+    if (contourCount === 0 && table.length === 10 && this.validation === "pdf-embedded") {
+      // Empty subset glyphs may consist only of their complete header, omitting
+      // the unused zero instructionLength word. No contour data is missing.
+      if (!this.emptyGlyphInstructionLengthReported) {
+        this.emptyGlyphInstructionLengthReported = true;
+        this.diagnosticData = Object.freeze([...this.diagnosticData, Object.freeze({
+          code: "font.sfnt-empty-glyph-normalized", severity: "warning" as const,
+          message: "An empty embedded TrueType glyph omitted its instruction-length word; its empty outline and original advance width were retained."
+        })]);
+      }
+      return { points: Object.freeze([]), contourEnds: Object.freeze([]), bounds, metricsGlyphId: glyphId };
+    }
     if (
       this.maxpProfile !== null &&
       contourCount > this.maxpProfile.maxContours
@@ -4318,7 +4400,9 @@ function isConsumedSfntTable(tag: string): boolean {
 function readSfntCmaps(
   view: DataView,
   table: SfntTable | undefined,
-  limits: Readonly<NativeSfntParserLimits>
+  limits: Readonly<NativeSfntParserLimits>,
+  validation: "strict" | "pdf-embedded",
+  diagnostics: PdfDiagnostic[]
 ): SfntCmaps {
   if (!table) return { base: Object.freeze([]), variation: Object.freeze([]) };
   requireSfntTableLength(table, 4, "cmap");
@@ -4389,7 +4473,9 @@ function readSfntCmaps(
       encoding,
       priority,
       limits,
-      groupBudget
+      groupBudget,
+      validation,
+      diagnostics
     );
     const recordKey = `${platform}:${encoding}:${lookup.language}`;
     if (seenSupportedRecords.has(recordKey)) {
@@ -4430,7 +4516,9 @@ function createCmapLookup(
   encoding: number,
   priority: number,
   limits: Readonly<NativeSfntParserLimits>,
-  groupBudget: { count: number }
+  groupBudget: { count: number },
+  validation: "strict" | "pdf-embedded",
+  diagnostics: PdfDiagnostic[]
 ): CmapLookup {
   if (format === 0) {
     const length = boundedU16(view, offset + 2, parent);
@@ -4448,9 +4536,14 @@ function createCmapLookup(
   }
   if (format === 4) {
     const length = boundedU16(view, offset + 2, parent);
-    if (length < 16 || (length & 1) !== 0 || !cmapRangeFits(parent, offset, length)) {
+    if (length < 16 || ((length & 1) !== 0 && validation !== "pdf-embedded") || !cmapRangeFits(parent, offset, length)) {
       throw unsupportedFont("The sfnt format 4 cmap is malformed.");
     }
+    if ((length & 1) !== 0) diagnostics.push(Object.freeze({
+      code: "font.sfnt-cmap-padding-ignored", severity: "warning",
+      message: "An embedded sfnt format 4 cmap declared an odd byte length; its bounded character mappings were retained.",
+      details: Object.freeze({ platform, encoding, length })
+    }));
     const subtable: SfntTable = { offset, length };
     const segCount = boundedU16(view, offset + 6, subtable) / 2;
     if (!Number.isInteger(segCount) || segCount < 1) {
@@ -4474,6 +4567,7 @@ function createCmapLookup(
       throw unsupportedFont("The sfnt format 4 cmap arrays are truncated.");
     }
     let previousEnd = -1;
+    let normalizedSentinel = false;
     for (let index = 0; index < segCount; index += 1) {
       const start = boundedU16(view, startCodes + index * 2, subtable);
       const end = boundedU16(view, endCodes + index * 2, subtable);
@@ -4494,6 +4588,11 @@ function createCmapLookup(
           startAddress < glyphArray ||
           !sfntRangeFits(startAddress - offset, endAddress - startAddress + 2, length)
         ) {
+          if (validation === "pdf-embedded" && index === segCount - 1 && start === 0xffff && end === 0xffff &&
+              boundedU16(view, deltas + index * 2, subtable) === 1) {
+            normalizedSentinel = true;
+            continue;
+          }
           throw unsupportedFont("The sfnt format 4 cmap glyph array offset is invalid.");
         }
       }
@@ -4504,6 +4603,11 @@ function createCmapLookup(
     ) {
       throw unsupportedFont("The sfnt format 4 cmap has no terminal sentinel segment.");
     }
+    if (normalizedSentinel) diagnostics.push(Object.freeze({
+      code: "font.sfnt-cmap-sentinel-normalized", severity: "warning",
+      message: "An embedded sfnt format 4 cmap had an invalid terminal offset; its U+FFFF sentinel was restored to the missing glyph and ordinary character mappings were retained.",
+      details: Object.freeze({ platform, encoding })
+    }));
     return {
       platform,
       encoding,
@@ -4512,6 +4616,7 @@ function createCmapLookup(
       priority,
       lookup(code) {
         if (code > 0xffff) return 0;
+        if (normalizedSentinel && code === 0xffff) return 0;
         let low = 0;
         let high = segCount - 1;
         while (low <= high) {
@@ -4540,9 +4645,16 @@ function createCmapLookup(
     }
     const first = view.getUint16(offset + 6, false);
     const count = view.getUint16(offset + 8, false);
-    if (10 + count * 2 !== length || first + count > 0x10000) {
+    const requiredLength = 10 + count * 2;
+    if (requiredLength > length || first + count > 0x10000 ||
+        (requiredLength !== length && validation !== "pdf-embedded")) {
       throw unsupportedFont("The sfnt format 6 cmap range is invalid.");
     }
+    if (requiredLength !== length) diagnostics.push(Object.freeze({
+      code: "font.sfnt-cmap-padding-ignored", severity: "warning",
+      message: "An embedded sfnt format 6 cmap included unused trailing bytes; its complete character mappings were retained.",
+      details: Object.freeze({ platform, encoding, trailingBytes: length - requiredLength })
+    }));
     return {
       platform,
       encoding,

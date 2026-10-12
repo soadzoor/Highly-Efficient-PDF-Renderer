@@ -38,6 +38,34 @@ try {
 
   const rgbResult = await resolveBundledImageCodec(request(rgb, 3));
   assertConstantPixels(rgbResult, [16, 85, 204]);
+  const paddedRgb = Uint8Array.from([
+    ...rgb.subarray(0, -2), ...new Uint8Array(639), ...rgb.subarray(-2)
+  ]);
+  const paddedSnapshot = paddedRgb.slice();
+  const recoveredRgb = await resolveBundledImageCodec(request(paddedRgb, 3));
+  assert.deepEqual(recoveredRgb.samples, rgbResult.samples,
+    "extraneous entropy bytes before EOI preserve the complete JPEG pixels");
+  assert.deepEqual(paddedRgb, paddedSnapshot);
+  assert.equal(recoveredRgb.diagnostics?.[0].code, "image.jpeg-recovered-data");
+  await verifyIncompleteDecoderReturns(resolveBundledImageCodec, rgb);
+  const fatalJpeg = flatJpeg(8, 8, 3);
+  const missingQuantization = Uint8Array.from([
+    ...fatalJpeg.subarray(0, 2), ...fatalJpeg.subarray(2 + 69)
+  ]);
+  await assert.rejects(resolveBundledImageCodec(request(missingQuantization, 3)),
+    error => unsupportedImage(error) && error.details?.reason === "jpeg-decoder-failed",
+    "fatal JPEG errors still fail instead of returning partially initialized samples");
+  const recoveredDiagnostics = [];
+  const recoveredSession = await openPdf({ kind: "bytes", bytes: jpegPdfFixture(paddedRgb) }, {
+    onDiagnostic(diagnostic) { recoveredDiagnostics.push(diagnostic); }
+  });
+  try {
+    const page = await recoveredSession.compilePage(0, { optimization: "none" });
+    assert.deepEqual([...page.stores.images.data.subarray(0, 4)], [16, 85, 204, 255]);
+    assert.equal(recoveredDiagnostics.filter(({ code }) => code === "image.jpeg-recovered-data").length, 1);
+  } finally {
+    await recoveredSession.close();
+  }
 
   const encoderParameters = {
     Blend: 1,
@@ -68,6 +96,30 @@ try {
 
   const grayResult = await resolveBundledImageCodec(request(gray, 1));
   assertConstantPixels(grayResult, [64]);
+  for (const transform of [1, 2]) {
+    const taggedGray = withAdobeTransform(gray, transform);
+    const snapshot = taggedGray.slice();
+    const result = await resolveBundledImageCodec(request(taggedGray, 1));
+    assert.deepEqual(result.samples, grayResult.samples,
+      "a redundant Adobe chroma transform leaves exact grayscale samples intact");
+    assert.deepEqual(taggedGray, snapshot);
+    assert.equal(result.diagnostics?.[0].code, "image.jpeg-grayscale-transform-ignored");
+    const diagnostics = [];
+    const session = await openPdf({
+      kind: "bytes", bytes: jpegPdfFixture(taggedGray, 8, 8, "", "DeviceGray")
+    }, { onDiagnostic(diagnostic) { diagnostics.push(diagnostic); } });
+    try {
+      const page = await session.compilePage(0, { optimization: "none" });
+      assert.deepEqual([...page.stores.images.data.subarray(0, 4)], [64, 64, 64, 255]);
+      assert.equal(diagnostics.filter(({ code }) => code === "image.jpeg-grayscale-transform-ignored").length, 1);
+    } finally {
+      await session.close();
+    }
+  }
+  for (const [bytes, components, transform] of [[rgb, 3, 2], [markerlessCmyk, 4, 1]]) {
+    await assert.rejects(resolveBundledImageCodec(request(withAdobeTransform(bytes, transform), components)),
+      error => error?.details?.reason === "adobe-transform-component-mismatch");
+  }
 
   const cmykResult = await resolveBundledImageCodec(request(cmyk, 4));
   assertConstantPixels(cmykResult, [191, 127, 65, 223]);
@@ -267,6 +319,34 @@ try {
   hooks.deregister();
 }
 
+async function verifyIncompleteDecoderReturns(resolveBundledImageCodec, encoded) {
+  const instantiate = WebAssembly.instantiate;
+  for (const partial of [false, true]) {
+    let calls = 0;
+    WebAssembly.instantiate = async (...args) => {
+      const instance = await instantiate(...args);
+      return { exports: { ...instance.exports,
+        tjDecompress2(handle, inputPointer, inputLength, outputPointer, width, pitch, height) {
+          calls += 1;
+          if (partial) {
+            new Uint8Array(instance.exports.memory.buffer, outputPointer, pitch * height)
+              .fill(32, 0, Math.floor(pitch * height / 2));
+          }
+          return -1;
+        }
+      } };
+    };
+    try {
+      await assert.rejects(resolveBundledImageCodec(request(encoded, 3)),
+        error => unsupportedImage(error) && error.details?.reason === "jpeg-decoder-failed",
+        `${partial ? "partial" : "non-writing"} fatal returns cannot expose uninitialized JPEG samples`);
+      assert.equal(calls, 2, "a warning return verifies that every output byte was written");
+    } finally {
+      WebAssembly.instantiate = instantiate;
+    }
+  }
+}
+
 async function verifyReducedResolution(createBundledImageCodecResolver, openPdf) {
   // A 1024x1024 RGB decode needs about 14 MiB of working set; half
   // resolution needs under 5 MiB. A reducible request decodes at 1/2 scale.
@@ -444,7 +524,15 @@ function manyScanJpeg(frameMarker, scans) {
   return Uint8Array.from(output);
 }
 
-function jpegPdfFixture(jpeg, width = 8, height = 8, decodeParameters = "") {
+function withAdobeTransform(jpeg, transform) {
+  return Uint8Array.from([
+    ...jpeg.subarray(0, 2),
+    0xff, 0xee, 0, 14, ...new TextEncoder().encode("Adobe"), 0, 100, 0, 0, 0, 0, transform,
+    ...jpeg.subarray(2)
+  ]);
+}
+
+function jpegPdfFixture(jpeg, width = 8, height = 8, decodeParameters = "", colorSpace = "DeviceRGB") {
   const decodeParametersEntry = decodeParameters ? ` /DecodeParms << ${decodeParameters} >>` : "";
   return writeTinyPdf({ objects: [
     { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
@@ -457,7 +545,7 @@ function jpegPdfFixture(jpeg, width = 8, height = 8, decodeParameters = "") {
     {
       number: 5,
       body: tinyPdfStream(
-        `/Type /XObject /Subtype /Image /Width ${width} /Height ${height} /BitsPerComponent 8 /ColorSpace /DeviceRGB /Filter /DCTDecode${decodeParametersEntry}`,
+        `/Type /XObject /Subtype /Image /Width ${width} /Height ${height} /BitsPerComponent 8 /ColorSpace /${colorSpace} /Filter /DCTDecode${decodeParametersEntry}`,
         jpeg
       )
     }

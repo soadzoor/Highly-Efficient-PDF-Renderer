@@ -53,6 +53,7 @@ export interface NativePdfType3CharProcRecord {
   readonly encodedContentBytes: number;
   readonly decodedBytes: Uint8Array;
   readonly metrics: NativePdfType3Metrics;
+  readonly diagnostics: readonly PdfDiagnostic[];
 }
 
 export interface NativePdfType3GlyphInvocation {
@@ -417,7 +418,11 @@ export class NativePdfType3Registry {
       : this.objectIdentity(value);
     const identity = `${sourceIdentity}|resources:${font.resourceIdentity}`;
     const cached = this.recordCache.get(identity);
-    if (cached) return await cached;
+    if (cached) {
+      const record = await cached;
+      font.addCharProcDiagnostics(record);
+      return record;
+    }
     const pending = this.decodeAndAppendCharProc(
       value,
       sourceRef,
@@ -430,7 +435,9 @@ export class NativePdfType3Registry {
       throw error;
     });
     this.recordCache.set(identity, pending);
-    return await pending;
+    const record = await pending;
+    font.addCharProcDiagnostics(record);
+    return record;
   }
 
   private async decodeAndAppendCharProc(
@@ -499,7 +506,8 @@ export class NativePdfType3Registry {
         }
       );
     }
-    const metrics = parseLeadingType3Metrics(decodedBytes, sourceName);
+    const diagnostics: PdfDiagnostic[] = [];
+    const metrics = parseLeadingType3Metrics(decodedBytes, sourceName, diagnostics);
     const index = this.records.length;
     const record: NativePdfType3CharProcRecord = Object.freeze({
       index,
@@ -510,7 +518,8 @@ export class NativePdfType3Registry {
       resourceOrigin: font.resourceOrigin,
       encodedContentBytes: stream.bytes.byteLength,
       decodedBytes,
-      metrics
+      metrics,
+      diagnostics: Object.freeze(diagnostics)
     });
     this.records.push(record);
     this.cachedDecodedBytes += decodedBytes.byteLength;
@@ -562,7 +571,9 @@ class PreparedType3Font implements NativePdfPreparedType3Font {
   readonly dictionary: PdfDictionary;
   readonly fontMatrix: NativePdfType3Matrix;
   readonly fontBBox: NativePdfType3Rectangle;
-  readonly diagnostics: readonly PdfDiagnostic[];
+  private diagnosticData: readonly PdfDiagnostic[];
+  private readonly diagnosedCharProcs = new Set<string>();
+  get diagnostics(): readonly PdfDiagnostic[] { return this.diagnosticData; }
   readonly firstChar: number;
   readonly lastChar: number;
   readonly widths: readonly number[];
@@ -589,7 +600,7 @@ class PreparedType3Font implements NativePdfPreparedType3Font {
     this.dictionary = dictionary;
     this.fontMatrix = data.fontMatrix;
     this.fontBBox = data.fontBBox;
-    this.diagnostics = data.diagnostics;
+    this.diagnosticData = data.diagnostics;
     this.firstChar = data.firstChar;
     this.lastChar = data.lastChar;
     this.widths = data.widths;
@@ -600,6 +611,12 @@ class PreparedType3Font implements NativePdfPreparedType3Font {
     this.resources = resources.dictionary;
     this.resourceOrigin = resources.origin;
     this.resourceIdentity = resources.identity;
+  }
+
+  addCharProcDiagnostics(record: NativePdfType3CharProcRecord): void {
+    if (record.diagnostics.length === 0 || this.diagnosedCharProcs.has(record.id)) return;
+    this.diagnosedCharProcs.add(record.id);
+    this.diagnosticData = Object.freeze([...this.diagnosticData, ...record.diagnostics]);
   }
 
   charProcNameForCode(code: number): string {
@@ -899,7 +916,8 @@ async function readType3ToUnicode(
 /** Parse only the required leading d0/d1 operator; never scan or repair content. */
 export function parseLeadingType3Metrics(
   bytes: Uint8Array,
-  charProcName = "(unnamed)"
+  charProcName = "(unnamed)",
+  diagnostics?: PdfDiagnostic[]
 ): NativePdfType3Metrics {
   let offset = skipType3WhitespaceAndComments(bytes, 0);
   const numbers: number[] = [];
@@ -950,14 +968,19 @@ export function parseLeadingType3Metrics(
         { charProcName }
       );
     }
-    const boundingBox = asRectangle(numbers.slice(2));
-    if (boundingBox[0] > boundingBox[2] || boundingBox[1] > boundingBox[3]) {
-      throw type3Error(
-        `Type3 CharProc /${charProcName} d1 bounding box is reversed.`,
-        "type3-charproc-bbox-reversed",
-        { charProcName }
-      );
-    }
+    const sourceBoundingBox = asRectangle(numbers.slice(2));
+    const reversed = sourceBoundingBox[0] > sourceBoundingBox[2] || sourceBoundingBox[1] > sourceBoundingBox[3];
+    const boundingBox = reversed ? asRectangle([
+      Math.min(sourceBoundingBox[0], sourceBoundingBox[2]),
+      Math.min(sourceBoundingBox[1], sourceBoundingBox[3]),
+      Math.max(sourceBoundingBox[0], sourceBoundingBox[2]),
+      Math.max(sourceBoundingBox[1], sourceBoundingBox[3])
+    ]) : sourceBoundingBox;
+    if (reversed) diagnostics?.push(Object.freeze({
+      code: "font.type3-charproc-bbox-normalized", severity: "warning",
+      message: `Normalized reversed Type3 CharProc /${charProcName} d1 bounds; its vector painting and advance width were retained.`,
+      details: Object.freeze({ charProcName, sourceBoundingBox: sourceBoundingBox.join(" "), boundingBox: boundingBox.join(" ") })
+    }));
     return Object.freeze({
       operator: "d1",
       colored: false,

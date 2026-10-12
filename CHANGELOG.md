@@ -8,6 +8,24 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
+- Preserve vector content in production PDF conversions with recoverable CFF,
+  TrueType and Type3 font defects, malformed text/marked-content scopes,
+  incomplete annotation metadata, and redundant path-closing coordinates.
+  Diagnose compatibility repairs instead of rejecting otherwise usable documents.
+- Recover padded image samples, redundant stencil color spaces, packed
+  RunLength images, excess CCITT rows, and validated Flate framing defects
+  while retaining cancellation, configured limits and corrupt-data checks.
+  Retain JPEG samples after recoverable decoder warnings, preserve supplied
+  Indexed palette entries while diagnosing approximated missing entries, and recover
+  complete raw inline images whose final EI samples replace their terminator.
+- Keep intact font, image and object streams during safe xref repair when only
+  the EOL before their exact declared endstream boundary is missing.
+- Remove image mattes before applying soft masks in retained vector output,
+  avoiding unnecessary raster fallback for surrounding transparency groups,
+  patterns and page soft masks. Preserve valid PDF values split across content
+  streams when preparing inline images, and retain small invertible shading
+  transforms. Allow complex shading meshes beyond the former default triangle
+  and subdivision ceilings while preserving caller-selected limits.
 - Keep Reader zoom focused through scroll boundaries and high magnification in
   both demos. Preserve precise camera positions independently of browser scroll
   limits and rounding, with bounded scrollbar ranges and consistent touch,

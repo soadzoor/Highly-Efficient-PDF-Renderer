@@ -96,6 +96,37 @@ function testLatin1StringsAreAccepted() {
   assert.deepEqual(latin1.getGlyphOutline(1), baseline.getGlyphOutline(1));
 }
 
+function testNonstandardFontNamesAndDuplicateEncodings() {
+  const baseline = NativeCffFont.parse(buildCffFixture());
+  const named = NativeCffFont.parse(buildCffFixture({ fontName: ascii("*Fixture Cff") }));
+  assert.deepEqual(named.getGlyphOutline(1), baseline.getGlyphOutline(1));
+  assert.equal(named.diagnostics[0].code, "font.cff-name-recovered");
+  const obsoleteHint = NativeCffFont.parse(buildCffFixture({
+    privateExtra: concat(dictInteger(0), Uint8Array.of(12, 15))
+  }));
+  assert.deepEqual(obsoleteHint.getGlyphOutline(1), baseline.getGlyphOutline(1));
+  assert.equal(obsoleteHint.diagnostics[0].code, "font.cff-obsolete-hint-ignored");
+
+  for (const [encoding, expectedName] of [
+    [Uint8Array.of(0, 4, 65, 65, 193, 66), "acute"],
+    [Uint8Array.of(1, 2, 65, 1, 65, 1), "Aacute"],
+    [Uint8Array.of(0x80, 4, 65, 194, 193, 66, 1, 65, 0, 125), "acute"]
+  ]) {
+    const font = NativeCffFont.parse(buildCffFixture({ encoding }));
+    assert.equal(font.builtInGlyphNames[65], expectedName, "the final duplicate assignment wins");
+    assert.equal(font.diagnostics[0].code, "font.cff-encoding-normalized");
+    assert.equal(font.glyphIdForName("A"), 1, "duplicate byte codes preserve charset glyph selection");
+    assert.deepEqual(font.getGlyphOutline(1), baseline.getGlyphOutline(1));
+  }
+  const redundant = NativeCffFont.parse(buildCffFixture({
+    encoding: Uint8Array.of(0x80, 4, 65, 194, 193, 66, 1, 65, 0, 34)
+  }));
+  assert.equal(redundant.builtInGlyphNames[65], "A");
+  assert.equal(redundant.diagnostics.length, 0, "repeating the same mapping needs no fidelity warning");
+  expectPdf(() => NativeCffFont.parse(buildCffFixture({ encoding: Uint8Array.of(1, 1, 254, 3) })),
+    "unsupported-font", /range exceeds/i);
+}
+
 function testPredefinedExpertCharsetsAndEncoding() {
   const emptyGlyph = type2(["endchar"]);
   const expert = NativeCffFont.parse(buildCffFixture({
@@ -708,10 +739,10 @@ function buildCffFixture(options = {}) {
     ])
   ];
   const header = Uint8Array.of(1, 0, 4, 4);
-  const nameIndex = cffIndex([ascii("FixtureCff")]);
+  const nameIndex = cffIndex([options.fontName ?? ascii("FixtureCff")]);
   const stringIndex = cffIndex([ascii("fixtureGlyph"), ...(options.extraStrings ?? [])]);
   const globalSubrsIndex = cffIndex(globalSubrs);
-  const encoding = Uint8Array.of(0, 4, 65, 194, 193, 66);
+  const encoding = options.encoding ?? Uint8Array.of(0, 4, 65, 194, 193, 66);
   const charset = Uint8Array.of(0, 0, 34, 0, 125, 0, 171, 1, 135);
   const charStringsIndex = cffIndex(charStrings);
 
@@ -1162,6 +1193,7 @@ testStrokedFontsAndComputedPostScript();
 testCidFontDictionaryPostScript();
 testLegacyMultipleMasterPrograms();
 testLatin1StringsAreAccepted();
+testNonstandardFontNamesAndDuplicateEncodings();
 await testPdfFontSelectionIsSeparateFromToUnicode();
 await testPdfSyntheticFontSetSelection();
 await testCffDiagnosticPropagation();
