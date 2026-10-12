@@ -13,6 +13,8 @@ export interface ThreePageBinding {
   page?: number;
 }
 
+const PLANAR_CLIP_COMPONENTS = [0, 1, 3, 4, 5, 7, 12, 13, 15] as const;
+
 /** Geometry stays canonical. Only the small matrix/visibility tables are mutable. */
 export class ThreePageTransforms {
   readonly matrices: THREE.DataTexture;
@@ -22,7 +24,19 @@ export class ThreePageTransforms {
   readonly coarseBounds: Bounds[];
   readonly runPages: Uint16Array | null;
   readonly projectionElements: readonly number[][];
+  /**
+   * Per page: 0 when not drawn, 1 when drawn as an XY translation of the
+   * document, 2 when drawn with any other transform. Unlike `visibility`, it
+   * does not depend on the camera.
+   */
+  readonly layout: Uint8Array;
+  /** Per page data-to-document X/Y translation, as drawn (Float32). */
+  readonly translations: Float64Array;
   revision = 0;
+  /** Increments whenever `layout` or a translation changes. */
+  layoutRevision = 0;
+  /** Increments whenever a page's coarse text bounds grow. */
+  boundsRevision = 0;
   minUnitsPerPixel = 1;
   maxUnitsPerPixel = 1;
   opaque = false;
@@ -33,6 +47,8 @@ export class ThreePageTransforms {
   private disposed = false;
   private parametersDirty = false;
   private projectionDirty = false;
+  private layoutDirty = false;
+  private transformedPages = 0;
 
   constructor(partition: ScenePageViews) {
     this.partition = partition;
@@ -54,7 +70,14 @@ export class ThreePageTransforms {
     this.coarseBounds = Array.from({ length: count }, () => ({ minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity }));
     this.projections = Array.from({ length: count }, () => new THREE.Matrix4());
     this.visibility = new Uint8Array(count);
+    this.layout = new Uint8Array(count);
+    this.translations = new Float64Array(count * 2);
     this.projectionElements = this.projections.map(matrix => matrix.elements);
+  }
+
+  /** Every drawn page is an XY translation of the document plane. */
+  get translatedLayout(): boolean {
+    return this.transformedPages === 0;
   }
 
   get requiredTextureDimension(): number {
@@ -63,13 +86,24 @@ export class ThreePageTransforms {
     return dimension;
   }
 
-  setPage(index: number, dataToDocument: THREE.Matrix4, dataToClip: THREE.Matrix4, visible: boolean, unitsPerPixel: number): void {
+  /** `enabled` reports whether the page is drawn at all, independent of the camera. */
+  setPage(index: number, dataToDocument: THREE.Matrix4, dataToClip: THREE.Matrix4, visible: boolean, unitsPerPixel: number,
+    enabled = visible): void {
     const matrices = this.matrices.image.data as Float32Array;
     const params = this.parameters.image.data as Float32Array;
+    let translation = true;
     for (let i = 0; i < 16; i++) {
       const value = Math.fround(dataToDocument.elements[i]);
-      if (matrices[index * 16 + i] !== value) { matrices[index * 16 + i] = value; this.matrixDirty = true; }
+      if (i !== 12 && i !== 13 && value !== (i % 5 === 0 ? 1 : 0)) translation = false;
+      if (matrices[index * 16 + i] !== value) { matrices[index * 16 + i] = value; this.matrixDirty = this.layoutDirty = true; }
     }
+    const layout = !enabled ? 0 : translation ? 1 : 2;
+    if (this.layout[index] !== layout) {
+      this.transformedPages += Number(layout === 2) - Number(this.layout[index] === 2);
+      this.layout[index] = layout; this.layoutDirty = true;
+    }
+    this.translations[index * 2] = matrices[index * 16 + 12];
+    this.translations[index * 2 + 1] = matrices[index * 16 + 13];
     const units = Math.fround(unitsPerPixel);
     if (params[index * 4] !== units || this.visibility[index] !== Number(visible)) {
       params[index * 4] = units; params[index * 4 + 1] = Number(visible);
@@ -78,7 +112,7 @@ export class ThreePageTransforms {
     const previous = this.projections[index].elements;
     // Text selection depends on XY/W on the z=0 page plane, not clip depth.
     // Orthographic Z animation must not rescan every glyph cluster in a book.
-    for (const component of [0, 1, 3, 4, 5, 7, 12, 13, 15]) {
+    for (const component of PLANAR_CLIP_COMPONENTS) {
       if (previous[component] !== dataToClip.elements[component]) { this.projectionDirty = true; break; }
     }
     this.projections[index].copy(dataToClip);
@@ -88,7 +122,8 @@ export class ThreePageTransforms {
     if (this.matrixDirty) this.matrices.needsUpdate = true;
     if (this.parametersDirty) this.parameters.needsUpdate = true;
     if (this.parametersDirty || this.projectionDirty) this.revision++;
-    this.matrixDirty = this.parametersDirty = this.projectionDirty = false;
+    if (this.layoutDirty) this.layoutRevision++;
+    this.matrixDirty = this.parametersDirty = this.projectionDirty = this.layoutDirty = false;
   }
 
   page(kind: PrimitiveKind, index: number): ThreePageBinding {
@@ -102,6 +137,7 @@ export class ThreePageTransforms {
       const exact = owners, data = getOrBuildTextLod(this.partition.scene).data;
       owners = new Uint32Array(scene.textInstanceCount); owners.set(exact);
       if (!data || data.combinedInstanceCount !== owners.length) throw new Error("Missing coarse text page ownership.");
+      this.boundsRevision++;
       for (const run of data.runs) if (run.coarseIndex >= 0) {
         owners[exact.length + run.coarseIndex] = run.pageIndex;
         const bounds = this.coarseBounds[run.pageIndex];

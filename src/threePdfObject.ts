@@ -337,6 +337,24 @@ export interface HeprThreePdfObjectEventMap extends THREE.Object3DEventMap {
  * ```
  */
 export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> {
+  /**
+   * One page as the batch frame cache reads it every frame. Prototype
+   * accessors keep the thousands of sources on one shape.
+   */
+  private static readonly PageBatchSource = class implements ThreePageBatchSource {
+    readonly object: HeprThreePdfObject;
+    readonly view: ScenePageView;
+    constructor(object: HeprThreePdfObject, view: ScenePageView) { this.object = object; this.view = view; }
+    get dataToLocalMatrix(): THREE.Matrix4 { return this.object.dataToLocalMatrix; }
+    get isDisposed(): boolean { return this.object.isDisposed; }
+    get pageBackgroundAlpha(): number { return this.object.rendererConfig.pageBackground[3]; }
+    deriveCullingBounds(camera: THREE.Camera, viewport: ViewportPixels): Bounds | undefined {
+      // Batched frames refresh only page matrices; this projection reads the world matrix.
+      this.object.updateWorldMatrix(false, false);
+      return this.object.deriveViewStateFromThreeCamera(camera, viewport)?.cullingBounds;
+    }
+  };
+
   private pageViews: { object: HeprThreePdfObject; view: ScenePageView }[] | null = null;
   private pagePartition: ScenePageViews | null = null;
   private pageBatch: HeprThreePdfObject | null = null;
@@ -359,6 +377,13 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   private pageBatchFrameSources: ThreePageBatchSource[] = [];
   private pageBatchFrameSourceViews: typeof this.pageViews = null;
   private pageBatchFrameResult: ReturnType<typeof updateThreePageBatchFrame> | null = null;
+  /** Shared-batch appearance checks, refreshed with `pageAppearanceRevision`. */
+  private pageBatchAppearanceChecked = -1;
+  private pageBatchIncompatible = new Uint8Array(0);
+  /** Pages owning search, selection or primitive highlight layers. */
+  private readonly pageBatchAuxiliaryPages: { object: HeprThreePdfObject; view: ScenePageView }[] = [];
+  /** Pages whose overlays currently show content and need page-ordered drawing. */
+  private readonly pageBatchOverlayPages: { object: HeprThreePdfObject; view: ScenePageView }[] = [];
   private readonly pageBatchDocumentOrigin = new THREE.Matrix4();
   private readonly pageBatchDocumentToClip = new THREE.Matrix4();
   private pagePreparation: Promise<readonly HeprThreePdfObject[]> | null = null;
@@ -590,34 +615,19 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     if (!cameraType.isOrthographicCamera && !cameraType.isPerspectiveCamera) {
       this.pageBatchReason = "unsupported-camera"; return null;
     }
-    const config = this.rendererConfig;
-    for (const { object } of this.pageViews!) {
+    this.refreshPageBatchAppearance();
+    const views = this.pageViews!, incompatible = this.pageBatchIncompatible;
+    for (let index = 0; index < views.length; index++) {
+      const object = views[index].object;
       if (object.parent !== this) { this.pageBatchReason = "reparented-page"; return null; }
       if (!object.matrixWorldAutoUpdate) { this.pageBatchReason = "manual-world-matrix"; return null; }
-      if (!object.visible || object.isDisposed) continue;
-      const other = object.rendererConfig;
-      if (other.vectorLodMode !== config.vectorLodMode || other.textLodMode !== config.textLodMode ||
-          other.strokeCurveEnabled !== config.strokeCurveEnabled || other.textVectorOnly !== config.textVectorOnly ||
-          other.pageBackground.some((value,i)=>value !== config.pageBackground[i]) ||
-          other.vectorOverride.some((value,i)=>value !== config.vectorOverride[i]) ||
-          PAGE_PRIMITIVE_KINDS.some(kind => object.primitiveAppearance.hasOverrides(kind))) {
-        this.pageBatchReason = "page-appearance"; return null;
-      }
+      if (incompatible[index] && object.visible && !object.isDisposed) { this.pageBatchReason = "page-appearance"; return null; }
     }
     const viewport = readThreeRendererViewportPixels(renderer);
     if (this.pageBatchFrameSourceViews !== this.pageViews) {
       this.pageBatchFrameSourceViews = this.pageViews;
-      this.pageBatchFrameSources = this.pageViews!.map(page => ({
-        get view() { return page.view; },
-        object: {
-          get matrix() { return page.object.matrix; },
-          get dataToLocalMatrix() { return page.object.dataToLocalMatrix; },
-          get visible() { return page.object.visible; },
-          get isDisposed() { return page.object.isDisposed; },
-          get rendererConfig() { return page.object.rendererConfig; },
-          deriveViewStateFromThreeCamera: (nextCamera, nextViewport) => page.object.deriveViewStateFromThreeCamera(nextCamera, nextViewport)
-        }
-      }));
+      // Views change only in demand swaps, which rebuild these sources.
+      this.pageBatchFrameSources = this.pageViews!.map(page => new HeprThreePdfObject.PageBatchSource(page.object, page.view));
     }
     const documentOrigin = this.pageBatchDocumentOrigin.makeTranslation(this.sceneCenterX, this.sceneCenterY, 0);
     const documentToClip = this.pageBatchDocumentToClip.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
@@ -626,12 +636,15 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     const profile = getThreeRenderPerformance();
     profile?.beginSection("three.pageCache");
     const prepared = this.pageBatchFrameCache.update(this.pageBatchFrameSources, table, documentOrigin, documentToClip,
-      camera, viewport, this.pageOverlapMode === "fast");
+      camera, viewport, this.pageOverlapMode === "fast", this.pageAppearanceRevision);
     profile?.endSection("three.pageCache");
     profile?.beginSection("three.pageProjection");
-    const frame = !prepared.changed && this.pageBatchFrameResult ? this.pageBatchFrameResult
-      : this.pageBatchFrameResult = updateThreePageBatchFrame(table, prepared.frames, viewport,
-        camera.coordinateSystem === THREE.WebGPUCoordinateSystem ? 0 : -1, this.pageOverlapMode === "fast");
+    let frame = this.pageBatchFrameResult;
+    if (prepared.changed || !frame) {
+      frame = this.pageBatchFrameResult = updateThreePageBatchFrame(table, prepared.frames, viewport,
+        camera.coordinateSystem === THREE.WebGPUCoordinateSystem ? 0 : -1, this.pageOverlapMode === "fast", prepared.pending);
+      this.pageBatchFrameCache.markApplied(prepared.pending);
+    }
     profile?.endSection("three.pageProjection");
     if (profile) {
       profile.add("three.pageCount", this.pageViews!.length);
@@ -651,20 +664,25 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     if (!frame) return false;
     const batch = this.pageBatch!;
     profile?.beginSection("three.pageOverlays");
-    for (const { object } of this.pageViews!) {
-      if (!this.pageBatchActive) object.configureDormantPipeline();
-      object.showPageMesh(false);
-      if (object.paintCompositor) object.paintCompositor.mesh.visible = false;
-      if (object.visible && !object.isDisposed) {
-        object.syncAuxiliaryOutputColorSpace(renderer);
-        object.syncPrimitiveHighlightFrame(renderer,camera);
+    // Only the shared batch draws page content. Entering it retires every
+    // page's own drawing once; afterwards only overlay layers need a frame.
+    if (!this.pageBatchActive) {
+      for (const { object } of this.pageViews!) {
+        object.configureDormantPipeline();
+        object.showPageMesh(false);
+        if (object.paintCompositor) object.paintCompositor.mesh.visible = false;
+        object.traverse(child => { if ((child as THREE.Group).isGroup) child.renderOrder = 0; });
       }
-      if (!this.pageBatchActive) object.traverse(child => { if ((child as THREE.Group).isGroup) child.renderOrder = 0; });
+    }
+    for (const { object } of this.pageBatchAuxiliaryPages) {
+      if (!object.visible || object.isDisposed) continue;
+      object.syncAuxiliaryOutputColorSpace(renderer);
+      object.syncPrimitiveHighlightFrame(renderer,camera);
     }
     // Overlays keep their existing transparent-queue behavior and page order.
     // Only pages with overlays need sorting while content uses shared batches.
-    const overlays = this.pageViews!.filter(({ object }) => object.visible && !object.isDisposed &&
-      (object.searchHighlightMatches.length || object.textSelectionHighlightRects.length || object.primitiveAppearance.getHighlights()?.count));
+    const overlays = this.pageBatchOverlayPages.filter(({ object }) => object.visible && !object.isDisposed);
+    for (const { object } of overlays) object.updateWorldMatrix(false, false);
     const overlayPosition = new THREE.Vector3();
     const depth = (object: HeprThreePdfObject) => overlayPosition.setFromMatrixPosition(object.matrixWorld).applyMatrix4(camera.matrixWorldInverse).z;
     overlays.sort((a, b) => depth(a.object) - depth(b.object) || a.view.pageIndex - b.view.pageIndex);
@@ -678,6 +696,29 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     batch.traverse(child => { if ((child as THREE.Group).isGroup) child.renderOrder = HEPR_THREE_LAYER_ORDER_PAGE_DEPTH; });
     this.pageBatchActive = true;
     return true;
+  }
+
+  /** Refresh the per-page shared-batch checks after an appearance or overlay change. */
+  private refreshPageBatchAppearance(): void {
+    const views = this.pageViews!;
+    if (this.pageBatchAppearanceChecked === this.pageAppearanceRevision && this.pageBatchIncompatible.length === views.length) return;
+    this.pageBatchAppearanceChecked = this.pageAppearanceRevision;
+    if (this.pageBatchIncompatible.length !== views.length) this.pageBatchIncompatible = new Uint8Array(views.length);
+    const config = this.rendererConfig, background = config.pageBackground, override = config.vectorOverride;
+    this.pageBatchAuxiliaryPages.length = 0; this.pageBatchOverlayPages.length = 0;
+    views.forEach((page, index) => {
+      const object = page.object, other = object.rendererConfig, b = other.pageBackground, o = other.vectorOverride;
+      this.pageBatchIncompatible[index] = other.vectorLodMode !== config.vectorLodMode || other.textLodMode !== config.textLodMode ||
+        other.strokeCurveEnabled !== config.strokeCurveEnabled || other.textVectorOnly !== config.textVectorOnly ||
+        b[0] !== background[0] || b[1] !== background[1] || b[2] !== background[2] || b[3] !== background[3] ||
+        o[0] !== override[0] || o[1] !== override[1] || o[2] !== override[2] || o[3] !== override[3] ||
+        PAGE_PRIMITIVE_KINDS.some(kind => object.primitiveAppearance.hasOverrides(kind)) ? 1 : 0;
+      if (object.searchHighlightGroup || object.textSelectionHighlightGroup || object.primitiveHighlightLayer) {
+        this.pageBatchAuxiliaryPages.push(page);
+      }
+      if (object.searchHighlightMatches.length || object.textSelectionHighlightRects.length ||
+          object.primitiveAppearance.getHighlights()?.count) this.pageBatchOverlayPages.push(page);
+    });
   }
 
   /**
@@ -772,10 +813,10 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   private prepareIndependentPages(renderer: ThreeHostRenderer, camera: THREE.Camera): void {
     // Three already updated world matrices for this frame; batched pages only
     // read their own. Dormant page content is refreshed only when drawn.
+    // The page batch cache refreshes page matrices that moved since the last frame.
     const profile = getThreeRenderPerformance();
     profile?.beginSection("three.pageMatrices");
     this.updateWorldMatrix(true, false); camera.updateMatrixWorld();
-    for (const { object } of this.pageViews!) object.updateWorldMatrix(false, false);
     this.pageBatch?.updateWorldMatrix(false, true);
     profile?.endSection("three.pageMatrices");
     if (this.prepareBatchedPages(renderer,camera)) return;
@@ -1336,12 +1377,12 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
       if (partition && this.pageViews) {
         this.pagePartition = partition;
         this.pageViews.forEach((page,index) => { page.view = partition!.extract(index); });
-        this.pageBatchFrameCache = null; this.pageBatchFrameResult = null;
+        this.pageBatchFrameCache = null; this.pageBatchFrameResult = null; this.pageBatchFrameSourceViews = null;
         if (this.pageBatch && !table) {
           this.pageBatch.removeFromParent(); this.pageBatch.dispose(); this.pageBatch = null;
           this.pageBatchReason = "pdf-compositing";
         }
-        this.pageBatchActive = false; this.pageAppearanceChecked = -1;
+        this.pageBatchActive = false; this.pageAppearanceChecked = this.pageBatchAppearanceChecked = -1;
         // Installation resets material residency; force layout visibility to be reapplied.
         const documentMode = this.pageDocumentMode;
         this.pageDocumentMode = !documentMode;

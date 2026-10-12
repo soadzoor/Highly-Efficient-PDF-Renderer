@@ -9,6 +9,8 @@ export interface ThreePageFrame {
   dataToDocument: THREE.Matrix4;
   dataToClip: THREE.Matrix4;
   visible: boolean;
+  /** Whether the page is drawn at all when `visible` is already culled by the camera; defaults to `visible`. */
+  enabled?: boolean;
   opaque: boolean;
   cullingBounds?: Bounds;
 }
@@ -38,17 +40,23 @@ type Viewport = { width: number; height: number };
  * Project actual paint extents, including off-page content, before commuting pages.
  * With `approximateOverlaps`, opaque pages stay batched even where depth cannot
  * order them exactly; the result then reports `approximated`.
+ *
+ * `pending` limits the pass to the listed pages. It must include every visible
+ * page; the table must already hold every other page's state.
  */
-export function updateThreePageBatchFrame(table: ThreePageTransforms, pages: readonly ThreePageFrame[], viewport: Viewport, nearDepth = -1, approximateOverlaps = false) {
+export function updateThreePageBatchFrame(table: ThreePageTransforms, pages: readonly ThreePageFrame[], viewport: Viewport, nearDepth = -1,
+  approximateOverlaps = false, pending?: readonly number[]) {
   const bounds: Bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
   const boxes: PageBox[] = [];
   const projection = createPlanarBoundsProjection(), inkProjection = createPlanarBoundsProjection(), point = new THREE.Vector4();
-  const corners = new Float64Array(pages.length * 12);
+  const count = pending ? pending.length : pages.length;
+  const corners = new Float64Array(count * 12);
   let minUnits = Infinity, maxUnits = 0, reason: string | null = null, approximated = false;
-  pages.forEach((page, index) => {
+  for (let slot = 0; slot < count; slot++) {
+    const index = pending ? pending[slot] : slot, page = pages[index];
     if (!page.visible) {
-      table.setPage(index, page.dataToDocument, page.dataToClip, false, 1);
-      return;
+      table.setPage(index, page.dataToDocument, page.dataToClip, false, 1, page.enabled ?? false);
+      continue;
     }
     const coarseBounds = table.coarseBounds[index], paint = page.paintBounds;
     const ink = { minX: Math.min(paint.minX, coarseBounds.minX), minY: Math.min(paint.minY, coarseBounds.minY),
@@ -58,7 +66,7 @@ export function updateThreePageBatchFrame(table: ThreePageTransforms, pages: rea
       maxX: Math.max(r.maxX, ink.maxX), maxY: Math.max(r.maxY, ink.maxY) };
     analyzePlanarBoundsProjectionInto(b, page.dataToClip.elements, viewport, projection);
     let z0 = Infinity, z1 = -Infinity, behind = 0;
-    const corner = index * 12;
+    const corner = slot * 12;
     for (let i = 0; i < 4; i++) {
       // (minX,minY), (minX,maxY), (maxX,minY), (maxX,maxY)
       point.set(i < 2 ? b.minX : b.maxX, i % 2 ? b.maxY : b.minY, 0, 1).applyMatrix4(page.dataToClip);
@@ -71,8 +79,8 @@ export function updateThreePageBatchFrame(table: ThreePageTransforms, pages: rea
     const visible = page.visible && behind !== 4 && projection.visible && z1 >= nearDepth && z0 <= 1;
     const fine = 1 / Math.max(1e-8,projection.maxPixelsPerLocalUnit);
     const coarse = 1 / Math.max(1e-8,projection.minPixelsPerLocalUnit);
-    table.setPage(index,page.dataToDocument,page.dataToClip,visible,Number.isFinite(coarse) ? coarse : 1);
-    if (!visible) return;
+    table.setPage(index,page.dataToDocument,page.dataToClip,visible,Number.isFinite(coarse) ? coarse : 1,page.enabled ?? true);
+    if (!visible) continue;
     minUnits = Math.min(minUnits,fine); maxUnits = Math.max(maxUnits,coarse);
     const clip = page.cullingBounds;
     bounds.minX = Math.min(bounds.minX,clip ? Math.max(b.minX,clip.minX) : b.minX);
@@ -98,7 +106,7 @@ export function updateThreePageBatchFrame(table: ThreePageTransforms, pages: rea
       bounded: ink.minX-localMargin >= r.minX && ink.minY-localMargin >= r.minY &&
         ink.maxX+localMargin <= r.maxX && ink.maxY+localMargin <= r.maxY,
       corners, corner, slope: Infinity });
-  });
+  }
   // Sweep where pages are more separated relative to their painted widths.
   // Reader columns share X, so an X sweep would compare every visible pair.
   const sweepY = sweepAlongY(boxes);

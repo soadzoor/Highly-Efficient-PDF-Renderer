@@ -59,6 +59,19 @@ export interface TextLodSelectionUpdate {
   pageVisibility?: Uint8Array;
   /** Increment after changing page projections or visibility; omit to disable reuse. */
   pageRevision?: number;
+  /**
+   * Shared page batches whose drawn pages are all XY translations of one
+   * document plane, which `localToClip` then projects. An affine view keeps the
+   * affine document path: each page tests the snapped document view moved by
+   * its offset, so scrolling reselects only after crossing a visibility step.
+   * It then supersedes `pageLocalToClip`, `pageVisibility` and `cullingBounds`;
+   * a projective view still uses those.
+   */
+  pageOffsets?: ArrayLike<number>;
+  /** Pages drawn by a translated batch, independent of the camera (0 skips a page). */
+  pageEnabled?: ArrayLike<number>;
+  /** Increment after changing `pageOffsets` or `pageEnabled`. */
+  pageLayoutRevision?: number;
   /** Column-major PDF-local-to-clip 4x4 matrix. */
   localToClip: ArrayLike<number>;
   /** Render viewport dimensions in device pixels. */
@@ -259,6 +272,9 @@ export class TextLodRuntime {
   private lastUpdateValid = false;
   private lastPageMatrices: TextLodSelectionUpdate["pageLocalToClip"];
   private lastPageRevision: number | undefined;
+  private lastPageOffsets: TextLodSelectionUpdate["pageOffsets"];
+  private lastPageEnabled: TextLodSelectionUpdate["pageEnabled"];
+  private lastPageLayoutRevision: number | undefined;
   private readonly lastLocalToClip = new Float64Array(16);
   private lastViewportWidth = 0;
   private lastViewportHeight = 0;
@@ -272,6 +288,7 @@ export class TextLodRuntime {
   private readonly clusterProjection: PlanarBoundsProjection = createPlanarBoundsProjection();
   private readonly selectionViewportScratch: PlanarViewport = {width: 1, height: 1};
   private readonly visibilityBounds: Bounds = {minX: 0, minY: 0, maxX: 0, maxY: 0};
+  private readonly pageVisibilityBounds: Bounds = {minX: 0, minY: 0, maxX: 0, maxY: 0};
   // Affine views have one pixel scale everywhere, so a selection is fully
   // determined by that scale and the snapped visibility rectangle.
   private readonly affineViewBounds: Bounds = {minX: 0, minY: 0, maxX: 0, maxY: 0};
@@ -356,8 +373,12 @@ export class TextLodRuntime {
     // page and cluster, and its visibility is the snapped local rectangle alone.
     // The same scale and rectangle therefore reproduce the previous selection,
     // which lets a pan skip the whole pass until it crosses a visibility step.
-    const affine = !update.pageLocalToClip && this.resolveAffineView(update);
-    if (affine && this.selectionInitialized && this.isSameAffineSelection()) {
+    // Translated page batches share that scale; only their offsets differ.
+    // Projective views of them keep the per-page projections.
+    const translated = update.pageOffsets !== undefined && this.resolveAffineView(update);
+    const offsets = translated ? update.pageOffsets : undefined;
+    const affine = translated || (!update.pageLocalToClip && this.resolveAffineView(update));
+    if (affine && this.selectionInitialized && this.isSameAffineSelection() && this.isSamePageLayout(update)) {
       this.rememberSelectionUpdate(update);
       return {instanceIds: this.selectedInstanceIds, changed: false, stats: this.getStats()};
     }
@@ -374,8 +395,25 @@ export class TextLodRuntime {
       : this.resolveVisibilityBounds(update.cullingBounds);
 
     for (const page of data.pages) {
+      let pageCulling = cullingBounds;
+      if (offsets && cullingBounds) {
+        if (update.pageEnabled?.[page.pageIndex] === 0) {
+          if (markClustersInvisible(page.clusterStart, page.clusterCount, this.clusterVisibility)) {
+            selectionDecisionChanged = true;
+          }
+          continue;
+        }
+        // The page draws its data moved by its offset; test it against the
+        // document view moved back.
+        const dx = offsets[page.pageIndex * 2], dy = offsets[page.pageIndex * 2 + 1];
+        pageCulling = this.pageVisibilityBounds;
+        pageCulling.minX = cullingBounds.minX - dx;
+        pageCulling.minY = cullingBounds.minY - dy;
+        pageCulling.maxX = cullingBounds.maxX - dx;
+        pageCulling.maxY = cullingBounds.maxY - dy;
+      }
       const pageMatrix = update.pageLocalToClip?.[page.pageIndex] ?? update.localToClip;
-      if (update.pageVisibility?.[page.pageIndex] === 0 || (cullingBounds && !boundsIntersect(page.bounds, cullingBounds))) {
+      if ((!offsets && update.pageVisibility?.[page.pageIndex] === 0) || (pageCulling && !boundsIntersect(page.bounds, pageCulling))) {
         if (markClustersInvisible(page.clusterStart, page.clusterCount, this.clusterVisibility)) {
           selectionDecisionChanged = true;
         }
@@ -438,7 +476,7 @@ export class TextLodRuntime {
       const clusterEnd = page.clusterStart + page.clusterCount;
       for (let clusterIndex = page.clusterStart; clusterIndex < clusterEnd; clusterIndex += 1) {
         const cluster = data.clusters[clusterIndex];
-        if (cullingBounds && !boundsIntersect(cluster.bounds, cullingBounds)) {
+        if (pageCulling && !boundsIntersect(cluster.bounds, pageCulling)) {
           if (setClusterValue(this.clusterVisibility, clusterIndex, 0)) {
             selectionDecisionChanged = true;
           }
@@ -548,7 +586,9 @@ export class TextLodRuntime {
     if (!view) return false;
     const scale = affinePlanarPixelsPerLocalUnit(update.localToClip, width, height);
     if (!Number.isFinite(scale)) return false;
-    const culling = update.cullingBounds;
+    // Page batch bounds are in page data space; they cannot narrow the shared
+    // document view of translated pages.
+    const culling = update.pageOffsets ? null : update.cullingBounds;
     if (culling) {
       view.minX = Math.max(view.minX, culling.minX);
       view.minY = Math.max(view.minY, culling.minY);
@@ -585,6 +625,12 @@ export class TextLodRuntime {
       if (length > 0) return Math.abs(ux * vy - uy * vx) / length;
     }
     return Math.hypot(vx, vy);
+  }
+
+  private isSamePageLayout(update: TextLodSelectionUpdate): boolean {
+    return this.lastPageOffsets === update.pageOffsets && this.lastPageEnabled === update.pageEnabled &&
+      this.lastPageLayoutRevision === update.pageLayoutRevision &&
+      (update.pageOffsets === undefined || update.pageLayoutRevision !== undefined);
   }
 
   private isSameAffineSelection(): boolean {
@@ -754,14 +800,15 @@ export class TextLodRuntime {
 
   private isSameSelectionUpdate(update: TextLodSelectionUpdate): boolean {
     if (!this.lastUpdateValid || update.localToClip.length < 16 || this.lastPageMatrices !== update.pageLocalToClip ||
-        this.lastPageRevision !== update.pageRevision || (update.pageLocalToClip && update.pageRevision === undefined)) return false;
+        this.lastPageRevision !== update.pageRevision || (update.pageLocalToClip && update.pageRevision === undefined) ||
+        !this.isSamePageLayout(update)) return false;
     if (
       Number(update.viewportWidth) !== this.lastViewportWidth ||
       Number(update.viewportHeight) !== this.lastViewportHeight
     ) {
       return false;
     }
-    if (!update.pageLocalToClip) for (let i = 0; i < 16; i += 1) {
+    if (!update.pageLocalToClip || update.pageOffsets) for (let i = 0; i < 16; i += 1) {
       if (Number(update.localToClip[i]) !== this.lastLocalToClip[i]) return false;
     }
     const bounds = update.cullingBounds;
@@ -777,6 +824,8 @@ export class TextLodRuntime {
 
   private rememberSelectionUpdate(update: TextLodSelectionUpdate): void {
     this.lastPageMatrices = update.pageLocalToClip; this.lastPageRevision = update.pageRevision;
+    this.lastPageOffsets = update.pageOffsets; this.lastPageEnabled = update.pageEnabled;
+    this.lastPageLayoutRevision = update.pageLayoutRevision;
     if (update.localToClip.length < 16) {
       this.lastUpdateValid = false;
       return;

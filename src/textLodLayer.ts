@@ -170,10 +170,17 @@ export class ThreeTextLodLayer {
         viewportWidth,
         viewportHeight
       );
+    const pages = this.pageTransforms;
+    // A Reader column or grid of moved pages is one plane; its selection then
+    // follows the document camera instead of every page's projection.
+    const translated = pages?.translatedLayout === true && this.useLocalToClip;
     const selection = runtime.update({
-      pageLocalToClip: this.pageTransforms?.projectionElements,
-      pageVisibility: this.pageTransforms?.visibility,
-      pageRevision: this.pageTransforms?.revision,
+      pageLocalToClip: pages?.projectionElements,
+      pageVisibility: pages?.visibility,
+      pageRevision: pages?.revision,
+      pageOffsets: translated ? pages.translations : undefined,
+      pageEnabled: translated ? pages.layout : undefined,
+      pageLayoutRevision: translated ? pages.layoutRevision : undefined,
       localToClip,
       viewportWidth,
       viewportHeight,

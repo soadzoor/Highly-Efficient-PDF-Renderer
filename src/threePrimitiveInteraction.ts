@@ -4,6 +4,7 @@ import {
   createPrimitiveInteractionControllerForAdapter,
   type PrimitiveInteractionCallbacks, type PrimitiveInteractionController
 } from "./primitiveInteraction";
+import { createThreeViewKey } from "./threeViewKey";
 
 export interface ThreePrimitiveInteractionOptions extends PrimitiveInteractionCallbacks {
   getCanvas(): HTMLCanvasElement;
@@ -45,16 +46,7 @@ export function createThreePrimitiveInteractionController(
     getCanvas: options.getCanvas,
     getScene: () => options.getPdfObject()?.sceneData ?? null,
     getTarget: options.getPdfObject,
-    getViewKey() {
-      const camera = options.getCamera();
-      camera.updateWorldMatrix(true, false);
-      const pdf = options.getPdfObject();
-      pdf?.updateWorldMatrix(true, true);
-      // Include object transforms and the entire camera projection, covering
-      // orthographic/perspective changes and nonuniform parent transforms.
-      return `${camera.projectionMatrix.elements.join(",")}:${camera.matrixWorld.elements.join(",")}:` +
-        `${pdf?.matrixWorld.elements.join(",") ?? ""}:${pdf?.layerVisibilityRevision ?? 0}`;
-    },
+    getViewKey: createThreeViewKey(() => options.getCamera(), () => options.getPdfObject()),
     async pick(point, signal) {
       return object?.pick({ camera: options.getCamera(), element: options.getCanvas(),
         clientX: point.x, clientY: point.y, tolerancePx: 4, signal }) ?? null;

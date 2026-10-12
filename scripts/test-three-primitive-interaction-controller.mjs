@@ -108,6 +108,13 @@ try {
   click(canvas); frame(); object.position.y = 6; await settle();
   assert.equal(selected, null, "an object transform invalidates a pending click's projection");
   object.position.y = 0; controller.onFrame(); click(canvas); await settle(); assert(selected);
+  // Page transforms are part of the view: moving a page while the camera holds
+  // still retries a pending click against the new layout.
+  const layoutPage = new THREE.Group(); layoutPage.userData.hepr = true; object.add(layoutPage); controller.onFrame();
+  let picks = 0; const pick = object.pick.bind(object); object.pick = options => { picks++; return pick(options); };
+  click(canvas); frame(); layoutPage.position.x = 1; await settle();
+  assert.equal(picks, 2, "a page transform retries a pending click"); assert(selected);
+  object.remove(layoutPage); delete object.pick; controller.onFrame();
   controller.resetSelectedColor(); assert.deepEqual(selectedColor, [0, 0, 0]);
   controller.setSelectedColor("blue"); controller.disable();
   assert.equal(object.primitivePicker, null); assert.equal(object.primitiveHighlightLayer, null);

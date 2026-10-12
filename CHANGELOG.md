@@ -25,9 +25,17 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   instead of rebuilding it.
 - Reduce Three Reader frame preparation by sharing viewport calculations across
   flat pages, skipping offscreen page projections, and reusing unchanged page
-  matrices and frame results. Check overlaps along the more separated screen
-  axis to avoid comparing every pair in long page columns. Preserve the general
-  path for 3D page layouts, and include page preparation timings in captures.
+  matrices and frame results. Per-frame work now follows the visible and
+  changed pages rather than the page count, and Text LOD keeps its selection
+  while scrolling a translated page column instead of reselecting every frame.
+  Check overlaps along the more separated screen axis to avoid comparing every
+  pair in long page columns. Preserve the general path for 3D page layouts, and
+  include page preparation timings in captures.
+- Stop Three annotation picking and drawing selection from updating every page
+  subtree and stringifying every page transform each frame, which cost
+  milliseconds per frame in long documents with links, in both Reader and Grid.
+  Drawing selection now also discards stale hover and pending clicks when pages
+  move while the camera holds still, such as during layout animations.
 - Reuse glyph raster atlases across Reader thumbnails and shared page scenes,
   avoiding repeated glyph rasterization while scrolling. Skip unchanged toolbar
   updates and schedule native scroll rendering without an extra animation frame.

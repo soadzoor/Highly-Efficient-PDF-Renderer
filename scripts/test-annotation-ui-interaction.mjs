@@ -178,8 +178,17 @@ try {
   await three.pick({ x: 20, y: 10 }, signal);
   assert.equal(pickOptions.camera, camera); assert.equal(pickOptions.element, canvas); assert.equal(pickOptions.includeHidden, true);
   three.setSelection(["a"]); three.setHover("b"); assert.equal(renderRequests, 2);
+  three.getViewKey();
   const beforePageMove = three.getViewKey(); page.position.x = 10;
   assert.notEqual(three.getViewKey(), beforePageMove, "independent page transforms invalidate picking");
+  const settled = three.getViewKey();
+  assert.equal(three.getViewKey(), settled, "an unchanged view keeps its key");
+  // Camera motion skips the page scan; the next still frame must still see pages moved meanwhile.
+  camera.position.y = 5; page.position.x = 20; const scrolled = three.getViewKey();
+  assert.notEqual(scrolled, settled, "camera motion invalidates picking");
+  assert.notEqual(three.getViewKey(), scrolled, "pages moved during camera motion invalidate picking once still");
+  const still = three.getViewKey(); camera.position.y = 6; three.getViewKey(); camera.position.y = 5;
+  assert.equal(three.getViewKey(), still, "returning the camera without page motion restores the key");
 
   // The native demo initializes annotation controls before constructing its renderer.
   const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");

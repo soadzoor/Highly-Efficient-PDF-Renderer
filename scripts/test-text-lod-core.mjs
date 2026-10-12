@@ -560,6 +560,52 @@ assert.throws(
   "unrelated programming RangeErrors must not be hidden as optional-resource fallback"
 );
 
+// A Reader column draws each page of a grid-composed document moved by an XY
+// translation. The translated path must keep every glyph the per-page
+// projections select, while reusing its selection for small scrolls.
+{
+  const pageCount = 3;
+  const paged = buildTextLod(createPagedTextScene(pageCount));
+  assert.ok(paged.data, paged.fallbackReason);
+  assert.equal(paged.data.pages.length, pageCount);
+  const offsets = new Float64Array(pageCount * 2);
+  for (let page = 0; page < pageCount; page += 1) {
+    offsets[page * 2] = -page * 200; offsets[page * 2 + 1] = -page * 1700;
+  }
+  const enabled = new Uint8Array(pageCount).fill(1);
+  const visibility = new Uint8Array(pageCount).fill(1);
+  const translatedRuntime = new TextLodRuntime(paged), projectedRuntime = new TextLodRuntime(paged);
+  let layoutRevision = 1, revision = 0;
+  const select = (centerY, layout = {}) => {
+    const documentToClip = createOrthographicLocalToClip(50, centerY, 2, 400, 400);
+    const view = { localToClip: documentToClip, viewportWidth: 400, viewportHeight: 400,
+      pageLocalToClip: Array.from({ length: pageCount }, (_, page) => translate(documentToClip, offsets[page * 2], offsets[page * 2 + 1])),
+      pageVisibility: visibility, pageRevision: ++revision };
+    const projected = projectedRuntime.update(view);
+    const translated = translatedRuntime.update({ ...view, pageOffsets: offsets, pageEnabled: enabled,
+      pageLayoutRevision: layoutRevision, ...layout });
+    return { projected: [...projected.instanceIds], translated: [...translated.instanceIds], changed: translated.changed };
+  };
+  const pageOf = id => Math.floor(id / 17_000);
+  let reused = 0, steps = 0;
+  for (let centerY = 150; centerY >= -350; centerY -= 1, steps += 1) {
+    const { projected, translated, changed } = select(centerY);
+    const kept = new Set(translated);
+    assert.ok(projected.every(id => kept.has(id)), `translated pages keep every projected glyph at y=${centerY}`);
+    assert.ok(translated.length <= projected.length + 1500, `translated culling stays near the view at y=${centerY}`);
+    if (!changed) reused += 1;
+  }
+  assert.ok(reused > steps * 0.8, `small Reader scrolls reuse the translated selection (${reused}/${steps})`);
+
+  const atPageOne = select(-150).translated;
+  assert.ok(atPageOne.some(id => pageOf(id) === 1) && !atPageOne.some(id => pageOf(id) === 0));
+  enabled[1] = 0; layoutRevision += 1;
+  assert.ok(!select(-150).translated.some(id => pageOf(id) === 1), "disabled pages select nothing");
+  enabled[1] = 1; offsets[0] = 0; offsets[1] = -1700; layoutRevision += 1;
+  const moved = select(-150).translated;
+  assert.ok(moved.some(id => pageOf(id) === 0) && moved.some(id => pageOf(id) === 1), "a layout revision applies moved pages");
+}
+
 console.log("text LOD core tests passed");
 
 function createDenseTextScene(instanceCount = 50_000) {
@@ -625,6 +671,29 @@ function createDenseTextScene(instanceCount = 50_000) {
     pageBounds: {minX: -1000, minY: -1000, maxX: 2000, maxY: 2000},
     textGlyphSegmentCountBeforeLod: 4
   };
+}
+
+function createPagedTextScene(pageCount, perPage = 17_000) {
+  const scene = createDenseTextScene(pageCount * perPage);
+  // Grid-composed pages: page p spans x in [p*200, p*200+100], y in [0, 1600].
+  for (let i = 0; i < pageCount * perPage; i += 1) {
+    const page = Math.floor(i / perPage), local = i % perPage;
+    scene.textInstanceA.set([1, 0, 0, 1], i * 4);
+    scene.textInstanceB.set([page * 200 + 5 + (local % 50) * 1.8, 1595 - Math.floor(local / 50) * 4.5, 0, 0], i * 4);
+  }
+  const pageRects = new Float32Array(pageCount * 4), pageTextRanges = new Uint32Array(pageCount * 2);
+  for (let page = 0; page < pageCount; page += 1) {
+    pageRects.set([page * 200, 0, page * 200 + 100, 1600], page * 4);
+    pageTextRanges.set([page * perPage, perPage], page * 2);
+  }
+  const bounds = {minX: 0, minY: 0, maxX: pageCount * 200 - 100, maxY: 1600};
+  return {...scene, pageCount, pageRects, pageTextRanges, bounds, pageBounds: bounds};
+}
+
+function translate(matrix, dx, dy) {
+  const result = Float64Array.from(matrix);
+  for (let row = 0; row < 4; row += 1) result[12 + row] += matrix[row] * dx + matrix[4 + row] * dy;
+  return result;
 }
 
 function area(bounds) {
