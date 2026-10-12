@@ -211,7 +211,7 @@ function malformedCcittImage() {
 function extensionCcittImage() {
   return tinyPdfStream(
     `/Type /XObject /Subtype /Image ${g3Entries()}`,
-    packBits("000000001 111")
+    packBits("000000001 110") // Reserved selector; 111 is standard uncompressed mode.
   );
 }
 

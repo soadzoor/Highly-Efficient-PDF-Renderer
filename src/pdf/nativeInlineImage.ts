@@ -10,7 +10,7 @@ import {
   type PdfValue
 } from "./nativeCos";
 import { readDecodeParameters, readFilterNames } from "./nativeFilters";
-import { PdfError, throwIfAborted } from "./nativeTypes";
+import { PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
 
 export interface NativeInlineImageLimits {
   readonly maxImages: number;
@@ -36,6 +36,13 @@ export interface NativeInlineImageOptions {
   readonly signal?: AbortSignal;
   /** Absolute offset represented by `content[0]`. @default 0 */
   readonly sourceOffset?: number;
+  /** A streamed /Contents tail may end inside a value completed by the next stream. @internal */
+  readonly allowIncompleteContentTail?: boolean;
+  /** Decoded /Contents stream ends; inline images cannot cross these boundaries. @internal */
+  readonly streamEndOffsets?: readonly number[];
+  /** Recover an exact raw payload ending in EI when only the following Q remains. */
+  readonly recoverMissingRawEi?: boolean;
+  readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
 }
 
 export interface NativeInlineImageRecord {
@@ -149,8 +156,8 @@ const PDF_NUMBER = /^[+-]?(?:\d+\.?\d*|\.\d+)$/;
 
 /**
  * Finds and prepares every inline image in one decoded PDF content byte stream.
- * It does not repair malformed syntax and never resolves references or fetches
- * resources. Non-image spans retain source order for later compiler interleave.
+ * Syntax is strict unless a specific recovery is enabled. It never resolves
+ * references or fetches resources. Non-image spans retain source paint order.
  */
 export function prepareNativeInlineImages(
   content: Uint8Array,
@@ -178,7 +185,8 @@ export function prepareNativeInlineImages(
   ) {
     return createContentOnlyResult(content, sourceOffset);
   }
-  return new NativeInlineImageParser(content, sourceOffset, limits, options.signal).parse();
+  return new NativeInlineImageParser(content, sourceOffset, limits, options.signal,
+    options.allowIncompleteContentTail === true, options.streamEndOffsets, undefined, options).parse();
 }
 
 /** Alias emphasizing the structural parsing phase. */
@@ -278,17 +286,27 @@ class NativeInlineImageParser {
   private readonly images: NativeInlineImageRecord[] = [];
   private readonly contentSpans: NativeInlineContentSpan[] = [];
   private readonly segments: NativeInlineContentSegment[] = [];
+  private readonly allowIncompleteContentTail: boolean;
+  private readonly streamEndOffsets?: readonly number[];
+  private readonly recovery?: Pick<NativeInlineImageOptions, "recoverMissingRawEi" | "onDiagnostic">;
 
   constructor(
     bytes: Uint8Array,
     baseOffset: number,
     limits: Readonly<NativeInlineImageLimits>,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    allowIncompleteContentTail = false,
+    streamEndOffsets?: readonly number[],
+    budget?: ScanBudget,
+    recovery?: Pick<NativeInlineImageOptions, "recoverMissingRawEi" | "onDiagnostic">
   ) {
     this.bytes = bytes;
     this.baseOffset = baseOffset;
     this.limits = limits;
-    this.budget = new ScanBudget(limits.maxScanBytes, signal);
+    this.allowIncompleteContentTail = allowIncompleteContentTail;
+    this.streamEndOffsets = streamEndOffsets;
+    this.recovery = recovery;
+    this.budget = budget ?? new ScanBudget(limits.maxScanBytes, signal);
   }
 
   parse(): NativeInlineImageResult {
@@ -296,17 +314,28 @@ class NativeInlineImageParser {
     let offset = 0;
     let contentStart = 0;
     let operandCount = 0;
+    let streamIndex = 0;
     while (true) {
       offset = skipWhitespaceAndComments(this.bytes, offset, this.budget);
       if (offset >= this.bytes.length) break;
-      const item = readContentItem(
-        this.bytes,
-        offset,
-        this.limits.maxNestingDepth,
-        this.budget,
-        this.baseOffset,
-        "unsupported-content"
-      );
+      let item: ContentItem;
+      try {
+        item = readContentItem(
+          this.bytes,
+          offset,
+          this.limits.maxNestingDepth,
+          this.budget,
+          this.baseOffset,
+          "unsupported-content"
+        );
+      } catch (error) {
+        // Inline images stay local to one stream. Ordinary dictionaries,
+        // arrays and strings belong to the long-lived content compiler and
+        // may legally continue in the next /Contents stream.
+        if (this.allowIncompleteContentTail && error instanceof PdfError &&
+            error.cause instanceof PdfNeedMoreDataError) break;
+        throw error;
+      }
       offset = item.end;
       if (item.kind === "value") {
         operandCount += 1;
@@ -323,9 +352,18 @@ class NativeInlineImageParser {
           });
         }
         this.appendContentSpan(contentStart, item.start);
-        const parsed = this.parseInline(item.start, item.end);
-        this.images.push(parsed.record);
-        this.segments.push(parsed.record);
+        while (this.streamEndOffsets && this.streamEndOffsets[streamIndex] <= item.start) streamIndex++;
+        const streamEnd = this.streamEndOffsets?.[streamIndex] ?? this.bytes.length;
+        // Scan ordinary values across the concatenated content, but bound
+        // every BI dictionary/payload/EI search to its own source stream.
+        const parser = streamEnd < this.bytes.length
+          ? new NativeInlineImageParser(this.bytes.subarray(0, streamEnd), this.baseOffset,
+            this.limits, undefined, false, undefined, this.budget, this.recovery)
+          : this;
+        const parsed = parser.parseInline(item.start, item.end);
+        const record = Object.freeze({ ...parsed.record, imageIndex: this.images.length });
+        this.images.push(record);
+        this.segments.push(record);
         offset = parsed.end;
         contentStart = offset;
         operandCount = 0;
@@ -509,6 +547,24 @@ class NativeInlineImageParser {
             "Inline image payload is shorter than its exact sample layout.",
             this.absolute(dataStart)
           );
+        }
+        // Some producers mistake the final two grayscale samples, literally
+        // E and I, for the delimiter and omit the separate EI. The declared
+        // grid still supplies every sample. Recover only that exact case,
+        // followed by Q, so no following graphics token becomes image data.
+        if (this.recovery?.recoverMissingRawEi && exactLength >= 2 &&
+            this.bytes[dataEnd - 2] === 0x45 && this.bytes[dataEnd - 1] === 0x49 &&
+            isPdfWhitespace(this.bytes[dataEnd])) {
+          const next = skipWhitespaceAndComments(this.bytes, dataEnd, this.budget);
+          if (matchesKeywordAt(this.bytes, next, "Q")) {
+            this.recovery.onDiagnostic?.({
+              code: "image.inline-missing-ei-recovered", severity: "warning",
+              message: "An unfiltered inline image ended with EI sample bytes but omitted its separate terminator; the complete declared sample grid was retained before Q.",
+              offset: this.absolute(dataEnd),
+              details: { payloadBytes: exactLength }
+            });
+            return { dataEnd, eiStart: dataEnd, eiEnd: dataEnd };
+          }
         }
         return this.requireEiAfterKnownPayload(dataEnd);
       }

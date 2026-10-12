@@ -560,10 +560,19 @@ async function testIndexedSpaces() {
   const streamIndex = await colors.add(indexed(name("DeviceRGB"), 0, lookupStream));
   assert.deepEqual(colors.convertToSrgb(streamIndex, [0]), [0, 0, 1]);
 
-  await rejectsCode(
-    () => colors.add(indexed(name("DeviceRGB"), 1, pdfString([0, 0, 0]))),
-    "unsupported-color"
-  );
+  const paletteDiagnostics = [];
+  const compatible = new NativePdfColorRegistry(document, undefined, {
+    onDiagnostic(diagnostic) { paletteDiagnostics.push(diagnostic); }
+  });
+  const shortPalette = await compatible.add(indexed(name("DeviceRGB"), 2, pdfString([255, 0, 0, 0, 255, 0])));
+  assert.deepEqual([...compatible.describe(shortPalette).lookup], [255, 0, 0, 0, 255, 0, 0, 0, 0]);
+  assert.deepEqual(compatible.defaultDecode(shortPalette), [0, 2], "truncated palettes retain the declared index range");
+  assert.deepEqual(compatible.convertToSrgb(shortPalette, [0]), [1, 0, 0]);
+  assert.deepEqual(compatible.convertToSrgb(shortPalette, [1]), [0, 1, 0]);
+  assert.deepEqual(compatible.convertToSrgb(shortPalette, [2]), [0, 0, 0], "only missing palette components are approximated");
+  assert.equal(paletteDiagnostics.length, 1);
+  assert.equal(paletteDiagnostics[0].code, "color.indexed-lookup-truncated");
+  assert.deepEqual(paletteDiagnostics[0].details, { expectedBytes: 9, actualBytes: 6, highValue: 2, missingEntryCount: 1 });
   for (const highValue of [-1, 0.5, 256]) {
     await rejectsCode(
       () => colors.add(indexed(name("DeviceGray"), highValue, pdfString([0]))),
@@ -600,6 +609,13 @@ async function testSeparationAndDeviceN() {
 
   const all = await colors.add(separation("All", name("DeviceRGB"), tint));
   const none = await colors.add(separation("None", name("DeviceRGB"), tint));
+  assert.equal(colors.paints(spot), true);
+  assert.equal(colors.paints(all), true);
+  assert.equal(colors.paints(none), false);
+  const indexedNone = await colors.add(indexed(
+    separation("None", name("DeviceRGB"), tint), 0, pdfString([255])
+  ));
+  assert.equal(colors.paints(indexedNone), false, "Indexed inherits no-paint from its colorant base");
   // Registration /All shows through its tint transform like any spot color.
   closeRgb(colors.convertToSrgb(all, [1]), [0, 0, 1]);
   throwsCode(() => colors.convertToSrgb(none, [1]), "unsupported-color");
@@ -620,6 +636,11 @@ async function testSeparationAndDeviceN() {
     calculator("{ add 2 div }", 2, 1)
   ));
   throwsCode(() => colors.convertToSrgb(repeatedNone, [0, 0]), "unsupported-color");
+  assert.equal(colors.paints(repeatedNone), false);
+  const mixedNone = await colors.add(deviceN(
+    ["None", "Ink"], name("DeviceRGB"), duoFunction
+  ));
+  assert.equal(colors.paints(mixedNone), true);
 
   const nChannel = await colors.add(deviceN(
     ["Spot"],

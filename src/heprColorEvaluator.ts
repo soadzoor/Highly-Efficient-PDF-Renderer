@@ -14,6 +14,29 @@ export class HeprColorEvaluator {
   constructor(colors: HeprColorStore,
     evaluateFunctions: (indices: readonly number[], inputs: readonly number[], path: string) => readonly number[],
     signal?: AbortSignal) { this.colors = colors; this.evaluateFunctions = evaluateFunctions; this.signal = signal; }
+
+  /** `/None` colorants suppress painting; they have no RGB or alpha substitute. */
+  paints(index: number): boolean {
+    this.signal?.throwIfAborted();
+    const colors = this.colors;
+    let active: Set<number> | undefined, kind: number;
+    while (true) {
+      if (!Number.isSafeInteger(index) || index < 0 || index >= colors.spaceKinds.length) {
+        this.unsupportedColorMetadata(index, "color-space");
+      }
+      kind = colors.spaceKinds[index];
+      if (kind !== HEPR_COLOR_SPACE_KIND.Indexed) break;
+      active ??= new Set();
+      if (active.has(index)) throw colorError("An Indexed color-space graph is recursive.", "color-space");
+      active.add(index);
+      index = colors.alternateSpaceIndices[index];
+      this.signal?.throwIfAborted();
+    }
+    if (kind !== HEPR_COLOR_SPACE_KIND.Separation && kind !== HEPR_COLOR_SPACE_KIND.DeviceN) return true;
+    const names = colors.names.slice(colors.nameOffsets[index], colors.nameOffsets[index + 1]);
+    return names.length === 0 || !names.every((name) => name === "None");
+  }
+
   convert(
     index: number,
     components: ArrayLike<number>,

@@ -930,11 +930,14 @@ export function createHeprPageDataFromDense(
       overprint: state.strokeOverprint ?? false,
       overprintMode: state.overprintMode ?? 0
     });
-    const fills = renderingMode === 0 || renderingMode === 2 ||
-      renderingMode === 4 || renderingMode === 6;
-    const strokes = renderingMode === 1 || renderingMode === 2 ||
-      renderingMode === 5 || renderingMode === 6;
+    // Font-owned programs retain their source text mode so explicit glyph
+    // colors can paint. Their ordinary outline remainder still obeys /None.
+    const fills = (paint.fillPaints ?? state.fillColorSpace.paints) !== false && (renderingMode === 0 || renderingMode === 2 ||
+      renderingMode === 4 || renderingMode === 6);
+    const strokes = (paint.strokePaints ?? state.strokeColorSpace.paints) !== false && (renderingMode === 1 || renderingMode === 2 ||
+      renderingMode === 5 || renderingMode === 6);
     return Object.freeze({
+      renderingMode: (renderingMode >= 4 ? 4 : 0) + (fills ? strokes ? 2 : 0 : strokes ? 1 : 3),
       fillPaintIndex: fills
         ? (paint.fillPaintInherited === true
             ? -1
@@ -963,6 +966,20 @@ export function createHeprPageDataFromDense(
       }) satisfies DensePdfCompositeState
     });
   };
+  let ordinaryGlyphFlagsCopied = false;
+  const setOrdinaryGlyphVisibility = (first: number, count: number, renderingMode: number): void => {
+    const invisible = renderingMode === 3 || renderingMode === 7;
+    for (let glyph = first; glyph < first + count; glyph++) {
+      if ((glyph & 0xfff) === 0) throwIfAborted(options.signal);
+      if (((stores.glyphs.flags[glyph] & HEPR_GLYPH_FLAG.Invisible) !== 0) === invisible) continue;
+      if (!ordinaryGlyphFlagsCopied) {
+        stores.glyphs = { ...stores.glyphs, flags: new Uint8Array(stores.glyphs.flags) };
+        ordinaryGlyphFlagsCopied = true;
+      }
+      if (invisible) stores.glyphs.flags[glyph] |= HEPR_GLYPH_FLAG.Invisible;
+      else stores.glyphs.flags[glyph] &= ~HEPR_GLYPH_FLAG.Invisible;
+    }
+  };
   const intrinsicPaths = new Map<string, number>();
   const appendIntrinsicGlyphCommand = (
     target: HeprDisplayCommand[], glyphIndex: number,
@@ -979,6 +996,7 @@ export function createHeprPageDataFromDense(
     throwIfAborted(options.signal);
     if (intrinsic.commands.length === 0) return true;
     const state = paint.initialGraphicsState;
+    if ((paint.fillPaints ?? state.fillColorSpace.paints) === false) return true;
     const hairline = intrinsic.width === 0;
     const key = `${fontIndex}:${glyphId}:${state.lineCap}:${state.lineJoin ?? 0}:${state.miterLimit ?? 10}:` +
       `${state.lineDash.join(",")}:${state.dashPhase}`;
@@ -1283,7 +1301,7 @@ export function createHeprPageDataFromDense(
     if (!options.type3?.implicitFillGlyphs?.has(glyphIndex)) return false;
     // A lasting PostScript color/clip governs the implicit font fill. The
     // independent PDF character stroke and text clip still use the raw path.
-    if (renderingMode === 2 || renderingMode === 6) {
+    if ((renderingMode === 2 || renderingMode === 6) && resources.strokeStyleIndex >= 0) {
       appendPaintCommand(target, {
         kind: "draw", ...commandState, source: "glyphs", first: glyphIndex, count: 1,
         fillPaintIndex: -1, strokePaintIndex: resources.strokePaintIndex,
@@ -1422,9 +1440,10 @@ export function createHeprPageDataFromDense(
           ...(paintResources.strokeTransformIndex === undefined ? {} : {
             strokeTransformIndex: paintResources.strokeTransformIndex
           }),
-          renderingMode: textRun.renderingMode
+          renderingMode: paintResources.renderingMode
         };
-        if (textRun.renderingMode !== 3 && textRun.renderingMode !== 7) {
+        setOrdinaryGlyphVisibility(ordinaryStart, end - ordinaryStart, paintResources.renderingMode);
+        if (paintResources.renderingMode !== 3 && paintResources.renderingMode !== 7) {
           appendPaintCommand(commands, command, paintResources.wrapperComposite, true);
         }
         else commands.push(command);
@@ -1680,9 +1699,10 @@ export function createHeprPageDataFromDense(
         ...(paintResources.strokeTransformIndex === undefined ? {} : {
           strokeTransformIndex: paintResources.strokeTransformIndex
         }),
-        renderingMode: textRun.renderingMode
+        renderingMode: paintResources.renderingMode
       };
-      if (textRun.renderingMode === 3 || textRun.renderingMode === 7) target.push(command);
+      setOrdinaryGlyphVisibility(ordinaryStart, end - ordinaryStart, paintResources.renderingMode);
+      if (paintResources.renderingMode === 3 || paintResources.renderingMode === 7) target.push(command);
       else appendPaintCommand(target, command, paintResources.wrapperComposite, true);
       ordinaryStart = -1;
     };

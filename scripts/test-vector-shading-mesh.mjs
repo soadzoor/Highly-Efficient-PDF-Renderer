@@ -12,6 +12,7 @@ const webGpu = await import("../src/threeWebGpuBackend.ts");
 try {
   const { openPdf } = await import("../src/pdfSession.ts");
   const { buildHeprVectorGradient } = await import("../src/retainedVectorGradient.ts");
+  const { buildHeprVectorShadingMesh } = await import("../src/vectorShadingMesh.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { sampleSceneGradientChannel } = await import("../src/gradientSampling.ts");
   const { getScenePrimitive, ScenePrimitivePicker } = await import("../src/scenePrimitives.ts");
@@ -30,6 +31,17 @@ try {
     const session = await openPdf({ kind: "bytes", bytes: fixture(kind) });
     try {
       const retained = await session.compilePage(0);
+      if (kind === 4) {
+        const triangleCount = 65_537, indices = Uint32Array.from({ length: triangleCount * 3 }, (_, i) => i % 3);
+        const large = { ...retained, stores: { ...retained.stores, meshes: { ...retained.stores.meshes,
+          indices, indexOffsets: Uint32Array.of(0, indices.length) } } };
+        const mesh = await buildHeprVectorShadingMesh(large, 0);
+        assert.equal(mesh.indices.length / 3, triangleCount, "meshes above the former default triangle ceiling stay vector");
+        await assert.rejects(() => buildHeprVectorShadingMesh(large, 0, { maxTriangles: 65_536 }),
+          error => error.code === "resource-limit", "caller-selected triangle limits still apply");
+        const tiny = await buildHeprVectorGradient(retained, 0, [1e-7, 0, 0, 1e-7, 0, 0], bounds, 1);
+        assert(tiny.gradientMetaB.every(Number.isFinite), "small invertible mesh transforms remain representable");
+      }
       const compiled = await session.compileVectorPage(0, { vectorFallback: "error", optimization: "none" });
       assert.equal(compiled.rasterLayers.length, 0, `type ${kind} stays vector through the public compiler`);
       assert.equal(compiled.gradientMetaA[0], 2);

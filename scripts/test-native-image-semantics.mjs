@@ -317,13 +317,98 @@ try {
   ], "device image shortcuts must not bypass a scoped calibrated default");
   await rejectsCode(images.add(grayStream([-Number.MAX_VALUE, Number.MAX_VALUE])), "unsupported-image");
 
+  const noneSpace = [name("Separation"), name("None"), name("DeviceRGB"), new Map([
+    ["FunctionType", 2], ["Domain", [0, 1]], ["C0", [1, 0, 0]], ["C1", [0, 1, 0]], ["N", 1]
+  ])];
+  const noneStream = (bits, bytes, entries = {}) => ({
+    kind: "stream", dictionary: new Map(Object.entries({
+      Type: name("XObject"), Subtype: name("Image"), Width: 2, Height: 1,
+      BitsPerComponent: bits, ColorSpace: noneSpace, ...entries
+    })), bytes
+  });
+  for (const [bits, bytes, rawSamples] of [
+    [1, Uint8Array.of(0x40), [0, 1]], [2, Uint8Array.of(0x70), [1, 3]],
+    [4, Uint8Array.of(0x2e), [2, 14]], [8, Uint8Array.of(12, 230), [12, 230]],
+    [16, Uint8Array.of(0x12, 0x34, 0xff, 0xab), null]
+  ]) {
+    const snapshot = bytes.slice();
+    const invisible = images.describe(await images.add(noneStream(bits, bytes)));
+    assert.equal(images.colors.paints(invisible.colorSpaceIndex), false);
+    assert.equal(invisible.sourceBitsPerComponent, bits);
+    assert.deepEqual(invisible.decode, [0, 1]);
+    if (rawSamples) {
+      assert.equal(invisible.format, HEPR_IMAGE_FORMAT.GrayAlpha8);
+      assert.deepEqual([...invisible.data], rawSamples.flatMap(value => [value, 0]),
+        "nonpainting one-component images retain raw samples beside zero coverage");
+    } else {
+      assert.equal(invisible.format, HEPR_IMAGE_FORMAT.Rgba16);
+      assert.ok(invisible.data.every(value => value === 0));
+    }
+    assert.deepEqual(bytes, snapshot);
+  }
+  const noneDeviceN = [name("DeviceN"), [name("None"), name("None")], name("DeviceRGB"), {
+    kind: "stream", dictionary: new Map([
+      ["FunctionType", 0], ["Domain", [0, 1, 0, 1]], ["Range", [0, 1, 0, 1, 0, 1]],
+      ["Size", [2, 2]], ["BitsPerSample", 8]
+    ]), bytes: Uint8Array.of(255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0)
+  }];
+  const invisibleDeviceN = images.describe(await images.add(noneStream(8,
+    Uint8Array.of(10, 20, 30, 40), { ColorSpace: noneDeviceN })));
+  assert.equal(images.colors.paints(invisibleDeviceN.colorSpaceIndex), false);
+  assert.equal(invisibleDeviceN.format, HEPR_IMAGE_FORMAT.Rgba8);
+  assert.ok(invisibleDeviceN.data.every(value => value === 0),
+    "all-None DeviceN must not evaluate its opaque red alternate color");
+  const indexedNone = images.describe(await images.add(noneStream(1, Uint8Array.of(0x40), {
+    ColorSpace: [name("Indexed"), noneSpace, 1, { kind: "string", bytes: Uint8Array.of(0, 255) }]
+  })));
+  assert.equal(images.colors.describe(indexedNone.colorSpaceIndex).kind, "Indexed");
+  assert.equal(images.colors.paints(indexedNone.colorSpaceIndex), false);
+  assert.deepEqual([...indexedNone.data], [0, 0, 1, 0],
+    "an Indexed image with a /None base retains exact indices without painting its alternate colors");
+
+  let invisibleCodecCalls = 0;
+  const opacityImages = new NativePdfImageRegistry(document, images.colors, {
+    codecResolver(request) {
+      invisibleCodecCalls += 1;
+      return { width: 2, height: 1, components: 2, bitsPerComponent: 8,
+        samples: Uint8Array.of(12, 255, 230, 255) };
+    }
+  });
+  const invisibleOpacity = opacityImages.describe(await opacityImages.add(noneStream(8,
+    Uint8Array.of(0xff, 0x4f), { Filter: name("JPXDecode"), SMaskInData: 1 })));
+  assert.equal(invisibleCodecCalls, 0, "an all-None JPX image needs no decoded color or opacity samples");
+  assert.equal(invisibleOpacity.format, HEPR_IMAGE_FORMAT.Jpeg2000);
+  assert.equal(invisibleOpacity.codecRequest.decodeParameters.SMaskInData, 1);
+  assert.deepEqual([...unpackNativeImageCodecRequest(invisibleOpacity.data).encoded], [0xff, 0x4f],
+    "the invisible JPX payload and embedded-opacity metadata remain available without requesting a decoder");
+
   const stencil = images.describe(await images.add(ref(10)));
   assert.equal(stencil.sourceBitsPerComponent, 1, "ImageMask BPC defaults to one");
   assert.equal(stencil.interpolate, true);
   assert.deepEqual(stencil.decode, [1, 0]);
   assert.deepEqual([...stencil.data], [255, 0]);
 
-  for (const objectNumber of [11, 12, 13]) {
+  const compatibilityDiagnostics = [];
+  const compatibleImages = new NativePdfImageRegistry(document, undefined, {
+    onDiagnostic(diagnostic) { compatibilityDiagnostics.push(diagnostic); }
+  });
+  const redundantMaskColorSpace = compatibleImages.describe(await compatibleImages.add(ref(11)));
+  assert.equal(redundantMaskColorSpace.imageMask, true);
+  assert.deepEqual([...redundantMaskColorSpace.data], [255]);
+  // An unused mask ColorSpace is ignored without resolving a dangling value.
+  await compatibleImages.add({
+    kind: "stream",
+    dictionary: new Map([
+      ["Subtype", name("Image")], ["Width", 1], ["Height", 1],
+      ["ImageMask", true], ["ColorSpace", ref(999)]
+    ]),
+    bytes: Uint8Array.of(0)
+  });
+  assert.deepEqual(compatibilityDiagnostics.map(({ code }) => code), [
+    "image.mask-color-space-ignored", "image.mask-color-space-ignored"
+  ]);
+  compatibilityDiagnostics.length = 0;
+  for (const objectNumber of [12, 13]) {
     await rejectsCode(images.add(ref(objectNumber)), "unsupported-image");
   }
 
@@ -358,7 +443,34 @@ try {
   for (const objectNumber of [32, 33, 34]) {
     await rejectsCode(images.add(ref(objectNumber)), "unsupported-image");
   }
-  await rejectsCode(images.add(ref(72)), "unsupported-image");
+  assert.deepEqual([...images.describe(await images.add(ref(72))).data], [0, 0, 0, 255],
+    "RunLengthDecode preserves packed one-bit samples");
+  for (const precision of [1, 2, 4, 8, 16]) {
+    const width = 3, height = 2;
+    const rowBytes = Math.ceil(width * precision / 8);
+    const samples = Uint8Array.from({ length: rowBytes * height }, (_, index) => (index * 37 + 91) & 255);
+    const entries = new Map([
+      ["Subtype", name("Image")], ["Width", width], ["Height", height],
+      ["BitsPerComponent", precision], ["ColorSpace", name("DeviceGray")]
+    ]);
+    const expected = compatibleImages.describe(await compatibleImages.add({
+      kind: "stream", dictionary: entries, bytes: samples
+    }));
+    const trailingBytes = Uint8Array.of(0, 33, 255);
+    const padded = compatibleImages.describe(await compatibleImages.add({
+      kind: "stream", dictionary: entries, bytes: Uint8Array.from([...samples, ...trailingBytes])
+    }));
+    assert.deepEqual(padded.data, expected.data, `${precision}-bit samples ignore only bytes beyond the declared grid`);
+    const runLength = compatibleImages.describe(await compatibleImages.add({
+      kind: "stream", dictionary: new Map([...entries, ["Filter", name("RunLengthDecode")]]),
+      bytes: Uint8Array.from([samples.length - 1, ...samples, 128])
+    }));
+    assert.deepEqual(runLength.data, expected.data, `RunLengthDecode supports ${precision}-bit samples`);
+  }
+  assert.equal(compatibilityDiagnostics.length, 5);
+  assert.ok(compatibilityDiagnostics.every(({ code, details }) =>
+    code === "image.trailing-sample-data" && details.actualBytes - details.expectedBytes === 3));
+  assert.deepEqual([...compatibleImages.describe(await compatibleImages.add(ref(53))).data], [0, 0, 0, 255]);
   assert.deepEqual([...images.describe(await images.add(ref(73))).data], [171, 171, 171, 255],
     "filter predictor precision is independent of image sample precision");
   assert.deepEqual(
@@ -381,7 +493,7 @@ try {
 
   const beforeUnused = images.size;
   assert.equal(images.buildStore().widths.length, beforeUnused, "unused malformed XObjects remain lazy");
-  for (const objectNumber of [38, 39, 40, 41, 42, 43, 44, 47, 53, 54, 56, 75]) {
+  for (const objectNumber of [38, 39, 40, 41, 42, 43, 44, 47, 54, 56, 75]) {
     await rejectsCode(images.add(ref(objectNumber)), "unsupported-image");
   }
 
@@ -427,6 +539,7 @@ try {
     height: 10
   });
   page.stores.colors = images.colors.buildStore();
+  page.stores.functions = images.colors.functions.buildStore();
   page.stores.images = store;
   validateHeprPageData(page);
   assert.equal(store.dataOffsets.at(-1), store.data.length);

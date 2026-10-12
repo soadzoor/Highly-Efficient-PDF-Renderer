@@ -259,21 +259,18 @@ async function* decodeFlateChunks(
   }
 }
 
-/**
- * Find a strictly valid zlib stream with exactly one misplaced EOL repaired.
- * Probe without retaining decoded chunks: some platforms discard queued output
- * on error, so the initial attempt's delivered length cannot prove completeness.
- */
+interface ZlibRecovery {
+  readonly inputs: readonly Uint8Array[];
+  readonly length: number;
+  readonly diagnostic: PdfDiagnostic;
+}
+
+/** Probe validated framing repairs without retaining decoded chunks. */
 async function validateZlibFraming(
   input: Uint8Array,
   limit: number,
   signal?: AbortSignal
-): Promise<{
-  readonly inputs: readonly Uint8Array[];
-  readonly length: number;
-  readonly trimmedByteCount: number;
-  readonly appendedByteCount: number;
-} | null> {
+): Promise<ZlibRecovery | null> {
   const last = input[input.length - 1];
   const maxTrim = last === 0x0a && input[input.length - 2] === 0x0d ? 2
     : last === 0x0a || last === 0x0d ? 1 : 0;
@@ -296,10 +293,115 @@ async function validateZlibFraming(
     try {
       const decoded = await inflateWithPlatformStream(candidate.inputs, "deflate", limit, signal, false);
       throwIfAborted(signal);
-      return { ...candidate, length: decoded.length };
+      return {
+        inputs: candidate.inputs,
+        length: decoded.length,
+        diagnostic: {
+          code: "filter.flate-eol-recovered",
+          severity: "warning",
+          message: candidate.appendedByteCount > 0
+            ? "Restored an EOL byte sequence excluded from the FlateDecode checksum by the stream length; the complete stream checksum was validated."
+            : "Removed an EOL byte sequence included after the FlateDecode stream; the complete stream checksum was validated.",
+          details: {
+            trimmedByteCount: candidate.trimmedByteCount,
+            appendedByteCount: candidate.appendedByteCount
+          }
+        }
+      };
     } catch (cause) {
       throwIfAborted(signal);
       if (!(cause instanceof PdfError) || cause.code !== "invalid-object") throw cause;
+    }
+  }
+  return null;
+}
+
+async function validateZlibCompatibility(
+  input: Uint8Array,
+  limit: number,
+  signal?: AbortSignal
+): Promise<ZlibRecovery | null> {
+  const framing = await validateZlibFraming(input, limit, signal);
+  if (framing) return framing;
+  const validate = async (inputs: readonly Uint8Array[], diagnostic: PdfDiagnostic): Promise<ZlibRecovery | null> => {
+    try {
+      const decoded = await inflateWithPlatformStream(inputs, "deflate", limit, signal, false);
+      return { inputs, length: decoded.length, diagnostic };
+    } catch (cause) {
+      throwIfAborted(signal);
+      if (!(cause instanceof PdfError) || cause.code !== "invalid-object") throw cause;
+      return null;
+    }
+  };
+  // Some producers repeat the final checksum byte. Trimming it is safe only
+  // when the remaining complete zlib stream still validates its checksum.
+  if (input[input.length - 1] === input[input.length - 2]) {
+    const recovered = await validate([input.subarray(0, -1)], {
+      code: "filter.flate-trailing-data",
+      severity: "warning",
+      message: "Removed a repeated byte after the FlateDecode stream; the complete stream checksum was validated.",
+      details: { trimmedByteCount: 1 }
+    });
+    if (recovered) return recovered;
+  }
+  // A few encoders advertise a small window while using larger backreferences.
+  // Raise only the window declaration; preserve the compressed data and Adler.
+  if (input[0] !== 0x78) {
+    const flags = input[1] & 0xe0;
+    const header = Uint8Array.of(0x78, flags + (31 - ((0x7800 | flags) % 31)) % 31);
+    const recovered = await validate([header, input.subarray(2)], {
+      code: "filter.flate-window-recovered",
+      severity: "warning",
+      message: "Corrected a FlateDecode window declaration that was smaller than its backreferences; the complete stream checksum was validated.",
+      details: { declaredWindowBits: (input[0] >>> 4) + 8, decodedWindowBits: 15 }
+    });
+    if (recovered) return recovered;
+  }
+
+  // A raw decoder proves the complete DEFLATE payload and computes its Adler
+  // without keeping a second decoded copy. Accept a missing checksum suffix
+  // only when appending it makes the original zlib stream strictly valid:
+  // present checksum bytes are never changed, nor is truncated pixel data.
+  const checksumFor = async (inputs: readonly Uint8Array[]): Promise<number | null> => {
+    const checksum = createAdler32State();
+    try {
+      for await (const chunk of inflatePlatformChunks(
+        inputs, "deflate-raw", limit, signal, { length: 0 }
+      )) updateAdler32(checksum, chunk, signal);
+      return finishAdler32(checksum);
+    } catch (cause) {
+      throwIfAborted(signal);
+      if (!(cause instanceof PdfError) || cause.code !== "invalid-object") throw cause;
+      return null;
+    }
+  };
+  const raw = input.subarray(2);
+  let checksum = await checksumFor([raw]);
+  if (checksum !== null) {
+    const trailer = adler32Bytes(checksum);
+    for (let missing = 1; missing <= trailer.length; missing += 1) {
+      const recovered = await validate([input, trailer.subarray(trailer.length - missing)], {
+        code: "filter.flate-checksum-recovered",
+        severity: "warning",
+        message: "Restored a missing FlateDecode checksum suffix after validating the complete compressed payload and every checksum byte present in the PDF.",
+        details: { appendedByteCount: missing, preservedChecksumByteCount: trailer.length - missing }
+      });
+      if (recovered) return recovered;
+    }
+  } else if (input.length >= 6 && input[input.length - 4] === 0 && input[input.length - 3] === 0 &&
+      input[input.length - 2] === 255 && input[input.length - 1] === 255) {
+    // A sync-flushed stream ends at an empty stored block, without BFINAL or
+    // Adler. Append an empty final block only when the strict decoder proves
+    // that the existing payload ends at that block boundary.
+    const finalBlock = Uint8Array.of(3, 0);
+    checksum = await checksumFor([raw, finalBlock]);
+    if (checksum !== null) {
+      return await validate([input, finalBlock, adler32Bytes(checksum)], {
+        code: "filter.flate-sync-flush-recovered",
+        severity: "warning",
+        message: "Completed a FlateDecode stream ending at a sync-flush boundary; its original compressed payload was complete but had no final block or checksum.",
+        details: { appendedByteCount: 6 }
+      });
     }
   }
   return null;
@@ -330,7 +432,7 @@ async function inflateWithPlatformStream(
   limit: number,
   signal: AbortSignal | undefined,
   collect: boolean,
-  recoverEolMarker = false,
+  recoverZlib = false,
   onDiagnostic?: PdfFilterDecodeOptions["onDiagnostic"]
 ): Promise<{ readonly bytes?: Uint8Array; readonly length: number }> {
   const state: PlatformInflateState = { length: 0 };
@@ -341,7 +443,7 @@ async function inflateWithPlatformStream(
     limit,
     signal,
     state,
-    recoverEolMarker,
+    recoverZlib,
     onDiagnostic
   )) {
     writer?.append(chunk);
@@ -361,7 +463,7 @@ async function* inflatePlatformChunks(
   limit: number,
   signal: AbortSignal | undefined,
   state: PlatformInflateState,
-  recoverEolMarker = false,
+  recoverZlib = false,
   onDiagnostic?: PdfFilterDecodeOptions["onDiagnostic"]
 ): AsyncIterable<Uint8Array> {
   if (typeof DecompressionStream !== "function") {
@@ -407,12 +509,10 @@ async function* inflatePlatformChunks(
     await reader.cancel().catch(() => undefined);
     if (cause instanceof PdfError) throw cause;
     if (signal?.aborted) throwIfAborted(signal);
-    // PDF 32000-1 7.3.8.1 excludes the following EOL from /Length, but some
-    // producers include it. Recover only original zlib input, never raw data
-    // or its synthetic validation checksum. Strict retries keep checksum,
-    // truncation, byte-limit and cancellation checks intact.
-    if (recoverEolMarker && format === "deflate" && inputs.length === 1) {
-      const recovered = await validateZlibFraming(inputs[0], limit, signal);
+    // Recover only original zlib input, never raw data or its synthetic
+    // validation checksum. Every repair is validated before replaying output.
+    if (recoverZlib && format === "deflate" && inputs.length === 1) {
+      const recovered = await validateZlibCompatibility(inputs[0], limit, signal);
       if (recovered && recovered.length >= state.length) {
         if (recovered.length > state.length) {
           // Replay only if the failed decoder withheld output. Skip the prefix
@@ -435,15 +535,8 @@ async function* inflatePlatformChunks(
         }
         throwIfAborted(signal);
         onDiagnostic?.(Object.freeze({
-          code: "filter.flate-eol-recovered",
-          severity: "warning" as const,
-          message: recovered.appendedByteCount > 0
-            ? "Restored an EOL byte sequence excluded from the FlateDecode checksum by the stream length; the complete stream checksum was validated."
-            : "Removed an EOL byte sequence included after the FlateDecode stream; the complete stream checksum was validated.",
-          details: Object.freeze({
-            trimmedByteCount: recovered.trimmedByteCount,
-            appendedByteCount: recovered.appendedByteCount
-          })
+          ...recovered.diagnostic,
+          details: Object.freeze({ ...recovered.diagnostic.details })
         }));
         completed = true;
         return;
@@ -515,6 +608,10 @@ function adler32(bytes: Uint8Array, signal?: AbortSignal): number {
   const state = createAdler32State();
   updateAdler32(state, bytes, signal);
   return finishAdler32(state);
+}
+
+function adler32Bytes(checksum: number): Uint8Array {
+  return Uint8Array.of(checksum >>> 24, (checksum >>> 16) & 255, (checksum >>> 8) & 255, checksum & 255);
 }
 
 function decodeLzw(

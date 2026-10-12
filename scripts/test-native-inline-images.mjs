@@ -139,6 +139,19 @@ const imageMask = prepareNativeInlineImages(
 );
 assert.equal(imageMask.images[0].stream.dictionary.get("ImageMask"), true);
 
+const missingRawEi = bytes("q BI /W 2 /H 1 /BPC 8 /CS /G ID EI Q");
+expectPdfError(() => prepareNativeInlineImages(missingRawEi), "unsupported-image", "inline-image-missing-ei");
+const eiDiagnostics = [];
+const recoveredRawEi = prepareNativeInlineImages(missingRawEi, {
+  recoverMissingRawEi: true, onDiagnostic: diagnostic => eiDiagnostics.push(diagnostic)
+});
+assert.deepEqual([...recoveredRawEi.images[0].stream.bytes], [69, 73], "the exact EI sample bytes remain pixels");
+assert.equal(eiDiagnostics[0].code, "image.inline-missing-ei-recovered");
+assert.equal(new TextDecoder().decode(recoveredRawEi.contentSpans.at(-1).bytes).trim(), "Q");
+expectPdfError(() => prepareNativeInlineImages(bytes("q BI /W 2 /H 1 /BPC 8 /CS /G ID AB Q"), {
+  recoverMissingRawEi: true
+}), "unsupported-image", "inline-image-missing-ei");
+
 const resourceColor = prepareNativeInlineImages(
   inline("/W 1 /H 1 /BPC 8 /CS /Al#69as", Uint8Array.of(255, 0, 0))
 );

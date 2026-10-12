@@ -101,6 +101,8 @@ export interface NativeImageCodecRequest {
  * represent its premultiplication semantics.
  */
 export interface NativeImageCodecResult {
+  /** Metadata recovery warnings emitted by package-owned codec kernels. */
+  readonly diagnostics?: readonly PdfDiagnostic[];
   readonly jbig2Symbols?: MonochromeSymbolScene;
   readonly samples: Uint8Array;
   readonly width: number;
@@ -400,6 +402,14 @@ export class NativePdfImageRegistry {
     const imageMask = await optionalBoolean(this.document, dictionary, "ImageMask", false, signal);
     const interpolate = await optionalBoolean(this.document, dictionary, "Interpolate", false, signal);
     validateLocalImageStream(dictionary, imageMask);
+    if (imageMask && dictionary.has("ColorSpace")) {
+      this.onDiagnostic?.({
+        code: "image.mask-color-space-ignored",
+        severity: "warning",
+        message: "An image mask specifies ColorSpace; it was ignored and the samples were used as stencil coverage.",
+        details: { width, height }
+      });
+    }
     const filters = await resolveFilters(this.document, dictionary.get("Filter"), signal);
     const decodeParameters = await resolveDecodeParameters(
       this.document,
@@ -428,7 +438,6 @@ export class NativePdfImageRegistry {
       signal
     );
     let sourceBitsPerComponent = bitsPerComponent;
-    validateImageSampleFilterConsistency(filters, decodeParameters, bitsPerComponent);
     let colorSpaceIndex = -1;
     let componentCount = 1;
     if (!imageMask && dictionary.has("ColorSpace")) {
@@ -439,6 +448,10 @@ export class NativePdfImageRegistry {
     } else if (!imageMask) {
       componentCount = 0;
     }
+    const paints = imageMask || colorSpaceIndex < 0 || this.colors.paints(colorSpaceIndex);
+    // Invisible colorants need no decoder. Preserve their encoded payload and
+    // source metadata for HEP storage instead of requiring an unused kernel.
+    const codecResolver = paints ? this.codecResolver : undefined;
     const decode = await readImageDecode(
       this.document,
       dictionary,
@@ -487,7 +500,7 @@ export class NativePdfImageRegistry {
             { limits: this.document.limits, signal }
           );
       let nativeCcittDecoded = false;
-      if (terminalCodec === "ccitt") {
+      if (terminalCodec === "ccitt" && paints) {
         try {
           if (!imageMask && componentCount !== 1) {
             throw new PdfError(
@@ -519,7 +532,7 @@ export class NativePdfImageRegistry {
               signal,
               recoverMissingEndOfBlock: true,
               onDiagnostic: this.onDiagnostic,
-              limits: imageCcittLimits(this.document, encodedSize.columns, encodedSize.rows)
+              limits: imageCcittLimits(this.document, encodedSize.columns)
             }
           );
           let normalizedBytes = normalizeCcittBlackPolarity(
@@ -595,7 +608,7 @@ export class NativePdfImageRegistry {
         }
       }
       if (!nativeCcittDecoded) {
-        if (this.codecPolicy === "error") {
+        if (this.codecPolicy === "error" && paints) {
           throw new PdfError("unsupported-image", `${terminalCodec} image data requires its pinned codec kernel.`, {
             details: { codec: terminalCodec, filter: filters[terminalIndex] }
           });
@@ -635,7 +648,7 @@ export class NativePdfImageRegistry {
         // 1/8 scale instead of failing. A Matte soft mask must keep the
         // parent's exact dimensions, so it pins full resolution.
         const reducible = terminalCodec === "jpeg" && this.trustedCodecResolver &&
-          !!this.codecResolver && mask.matte.length === 0;
+          !!codecResolver && mask.matte.length === 0;
         codecRequest = Object.freeze({
           codec: terminalCodec,
           width,
@@ -654,7 +667,7 @@ export class NativePdfImageRegistry {
           ...(reducible ? { maxReduction: MAX_CODEC_REDUCTION } : {})
         });
         let unresolvedPayload: Uint8Array | null = null;
-        if (!this.codecResolver) {
+        if (!codecResolver) {
           unresolvedPayload = packNativeImageCodecRequest(
             terminalCodec,
             requestEncoded,
@@ -675,9 +688,11 @@ export class NativePdfImageRegistry {
             );
           }
         }
-        this.requests.push(codecRequest);
-        this.onCodecRequest?.(codecRequest);
-        if (this.codecResolver) {
+        if (paints) {
+          this.requests.push(codecRequest);
+          this.onCodecRequest?.(codecRequest);
+        }
+        if (codecResolver) {
           // Enforce the document's lowered image/stream ceilings before a
           // focused codec is allowed to allocate native or WASM output. JPX
           // may own its sample layout (zero components/precision), so its
@@ -712,13 +727,14 @@ export class NativePdfImageRegistry {
             );
           }
           const resolved = await resolveCodecThroughCaller(
-            this.codecResolver,
+            codecResolver,
             codecRequest,
             this.document,
             this.codecDecodedByteLimit,
             this.trustedCodecResolver,
             signal
           );
+          for (const diagnostic of resolved.diagnostics ?? []) this.onDiagnostic?.(diagnostic);
           sourceBitsPerComponent = resolved.bitsPerComponent;
           if (resolved.width !== width || resolved.height !== height) {
             decodedWidth = resolved.width;
@@ -791,7 +807,7 @@ export class NativePdfImageRegistry {
               separated.opacity === null,
               signal
             );
-            if (separated.opacity) {
+            if (separated.opacity && this.colors.paints(colorSpaceIndex)) {
               applyEmbeddedOpacity(
                 converted.data,
                 separated.opacity,
@@ -816,7 +832,22 @@ export class NativePdfImageRegistry {
         componentCount,
         bitsPerComponent
       );
-      const decoded = await this.document.decodeStream(value, signal);
+      const decodedBytes = await this.document.decodeStream(value, signal);
+      const expectedBytes = Math.ceil(width * componentCount * bitsPerComponent / 8) * height;
+      // Read only the declared sample grid. Some producers pad the last
+      // ASCII85 group to four bytes, or append other data after the pixels.
+      // Keep short streams and codec bridge results strictly validated.
+      const decoded = decodedBytes.length > expectedBytes
+        ? decodedBytes.subarray(0, expectedBytes)
+        : decodedBytes;
+      if (decodedBytes.length > expectedBytes) {
+        this.onDiagnostic?.({
+          code: "image.trailing-sample-data",
+          severity: "warning",
+          message: `Ignored ${decodedBytes.length - expectedBytes} decoded bytes after the declared image samples.`,
+          details: { width, height, expectedBytes, actualBytes: decodedBytes.length }
+        });
+      }
       const packedGray = imageMask ? null : convertPackedGray1(
         decoded, width, height, componentCount, bitsPerComponent,
         decode, colorKeyMask, colorSpaceIndex, this.colors, signal
@@ -1224,6 +1255,7 @@ async function resolveCodecThroughCaller(
     height: raw.height,
     components: raw.components,
     bitsPerComponent: raw.bitsPerComponent,
+    ...(trustedResolver && raw.diagnostics ? { diagnostics: raw.diagnostics } : {}),
     ...(trustedResolver && request.codec === "jbig2" && raw.jbig2Symbols ? { jbig2Symbols: raw.jbig2Symbols } : {})
   });
 }
@@ -1386,6 +1418,25 @@ function convertSamplesToSrgb(
   const maximum = (2 ** bitsPerComponent) - 1;
   const sixteenBit = bitsPerComponent === 16;
   const bytesPerComponent = sixteenBit ? 2 : 1;
+  if (!colors.paints(colorSpaceIndex)) {
+    // /None has no display color. Keep an exact single raw sample plane when
+    // the existing transparent gray format can hold it; other layouts retain
+    // their source color/decode metadata beside an entirely transparent store
+    // payload. Compilers and renderers omit the paint itself, including its
+    // knockout contribution, rather than drawing this payload at zero alpha.
+    if (componentCount === 1 && !sixteenBit) {
+      const data = allocateBytes(width * height * 2, "nonpainting image samples");
+      for (let pixel = 0; pixel < width * height; pixel += 1) {
+        if ((pixel & 0xfff) === 0) throwIfAborted(signal);
+        data[pixel * 2] = samples[pixel];
+      }
+      return { data, format: HEPR_IMAGE_FORMAT.GrayAlpha8 };
+    }
+    return {
+      data: allocateBytes(width * height * 4 * bytesPerComponent, "nonpainting image output"),
+      format: sixteenBit ? HEPR_IMAGE_FORMAT.Rgba16 : HEPR_IMAGE_FORMAT.Rgba8
+    };
+  }
   // A DeviceGray byte is already its own sRGB value, so an RGBA8 result repeats
   // it three times beside a constant alpha. Keeping the single channel leaves a
   // retained page's serialized image store four times smaller; consumers that
@@ -1659,9 +1710,9 @@ function requireCcittBoolean(name: string, value: PdfValue): boolean {
 }
 
 /**
- * The encoded fax size bounds the decoder. /Columns and a positive /Rows
- * describe the encoded data exactly; Rows=0 means unknown and is resolved
- * from RTC/EOFB or physical EOD, bounded by the image /Height.
+ * Read the expected fax size for working-set validation. With /EndOfBlock,
+ * RTC/EOFB or physical EOD determines the actual rows independently of /Rows,
+ * bounded by the configured image limits.
  */
 function readCcittEncodedSize(
   document: NativePdfDocument,
@@ -1718,17 +1769,16 @@ function fitPackedBitmap(
 
 function imageCcittLimits(
   document: NativePdfDocument,
-  width: number,
-  height: number
+  width: number
 ): NativeCcittLimits {
-  const maxDecodedBytes = document.limits.maxDecodedStreamBytes;
-  const maxPixels = width * height;
-  const maxPackedBytes = Math.ceil(width / 8) * height;
   return {
     maxColumns: width,
-    maxRows: height,
-    maxPixels,
-    maxOutputBytes: Math.min(maxDecodedBytes, maxPackedBytes),
+    // /EndOfBlock=true makes the fax terminator authoritative, even when
+    // /Rows or the XObject /Height is smaller. Decode within the caller's
+    // limits, then crop or white-pad to the declared image grid above.
+    maxRows: document.limits.maxImageDimension,
+    maxPixels: document.limits.maxImagePixels,
+    maxOutputBytes: document.limits.maxDecodedStreamBytes,
     maxScanBits: Number.MAX_SAFE_INTEGER,
     maxTransitions: Number.MAX_SAFE_INTEGER,
     maxDamagedRows: Number.MAX_SAFE_INTEGER
@@ -1770,26 +1820,6 @@ function normalizeCcittBlackPolarity(
     bytes[rowEnd - 1] &= tailMask;
   }
   return bytes;
-}
-
-function validateImageSampleFilterConsistency(
-  filters: readonly string[],
-  decodeParameters: readonly (PdfDictionary | null)[],
-  bitsPerComponent: number
-): void {
-  if (bitsPerComponent === 0 || filters.length === 0) return;
-  const terminalFilter = filters[filters.length - 1];
-  const parameters = decodeParameters[decodeParameters.length - 1];
-  const predictor = parameters?.get("Predictor") ?? 1;
-  if (Number.isSafeInteger(predictor) && (predictor as number) !== 1) {
-    // Predictor precision describes the byte transform, independently of the
-    // image samples. For example, a 1-bit mask may predict packed bitmap bytes
-    // using the default 8-bit precision and blocks spanning several scanlines.
-    return;
-  }
-  if ((terminalFilter === "RunLengthDecode" || terminalFilter === "RL") && bitsPerComponent !== 8) {
-    throw new PdfError("unsupported-image", "A RunLengthDecode image must use eight-bit samples.");
-  }
 }
 
 function codecFormat(codec: NativeImageCodec): number {
@@ -1976,9 +2006,6 @@ function validateLocalImageStream(dictionary: PdfDictionary, imageMask: boolean)
   // /DP is an inline-image abbreviation, not an Image XObject dictionary key.
   if (dictionary.has("DP")) {
     throw new PdfError("unsupported-image", "Image XObjects must use /DecodeParms rather than /DP.");
-  }
-  if (imageMask && dictionary.has("ColorSpace")) {
-    throw new PdfError("unsupported-image", "An image mask must not specify ColorSpace.");
   }
   if (imageMask && dictionary.has("Mask")) {
     throw new PdfError("unsupported-image", "An image mask must not specify another Mask.");

@@ -165,8 +165,65 @@ function testTableDirectoryAndMetricValidation() {
   );
 }
 
+function testEmbeddedGlyphUnicodeFallback() {
+  const fixture = buildFixture();
+  const parse = records => {
+    const tables = cloneTables(fixture.tables);
+    tables.set("cmap", buildCmap(records));
+    return NativeSfntFont.parse(buildSfnt(tables));
+  };
+  for (const [encoding, bytes] of [
+    [0, cmapFormat0([[65, 1], [66, 2]])],
+    [3, cmapFormat4([[65, 1], [66, 2]])],
+    [3, cmapFormat6(65, [1, 2])],
+    [4, cmapFormat10(65, [1, 2])],
+    [4, cmapFormat12([[65, 66, 1]])],
+    [6, cmapFormat13([[65, 65, 1], [66, 66, 2]])]
+  ]) {
+    const font = parse([{ platform: 0, encoding, bytes }]);
+    const recovered = font.getGlyphUnicodeFallback();
+    assert.deepEqual([...recovered], [[1, "A"], [2, "B"]]);
+    assert.strictEqual(font.getGlyphUnicodeFallback(), recovered, "the inverse is built once per embedded face");
+  }
+  const ambiguous = parse([{ platform: 0, encoding: 3, bytes: cmapFormat4([
+    [0, 4], [32, 1], [65, 2], [160, 1], [0xe000, 3], [0xfdd0, 5]
+  ]) }]);
+  assert.deepEqual([...ambiguous.getGlyphUnicodeFallback()], [[2, "A"]],
+    "shared glyph aliases, controls, and private-use codes remain unindexed");
+  const selected = parse([
+    { platform: 0, encoding: 3, bytes: cmapFormat4([[65, 1]]) },
+    { platform: 0, encoding: 4, bytes: cmapFormat12([[90, 90, 1]]) }
+  ]);
+  assert.equal(selected.getGlyphUnicodeFallback().get(1), "Z", "only the selected Unicode cmap is inverted");
+  const symbol = parse([{ platform: 3, encoding: 0, bytes: cmapFormat4([[65, 1]]) }]);
+  assert.equal(symbol.getGlyphUnicodeFallback().size, 0, "symbol char codes do not imply Unicode");
+  const constant = parse([{ platform: 0, encoding: 6, bytes: cmapFormat13([[0x10000, 0x10ffff, 1]]) }]);
+  assert.equal(constant.getGlyphUnicodeFallback().size, 0, "constant ranges are ambiguous without expansion");
+  const sparse = parse([{ platform: 0, encoding: 4, bytes: cmapFormat12([[0x10000, 0x10ffff, 1]]) }]);
+  assert.equal(sparse.getGlyphUnicodeFallback().size, 9, "unreachable range GIDs are skipped");
+  assert.equal(sparse.getGlyphUnicodeFallback().get(1), "\u{10000}");
+}
+
 function testPdfEmbeddedSubsetCompatibility() {
   const fixture = buildFixture();
+  const badHintingZones = cloneTables(fixture.tables);
+  new DataView(badHintingZones.get("maxp").buffer).setUint16(14, 3, false);
+  expectPdf(() => NativeSfntFont.parse(buildSfnt(badHintingZones)), "unsupported-font", /maxZones/i);
+  const unhinted = NativeSfntFont.parse(buildSfnt(badHintingZones), 0, undefined, "pdf-embedded");
+  assert.deepEqual(unhinted.getGlyphOutline(1), NativeSfntFont.parse(buildSfnt(fixture.tables)).getGlyphOutline(1));
+  assert.equal(unhinted.diagnostics[0].code, "font.sfnt-max-zones-ignored");
+  for (const tag of ["head", "hhea"]) {
+    const padded = cloneTables(fixture.tables);
+    padded.set(tag, concatenate([padded.get(tag), Uint8Array.of(0, 0)]));
+    const bytes = buildSfnt(padded);
+    expectPdf(() => NativeSfntFont.parse(bytes), "unsupported-font", /head or hhea.*length/i);
+    const recovered = NativeSfntFont.parse(bytes, 0, undefined, "pdf-embedded");
+    assert.deepEqual(recovered.getGlyphOutline(1), NativeSfntFont.parse(buildSfnt(fixture.tables)).getGlyphOutline(1));
+    assert.equal(recovered.diagnostics[0].code, "font.sfnt-header-padding-ignored");
+    padded.set(tag, padded.get(tag).subarray(0, tag === "head" ? 53 : 35).slice());
+    expectPdf(() => NativeSfntFont.parse(buildSfnt(padded), 0, undefined, "pdf-embedded"),
+      "unsupported-font", /truncated|short/i);
+  }
   const tablesWithMetadata = cloneTables(fixture.tables);
   tablesWithMetadata.set("OS/2", Uint8Array.of(
     0, 4, 0, 1, 0, 2, 0, 3,
@@ -490,6 +547,17 @@ function testBinaryHmtxNormalizationFixtures() {
   assert.equal(approximated.diagnostics[0]?.severity, "warning");
   assert.match(approximated.diagnostics[0]?.message ?? "", /approximated by glyph xMin/);
 
+  const emptyTail = cloneTables(buildFixture().tables);
+  emptyTail.set("hmtx", emptyTail.get("hmtx").slice(0, -2));
+  const exactEmpty = NativeSfntFont.parse(buildSfnt(emptyTail), 0, undefined, "pdf-embedded");
+  assert.deepEqual(exactEmpty.getHorizontalMetric(9), { advanceWidth: 900, leftSideBearing: 0 });
+  assert.deepEqual(exactEmpty.getGlyphOutline(9).commands, []);
+  assert.equal(exactEmpty.diagnostics[0].severity, "info");
+  assert.equal(exactEmpty.diagnostics[0].details.exact, true);
+  assert.equal(exactEmpty.diagnostics[0].details.emptyGlyphs, true,
+    "missing bearings of provably empty glyphs recover exact zero without head.flags bit1");
+  expectPdf(() => NativeSfntFont.parse(buildSfnt(emptyTail)), "unsupported-font", /hhea\/hmtx/i);
+
   const missingLongMetricTables = cloneTables(buildFixture().tables);
   const missingLongMetricHead = new DataView(missingLongMetricTables.get("head").buffer);
   missingLongMetricHead.setUint16(16, missingLongMetricHead.getUint16(16, false) | 0x0002, false);
@@ -513,6 +581,18 @@ function testLazyGlyphValidationAndLimits() {
   const fixture = buildFixture();
   const bytes = buildSfnt(fixture.tables);
   const font = NativeSfntFont.parse(bytes);
+
+  const emptyHeaderTables = cloneTables(fixture.tables);
+  const glyfWithEmptyHeader = concatenate([emptyHeaderTables.get("glyf"), glyphHeader(0, [0, 0, 0, 0]).finish()]);
+  emptyHeaderTables.set("glyf", glyfWithEmptyHeader);
+  new DataView(emptyHeaderTables.get("loca").buffer).setUint32(40, glyfWithEmptyHeader.length, false);
+  const emptyHeaderBytes = buildSfnt(emptyHeaderTables);
+  expectPdf(() => NativeSfntFont.parse(emptyHeaderBytes).getGlyphOutline(9), "unsupported-font", /out of bounds/i);
+  const emptyHeaderFont = NativeSfntFont.parse(emptyHeaderBytes, 0, undefined, "pdf-embedded");
+  assert.equal(emptyHeaderFont.diagnostics.length, 0, "unused glyph recovery remains lazy");
+  assert.deepEqual(emptyHeaderFont.getGlyphOutline(9).commands, []);
+  assert.equal(emptyHeaderFont.getGlyphOutline(9).advanceWidth, font.getGlyphOutline(9).advanceWidth);
+  assert.equal(emptyHeaderFont.diagnostics[0].code, "font.sfnt-empty-glyph-normalized");
 
   // Glyph 5 is deliberately recursive. Its malformed body remains lazy and
   // cannot prevent unrelated mapped glyphs from compiling.
@@ -624,6 +704,46 @@ function testLazyGlyphValidationAndLimits() {
 
 function testCmapValidationAndLimits() {
   const fixture = buildFixture();
+
+  const oddFormat4 = concatenate([cmapFormat4([[0x41, 1]]), Uint8Array.of(0)]);
+  new DataView(oddFormat4.buffer).setUint16(2, oddFormat4.length, false);
+  const repaired4Tables = cloneTables(fixture.tables);
+  repaired4Tables.set("cmap", buildCmap([{ platform: 3, encoding: 1, bytes: oddFormat4 }]));
+  const oddBytes = buildSfnt(repaired4Tables);
+  expectPdf(() => NativeSfntFont.parse(oddBytes), "unsupported-font", /format 4 cmap.*malformed/i);
+  const oddFont = NativeSfntFont.parse(oddBytes, 0, undefined, "pdf-embedded");
+  assert.equal(oddFont.mapCodePoint(0x41), 1);
+  assert.equal(oddFont.diagnostics[0].code, "font.sfnt-cmap-padding-ignored");
+
+  const invalidSentinel4 = cmapFormat4([[0x41, 1]]);
+  new DataView(invalidSentinel4.buffer).setUint16(30, 0xffff, false);
+  repaired4Tables.set("cmap", buildCmap([{ platform: 3, encoding: 1, bytes: invalidSentinel4 }]));
+  const sentinelBytes = buildSfnt(repaired4Tables);
+  expectPdf(() => NativeSfntFont.parse(sentinelBytes), "unsupported-font", /glyph array offset/i);
+  const sentinelFont = NativeSfntFont.parse(sentinelBytes, 0, undefined, "pdf-embedded");
+  assert.equal(sentinelFont.mapCodePoint(0x41), 1);
+  assert.equal(sentinelFont.mapCodePoint(0xffff), 0);
+  assert.equal(sentinelFont.diagnostics[0].code, "font.sfnt-cmap-sentinel-normalized");
+  new DataView(invalidSentinel4.buffer).setUint16(28, 0xffff, false);
+  repaired4Tables.set("cmap", buildCmap([{ platform: 3, encoding: 1, bytes: invalidSentinel4 }]));
+  expectPdf(() => NativeSfntFont.parse(buildSfnt(repaired4Tables), 0, undefined, "pdf-embedded"),
+    "unsupported-font", /glyph array offset/i);
+
+  const padded6 = concatenate([cmapFormat6(0x41, [1, 2]), Uint8Array.of(0, 0)]);
+  new DataView(padded6.buffer).setUint16(2, padded6.length, false);
+  const paddedTables = cloneTables(fixture.tables);
+  paddedTables.set("cmap", buildCmap([{ platform: 0, encoding: 3, bytes: padded6 }]));
+  const paddedBytes = buildSfnt(paddedTables);
+  expectPdf(() => NativeSfntFont.parse(paddedBytes), "unsupported-font", /format 6 cmap range/i);
+  const paddedFont = NativeSfntFont.parse(paddedBytes, 0, undefined, "pdf-embedded");
+  assert.equal(paddedFont.mapCodePoint(0x41), 1);
+  assert.equal(paddedFont.mapCodePoint(0x42), 2);
+  assert.equal(paddedFont.mapCodePoint(0x43), 0, "padding cannot create another mapping");
+  assert.equal(paddedFont.diagnostics[0].code, "font.sfnt-cmap-padding-ignored");
+  new DataView(padded6.buffer).setUint16(8, 4, false);
+  paddedTables.set("cmap", buildCmap([{ platform: 0, encoding: 3, bytes: padded6 }]));
+  expectPdf(() => NativeSfntFont.parse(buildSfnt(paddedTables), 0, undefined, "pdf-embedded"),
+    "unsupported-font", /format 6 cmap range/i);
 
   const outOfRange = cloneTables(fixture.tables);
   outOfRange.set("cmap", buildCmap([{ platform: 0, encoding: 2, bytes: cmapFormat6(0x41, [99]) }]));
@@ -1240,6 +1360,7 @@ class ByteWriter {
 
 try {
   testCheckedSfntAndCmaps();
+  testEmbeddedGlyphUnicodeFallback();
   testTableDirectoryAndMetricValidation();
   testPdfEmbeddedSubsetCompatibility();
   testBinaryHmtxNormalizationFixtures();

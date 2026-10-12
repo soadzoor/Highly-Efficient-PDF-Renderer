@@ -7,6 +7,8 @@
  * callers can then apply bounded fallback without silently omitting content.
  */
 
+import type { PdfDiagnostic } from "./nativeTypes";
+
 export type DensePdfMatrix = [number, number, number, number, number, number];
 
 export interface DensePdfBounds {
@@ -126,6 +128,8 @@ export interface DensePdfTextPaintRun {
   readonly first: number;
   readonly count: number;
   readonly renderingMode: number;
+  /** The glyph program can select its own colors after inheriting caller state. */
+  readonly hasOwnPaintPrograms?: boolean;
 }
 
 /** Synchronously pre-resolved PDF color space used by the streaming compiler. */
@@ -135,6 +139,8 @@ export interface DensePdfColorSpaceDefinition {
   readonly colorSpaceIndex: number;
   readonly componentCount: number;
   readonly initialComponents: readonly number[];
+  /** False for Separation /None and DeviceN spaces containing only /None. */
+  readonly paints?: boolean;
   convertToSrgb(components: readonly number[]): readonly [number, number, number];
 }
 
@@ -150,6 +156,8 @@ export interface DensePdfPatternDefinition {
   readonly resourceName: string;
   readonly patternIndex: number;
   readonly kind: "colored-tiling" | "uncolored-tiling" | "shading";
+  /** False when a shading pattern's own color space never paints. */
+  readonly paints?: boolean;
   /** Proven opaque, uniform coverage of a gapless colored tiling cell. */
   readonly solidColor?: readonly [number, number, number];
   /** PatternType 2 `/ExtGState`; merged at the exact source paint position. */
@@ -329,10 +337,15 @@ export interface DensePdfContentCompileOptions {
    * in the default view, keeping the hidden payload lazy.
    */
   imageXObjects?: ReadonlyMap<string, number>;
+  /** Image masks use the current nonstroking paint; ordinary images do not. */
+  imageIsMask?: (imageIndex: number) => boolean;
+  /** False when the image's own color space never paints. */
+  imagePaints?: (imageIndex: number) => boolean;
   /** Page-local native Form definition indexes keyed by `/XObject` resource name. */
   formXObjects?: ReadonlyMap<string, number>;
   /** Page-local HEPR gradient indexes keyed by `/Shading` resource name. */
   shadings?: ReadonlyMap<string, number>;
+  shadingPaints?: (gradientIndex: number) => boolean;
   /** Gradients representable by the analytic, ordered VectorScene renderer. */
   vectorShadings?: ReadonlySet<number>;
   /** Pre-resolved `/Pattern` and `[/Pattern base]` color spaces. */
@@ -381,6 +394,8 @@ export interface DensePdfContentCompileOptions {
   signal?: AbortSignal;
   yieldIntervalMs?: number;
   onProgress?: (progress: DensePdfCompileProgress) => void;
+  /** Reports recoverable malformed content while preserving its visible paint. */
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
 }
 
 /** Shared inputs for compilation contexts whose output is fixed. @internal */
@@ -747,6 +762,9 @@ export interface DensePdfGlyphPaint {
   readonly stroke: readonly [red: number, green: number, blue: number, alpha: number];
   readonly fillPaintInherited?: boolean;
   readonly strokePaintInherited?: boolean;
+  /** Effective roles include the active pattern, which can supersede a solid /None space. */
+  readonly fillPaints?: boolean;
+  readonly strokePaints?: boolean;
   /** Full state inherited by a Type3 CharProc at this source text-show position. */
   readonly initialGraphicsState: DensePdfInitialGraphicsState;
 }
@@ -2087,7 +2105,20 @@ class DenseContentCompiler {
       }
     }
     if (this.markedContentStack.length > 0) {
-      throw new DensePdfSyntaxError("PDF content ends inside an unterminated BMC/BDC scope.");
+      this.options.onDiagnostic?.({
+        code: "marked-content.unclosed-scope", severity: "warning",
+        message: "Unterminated BMC/BDC scopes were closed at the end of their content program; their painted content was retained."
+      });
+      while (this.markedContentStack.length > 0) {
+        this.markedContentStack.pop();
+        this.syncActiveMarkedContent();
+        this.textSink?.applyOperator("EMC", [], {
+          outputEnabled: this.contentVisible,
+          optionalContentIndex: this.activeOptionalContentIndex,
+          markedContentIndex: this.activeMarkedContentIndex
+        });
+        if ((this.markedContentStack.length & 0x1fff) === 0) await checkpoint();
+      }
     }
 
     // Uniform opaque, stroke-only pages can retain the established containment
@@ -2225,6 +2256,8 @@ class DenseContentCompiler {
           stroke: Object.freeze([...paint.stroke]) as DensePdfGlyphPaint["stroke"],
           ...(paint.fillPaintInherited === true ? { fillPaintInherited: true } : {}),
           ...(paint.strokePaintInherited === true ? { strokePaintInherited: true } : {}),
+          fillPaints: paint.fillPaints,
+          strokePaints: paint.strokePaints,
           initialGraphicsState: freezeInitialGraphicsState(paint.initialGraphicsState)
         }))
       ),
@@ -2404,7 +2437,7 @@ class DenseContentCompiler {
           ) {
             throw new DensePdfSyntaxError("The native text engine emitted an invalid glyph paint run.");
           }
-          this.recordGlyphPaintRun(run.first, run.count, run.renderingMode);
+          this.recordGlyphPaintRun(run.first, run.count, run.renderingMode, run.hasOwnPaintPrograms);
         }
       }
     }
@@ -2449,7 +2482,17 @@ class DenseContentCompiler {
         this.assertCurrentPathLimits(operator);
         return;
       case "h":
-        this.requireArgs(operator, args, 0);
+        // A few appearance producers repeat the subpath's starting point
+        // before h. Closing already draws that exact segment; retain the
+        // vector path while diagnosing these redundant operands.
+        if (this.operandCount === 2 && this.path.isSubpathStart(numberArg(args, 0), numberArg(args, 1))) {
+          this.options.onDiagnostic?.({
+            code: "path.close-operands-recovered", severity: "warning",
+            message: "Redundant coordinates matching the subpath start before h were ignored; the path was closed normally."
+          });
+        } else {
+          this.requireArgs(operator, args, 0);
+        }
         this.path.closePath(this.policy.displayProgram === true);
         this.assertCurrentPathLimits(operator);
         return;
@@ -2873,6 +2916,8 @@ class DenseContentCompiler {
             operator
           );
         }
+        this.referencedShadings.add(resourceName);
+        if (this.options.shadingPaints?.(gradientIndex) === false) return;
         if (this.policy.displayProgram !== true &&
             !(this.policy.vectorScene === true &&
               (this.policy.selectiveRaster === true ||
@@ -2882,7 +2927,6 @@ class DenseContentCompiler {
             operator
           );
         }
-        this.referencedShadings.add(resourceName);
         if (this.contentVisible && this.state.clipBounds) {
           if (this.policy.vectorScene === true) {
             this.assertVectorSceneComposite("nonstroke", operator);
@@ -2996,10 +3040,10 @@ class DenseContentCompiler {
         this.requireArgs(operator, args, 1);
         const tag = nameArg(args, 0);
         if (tag === "OC") {
-          throw new DensePdfUnsupportedError(
-            "An /OC BMC scope has no membership property and cannot be evaluated.",
-            operator
-          );
+          this.options.onDiagnostic?.({
+            code: "optional-content.missing-membership", severity: "warning",
+            message: "An /OC BMC scope has no membership property; its content remains visible and layer visibility may differ."
+          });
         }
         this.beginMarkedContent(tag, null, -1, -1, true, operator);
         this.textSink?.applyOperator(operator, [tag], {
@@ -3078,7 +3122,11 @@ class DenseContentCompiler {
       case "EMC":
         this.requireArgs(operator, args, 0);
         if (!this.markedContentStack.pop()) {
-          throw new DensePdfSyntaxError("EMC has no matching BMC or BDC scope.");
+          this.options.onDiagnostic?.({
+            code: "marked-content.unmatched-end", severity: "warning",
+            message: "An EMC operator without a matching BMC/BDC scope was ignored; painted content was retained."
+          });
+          return;
         }
         this.syncActiveMarkedContent();
         this.textSink?.applyOperator(operator, [], {
@@ -3239,6 +3287,32 @@ class DenseContentCompiler {
     };
   }
 
+  private currentColorPaints(role: "fill" | "stroke"): boolean {
+    const stroke = role === "stroke";
+    const patternSpace = stroke ? this.state.strokePatternColorSpace : this.state.fillPatternColorSpace;
+    const pattern = stroke ? this.state.strokePattern : this.state.fillPattern;
+    if (patternSpace) return pattern?.paints !== false && patternSpace.baseColorSpace?.paints !== false;
+    return (stroke ? this.state.strokeColorSpace : this.state.fillColorSpace).paints !== false;
+  }
+
+  private currentGlyphColorSpace(role: "fill" | "stroke"): Readonly<DensePdfColorSpaceDefinition> {
+    const stroke = role === "stroke";
+    const patternSpace = stroke ? this.state.strokePatternColorSpace : this.state.fillPatternColorSpace;
+    if (!patternSpace) return stroke ? this.state.strokeColorSpace : this.state.fillColorSpace;
+    // Text inherits a pattern's proven solid RGB, or the existing diagnostic
+    // RGB approximation. Its previous solid color space no longer describes
+    // the active paint and must not suppress an inherited glyph program.
+    const rgb = fallbackDeviceColorSpace("DeviceRGB", "Tj");
+    return this.currentColorPaints(role) ? rgb : { ...rgb, paints: false };
+  }
+
+  private paintingTextMode(mode: number): number {
+    const base = mode % 4;
+    const fill = (base === 0 || base === 2) && this.currentColorPaints("fill");
+    const stroke = (base === 1 || base === 2) && this.currentColorPaints("stroke");
+    return (mode >= 4 ? 4 : 0) + (fill ? stroke ? 2 : 0 : stroke ? 1 : 3);
+  }
+
   private currentGenericStrokeStyle(operator: string): DensePdfGenericStrokeStyle {
     if (this.retainedStrokeStyles >= this.maxStrokeStyles) {
       throw new DensePdfResourceLimitError(
@@ -3368,6 +3442,7 @@ class DenseContentCompiler {
     if (
       this.contentVisible &&
       operator === "S" &&
+      this.currentColorPaints("stroke") &&
       this.state.strokePatternColorSpace === null &&
       this.pendingClipRule === null &&
       // Ordered output records each paint's exact clip path; like the general
@@ -3398,10 +3473,10 @@ class DenseContentCompiler {
     const pathBounds = pathData.length > 0
       ? computeTransformedPathBounds(pathData, this.state.matrix)
       : null;
-    const strokePaint = operator === "S" || operator === "s" || operator === "B" ||
-      operator === "B*" || operator === "b" || operator === "b*";
-    const fillPaint = operator === "f" || operator === "F" || operator === "f*" ||
-      operator === "B" || operator === "B*" || operator === "b" || operator === "b*";
+    const strokePaint = this.currentColorPaints("stroke") && (operator === "S" || operator === "s" || operator === "B" ||
+      operator === "B*" || operator === "b" || operator === "b*");
+    const fillPaint = this.currentColorPaints("fill") && (operator === "f" || operator === "F" || operator === "f*" ||
+      operator === "B" || operator === "B*" || operator === "b" || operator === "b*");
     const isEndPath = operator === "n";
 
     const fillPathVisible = this.contentVisible && pathData.length > 0 &&
@@ -3436,6 +3511,15 @@ class DenseContentCompiler {
     let exactPathIndex = -1;
     const finishClip = (): void => {
       if (this.pendingClipRule === null) return;
+      // A containing rectangle cannot remove anything from the current clip.
+      // Avoid retaining exporter-generated "infinite" rectangles: quantizing
+      // their unused coordinates can otherwise clamp or overflow in HEP.
+      const clipBounds = this.state.clipBounds;
+      // Type3 FontBBox is advisory: those programs do not clip to pageBounds.
+      if (this.options.type3PaintMode === undefined && clipBounds && pathBounds &&
+          pathBounds.minX < clipBounds.minX && pathBounds.minY < clipBounds.minY &&
+          pathBounds.maxX > clipBounds.maxX && pathBounds.maxY > clipBounds.maxY &&
+          isExactAxisAlignedRectangle(pathData, this.state.matrix)) return;
       if (this.policy.displayProgram || this.policy.selectiveRaster || this.policy.orderedPaint) {
         if (exactPathIndex < 0) {
           exactPathIndex = this.retainExactPath(pathData, pathBounds, false, operator);
@@ -3785,6 +3869,7 @@ class DenseContentCompiler {
       !Array.isArray(definition.initialComponents) ||
       definition.initialComponents.length !== definition.componentCount ||
       definition.initialComponents.some((value) => !Number.isFinite(value)) ||
+      (definition.paints !== undefined && typeof definition.paints !== "boolean") ||
       typeof definition.convertToSrgb !== "function"
     ) {
       throw new TypeError(`Color-space resolver returned an invalid definition for /${resourceName}.`);
@@ -3821,6 +3906,7 @@ class DenseContentCompiler {
       definition.patternIndex > 0xffff_ffff ||
       (definition.kind !== "colored-tiling" &&
         definition.kind !== "uncolored-tiling" && definition.kind !== "shading") ||
+      (definition.paints !== undefined && typeof definition.paints !== "boolean") ||
       (definition.solidColor !== undefined && (definition.kind !== "colored-tiling" ||
         !Array.isArray(definition.solidColor) || definition.solidColor.length !== 3 ||
         definition.solidColor.some(value => !Number.isFinite(value) || value < 0 || value > 1))) ||
@@ -3844,6 +3930,9 @@ class DenseContentCompiler {
     if (components.some((value) => !Number.isFinite(value))) {
       throw new DensePdfSyntaxError(`${operator} contains a non-finite color component.`);
     }
+    // There is no RGB equivalent for /None. Keep the source space explicit;
+    // these private RGB slots are unused because its paint roles are omitted.
+    if (definition.paints === false) return [0, 0, 0];
     const converted = definition.convertToSrgb(components);
     if (
       !Array.isArray(converted) || converted.length !== 3 ||
@@ -4136,9 +4225,14 @@ class DenseContentCompiler {
     }
   }
 
-  private recordGlyphPaintRun(start: number, count: number, renderingMode: number): void {
+  private recordGlyphPaintRun(start: number, count: number, renderingMode: number, hasOwnPaintPrograms = false): void {
     if (count <= 0) return;
     if (this.policy.vectorScene === true) {
+      if (this.paintingTextMode(renderingMode) !== renderingMode) {
+        throw new DensePdfUnsupportedError(
+          "VectorScene output requires retained compilation for text under a no-paint caller color.", "Tj"
+        );
+      }
       this.recordVectorGlyphPaintRun(start, count, renderingMode);
       return;
     }
@@ -4168,7 +4262,8 @@ class DenseContentCompiler {
       pending.count += count;
     }
     if (!this.policy.displayProgram) return;
-    if (!this.state.textKnockout) {
+    const paintingMode = hasOwnPaintPrograms ? renderingMode : this.paintingTextMode(renderingMode);
+    if (paintingMode % 4 !== 3 && !this.state.textKnockout) {
       throw new DensePdfUnsupportedError(
         "Text knockout disabled requires a text-object transparency group.",
         "Tj"
@@ -4209,7 +4304,13 @@ class DenseContentCompiler {
       ],
       ...(this.state.fillPaintInherited ? { fillPaintInherited: true } : {}),
       ...(this.state.strokePaintInherited ? { strokePaintInherited: true } : {}),
-      initialGraphicsState: snapshotInitialGraphicsState(this.state)
+      fillPaints: this.currentColorPaints("fill"),
+      strokePaints: this.currentColorPaints("stroke"),
+      initialGraphicsState: {
+        ...snapshotInitialGraphicsState(this.state),
+        strokeColorSpace: this.currentGlyphColorSpace("stroke"),
+        fillColorSpace: this.currentGlyphColorSpace("fill")
+      }
     });
   }
 
@@ -4227,6 +4328,7 @@ class DenseContentCompiler {
         "Tj"
       );
     }
+    renderingMode = this.paintingTextMode(renderingMode);
     const outlined = renderingMode === 1 || renderingMode === 2;
     const vectorOutline = outlined && this.policy.orderedPaint && this.state.lineWidth >= 0 &&
       !this.state.strokeAdjustment;
@@ -4381,6 +4483,8 @@ class DenseContentCompiler {
     ) {
       throw new DensePdfSyntaxError("Image paint source metadata is invalid.");
     }
+    if (this.options.imagePaints?.(imageIndex) === false ||
+        (this.options.imageIsMask?.(imageIndex) === true && !this.currentColorPaints("fill"))) return;
     if (this.policy.vectorScene === true) {
       if (!this.policy.orderedPaint && this.policy.selectiveRaster === true &&
           !this.state.clipIsDefault && (!this.state.clipIsExactRectangle ||
@@ -5379,6 +5483,10 @@ class ReusablePathBuilder {
 
   isSingleLine(): boolean {
     return this.used === 6 && this.data[0] === DRAW_MOVE_TO && this.data[3] === DRAW_LINE_TO;
+  }
+
+  isSubpathStart(x: number, y: number): boolean {
+    return this.used > 0 && x === this.subpathStartX && y === this.subpathStartY;
   }
 
   moveTo(x: number, y: number): void {
@@ -7694,6 +7802,7 @@ function validateInitialGraphicsState(state: DensePdfInitialGraphicsState): void
     if (
       !definition || typeof definition.resourceName !== "string" ||
       !Number.isSafeInteger(definition.colorSpaceIndex) || definition.colorSpaceIndex < -1 ||
+      (definition.paints !== undefined && typeof definition.paints !== "boolean") ||
       typeof definition.convertToSrgb !== "function"
     ) {
       throw new TypeError("Initial Form color-space state is invalid.");
@@ -8038,6 +8147,35 @@ function isSingleAxisAlignedRectangle(
     { start: 0, end: pathData.length, bounds: pathBounds },
     matrix
   );
+}
+
+/** A strict proof for clip elision; tolerances or corner sets can admit bow ties. */
+function isExactAxisAlignedRectangle(pathData: Float32Array, matrix: DensePdfMatrix): boolean {
+  if (pathData.length !== 12 && pathData.length !== 13 &&
+      pathData.length !== 15 && pathData.length !== 16) return false;
+  const points: number[] = [];
+  for (let offset = 0; offset < pathData.length;) {
+    const operator = pathData[offset++];
+    if ((operator === DRAW_MOVE_TO && points.length === 0) ||
+        (operator === DRAW_LINE_TO && points.length > 0)) {
+      const x = pathData[offset++], y = pathData[offset++];
+      const px = matrix[0] * x + matrix[2] * y + matrix[4];
+      const py = matrix[1] * x + matrix[3] * y + matrix[5];
+      if (!Number.isFinite(px) || !Number.isFinite(py)) return false;
+      points.push(px, py);
+    } else if (operator !== DRAW_CLOSE || offset !== pathData.length) return false;
+  }
+  if (points.length !== 8 && !(points.length === 10 &&
+      points[8] === points[0] && points[9] === points[1])) return false;
+  let previousVertical: boolean | undefined;
+  for (let corner = 0; corner < 4; corner++) {
+    const next = (corner + 1) % 4;
+    const vertical = points[corner * 2] === points[next * 2];
+    const horizontal = points[corner * 2 + 1] === points[next * 2 + 1];
+    if (vertical === horizontal || vertical === previousVertical) return false;
+    previousVertical = vertical;
+  }
+  return true;
 }
 
 function combineClipMasks(

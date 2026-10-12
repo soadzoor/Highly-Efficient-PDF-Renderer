@@ -27,6 +27,8 @@ export interface NativeTextDrawRun {
   readonly fontIndex: number;
   /** PDF text rendering mode 0..7. */
   readonly renderingMode: number;
+  /** Type3 or PostScript glyph programs may select paint independently of the caller. */
+  readonly hasOwnPaintPrograms?: boolean;
 }
 
 export interface NativeTextCompilation {
@@ -156,6 +158,7 @@ export class NativeTextCompiler {
   private readonly runs: NativeTextDrawRun[] = [];
   private readonly diagnostics: PdfDiagnostic[] = [];
   private readonly missingUnicodeCodes = new Set<string>();
+  private readonly graphicsInTextOperators = new Set<string>();
   private pendingSeparator: " " | "\n" | null = null;
   private explicitGapCandidatePending = false;
   private previousPenEndX = 0;
@@ -197,7 +200,7 @@ export class NativeTextCompiler {
   }
 
   saveGraphicsState(): void {
-    this.requireOutsideTextObject("q");
+    this.reportGraphicsInsideTextObject("q");
     this.checkCancellation();
     if (this.graphicsStack.length >= this.maxGraphicsStateDepth) {
       throw new PdfError("resource-limit", "PDF text graphics-state nesting exceeds its configured limit.", {
@@ -208,7 +211,7 @@ export class NativeTextCompiler {
   }
 
   restoreGraphicsState(): void {
-    this.requireOutsideTextObject("Q");
+    this.reportGraphicsInsideTextObject("Q");
     this.checkCancellation();
     const snapshot = this.graphicsStack.pop();
     if (!snapshot) throw invalidText("PDF text graphics-state stack underflow.");
@@ -218,7 +221,7 @@ export class NativeTextCompiler {
 
   /** Concatenate a page-space transform after the current CTM. */
   concatTransform(matrix: PdfMatrix): void {
-    this.requireOutsideTextObject("cm");
+    this.reportGraphicsInsideTextObject("cm");
     this.checkCancellation();
     this.ctm = multiply(this.ctm, validateMatrix(matrix, "text CTM"));
   }
@@ -402,7 +405,7 @@ export class NativeTextCompiler {
     const resource = this.currentFont();
     const firstGlyph = this.glyphIds.length;
     this.appendTextBytes(resource, bytes);
-    this.appendRun(firstGlyph, this.glyphIds.length - firstGlyph, resource.fontIndex);
+    this.appendRun(firstGlyph, this.glyphIds.length - firstGlyph, resource);
   }
 
   showAdjustedText(items: readonly NativeTextArrayItem[]): void {
@@ -425,7 +428,7 @@ export class NativeTextCompiler {
         throw invalidText("TJ array entries must be byte strings or numbers.");
       }
     }
-    this.appendRun(firstGlyph, this.glyphIds.length - firstGlyph, resource.fontIndex);
+    this.appendRun(firstGlyph, this.glyphIds.length - firstGlyph, resource);
   }
 
   /** Append indexed OCR/ActualText geometry when no glyph instance exists. */
@@ -836,15 +839,18 @@ export class NativeTextCompiler {
     return Number.isFinite(forwardGap) && forwardGap > threshold;
   }
 
-  private appendRun(first: number, count: number, fontIndex: number): void {
+  private appendRun(first: number, count: number, resource: NativeTextFontResource): void {
     if (count === 0) return;
     // Preserve the text-show boundary. The graphics interpreter may have a
     // backdrop/clip/group barrier between otherwise compatible glyph spans.
     const run = Object.freeze({
       first,
       count,
-      fontIndex,
-      renderingMode: this.state.renderingMode
+      fontIndex: resource.fontIndex,
+      renderingMode: this.state.renderingMode,
+      ...((resource.type3 || resource.font.subtype === "Type3" || resource.font.sfnt?.usesPostScript ||
+        resource.font.cff?.usesPostScript || resource.font.type1?.usesPostScript)
+        ? { hasOwnPaintPrograms: true } : {})
     });
     this.runs.push(run);
     this.onRun?.(run);
@@ -892,10 +898,17 @@ export class NativeTextCompiler {
     if (!this.inTextObject) throw invalidText(`Text operator ${operator} occurs outside BT/ET.`);
   }
 
-  private requireOutsideTextObject(operator: string): void {
+  private reportGraphicsInsideTextObject(operator: string): void {
     this.checkCancellation();
-    if (this.inTextObject) {
-      throw invalidText(`Graphics operator ${operator} is not legal inside BT/ET.`);
+    if (this.inTextObject && !this.graphicsInTextOperators.has(operator)) {
+      this.graphicsInTextOperators.add(operator);
+      const diagnostic: PdfDiagnostic = {
+        code: "text.graphics-inside-text", severity: "warning",
+        message: `Graphics operator ${operator} inside BT/ET was applied to the graphics state; text positions and vector paint were retained.`,
+        details: { operator }
+      };
+      this.diagnostics.push(diagnostic);
+      this.onDiagnostic?.(diagnostic);
     }
   }
 

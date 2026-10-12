@@ -53,9 +53,98 @@ await testMergeCullAndFillBoundaries();
 await testLosslessExtremeCoordinateKeys();
 await testLargeVectorPaths();
 await testDeepMarkedContent();
+await testRecoveredMarkedContent();
+await testRedundantCloseCoordinates();
+await testNonPaintingColorSpaces();
 await testGroupedSelectiveImageCheckpoints();
 
 console.log("Dense PDF content compiler tests passed.");
+
+async function testNonPaintingColorSpaces() {
+  const none = { resourceName: "NoInk", colorSpaceIndex: 0, componentCount: 1,
+    initialComponents: [1], paints: false,
+    convertToSrgb() { assert.fail("a no-paint color must never be converted to RGB"); } };
+  const options = { colorSpaceResolver: name => name === "NoInk" ? none : undefined };
+  const source = "/NoInk cs 0 scn 0 0 100 100 re f /NoInk CS 0 SCN 0 0 m 100 100 l S " +
+    "0 0 1 RG 10 10 20 20 re B 1 0 0 rg /NoInk CS 0 SCN 40 40 10 10 re B " +
+    "q /NoInk cs 0 scn 0 0 5 5 re W f Q 60 60 10 10 re f";
+  const expected = "0 0 1 RG 10 10 20 20 re S 1 0 0 rg 40 40 10 10 re f 60 60 10 10 re f";
+  for (const compiler of [compileDensePdfContent, compileGroupedVectorPageContent]) {
+    const actual = await compile(source, options, compiler);
+    const reference = await compile(expected, {}, compiler);
+    for (const key of ["endpoints", "primitiveMeta", "styles", "fillPathMetaA", "fillPathMetaB", "fillPathMetaC", "fillSegmentsA", "fillSegmentsB"]) {
+      assert.deepEqual(actual[key], reference[key], key);
+    }
+    assert.equal(actual.fillPathCount, 2);
+    assert(actual.segmentCount > 0, "combined paint keeps its ordinary-color stroke");
+  }
+  const clipped = await compile("/NoInk cs 0 scn 0 0 5 5 re W f 1 0 0 rg 0 0 10 10 re f", options);
+  const clipReference = await compile("0 0 5 5 re W n 1 0 0 rg 0 0 10 10 re f");
+  assert.deepEqual(clipped.fillSegmentsA, clipReference.fillSegmentsA, "no-paint fills still install their pending clip");
+  assert.deepEqual(clipped.fillPathMetaA, clipReference.fillPathMetaA);
+
+  const patterns = new Map([
+    ["Colored", { resourceName: "Colored", patternIndex: 0, kind: "colored-tiling", solidColor: [1, 0, 0], hasExtGState: false }],
+    ["Uncolored", { resourceName: "Uncolored", patternIndex: 1, kind: "uncolored-tiling", hasExtGState: false }]
+  ]);
+  const patternOptions = { ...options, patterns, patternColorSpaces: new Map([
+    ["Pattern", { resourceName: "Pattern", baseColorSpace: null }],
+    ["NoInkPattern", { resourceName: "NoInkPattern", baseColorSpace: none }]
+  ]) };
+  const patterned = await compile("/NoInk cs 0 scn /Pattern cs /Colored scn 0 0 10 10 re f " +
+    "/NoInkPattern cs 0 /Uncolored scn 20 20 10 10 re f", { ...patternOptions, output: "display-program" });
+  assert.equal(patterned.patternPaints.length, 1, "colored patterns ignore stale None while uncolored None bases never paint");
+  const vectorPattern = await compile("/NoInk cs 0 scn /Pattern cs /Colored scn 0 0 10 10 re f", patternOptions, compileGroupedVectorPageContent);
+  assert.equal(vectorPattern.fillPathCount, 1);
+
+  let mode = 0, glyph = 0;
+  const text = await compile("BT /NoInk cs 0 scn (A) Tj 0 0 1 RG 2 Tr (B) Tj " +
+    "/NoInk CS 0 SCN 1 0 0 rg (C) Tj /NoInk cs 0 scn 6 Tr (D) Tj ET", {
+    ...options, output: "display-program", textOperatorSink: { applyOperator(op, args) {
+      if (op === "Tr") mode = args[0];
+      if (op === "Tj") return [{ first: glyph++, count: 1, renderingMode: mode }];
+    } }
+  });
+  assert.deepEqual(text.glyphPaints.map(p => p.renderingMode), [0, 2, 2, 6]);
+  assert.deepEqual(text.glyphPaints.map(p => [p.fillPaints, p.strokePaints]),
+    [[false, true], [false, true], [true, false], [false, false]]);
+  assert(text.clipPaths.some(p => p.firstGlyph === 3 && p.glyphCount === 1), "no-paint text retains its glyph clip");
+  const shading = await compile("/NoInk cs 0 scn /NoInkGradient sh", {
+    ...options, shadings: new Map([["NoInkGradient", 0]]), shadingPaints: () => false
+  });
+  assert.equal(shading.shadingPaints.length, 0);
+  assert.deepEqual(shading.referencedShadings, ["NoInkGradient"]);
+}
+
+async function testRedundantCloseCoordinates() {
+  const path = "93.946 213.813 m 160.428 213.813 l 160.428 205.032 l 93.946 205.032 l ";
+  const diagnostics = [];
+  const expected = await compile(path + "h f");
+  const actual = await compile(path + "93.946 213.813 h f", { onDiagnostic: d => diagnostics.push(d) });
+  assertSceneGeometryEqual(actual, expected);
+  assert.equal(actual.fillPathCount, 1);
+  assert.deepEqual(diagnostics.map(d => d.code), ["path.close-operands-recovered"]);
+  await assert.rejects(() => compile(path + "1 2 h f"), DensePdfSyntaxError);
+}
+
+async function testRecoveredMarkedContent() {
+  for (const [content, code] of [
+    ["/Span BMC 0 0 10 10 re f", "marked-content.unclosed-scope"],
+    ["EMC 0 0 10 10 re f", "marked-content.unmatched-end"],
+    ["/OC BMC 0 0 10 10 re f EMC", "optional-content.missing-membership"]
+  ]) {
+    const diagnostics = [];
+    const page = await compile(content, { onDiagnostic: d => diagnostics.push(d) });
+    assert.equal(page.fillPathCount, 1, "malformed scopes retain visible vector paint");
+    assert.deepEqual(diagnostics.map(d => d.code), [code]);
+  }
+  const hidden = await compile("/OC /Hidden BDC 0 0 10 10 re f", {
+    markedContentProperties: new Map([["Hidden", {
+      resourceName: "Hidden", optionalContentIndex: 0, defaultVisible: false, mcid: -1
+    }]])
+  });
+  assert.equal(hidden.fillPathCount, 0, "closing an incomplete hidden scope never exposes its paint");
+}
 
 async function compile(content, options = {}, compiler = compileDensePdfContent) {
   const source = typeof content === "string" ? encoder.encode(content) : content;
@@ -1047,7 +1136,6 @@ async function testUnsupportedAndMalformedContent() {
     await expectUnsupported(`${mode} Tr`, "Tr");
   }
   for (const content of [
-    "/OC BMC",
     "/Span << /OC /Layer >> BDC",
     "/Span << /Nested << /OCGs [] >> >> BDC",
     "/Span << /Nested << /Type /OCG >> >> BDC",

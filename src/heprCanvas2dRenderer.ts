@@ -488,6 +488,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
   private readonly frames: GroupFrame[] = [];
   private readonly masks = new Map<number, CachedImage>();
   private readonly imageCache = new Map<string, Promise<CachedImage>>();
+  private readonly gradientStopCache = new Map<number, readonly GradientStop[]>();
   private readonly localImageSurfaces = new Map<string, CachedImage>();
   private readonly diagnosedOverprintPaints = new Set<number>();
   private readonly timings: HeprCanvas2dTimings | undefined;
@@ -686,6 +687,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     this.frames.length = 0;
     this.masks.clear();
     this.imageCache.clear();
+    this.gradientStopCache.clear();
     this.localImageSurfaces.clear();
     this.sharedImages?.endRender();
     if (this.ownsPatternRuntime) {
@@ -1078,6 +1080,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
   ): Promise<void> {
     const command = execution.command;
     if (command.source !== "fill-paths") return;
+    if (!this.paintPaints(command.paintIndex >= 0 ? command.paintIndex : execution.state.type3PaintIndex)) return;
     const paint = this.readRequiredPaint(command.paintIndex, execution, "paintIndex");
     if (!paint.visible) return;
     const matrix = multiplyHeprMatrices(this.deviceMatrix, execution.state.transform);
@@ -1113,6 +1116,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
   ): Promise<void> {
     const command = execution.command;
     if (command.source !== "stroke-segments") return;
+    if (!this.paintPaints(command.paintIndex >= 0 ? command.paintIndex : execution.state.type3PaintIndex)) return;
     const paint = this.readRequiredPaint(command.paintIndex, execution, "paintIndex");
     if (!paint.visible) return;
     const matrix = multiplyHeprMatrices(this.deviceMatrix, execution.state.transform);
@@ -1427,7 +1431,10 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     );
     for (let imageIndex = command.first; imageIndex < command.first + command.count; imageIndex += 1) {
       this.options.signal?.throwIfAborted();
+      const colorSpaceIndex = this.page.stores.images.colorSpaceIndices[imageIndex];
+      if (colorSpaceIndex >= 0 && !this.colorSpacePaints(colorSpaceIndex)) continue;
       const imageMask = this.page.stores.images.imageMask[imageIndex] !== 0;
+      if (imageMask && !this.paintPaints(command.paintIndex >= 0 ? command.paintIndex : execution.state.type3PaintIndex)) continue;
       const resolvedPaint = imageMask
         ? this.readRequiredPaint(command.paintIndex, execution, "paintIndex")
         : null;
@@ -1765,6 +1772,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     if (command.source !== "meshes") return;
     for (let meshIndex = command.first; meshIndex < command.first + command.count; meshIndex += 1) {
       this.options.signal?.throwIfAborted();
+      if (!this.colorSpacePaints(this.page.stores.meshes.colorSpaceIndices[meshIndex])) continue;
       context.save();
       try {
         this.applyClips(context, execution.state.clips);
@@ -1791,6 +1799,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     paintBackground = true
   ): void {
     this.options.signal?.throwIfAborted();
+    if (!this.colorSpacePaints(this.page.stores.gradients.colorSpaceIndices[gradientIndex])) return;
     const metadata = this.readGradientMetadata(gradientIndex, path);
     const localToDevice = multiplyHeprMatrices(this.deviceMatrix, ownerTransform);
     context.save();
@@ -2046,6 +2055,9 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
   }
 
   private gradientStops(metadata: GradientMetadata, path: string): readonly GradientStop[] {
+    this.options.signal?.throwIfAborted();
+    const cached = this.gradientStopCache.get(metadata.gradientIndex);
+    if (cached) return cached;
     const gradients = this.page.stores.gradients;
     const stopStart = gradients.stopOffsets[metadata.gradientIndex];
     const stopEnd = gradients.stopOffsets[metadata.gradientIndex + 1];
@@ -2079,6 +2091,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
           path
         );
       }
+      this.gradientStopCache.set(metadata.gradientIndex, stops);
       return stops;
     }
     if (metadata.domain === null || metadata.functionIndices.length === 0) {
@@ -2176,6 +2189,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
       if (right.rgb.some((component, index) => component !== left.rgb[index])) output.push(right);
       low = right;
     }
+    this.gradientStopCache.set(metadata.gradientIndex, output);
     return output;
   }
 
@@ -2694,9 +2708,30 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     execution: HeprDrawRunExecution,
     field: string
   ): ResolvedPaint | null {
-    if (inherited) return this.readRequiredPaint(-1, execution, field);
+    if (inherited) return this.paintPaints(execution.state.type3PaintIndex)
+      ? this.readRequiredPaint(-1, execution, field) : null;
     if (paintIndex < 0) return null;
+    if (!this.paintPaints(paintIndex)) return null;
     return this.readPaint(paintIndex, `${execution.commandPath}.${field}`);
+  }
+
+  private paintPaints(index: number): boolean {
+    if (index < 0) return true;
+    const paints = this.page.stores.paints;
+    if (paints.kinds[index] === HEPR_PAINT_KIND.Pattern) {
+      const pattern = resolveHeprPatternPaint(this.page, index);
+      if (pattern?.kind === "shading") return this.colorSpacePaints(this.page.stores.gradients.colorSpaceIndices[pattern.gradientIndex]);
+      return !pattern || pattern.basePaintIndex < 0 || this.paintPaints(pattern.basePaintIndex);
+    }
+    if (paints.kinds[index] === HEPR_PAINT_KIND.Gradient) return this.colorSpacePaints(this.page.stores.gradients.colorSpaceIndices[paints.resourceIndices[index]]);
+    if (paints.kinds[index] !== HEPR_PAINT_KIND.SolidColor) return true;
+    return this.colorSpacePaints(paints.resourceIndices[index]);
+  }
+
+  private colorSpacePaints(index: number): boolean {
+    this.colorEvaluator ??= new HeprColorEvaluator(this.page.stores.colors,
+      (indices, inputs, path) => this.evaluateFunctions(indices, inputs, path), this.options.signal);
+    return this.colorEvaluator.paints(index);
   }
 
   private readRequiredPaint(

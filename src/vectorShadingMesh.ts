@@ -65,14 +65,16 @@ export function createRetainedShadingEvaluator(page: HeprPageData, signal?: Abor
 
 interface Vertex { x: number; y: number; inputs: readonly number[]; rgb: readonly number[] }
 
-/** Bounded adaptive vector approximation; source function/color conversion happens before RGB interpolation. */
+/** Adaptive vector approximation; source function/color conversion happens before RGB interpolation. */
 export async function buildHeprVectorShadingMesh(page: HeprPageData, gradientIndex: number,
   options: VectorShadingOptions = {}): Promise<VectorShadingMesh> {
   const { signal } = options;
-  const maximum = options.maxTriangles ?? 65_536, maxDepth = options.maxDepth ?? 10;
+  // Match the patch tessellator's addressable index range. Resource ceilings
+  // are caller-selected; valid complex meshes should use the available memory.
+  const maximum = options.maxTriangles ?? 0xffff_ffff, maxDepth = options.maxDepth ?? Number.MAX_SAFE_INTEGER;
   const tolerance = options.colorTolerance ?? 1 / 255, flatness = options.flatness ?? .05;
-  if (!Number.isSafeInteger(maximum) || maximum <= 0 || maximum > 1_000_000 ||
-      !Number.isSafeInteger(maxDepth) || maxDepth < 0 || maxDepth > 16 ||
+  if (!Number.isSafeInteger(maximum) || maximum <= 0 || maximum > 0xffff_ffff ||
+      !Number.isSafeInteger(maxDepth) || maxDepth < 0 ||
       !Number.isFinite(tolerance) || tolerance <= 0 || tolerance > 1 || !Number.isFinite(flatness) || flatness <= 0)
     throw new RangeError("Invalid vector shading tessellation limits.");
   signal?.throwIfAborted();
@@ -139,6 +141,14 @@ export async function buildHeprVectorShadingMesh(page: HeprPageData, gradientInd
     const minDepth = description.functions.length ? Math.min(3, maxDepth) : 0;
     if (depth < minDepth || error > tolerance) {
       if (depth >= maxDepth) throw new PdfError("resource-limit", "Vector shading color tolerance exceeds its subdivision-depth budget.");
+      const same = (p: Vertex, q: Vertex): boolean => p.x === q.x && p.y === q.y &&
+        p.inputs.every((value, i) => value === q.inputs[i]);
+      // Stop when floating-point midpoints can no longer refine this surface.
+      // Otherwise a discontinuous function could keep generating identical
+      // triangles after the caller leaves subdivision depth unrestricted.
+      if ((same(ab, a) || same(ab, b)) && (same(bc, b) || same(bc, c)) && (same(ca, c) || same(ca, a))) {
+        throw new PdfError("unsupported-content", "Vector shading color tolerance exceeds numeric subdivision precision.");
+      }
       push(a, ab, ca, depth + 1); push(ab, b, bc, depth + 1);
       push(ca, bc, c, depth + 1); push(ab, bc, ca, depth + 1);
       continue;

@@ -757,7 +757,8 @@ async function repairXref(
     try {
       const indirect = await readIndirectObjectAt(reader, candidate.offset, limits, signal, {
         resolveLength: resolveRepairLength,
-        duplicateDictionaryKeys: "keep-last"
+        duplicateDictionaryKeys: "keep-last",
+        repairMissingStreamEndEol: true
       });
       if (
         indirect.ref.objectNumber !== value.objectNumber ||
@@ -784,7 +785,8 @@ async function repairXref(
         signal,
         {
           resolveLength: resolveRepairLength,
-          duplicateDictionaryKeys: "keep-last"
+          duplicateDictionaryKeys: "keep-last",
+          repairMissingStreamEndEol: true
         }
       );
       if (

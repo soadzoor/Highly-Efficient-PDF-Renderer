@@ -27,6 +27,8 @@ try {
   await testAnnotationNamedImage(openPdf, validateHeprPageData);
   await testFailureBoundaries(openPdf);
   await testType3NamedMask(openPdf, validateHeprPageData, executeHeprDisplayProgram);
+  await testNonpaintingImages(openPdf, validateHeprPageData);
+  await testNonpaintingUnavailableCodecs(openPdf, validateHeprPageData);
 
   const session = await openPdf({
     kind: "bytes",
@@ -97,6 +99,72 @@ try {
   console.log("PDF reusable-program named-image tests passed");
 } finally {
   hooks.deregister();
+}
+
+async function testNonpaintingUnavailableCodecs(openPdf, validateHeprPageData) {
+  for (const filter of ["DCTDecode", "JPXDecode"]) {
+    for (const visible of [false, true]) {
+      let codecCalls = 0;
+      const session = await openPdf({ kind: "bytes", bytes: writeTinyPdf({ objects: [
+        { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+        { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+        { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R /Resources << /XObject << /Image 5 0 R >> >> >>" },
+        { number: 4, body: tinyPdfStream("", "/Image Do") },
+        { number: 5, body: tinyPdfStream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 " +
+          `/Filter /${filter} /ColorSpace ` + (visible ? "/DeviceRGB" :
+            "[/Separation /None /DeviceRGB << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 1 0] /N 1 >>]"),
+          Uint8Array.of(0xff, filter === "DCTDecode" ? 0xd8 : 0x4f)) }
+      ] }) }, { imageCodecResolver() { codecCalls += 1; throw new Error("decoder unavailable"); } });
+      try {
+        if (visible) {
+          await assert.rejects(session.compilePage(0), error => error.code === "unsupported-image");
+          assert.equal(codecCalls, 1, "visible image decoder failures must still be reported");
+        } else {
+          const page = await session.compilePage(0, { optimization: "none" });
+          validateHeprPageData(page);
+          assert.ok(page.stores.images.data.length > 0, "unpainted encoded payload remains retained");
+          const root = page.displayProgram.groups[page.displayProgram.rootGroupIndex];
+          assert.ok(!flattenProgramCommands(page, root.commands).some(command =>
+            command.kind === "draw" && command.source === "images"));
+          const scene = await session.compileVectorPage(0, { vectorFallback: "error", optimization: "none" });
+          assert.equal(scene.rasterLayers.length, 0);
+          assert.equal(codecCalls, 0, `${filter}: an own-None image must not require an unavailable decoder`);
+        }
+      } finally { await session.close(); }
+    }
+  }
+}
+
+async function testNonpaintingImages(openPdf, validateHeprPageData) {
+  const session = await openPdf({ kind: "bytes", bytes: writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+    { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R /Resources << /ColorSpace << /Invisible [/Separation /None /DeviceRGB 8 0 R] >> /XObject << /Normal 5 0 R /Stencil 6 0 R /OwnNone 7 0 R >> >> >>" },
+    { number: 4, body: tinyPdfStream("",
+      "/Invisible cs .5 scn /Normal Do /Stencil Do /OwnNone Do " +
+      "0 1 0 rg /Stencil Do q /Invisible cs .8 scn /Stencil Do Q 1 0 0 1 2 0 cm /Stencil Do") },
+    { number: 5, body: tinyPdfStream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceRGB", Uint8Array.of(255, 0, 0)) },
+    { number: 6, body: tinyPdfStream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ImageMask true", Uint8Array.of(0)) },
+    { number: 7, body: tinyPdfStream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /Invisible", Uint8Array.of(128)) },
+    { number: 8, body: "<< /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 1 0] /N 1 >>" }
+  ] }) });
+  try {
+    const page = await session.compilePage(0, { optimization: "none" });
+    validateHeprPageData(page);
+    const root = page.displayProgram.groups[page.displayProgram.rootGroupIndex];
+    const images = flattenProgramCommands(page, root.commands)
+      .filter(command => command.kind === "draw" && command.source === "images");
+    assert.equal(images.length, 3,
+      "current /None suppresses only stencils, own /None images emit no paint, and Q restores visible stencil color");
+    assert.equal(page.stores.images.imageMask[images[0].first], 0,
+      "ordinary image colors remain independent of current nonstroking /None");
+    assert.deepEqual(imageBytes(page, images[0].first), [255, 0, 0, 255]);
+    assert.ok(images.slice(1).every(({ first }) => page.stores.images.imageMask[first] === 1));
+    const scene = await session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" });
+    assert.equal(scene.rasterLayers.length, 3, "vector compilation retains exactly the three visible image invocations");
+  } finally {
+    await session.close();
+  }
 }
 
 async function testType3NamedMask(openPdf, validateHeprPageData, executeHeprDisplayProgram) {

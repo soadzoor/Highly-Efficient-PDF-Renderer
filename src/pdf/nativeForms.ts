@@ -561,6 +561,15 @@ export class NativePdfFormAppearanceRegistry {
       stateName = this.selectAppearanceState(annotation, normal);
       selectedRaw = normal.get(stateName)!;
       if (selectedRaw === undefined || selectedRaw === null) {
+        if (stateName === "Off" && annotation.widget?.fieldType === "Btn" &&
+            (annotation.widget.fieldFlags & FIELD_FLAG_PUSHBUTTON) === 0) {
+          this.emitDiagnostic({
+            code: "annotation.missing-off-appearance", severity: "warning", pageIndex: annotation.pageIndex,
+            message: `Unselected button annotation ${annotation.annotationIndex} has no /Off appearance; it was treated as empty.`,
+            details: { annotationIndex: annotation.annotationIndex }
+          });
+          return null;
+        }
         throw new PdfError(
           "unsupported-content",
           `Annotation appearance state /${stateName} is missing from /AP /N.`,
@@ -586,7 +595,8 @@ export class NativePdfFormAppearanceRegistry {
       selectedRaw,
       inheritedResources,
       `annotation ${annotation.annotationIndex}`,
-      signal
+      signal,
+      annotation
     );
     const { bbox } = record.publicForm;
     // The appearance is clipped to its BBox. An empty box has no visible
@@ -659,7 +669,8 @@ export class NativePdfFormAppearanceRegistry {
     rawValue: PdfValue,
     inheritedResources: PdfDictionary | undefined,
     label: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    annotation?: NativePdfAnnotationAppearance
   ): Promise<FormRecord> {
     throwIfAborted(signal);
     const resolved = await this.document.resolveValue(rawValue, signal);
@@ -674,7 +685,13 @@ export class NativePdfFormAppearanceRegistry {
       throw new PdfError("invalid-object", `${label} has an invalid Form /Type.`);
     }
     const subtype = await this.document.resolveValue(dictionary.get("Subtype"), signal);
-    if (!isPdfName(subtype, "Form")) {
+    if ((subtype === undefined || subtype === null) && annotation && dictionary.has("BBox")) {
+      this.emitDiagnostic({
+        code: "annotation.appearance-subtype-inferred", severity: "warning", pageIndex: annotation.pageIndex,
+        message: `Annotation ${annotation.annotationIndex} appearance omitted /Subtype /Form; its bounded vector program was retained.`,
+        details: { annotationIndex: annotation.annotationIndex }
+      });
+    } else if (!isPdfName(subtype, "Form")) {
       throw new PdfError("unsupported-content", `${label} is not a /Subtype /Form XObject.`, {
         details: {
           reason: "xobject-not-form",
@@ -1096,6 +1113,14 @@ export class NativePdfFormAppearanceRegistry {
       const parent = chain[childIndex + 1];
       const kids = await this.document.resolveValue(parent.dictionary.get("Kids"), signal);
       if (!Array.isArray(kids)) {
+        if (kids === undefined || kids === null) {
+          this.emitDiagnostic({
+            code: "annotation.field-kids-missing", severity: "warning", pageIndex,
+            message: "A field parent omitted /Kids; its widget's explicit /Parent chain was used for values and appearances.",
+            details: { annotationIndex }
+          });
+          continue;
+        }
         throw fieldStructureError(
           "A Widget field parent has no valid /Kids array.",
           pageIndex,
@@ -1119,12 +1144,12 @@ export class NativePdfFormAppearanceRegistry {
           );
         }
         if (seenKids.has(identity)) {
-          throw fieldStructureError(
-            "A field /Kids array contains a duplicate field.",
-            pageIndex,
-            annotationIndex,
-            "field-kid-duplicate"
-          );
+          this.emitDiagnostic({
+            code: "annotation.duplicate-field-kid", severity: "warning", pageIndex,
+            message: "A repeated field in a /Kids array was ignored; widget values and appearances were retained.",
+            details: { annotationIndex, fieldIdentity: identity }
+          });
+          continue;
         }
         seenKids.add(identity);
         if (identity === child.identity) childOccurrences += 1;
@@ -1156,12 +1181,11 @@ export class NativePdfFormAppearanceRegistry {
         if (identity === rootIdentity) rootOccurrences += 1;
       }
       if (rootOccurrences !== 1) {
-        throw fieldStructureError(
-          "A Widget field root is not present exactly once in AcroForm /Fields.",
-          pageIndex,
-          annotationIndex,
-          rootOccurrences === 0 ? "field-root-missing" : "field-root-duplicate"
-        );
+        this.emitDiagnostic({
+          code: "annotation.field-root-recovered", severity: "warning", pageIndex,
+          message: "A widget's field root is missing or repeated in AcroForm /Fields; its explicit /Parent chain was retained.",
+          details: { annotationIndex, rootOccurrences }
+        });
       }
     }
   }

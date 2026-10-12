@@ -35,7 +35,9 @@ export function buildNativeVectorGradients(
   registry: NativeVectorGradientSource | undefined,
   maxPaths: number,
   signal?: AbortSignal,
-  maxPathCoordinates = DEFAULT_PDF_RESOURCE_LIMITS.maxPathCoordinatesPerPage
+  maxPathCoordinates = DEFAULT_PDF_RESOURCE_LIMITS.maxPathCoordinatesPerPage,
+  /** Caller-owned cache, scoped to this resource registry's immutable shadings. */
+  colorTables?: Map<number, Uint8Array>
 ): GradientSceneData {
   if (paints.length > maxPaths || paints.length * 16 > maxPathCoordinates) {
     throw new PdfError("resource-limit", "Vector shading paints exceed their geometry or color-table storage limit.");
@@ -64,7 +66,7 @@ export function buildNativeVectorGradients(
   const gradientFillSegmentsA = new Float32Array(count * 16);
   const gradientFillSegmentsB = new Float32Array(count * 16);
   const supported = registry ? supportedNativeVectorShadings(registry) : new Set<number>();
-  const sampled = new Map<number, Uint8Array>();
+  const sampled = colorTables ?? new Map<number, Uint8Array>();
   for (let index = 0; index < count; index++) {
     throwIfAborted(signal);
     const paint = paints[index];
@@ -74,9 +76,11 @@ export function buildNativeVectorGradients(
     const det = a * d - b * c;
     const { minX, minY, maxX, maxY } = paint.clipBounds;
     if (![...paint.transform, minX, minY, maxX, maxY, paint.alpha, paint.paintOrder].every(Number.isFinite) ||
-        !Number.isFinite(det) || Math.abs(det) <= 1e-12 || minX > maxX || minY > maxY || paint.alpha < 0 || paint.alpha > 1 ||
+        !Number.isFinite(det) || det === 0 || minX > maxX || minY > maxY || paint.alpha < 0 || paint.alpha > 1 ||
         !Number.isSafeInteger(paint.paintOrder) || paint.paintOrder < 0) {
-      throw new PdfError("invalid-object", "Invalid native vector shading paint metadata.");
+      throw new PdfError("invalid-object", "Invalid native vector shading paint metadata.", {
+        details: { determinant: det, alpha: paint.alpha, paintOrder: paint.paintOrder }
+      });
     }
     const offset = index * 4;
     // Transform scene points into shading space before projection: transforming
@@ -89,7 +93,7 @@ export function buildNativeVectorGradients(
     gradientMetaB.set([d / det, -b / det, -c / det, a / det], offset);
     const inverseDet = gradientMetaB[offset] * gradientMetaB[offset + 3] -
       gradientMetaB[offset + 1] * gradientMetaB[offset + 2];
-    if (!Number.isFinite(inverseDet) || Math.abs(inverseDet) <= 1e-12) {
+    if (!Number.isFinite(inverseDet) || inverseDet === 0) {
       throw new PdfError("unsupported-content", "Native shading transformation exceeds the GPU precision range.");
     }
     gradientMetaC.set([(c * f - d * e) / det, (b * e - a * f) / det,

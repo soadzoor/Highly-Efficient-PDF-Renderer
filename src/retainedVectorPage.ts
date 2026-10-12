@@ -126,10 +126,12 @@ export interface RetainedVectorPageOptions {
  * The mask's gray samples are the image's alpha, and the two are independent
  * rasters that need not share a size, so the mask is sampled at base pixel
  * centers using its own interpolation policy. Existing source alpha multiplies,
- * as a mask and a source-alpha do when both apply.
+ * as a mask and a source-alpha do when both apply. A matte, when present, was
+ * preblended into the stored color and is removed using that same mask sample.
  */
 function applyHeprImageSoftMask(base: Uint8Array, width: number, height: number,
-  mask: Uint8Array, maskWidth: number, maskHeight: number, interpolate: boolean, signal?: AbortSignal): Uint8Array {
+  mask: Uint8Array, maskWidth: number, maskHeight: number, interpolate: boolean, signal?: AbortSignal,
+  matte?: readonly [number, number, number]): Uint8Array {
   if (maskWidth <= 0 || maskHeight <= 0 || width <= 0 || height <= 0) return base;
   const clampX = (x: number) => Math.max(0, Math.min(maskWidth - 1, x));
   const clampY = (y: number) => Math.max(0, Math.min(maskHeight - 1, y));
@@ -150,6 +152,15 @@ function applyHeprImageSoftMask(base: Uint8Array, width: number, height: number,
           (coverage(left, top + 1) * (1 - tx) + coverage(left + 1, top + 1) * tx) * ty;
       }
       const offset = (y * width + x) * 4;
+      if (matte && factor > 0) {
+        const alpha = factor / 255;
+        for (let channel = 0; channel < 3; channel++) {
+          base[offset + channel] = Math.round(Math.max(0, Math.min(1,
+            (base[offset + channel] / 255 - matte[channel] * (1 - alpha)) / alpha)) * 255);
+        }
+      } else if (matte) {
+        base[offset] = 0; base[offset + 1] = 0; base[offset + 2] = 0;
+      }
       base[offset + 3] = Math.round(base[offset + 3] * factor / 255);
     }
   }
@@ -253,6 +264,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const colors = new HeprColorEvaluator(page.stores.colors,
     (indices, inputs) => indices.flatMap(index => [...functions.evaluate(index, inputs, { signal })]), signal);
   const gradients: GradientSceneData[] = [];
+  const gradientColorTables = new Map<number, Uint8Array>();
   const imagePixels = new Map<number | string, { readonly data: Uint8Array; readonly width: number; readonly height: number;
     readonly monochrome?: MonochromeRaster }>();
   const binaryStencils = new Map<number, boolean>();
@@ -349,6 +361,18 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       itemScopes.set(scope, item);
     }
     return item;
+  };
+  const paints = (index: number, state?: HeprExecutionState): boolean => {
+    if (index < 0) index = state?.type3PaintIndex ?? -1;
+    if (index < 0) return true;
+    const store = page.stores.paints;
+    if (store.kinds[index] === HEPR_PAINT_KIND.Pattern) {
+      const resolved = resolveHeprPatternPaint(page, index);
+      if (resolved?.kind === "shading") return colors.paints(page.stores.gradients.colorSpaceIndices[resolved.gradientIndex]);
+      return !resolved || resolved.basePaintIndex < 0 || paints(resolved.basePaintIndex);
+    }
+    if (store.kinds[index] === HEPR_PAINT_KIND.Gradient) return colors.paints(page.stores.gradients.colorSpaceIndices[store.resourceIndices[index]]);
+    return store.kinds[index] !== HEPR_PAINT_KIND.SolidColor || colors.paints(store.resourceIndices[index]);
   };
   const color = (index: number, state?: HeprExecutionState): Color => {
     if (index < 0) index = state?.type3PaintIndex ?? -1;
@@ -711,7 +735,9 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   };
   const gradient = async (index: number, matrix: PdfMatrix, alpha: number, clip: DensePdfTextClip | null,
     condition?: number, shape?: Geometry, paintBackground = false): Promise<void> => {
-    const data = await buildHeprVectorGradient(page, index, matrix, shape?.bounds ?? scene.pageBounds, alpha, { signal, paintBackground });
+    if (!colors.paints(page.stores.gradients.colorSpaceIndices[index])) return;
+    const data = await buildHeprVectorGradient(page, index, matrix, shape?.bounds ?? scene.pageBounds, alpha,
+      { signal, paintBackground, colorTables: gradientColorTables });
     const paint = gradients.length;
     const meshBackground = data.gradientMetaA[0] === 2 && data.gradientMetaA[3] > 0;
     const grouped = alpha !== 1 || meshBackground;
@@ -856,6 +882,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
         message: "NoZoom/NoRotate annotation appearances use page geometry and scale with the page." });
     }
     if (command.source === "fill-paths") {
+      if (!paints(command.paintIndex, execution.state)) return;
       const store = page.stores.paths, rgba = color(command.paintIndex, execution.state);
       for (let path = command.first; path < command.first + command.count; path++) {
         const offset = path * 4, first = store.fillPathMetaA[offset], end = first + store.fillPathMetaA[offset + 1];
@@ -867,6 +894,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
         fill(g, rgba, store.fillPathMetaC[offset], clip, condition);
       }
     } else if (command.source === "stroke-segments") {
+      if (!paints(command.paintIndex, execution.state)) return;
       const store = page.stores.strokes, rgba = color(command.paintIndex, execution.state), scaleX = Math.hypot(matrix[0], matrix[1]), scaleY = Math.hypot(matrix[2], matrix[3]);
       const dot = matrix[0] * matrix[2] + matrix[1] * matrix[3];
       const uniform = scaleX > 0 && scaleY > 0 && Math.abs(scaleX - scaleY) <= 1e-6 * Math.max(scaleX, scaleY) &&
@@ -939,14 +967,17 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       if (packedCount) appendRun("stroke", first, packedCount, clip, condition);
     } else if (command.source === "paths") {
       for (let index = command.first; index < command.first + command.count; index++) {
-        const g = geometry([index], matrix);
         const fillPaint = command.fillPaintInherited ? execution.state.type3PaintIndex : command.fillPaintIndex;
-        if (fillPaint >= 0) {
+        const strokePaint = command.strokePaintInherited ? execution.state.type3PaintIndex : command.strokePaintIndex;
+        const fillPaints = fillPaint >= 0 && paints(fillPaint, execution.state);
+        const strokePaints = strokePaint >= 0 && paints(strokePaint, execution.state);
+        if (!fillPaints && !strokePaints) continue;
+        const g = geometry([index], matrix);
+        if (fillPaints) {
           if (page.stores.paints.kinds[fillPaint] === HEPR_PAINT_KIND.Pattern) await pattern(fillPaint, g, multiplyHeprMatrices(matrix, inverseMatrix(transform(command.transformIndex))), clip, command.fillRule, condition);
           else fill(g, color(fillPaint, execution.state), command.fillRule, clip, condition);
         }
-        const strokePaint = command.strokePaintInherited ? execution.state.type3PaintIndex : command.strokePaintIndex;
-        if (strokePaint >= 0) {
+        if (strokePaints) {
           if (page.stores.paints.kinds[strokePaint] === HEPR_PAINT_KIND.Pattern) {
             const outline = strokeGeometry([index], matrix, command.strokeStyleIndex);
             if (outline) await pattern(strokePaint, outline, multiplyHeprMatrices(matrix, inverseMatrix(transform(command.transformIndex))), clip, 0, condition);
@@ -958,13 +989,14 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
         glyphConditions[glyph] = condition ?? -1;
         const indices = glyphPaths(glyph), local = multiplyHeprMatrices(matrix, transform(page.stores.glyphs.transformIndices[glyph]));
         const firstInstance = textA.length / 4;
-        if ([0, 2, 4, 6].includes(command.renderingMode) && command.fillPaintIndex >= 0) text(glyph, indices, local, color(command.fillPaintIndex, execution.state), clip, condition);
+        const fillPaints = command.fillPaintIndex >= 0 && paints(command.fillPaintIndex, execution.state);
+        if ([0, 2, 4, 6].includes(command.renderingMode) && fillPaints) text(glyph, indices, local, color(command.fillPaintIndex, execution.state), clip, condition);
         // Modes 2 and 6 fill the glyph as well, so its shape survives an
         // outline this renderer cannot build; modes 1 and 5 have only the stroke.
-        if ([1, 2, 5, 6].includes(command.renderingMode) && command.strokePaintIndex >= 0) {
+        if ([1, 2, 5, 6].includes(command.renderingMode) && command.strokePaintIndex >= 0 && paints(command.strokePaintIndex, execution.state)) {
           strokeText(glyph, indices, local, command.strokeTransformIndex === undefined ? local
             : multiplyHeprMatrices(matrix, transform(command.strokeTransformIndex)), command.strokeStyleIndex, color(command.strokePaintIndex, execution.state),
-            clip, condition, command.renderingMode === 2 || command.renderingMode === 6);
+            clip, condition, fillPaints && (command.renderingMode === 2 || command.renderingMode === 6));
         }
         if (!glyphReachesPage(glyph, indices, local, clip)) {
           if (glyphReach[glyph] === 0) glyphReach[glyph] = 1;
@@ -978,9 +1010,8 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     } else if (command.source === "images") {
       const images = page.stores.images;
       for (let index = command.first; index < command.first + command.count; index++) {
-        // Each of these needs a different preparation, and which one it is
-        // decides whether a page keeps its vectors, so name them apart.
-        if (images.matteOffsets[index + 1] > images.matteOffsets[index]) return fail("a pre-multiplied image matte requires preparation.");
+        if (images.colorSpaceIndices[index] >= 0 && !colors.paints(images.colorSpaceIndices[index])) continue;
+        if (images.imageMask[index] && !paints(command.paintIndex, execution.state)) continue;
         // A stencil mask paints coverage in the current fill color. Matching
         // opaque plates share a raster; other masks retain their own color.
         const stencil = images.imageMask[index] ? color(command.paintIndex, execution.state) : undefined;
@@ -1037,10 +1068,16 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
             const mask = expandHeprImageToRgba8(images.data.subarray(images.dataOffsets[maskIndex], images.dataOffsets[maskIndex + 1]),
               images.formats[maskIndex], images.widths[maskIndex], images.heights[maskIndex], signal);
             if (!mask) return fail(`an image soft mask stored as format ${images.formats[maskIndex]} requires a codec.`);
+            const matteValues = images.matteValues.subarray(images.matteOffsets[index], images.matteOffsets[index + 1]);
+            // Image samples are already canonical sRGB. Remove their prepared
+            // matte in that same space before applying the mask's alpha, as in
+            // the native VectorScene image adapter.
+            const matte = matteValues.length ? colors.convert(images.colorSpaceIndices[index], matteValues,
+              `stores.images.matteOffsets[${index}]`) : undefined;
             // An Rgba8 store widens to itself, so the alpha is written into a
             // copy rather than back into the page's own image bytes.
             data = applyHeprImageSoftMask(owned ? data : Uint8Array.from(data), width, height,
-              mask, images.widths[maskIndex], images.heights[maskIndex], images.interpolate[maskIndex] !== 0, signal);
+              mask, images.widths[maskIndex], images.heights[maskIndex], images.interpolate[maskIndex] !== 0, signal, matte);
           }
           imagePixels.set(key, pixels = { data, width, height });
         }

@@ -227,6 +227,21 @@ export class NativePdfColorRegistry {
     return this.getRecord(index);
   }
 
+  /** `/None` colorants suppress painting instead of producing an RGB color. */
+  paints(index: number): boolean {
+    let record = this.getRecord(index);
+    let active: Set<number> | undefined;
+    while (record.kind === "Indexed") {
+      active ??= new Set();
+      if (active.has(index)) throw new PdfError("unsupported-color", "An Indexed color-space graph is recursive.");
+      active.add(index);
+      index = record.alternateSpaceIndex;
+      record = this.getRecord(index);
+    }
+    return !((record.kind === "Separation" || record.kind === "DeviceN") &&
+      record.names.length > 0 && record.names.every((name) => name === "None"));
+  }
+
   /** Default image Decode array for this color space. */
   defaultDecode(index: number): readonly number[] {
     const record = this.getRecord(index);
@@ -981,11 +996,29 @@ export class NativePdfColorRegistry {
         : null;
     if (!lookup) throw new PdfError("unsupported-color", "Indexed color-space lookup is not a string or stream.");
     const expected = (highValueRaw + 1) * base.componentCount;
-    if (lookup.length < expected) throw new PdfError("unsupported-color", "Indexed color-space lookup is truncated.");
+    let ownedLookup: Uint8Array;
+    if (lookup.length < expected) {
+      // Keep every supplied component and the declared index range. Missing
+      // suffix bytes are approximated with zero, so images referencing only
+      // the available palette entries retain their exact colors.
+      ownedLookup = new Uint8Array(expected);
+      ownedLookup.set(lookup);
+      this.onDiagnostic?.({
+        code: "color.indexed-lookup-truncated",
+        severity: "warning",
+        message: "An Indexed color palette is shorter than its declared range; missing palette components were approximated with zero. Colors using supplied entries are unchanged.",
+        details: {
+          expectedBytes: expected, actualBytes: lookup.length, highValue: highValueRaw,
+          missingEntryCount: highValueRaw + 1 - Math.floor(lookup.length / base.componentCount)
+        }
+      });
+    } else {
+      ownedLookup = lookup.slice(0, expected);
+    }
     return {
       ...colorRecord("Indexed", 1, [highValueRaw]),
       alternateSpaceIndex,
-      lookup: lookup.slice(0, expected),
+      lookup: ownedLookup,
       highValue: highValueRaw
     };
   }

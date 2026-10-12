@@ -196,12 +196,12 @@ for (const catalogGroups of ["", "/OCGs null"]) {
     pageProperties: "/Recovered 11 0 R"
   }), { onDiagnostic: diagnostic => diagnostics.push(diagnostic) }, async ({ document, registry }) => {
     assert.equal(registry.groupCount, 0, "an empty layer catalog must open successfully");
+    assert.equal(diagnostics.length, 0, "an unused empty layer catalog does not affect visibility");
     const [property] = await registry.resolvePageProperties(document.getPage(0).resources, ["Recovered"]);
     assert.equal(property.defaultVisible, true);
     assert.equal(registry.groupCount, 1, "content groups are still recovered lazily");
     assert.deepEqual(diagnostics.map(diagnostic => diagnostic.code), [
-      NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.MissingCatalogGroups,
-      NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.MissingCatalogGroup
+      NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.MissingCatalogGroups
     ]);
     assert.deepEqual(registry.getDiagnostics(), diagnostics);
   });
