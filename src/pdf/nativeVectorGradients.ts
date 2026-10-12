@@ -35,7 +35,9 @@ export function buildNativeVectorGradients(
   registry: NativeVectorGradientSource | undefined,
   maxPaths: number,
   signal?: AbortSignal,
-  maxPathCoordinates = DEFAULT_PDF_RESOURCE_LIMITS.maxPathCoordinatesPerPage
+  maxPathCoordinates = DEFAULT_PDF_RESOURCE_LIMITS.maxPathCoordinatesPerPage,
+  /** Caller-owned cache, scoped to this resource registry's immutable shadings. */
+  colorTables?: Map<number, Uint8Array>
 ): GradientSceneData {
   if (paints.length > maxPaths || paints.length * 16 > maxPathCoordinates) {
     throw new PdfError("resource-limit", "Vector shading paints exceed their geometry or color-table storage limit.");
@@ -64,7 +66,7 @@ export function buildNativeVectorGradients(
   const gradientFillSegmentsA = new Float32Array(count * 16);
   const gradientFillSegmentsB = new Float32Array(count * 16);
   const supported = registry ? supportedNativeVectorShadings(registry) : new Set<number>();
-  const sampled = new Map<number, Uint8Array>();
+  const sampled = colorTables ?? new Map<number, Uint8Array>();
   for (let index = 0; index < count; index++) {
     throwIfAborted(signal);
     const paint = paints[index];

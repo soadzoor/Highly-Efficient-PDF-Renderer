@@ -9,6 +9,8 @@ import {
   type PdfValue
 } from "./nativeCos";
 import type { NativePdfDocument } from "./nativeDocument";
+import { scanDensePdfPreparedResourceReferences } from "./nativeContentCompiler";
+import { prepareNativeInlineImages } from "./nativeInlineImage";
 import {
   parseNativePdfFont,
   type NativeEmbeddedFontPaint,
@@ -150,6 +152,7 @@ export class NativePdfAppearanceSynthesizer {
   private readonly diagnostics: PdfDiagnostic[] = [];
   private readonly resultCache = new WeakMap<NativePdfAnnotationAppearance, NativePdfSynthesizedAppearance>();
   private readonly contentByForm = new WeakMap<NativePdfForm, Uint8Array>();
+  private readonly repairedFreeText = new WeakMap<NativePdfAnnotationAppearance, NativePdfResolvedAnnotationAppearance>();
   private readonly fontCache = new WeakMap<PdfDictionary, Map<string, Promise<NativePdfFont>>>();
 
   constructor(
@@ -176,9 +179,91 @@ export class NativePdfAppearanceSynthesizer {
     return this.contentByForm.has(form);
   }
 
-  /** Return decoded synthetic content, or null for a source-backed Form. */
+  /** Return decoded synthetic/repaired content, or null for an unchanged source Form. */
   getDecodedFormContent(form: NativePdfForm): Uint8Array | null {
     return this.contentByForm.get(form) ?? null;
+  }
+
+  /** Recover a missing appearance font without rebuilding its positioned text. */
+  async recoverFreeTextFont(
+    registry: NativePdfFormAppearanceRegistry,
+    appearance: NativePdfResolvedAnnotationAppearance,
+    signal?: AbortSignal
+  ): Promise<NativePdfResolvedAnnotationAppearance> {
+    throwIfAborted(signal);
+    const annotation = appearance.annotation;
+    if (annotation.subtype !== "FreeText") return appearance;
+    const cached = this.repairedFreeText.get(annotation);
+    if (cached) return cached;
+    const source = appearance.normalAppearance.form;
+    const content = await registry.decodeFormContent(source, signal);
+    const prepared = prepareNativeInlineImages(content, { signal, limits: {
+      maxImages: this.document.limits.maxCommandsPerPage,
+      maxPayloadBytes: this.document.limits.maxDecodedStreamBytes,
+      maxScanBytes: this.document.limits.maxDecodedStreamBytes,
+      maxNestingDepth: this.document.limits.maxRecursionDepth
+    } });
+    let hasText = false;
+    const references = scanDensePdfPreparedResourceReferences(prepared.segments, {
+      signal,
+      onOperator(operator) {
+        if (operator === "Tj" || operator === "TJ" || operator === "'" || operator === "\"") hasText = true;
+      }
+    });
+    // A selected font, including an ExtGState font, must stay authoritative.
+    if (!hasText || references.fonts.length !== 0 || references.extGStates.length !== 0) return appearance;
+    const ds = await this.document.resolveValue(annotation.dictionary.get("DS"), signal);
+    const rc = await this.document.resolveValue(annotation.dictionary.get("RC"), signal);
+    const style = readFreeTextFontStyle(isPdfString(ds) ? decodePdfTextString(ds, annotation) : "", "DS") ??
+      (isPdfString(rc) ? readRichTextFontStyle(decodePdfTextString(rc, annotation)) : null);
+    if (!style) return appearance;
+    const resources: PdfDictionary = new Map(source.resources);
+    const rawFonts = await this.document.resolveValue(resources.get("Font"), signal);
+    if (rawFonts !== undefined && rawFonts !== null && !isPdfDictionary(rawFonts)) return appearance;
+    const fonts: PdfDictionary = new Map(isPdfDictionary(rawFonts) ? rawFonts : []);
+    let fontName = "HEPRFreeText";
+    while (fonts.has(fontName)) {
+      throwIfAborted(signal);
+      fontName += "_";
+    }
+    fonts.set(fontName, new Map<string, PdfValue>([
+      ["Type", pdfName("Font")], ["Subtype", pdfName("Type1")],
+      ["BaseFont", pdfName(style.baseFont)], ["Encoding", pdfName("WinAnsiEncoding")]
+    ]));
+    resources.set("Font", fonts);
+    // Font selection survives ET and the appearance's own q/Q pairs; all
+    // original text matrices, line spacing, colors and clips stay byte-exact.
+    const prefix = TEXT_ENCODER.encode(`BT /${fontName} ${pdfNumber(style.fontSize)} Tf ET\n`);
+    const length = prefix.length + content.length;
+    if (length > this.document.limits.maxDecodedStreamBytes) {
+      throw new PdfError("resource-limit", "A repaired FreeText appearance exceeds the decoded-stream limit.", {
+        pageIndex: annotation.pageIndex,
+        details: { annotationIndex: annotation.annotationIndex, byteLength: length,
+          limit: this.document.limits.maxDecodedStreamBytes }
+      });
+    }
+    throwIfAborted(signal);
+    const repairedContent = new Uint8Array(length);
+    repairedContent.set(prefix);
+    repairedContent.set(content, prefix.length);
+    const dictionary: PdfDictionary = new Map(source.dictionary);
+    dictionary.set("Resources", resources);
+    const id = `repaired:${annotation.id}:font`;
+    const form: NativePdfForm = Object.freeze({ ...source, id, ref: null, dictionary, resources,
+      resourceOrigin: "local", encodedContentBytes: length });
+    const result: NativePdfResolvedAnnotationAppearance = Object.freeze({ ...appearance,
+      normalAppearance: Object.freeze({ form, depth: 1, ancestry: Object.freeze([id]) }) });
+    const diagnostic: PdfDiagnostic = Object.freeze({
+      code: "annotation.appearance-font-recovered", severity: "warning", pageIndex: annotation.pageIndex,
+      message: `FreeText annotation ${annotation.annotationIndex} omitted its appearance font; ${style.baseFont} at ${style.fontSize} pt was recovered from /${style.source}. Original text positions and paint were retained with an approximate font.`,
+      details: Object.freeze({ annotationIndex: annotation.annotationIndex, baseFont: style.baseFont,
+        fontSize: style.fontSize, styleSource: style.source, approximate: true })
+    });
+    this.contentByForm.set(form, repairedContent);
+    this.repairedFreeText.set(annotation, result);
+    this.diagnostics.push(diagnostic);
+    this.onDiagnostic?.(diagnostic);
+    return result;
   }
 
   async synthesize(
@@ -1377,9 +1462,9 @@ export class NativePdfAppearanceSynthesizer {
 
 /**
  * Narrow integration hook for the Form graph. Source appearances retain their
- * existing registry path; only its explicit missing-appearance result invokes
- * deterministic synthesis. Callers can use `getDecodedFormContent()` to
- * distinguish the synthetic Form when preparing a definition.
+ * positioned programs, with a diagnosed font repair for malformed FreeText.
+ * Only an explicit missing-appearance result invokes deterministic synthesis.
+ * `getDecodedFormContent()` supplies synthetic or repaired programs.
  */
 export async function resolveNativePdfAnnotationAppearanceWithSynthesis(
   registry: NativePdfFormAppearanceRegistry,
@@ -1389,7 +1474,8 @@ export async function resolveNativePdfAnnotationAppearanceWithSynthesis(
   retainOptionalContent = false
 ): Promise<NativePdfResolvedAnnotationAppearance | null> {
   try {
-    return await registry.resolveAnnotationAppearance(annotation, signal, retainOptionalContent);
+    const appearance = await registry.resolveAnnotationAppearance(annotation, signal, retainOptionalContent);
+    return appearance ? await synthesizer.recoverFreeTextFont(registry, appearance, signal) : null;
   } catch (error) {
     if (
       !(error instanceof PdfError) ||
@@ -1400,6 +1486,59 @@ export async function resolveNativePdfAnnotationAppearanceWithSynthesis(
     }
     return await synthesizer.synthesize(annotation, signal, retainOptionalContent);
   }
+}
+
+interface FreeTextFontStyle {
+  readonly baseFont: string;
+  readonly fontSize: number;
+  readonly source: "DS" | "RC";
+}
+
+function readRichTextFontStyle(richText: string): FreeTextFontStyle | null {
+  for (const match of richText.matchAll(/\bstyle\s*=\s*(?:"([^"]*)"|'([^']*)')/gi)) {
+    const style = readFreeTextFontStyle((match[1] ?? match[2]).replace(/&quot;/gi, "\"")
+      .replace(/&apos;|&#39;/gi, "'").replace(/&amp;/gi, "&"), "RC");
+    if (style) return style;
+  }
+  return null;
+}
+
+/** Accept explicit point sizes; leave ambiguous CSS sizing to the normal error path. */
+function readFreeTextFontStyle(text: string, source: "DS" | "RC"): FreeTextFontStyle | null {
+  const declarations = new Map<string, string>();
+  for (const declaration of text.split(";")) {
+    const colon = declaration.indexOf(":");
+    if (colon > 0) declarations.set(declaration.slice(0, colon).trim().toLowerCase(), declaration.slice(colon + 1).trim());
+  }
+  let family = declarations.get("font-family") ?? "";
+  let size = declarations.get("font-size") ?? "";
+  let modifiers = `${declarations.get("font-weight") ?? ""} ${declarations.get("font-style") ?? ""}`;
+  const shorthand = declarations.get("font");
+  if (shorthand) {
+    // PDF /DS commonly writes "Helvetica 8pt"; rich text also uses CSS's
+    // usual "bold 8pt Helvetica" ordering.
+    const pdfStyle = /^(.*?)\s+(\d+(?:\.\d+)?pt)$/i.exec(shorthand);
+    const cssStyle = /^(.*?)\b(\d+(?:\.\d+)?pt)(?:\s*\/\s*[^\s]+)?\s+(.+)$/i.exec(shorthand);
+    if (pdfStyle) { family = pdfStyle[1]; size = pdfStyle[2]; }
+    else if (cssStyle) { family = cssStyle[3]; size = cssStyle[2]; modifiers += ` ${cssStyle[1]}`; }
+  }
+  const pointSize = /^(\d+(?:\.\d+)?)pt$/i.exec(size);
+  if (!pointSize) return null;
+  const fontSize = Number(pointSize[1]);
+  if (!Number.isFinite(fontSize) || fontSize <= 0) return null;
+  family = family.split(",")[0].trim().replace(/^(["'])(.*?)\1$/, "$2");
+  if (!/^[a-z0-9 _-]+$/i.test(family)) return null;
+  const key = family.toLowerCase().replace(/[ _-]/g, "");
+  const bold = /\bbold\b|\b[6-9]00\b/i.test(modifiers);
+  const italic = /\bitalic\b|\boblique\b/i.test(modifiers);
+  const baseFont = /^(helvetica|arial|sansserif)$/.test(key)
+    ? `Helvetica${bold ? "-Bold" : ""}${italic ? bold ? "Oblique" : "-Oblique" : ""}`
+    : /^(times|timesroman|timesnewroman|serif)$/.test(key)
+      ? bold ? italic ? "Times-BoldItalic" : "Times-Bold" : italic ? "Times-Italic" : "Times-Roman"
+      : /^(courier|couriernew|monospace)$/.test(key)
+        ? `Courier${bold ? "-Bold" : ""}${italic ? bold ? "Oblique" : "-Oblique" : ""}`
+        : family.replace(/\s+/g, "-");
+  return { baseFont, fontSize, source };
 }
 
 function appendRectangularBackgroundAndBorder(

@@ -165,6 +165,45 @@ function testTableDirectoryAndMetricValidation() {
   );
 }
 
+function testEmbeddedGlyphUnicodeFallback() {
+  const fixture = buildFixture();
+  const parse = records => {
+    const tables = cloneTables(fixture.tables);
+    tables.set("cmap", buildCmap(records));
+    return NativeSfntFont.parse(buildSfnt(tables));
+  };
+  for (const [encoding, bytes] of [
+    [0, cmapFormat0([[65, 1], [66, 2]])],
+    [3, cmapFormat4([[65, 1], [66, 2]])],
+    [3, cmapFormat6(65, [1, 2])],
+    [4, cmapFormat10(65, [1, 2])],
+    [4, cmapFormat12([[65, 66, 1]])],
+    [6, cmapFormat13([[65, 65, 1], [66, 66, 2]])]
+  ]) {
+    const font = parse([{ platform: 0, encoding, bytes }]);
+    const recovered = font.getGlyphUnicodeFallback();
+    assert.deepEqual([...recovered], [[1, "A"], [2, "B"]]);
+    assert.strictEqual(font.getGlyphUnicodeFallback(), recovered, "the inverse is built once per embedded face");
+  }
+  const ambiguous = parse([{ platform: 0, encoding: 3, bytes: cmapFormat4([
+    [0, 4], [32, 1], [65, 2], [160, 1], [0xe000, 3], [0xfdd0, 5]
+  ]) }]);
+  assert.deepEqual([...ambiguous.getGlyphUnicodeFallback()], [[2, "A"]],
+    "shared glyph aliases, controls, and private-use codes remain unindexed");
+  const selected = parse([
+    { platform: 0, encoding: 3, bytes: cmapFormat4([[65, 1]]) },
+    { platform: 0, encoding: 4, bytes: cmapFormat12([[90, 90, 1]]) }
+  ]);
+  assert.equal(selected.getGlyphUnicodeFallback().get(1), "Z", "only the selected Unicode cmap is inverted");
+  const symbol = parse([{ platform: 3, encoding: 0, bytes: cmapFormat4([[65, 1]]) }]);
+  assert.equal(symbol.getGlyphUnicodeFallback().size, 0, "symbol char codes do not imply Unicode");
+  const constant = parse([{ platform: 0, encoding: 6, bytes: cmapFormat13([[0x10000, 0x10ffff, 1]]) }]);
+  assert.equal(constant.getGlyphUnicodeFallback().size, 0, "constant ranges are ambiguous without expansion");
+  const sparse = parse([{ platform: 0, encoding: 4, bytes: cmapFormat12([[0x10000, 0x10ffff, 1]]) }]);
+  assert.equal(sparse.getGlyphUnicodeFallback().size, 9, "unreachable range GIDs are skipped");
+  assert.equal(sparse.getGlyphUnicodeFallback().get(1), "\u{10000}");
+}
+
 function testPdfEmbeddedSubsetCompatibility() {
   const fixture = buildFixture();
   const badHintingZones = cloneTables(fixture.tables);
@@ -507,6 +546,17 @@ function testBinaryHmtxNormalizationFixtures() {
   assert.equal(approximated.diagnostics[0]?.details?.exact, false);
   assert.equal(approximated.diagnostics[0]?.severity, "warning");
   assert.match(approximated.diagnostics[0]?.message ?? "", /approximated by glyph xMin/);
+
+  const emptyTail = cloneTables(buildFixture().tables);
+  emptyTail.set("hmtx", emptyTail.get("hmtx").slice(0, -2));
+  const exactEmpty = NativeSfntFont.parse(buildSfnt(emptyTail), 0, undefined, "pdf-embedded");
+  assert.deepEqual(exactEmpty.getHorizontalMetric(9), { advanceWidth: 900, leftSideBearing: 0 });
+  assert.deepEqual(exactEmpty.getGlyphOutline(9).commands, []);
+  assert.equal(exactEmpty.diagnostics[0].severity, "info");
+  assert.equal(exactEmpty.diagnostics[0].details.exact, true);
+  assert.equal(exactEmpty.diagnostics[0].details.emptyGlyphs, true,
+    "missing bearings of provably empty glyphs recover exact zero without head.flags bit1");
+  expectPdf(() => NativeSfntFont.parse(buildSfnt(emptyTail)), "unsupported-font", /hhea\/hmtx/i);
 
   const missingLongMetricTables = cloneTables(buildFixture().tables);
   const missingLongMetricHead = new DataView(missingLongMetricTables.get("head").buffer);
@@ -1310,6 +1360,7 @@ class ByteWriter {
 
 try {
   testCheckedSfntAndCmaps();
+  testEmbeddedGlyphUnicodeFallback();
   testTableDirectoryAndMetricValidation();
   testPdfEmbeddedSubsetCompatibility();
   testBinaryHmtxNormalizationFixtures();

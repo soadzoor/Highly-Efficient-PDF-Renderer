@@ -12,6 +12,20 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   TrueType and Type3 font defects, malformed text/marked-content scopes,
   incomplete annotation metadata, and redundant path-closing coordinates.
   Diagnose compatibility repairs instead of rejecting otherwise usable documents.
+- Support non-painting `/None` colorants in PDF and HEP rendering while retaining
+  clipping, searchable text and independently colored images, patterns and glyphs.
+  Recover missing FreeText appearance fonts from declared annotation styles,
+  preserving positioned text and diagnosing the approximate font repair.
+- Recover unambiguous Unicode mappings from embedded TrueType fonts when composite
+  fonts omit usable text mappings, preserving explicit mappings and caller limits.
+  Reuse identical ToUnicode programs within a document, and recognize exact
+  missing-bearing repairs for empty glyphs. Report a missing PDF
+  layer catalog once per document while retaining individual layers and explicit
+  visibility settings; avoid warnings for unused empty catalogs.
+- Elide provably redundant rectangular PDF clips before HEP coordinate encoding,
+  avoiding clamping unused oversized coordinates while preserving meaningful clips
+  and Type3 glyph clipping. Reuse shading color samples across placements without
+  changing gradient colors, transforms, clipping or opacity.
 - Recover padded image samples, redundant stencil color spaces, packed
   RunLength images, excess CCITT rows, and validated Flate framing defects
   while retaining cancellation, configured limits and corrupt-data checks.

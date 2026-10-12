@@ -15,6 +15,7 @@ import type { OptionalContentCondition, OptionalContentOrderNode, SceneOptionalC
 
 export const NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES = Object.freeze({
   HiddenDefault: "optional-content.hidden",
+  MissingCatalog: "optional-content.missing-catalog",
   MissingCatalogGroup: "optional-content.missing-catalog-group",
   MissingCatalogGroups: "optional-content.missing-catalog-groups",
   UnresolvedOptionalProperty: "optional-content.unresolved-property",
@@ -162,6 +163,8 @@ export class NativeOptionalContentRegistry {
   private readonly diagnostics: PdfDiagnostic[] = [];
   private readonly diagnosedHidden = new Set<string>();
   private readonly recoveredGroups = new Set<string>();
+  private missingCatalog: "properties" | "groups" | null = null;
+  private diagnosedMissingCatalog = false;
   private readonly diagnosedUnresolvedMetadataProperties = new Set<string>();
   private nextDirectIdentity = 0;
   private initialization: Promise<this> | null = null;
@@ -194,6 +197,7 @@ export class NativeOptionalContentRegistry {
     signal?.throwIfAborted();
     const rawProperties = this.resolver.catalog.get("OCProperties");
     if (rawProperties === undefined || rawProperties === null) {
+      this.missingCatalog = "properties";
       this.initialized = true;
       return this;
     }
@@ -207,13 +211,7 @@ export class NativeOptionalContentRegistry {
       // Some producers leave an empty /OCProperties dictionary after removing
       // its layers. Any groups still used by page content are recovered lazily.
       rawGroups = [];
-      const diagnostic: PdfDiagnostic = Object.freeze({
-        code: NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.MissingCatalogGroups,
-        severity: "warning",
-        message: "The catalog /OCProperties has no /OCGs array; groups used by content will be recovered as visible and layer visibility may differ."
-      });
-      this.diagnostics.push(diagnostic);
-      this.onDiagnostic?.(diagnostic);
+      this.missingCatalog = "groups";
     }
     if (!Array.isArray(rawGroups)) {
       throw invalidOptionalContent("The catalog /OCProperties /OCGs entry is not an array.");
@@ -1302,6 +1300,28 @@ export class NativeOptionalContentRegistry {
     this.membershipByIdentity.set(group.identity, Promise.resolve(membership));
     if (!group.defaultVisible) this.emitHiddenDiagnostic(membership, group.name);
     if (this.recoveredGroups.has(group.identity)) {
+      if (this.missingCatalog !== null) {
+        // A missing catalog affects the whole document, rather than each OCG.
+        // Delay this warning until a real group is used: empty catalogs left
+        // after flattening have no effect on visibility. Names and identities
+        // remain available in the complete group store without repeating the
+        // same warning for every layer in a CAD drawing.
+        if (!this.diagnosedMissingCatalog) {
+          this.diagnosedMissingCatalog = true;
+          const diagnostic: PdfDiagnostic = Object.freeze({
+            code: this.missingCatalog === "properties"
+              ? NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.MissingCatalog
+              : NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.MissingCatalogGroups,
+            severity: "warning",
+            message: this.missingCatalog === "properties"
+              ? "The document has no catalog /OCProperties; referenced optional-content groups are retained as initially visible."
+              : "The catalog /OCProperties has no /OCGs array; referenced groups are recovered and any explicit default configuration is preserved."
+          });
+          this.diagnostics.push(diagnostic);
+          this.onDiagnostic?.(diagnostic);
+        }
+        return;
+      }
       const diagnostic: PdfDiagnostic = Object.freeze({
         code: NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.MissingCatalogGroup,
         severity: "warning",

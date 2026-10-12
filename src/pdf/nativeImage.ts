@@ -448,6 +448,10 @@ export class NativePdfImageRegistry {
     } else if (!imageMask) {
       componentCount = 0;
     }
+    const paints = imageMask || colorSpaceIndex < 0 || this.colors.paints(colorSpaceIndex);
+    // Invisible colorants need no decoder. Preserve their encoded payload and
+    // source metadata for HEP storage instead of requiring an unused kernel.
+    const codecResolver = paints ? this.codecResolver : undefined;
     const decode = await readImageDecode(
       this.document,
       dictionary,
@@ -496,7 +500,7 @@ export class NativePdfImageRegistry {
             { limits: this.document.limits, signal }
           );
       let nativeCcittDecoded = false;
-      if (terminalCodec === "ccitt") {
+      if (terminalCodec === "ccitt" && paints) {
         try {
           if (!imageMask && componentCount !== 1) {
             throw new PdfError(
@@ -604,7 +608,7 @@ export class NativePdfImageRegistry {
         }
       }
       if (!nativeCcittDecoded) {
-        if (this.codecPolicy === "error") {
+        if (this.codecPolicy === "error" && paints) {
           throw new PdfError("unsupported-image", `${terminalCodec} image data requires its pinned codec kernel.`, {
             details: { codec: terminalCodec, filter: filters[terminalIndex] }
           });
@@ -644,7 +648,7 @@ export class NativePdfImageRegistry {
         // 1/8 scale instead of failing. A Matte soft mask must keep the
         // parent's exact dimensions, so it pins full resolution.
         const reducible = terminalCodec === "jpeg" && this.trustedCodecResolver &&
-          !!this.codecResolver && mask.matte.length === 0;
+          !!codecResolver && mask.matte.length === 0;
         codecRequest = Object.freeze({
           codec: terminalCodec,
           width,
@@ -663,7 +667,7 @@ export class NativePdfImageRegistry {
           ...(reducible ? { maxReduction: MAX_CODEC_REDUCTION } : {})
         });
         let unresolvedPayload: Uint8Array | null = null;
-        if (!this.codecResolver) {
+        if (!codecResolver) {
           unresolvedPayload = packNativeImageCodecRequest(
             terminalCodec,
             requestEncoded,
@@ -684,9 +688,11 @@ export class NativePdfImageRegistry {
             );
           }
         }
-        this.requests.push(codecRequest);
-        this.onCodecRequest?.(codecRequest);
-        if (this.codecResolver) {
+        if (paints) {
+          this.requests.push(codecRequest);
+          this.onCodecRequest?.(codecRequest);
+        }
+        if (codecResolver) {
           // Enforce the document's lowered image/stream ceilings before a
           // focused codec is allowed to allocate native or WASM output. JPX
           // may own its sample layout (zero components/precision), so its
@@ -721,7 +727,7 @@ export class NativePdfImageRegistry {
             );
           }
           const resolved = await resolveCodecThroughCaller(
-            this.codecResolver,
+            codecResolver,
             codecRequest,
             this.document,
             this.codecDecodedByteLimit,
@@ -801,7 +807,7 @@ export class NativePdfImageRegistry {
               separated.opacity === null,
               signal
             );
-            if (separated.opacity) {
+            if (separated.opacity && this.colors.paints(colorSpaceIndex)) {
               applyEmbeddedOpacity(
                 converted.data,
                 separated.opacity,
@@ -1412,6 +1418,25 @@ function convertSamplesToSrgb(
   const maximum = (2 ** bitsPerComponent) - 1;
   const sixteenBit = bitsPerComponent === 16;
   const bytesPerComponent = sixteenBit ? 2 : 1;
+  if (!colors.paints(colorSpaceIndex)) {
+    // /None has no display color. Keep an exact single raw sample plane when
+    // the existing transparent gray format can hold it; other layouts retain
+    // their source color/decode metadata beside an entirely transparent store
+    // payload. Compilers and renderers omit the paint itself, including its
+    // knockout contribution, rather than drawing this payload at zero alpha.
+    if (componentCount === 1 && !sixteenBit) {
+      const data = allocateBytes(width * height * 2, "nonpainting image samples");
+      for (let pixel = 0; pixel < width * height; pixel += 1) {
+        if ((pixel & 0xfff) === 0) throwIfAborted(signal);
+        data[pixel * 2] = samples[pixel];
+      }
+      return { data, format: HEPR_IMAGE_FORMAT.GrayAlpha8 };
+    }
+    return {
+      data: allocateBytes(width * height * 4 * bytesPerComponent, "nonpainting image output"),
+      format: sixteenBit ? HEPR_IMAGE_FORMAT.Rgba16 : HEPR_IMAGE_FORMAT.Rgba8
+    };
+  }
   // A DeviceGray byte is already its own sRGB value, so an RGBA8 result repeats
   // it three times beside a constant alpha. Keeping the single channel leaves a
   // retained page's serialized image store four times smaller; consumers that

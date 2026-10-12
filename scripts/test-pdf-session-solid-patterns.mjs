@@ -20,6 +20,12 @@ try {
   for (const [label, settings, expectedColor] of [
     ["full black tile with overprint", {}, cmykBlack],
     ["full red tile", { cell: "1 0 0 rg 0 0 10 12 re f" }, [1, 0, 0]],
+    ["colored tile after caller None", {
+      callerNone: true, cell: "1 0 0 rg 0 0 10 12 re f"
+    }, [1, 0, 0]],
+    ["direct colored Pattern after caller None", {
+      callerNone: true, directPattern: true, cell: "1 0 0 rg 0 0 10 12 re f"
+    }, [1, 0, 0]],
     ["transformed pattern lattice", { matrix: "0.5 1 -2 0.25 37 -11" }, cmykBlack],
     ["caller transparency", { outerAlpha: 0.5 }, cmykBlack],
     ["direct Pattern color space", { directPattern: true }, cmykBlack],
@@ -50,9 +56,51 @@ try {
         scene.fillPathMetaC[2], scene.fillPathMetaC[3]
       ], [...expectedColor, settings.outerAlpha ?? 1]);
       assert.equal(scene.segmentCount, 1, "the same constant pattern strokes paths as vectors");
+      if (settings.callerNone) {
+        const retained = await session.compilePage(0, { optimization: "none" });
+        const { encodeHeprPageData, decodeHeprPageData } = await import("../src/heprPageEncoding.ts");
+        const { lowerRetainedPageToVectorScene } = await import("../src/retainedVectorPage.ts");
+        const lowered = await lowerRetainedPageToVectorScene(decodeHeprPageData(encodeHeprPageData(retained)), {
+          signal: new AbortController().signal
+        });
+        assert.equal(lowered.rasterLayers.length, 0, "retained colored pattern stays vector after caller /None");
+        assert.equal(lowered.textInstanceCount, 3, "retained text must not inherit caller /None provenance");
+        assert.deepEqual([...lowered.textInstanceC.slice(0, 4)], [...expectedColor, 1]);
+        assert.ok(lowered.fillPathCount > 0, "retained path pattern must paint its own tile color");
+      }
       assert(!session.getDiagnostics().some(d =>
         d.code.endsWith("raster-fallback") || d.code === "text-pattern-approximation"),
       "a proven uniform pattern requires neither a raster nor a color approximation");
+    } finally { await session.close(); }
+  }
+
+  let type3Reference;
+  for (const callerNone of [false, true]) {
+    const session = await openPdf({ kind: "bytes", bytes: fixture({
+      callerNone, type3Font: true, cell: "1 0 0 rg 0 0 10 12 re f"
+    }) });
+    try {
+      const direct = await session.compileVectorPage(0, {
+        optimization: "none", preserveDrawingOrder: true, vectorFallback: "error"
+      });
+      const retained = await session.compilePage(0, { optimization: "none" });
+      const { encodeHeprPageData, decodeHeprPageData } = await import("../src/heprPageEncoding.ts");
+      const { lowerRetainedPageToVectorScene } = await import("../src/retainedVectorPage.ts");
+      const lowered = await lowerRetainedPageToVectorScene(decodeHeprPageData(encodeHeprPageData(retained)), {
+        signal: new AbortController().signal
+      });
+      const appearances = [direct, lowered].map(scene => ({
+        fills: scene.fillPathCount,
+        strokes: scene.segmentCount,
+        fillColors: [...scene.fillPathMetaB.filter((_, index) => index % 4 >= 2),
+          ...scene.fillPathMetaC.filter((_, index) => index % 4 >= 2)],
+        textColors: [...scene.textInstanceC]
+      }));
+      assert.ok([direct, lowered].every(scene => scene.rasterLayers.length === 0),
+        "Type3 glyphs using a solid pattern retain vector paint");
+      if (callerNone) assert.deepEqual(appearances, type3Reference,
+        "Type3 glyph programs inherit the selected pattern paint independently of a preceding /None color space");
+      else type3Reference = appearances;
     } finally { await session.close(); }
   }
 
@@ -118,35 +166,44 @@ function fixture({
   matrix = "1 0 0 1 262.029 357.443",
   outerAlpha = 1,
   directPattern = false,
+  callerNone = false,
+  type3Font = false,
   paintType = 1
 } = {}) {
   const patternSpace = directPattern ? "/Pattern" : "/CS1";
   const patternSelection = paintType === 2 ? "0 0 0 /P0" : "/P0";
   const content = [
     "0 0 1 rg",
-    `q /Outer gs ${patternSpace} cs ${patternSelection} scn`,
+    `q /Outer gs ${callerNone ? "/Invisible cs .5 scn " : ""}${patternSpace} cs ${patternSelection} scn`,
     "BT /F1 10 Tf 5 75 Td (A) Tj ET",
     `${patternSelection} scn BT /F1 10 Tf 15 75 Td (A) Tj ET`,
     "5 55 10 10 re f Q",
     "BT /F1 10 Tf 25 75 Td (B) Tj ET",
-    `q /Outer gs ${patternSpace} CS ${patternSelection} SCN 2 w 5 30 m 20 30 l S Q`
+    `q /Outer gs ${callerNone ? "/Invisible CS .5 SCN " : ""}${patternSpace} CS ${patternSelection} SCN 2 w 5 30 m 20 30 l S Q`
   ].join("\n");
   return writeTinyPdf({ objects: [
     { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
     { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
     { number: 3, body: [
       "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R",
-      `/Resources << /ColorSpace << /CS1 [/Pattern${paintType === 2 ? " /DeviceRGB" : ""}] >> /Pattern << /P0 6 0 R >>`,
+      `/Resources << /ColorSpace << /CS1 [/Pattern${paintType === 2 ? " /DeviceRGB" : ""}]`,
+      "/Invisible [/Separation /None /DeviceRGB << /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [1 1 1] /N 1 >>] >> /Pattern << /P0 6 0 R >>",
       `/ExtGState << /Outer << /ca ${outerAlpha} /CA ${outerAlpha} >> >>`,
       "/Font << /F1 5 0 R >> >> >>"
     ].join(" ") },
     { number: 4, body: tinyPdfStream("", content) },
-    { number: 5, body: "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>" },
+    { number: 5, body: type3Font
+      ? "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 500 700] /FontMatrix [.001 0 0 .001 0 0] /FirstChar 65 /LastChar 66 /Widths [500 500] /Encoding << /Type /Encoding /Differences [65 /A /B] >> /CharProcs << /A 8 0 R /B 9 0 R >> /Resources << >> >>"
+      : "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>" },
     { number: 6, body: tinyPdfStream([
       `/Type /Pattern /PatternType 1 /PaintType ${paintType} /TilingType 3`,
       `/BBox [0 0 10 12] /XStep ${xStep} /YStep ${yStep} /Matrix [${matrix}]`,
       "/Resources << /ExtGState << /TileState 7 0 R >> >>"
     ].join(" "), cell) },
-    { number: 7, body: `<< ${state} >>` }
+    { number: 7, body: `<< ${state} >>` },
+    ...(type3Font ? [
+      { number: 8, body: tinyPdfStream("", "500 0 d0 0 0 500 700 re f") },
+      { number: 9, body: tinyPdfStream("", "500 0 d0 0 0 500 700 re f") }
+    ] : [])
   ] });
 }

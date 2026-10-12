@@ -9,7 +9,11 @@ import { PdfError } from "./pdf/nativeTypes";
 
 /** A self-contained shading paint, ready to append to a scene's canonical gradient arrays. */
 export async function buildHeprVectorGradient(page: HeprPageData, gradientIndex: number, matrix: PdfMatrix,
-  clipBounds: Bounds, alpha: number, options: VectorShadingOptions & { paintBackground?: boolean } = {}): Promise<GradientSceneData> {
+  clipBounds: Bounds, alpha: number, options: VectorShadingOptions & {
+    paintBackground?: boolean;
+    /** Shared only while lowering this page; paint transforms and coverage are never cached. */
+    colorTables?: Map<number, Uint8Array>;
+  } = {}): Promise<GradientSceneData> {
   const description = readRetainedShading(page, gradientIndex), { evaluate, colors } = createRetainedShadingEvaluator(page, options.signal);
   let data: GradientSceneData;
   if (description.kind === HEPR_GRADIENT_KIND.Axial || description.kind === HEPR_GRADIENT_KIND.Radial) {
@@ -22,7 +26,12 @@ export async function buildHeprVectorGradient(page: HeprPageData, gradientIndex:
         background: description.background, extend: [!!(description.flags & 1), !!(description.flags & 2)], antiAlias: !!(description.flags & 4) }),
       functions: { evaluate: (index, inputs) => evaluate([index], inputs) },
       colors: { convertToSrgb: (index, inputs) => colors.convert(index, inputs, "retained-gradient") } };
-    data = buildNativeVectorGradients([{ gradientIndex: 0, transform: [...matrix], clipBounds, alpha, paintOrder: 0 }], registry, 1, options.signal);
+    const colorTables = new Map<number, Uint8Array>();
+    const cached = options.colorTables?.get(gradientIndex);
+    if (cached) colorTables.set(0, cached);
+    data = buildNativeVectorGradients([{ gradientIndex: 0, transform: [...matrix], clipBounds, alpha, paintOrder: 0 }],
+      registry, 1, options.signal, undefined, colorTables);
+    if (!cached) options.colorTables?.set(gradientIndex, colorTables.get(0)!);
   } else {
     const mesh = await buildHeprVectorShadingMesh(page, gradientIndex, options);
     const [a, b, c, d, e, f] = matrix, det = a * d - b * c;

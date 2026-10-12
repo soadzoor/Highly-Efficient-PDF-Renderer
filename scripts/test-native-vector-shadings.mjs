@@ -18,6 +18,9 @@ try {
   const { supportedNativeVectorShadings, buildNativeVectorGradients } = await import("../src/pdf/nativeVectorGradients.ts");
   const { buildHep } = await import("../src/hepBuilder.ts");
   const { loadSceneFromHep } = await import("../src/hep.ts");
+  const { HeprFunctionEvaluator } = await import("../src/heprFunctionEvaluator.ts");
+  const { buildHeprVectorGradient } = await import("../src/retainedVectorGradient.ts");
+  const { lowerRetainedPageToVectorScene } = await import("../src/retainedVectorPage.ts");
   const curve = "10 15 m 10 60 60 70 65 20 c 40 5 20 5 10 15 c h W n";
   const cases = [
     { name: "sheared shading with nested curved and even-odd clips",
@@ -70,6 +73,62 @@ try {
       assertPixelsClose(actual, expected, entry.name);
       if (entry === cases[0]) persisted = { scene, pixels: actual };
     } finally { await session.close(); }
+  }
+  const repeated = await openPdf({ kind: "bytes", bytes: fixture({
+    content: "q 3 4 20 30 re W n 20 0 0 30 3 4 cm /S sh Q " +
+      "q 30 10 25 45 re W n 25 8 0 45 30 10 cm /S sh Q " +
+      "q 58 38 18 35 re W n 18 0 -4 35 58 38 cm /S sh Q"
+  }) });
+  const originalEvaluate = HeprFunctionEvaluator.prototype.evaluate;
+  let evaluations = 0;
+  HeprFunctionEvaluator.prototype.evaluate = function (...args) {
+    evaluations++;
+    return originalEvaluate.apply(this, args);
+  };
+  try {
+    const page = await repeated.compilePage(0, { optimization: "none" });
+    const source = structuredClone(page);
+    const colorTables = new Map();
+    const bounds = { minX: 0, minY: 0, maxX: 20, maxY: 30 };
+    evaluations = 0;
+    const first = await buildHeprVectorGradient(page, 0, [20, 0, 0, 30, 3, 4], bounds, .25, { colorTables });
+    assert.equal(evaluations, 1024);
+    const otherBounds = { minX: 30, minY: 10, maxX: 55, maxY: 55 };
+    const second = await buildHeprVectorGradient(page, 0, [25, 8, 0, 45, 30, 10], otherBounds, .75, { colorTables });
+    assert.equal(evaluations, 1024, "a transformed repeated shading reuses its color function samples");
+    const uncached = await buildHeprVectorGradient(page, 0, [25, 8, 0, 45, 30, 10], otherBounds, .75);
+    assert.deepEqual(second, uncached, "cached samples preserve independent transforms, bounds and alpha");
+    assert.equal(first.gradientFillPathMetaC[3], .25);
+    assert.equal(second.gradientFillPathMetaC[3], .75);
+    first.gradientLut.fill(0);
+    const third = await buildHeprVectorGradient(page, 0, [25, 8, 0, 45, 30, 10], otherBounds, .75, { colorTables });
+    assert.deepEqual(third, uncached, "mutable scene tables never alias the cached samples");
+    const aborted = new AbortController(); aborted.abort();
+    await assert.rejects(buildHeprVectorGradient(page, 0, [1, 0, 0, 1, 0, 0], bounds, 1,
+      { colorTables, signal: aborted.signal }), { code: "aborted" });
+
+    evaluations = 0;
+    const scene = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal });
+    assert.equal(scene.gradientCount, 3);
+    assert.equal(evaluations, 1024, "retained lowering samples once across every placement of one shading");
+    const root = page.displayProgram.rootGroupIndex;
+    assert.equal(page.displayProgram.groups[root].commands.length, 3);
+    const singlePaint = { ...page, displayProgram: { ...page.displayProgram,
+      groups: page.displayProgram.groups.map((group, index) => index === root
+        ? { ...group, commands: group.commands.slice(0, 1) } : group) } };
+    evaluations = 0;
+    await renderHeprPageToCanvas2d(singlePaint, { scale, surfaceFactory });
+    const once = evaluations;
+    assert(once > 0, "the Canvas reference evaluates the source color function");
+    evaluations = 0;
+    const reference = await renderHeprPageToCanvas2d(page, { scale, surfaceFactory });
+    assert.equal(evaluations, once, "Canvas reference stops are sampled once per render and shading");
+    assertPixelsClose(renderScene(scene, scene.drawRuns),
+      reference.surface.context.getImageData(0, 0, side * scale, side * scale).data, "repeated retained shading clips");
+    assert.deepEqual(page, source, "both sampling caches leave retained source data unchanged");
+  } finally {
+    HeprFunctionEvaluator.prototype.evaluate = originalEvaluate;
+    await repeated.close();
   }
   const descriptions = [
     { shadingType: 2, coordinates: [0, 0, 1, 0], extend: [true, true], background: null },

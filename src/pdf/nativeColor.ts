@@ -227,6 +227,21 @@ export class NativePdfColorRegistry {
     return this.getRecord(index);
   }
 
+  /** `/None` colorants suppress painting instead of producing an RGB color. */
+  paints(index: number): boolean {
+    let record = this.getRecord(index);
+    let active: Set<number> | undefined;
+    while (record.kind === "Indexed") {
+      active ??= new Set();
+      if (active.has(index)) throw new PdfError("unsupported-color", "An Indexed color-space graph is recursive.");
+      active.add(index);
+      index = record.alternateSpaceIndex;
+      record = this.getRecord(index);
+    }
+    return !((record.kind === "Separation" || record.kind === "DeviceN") &&
+      record.names.length > 0 && record.names.every((name) => name === "None"));
+  }
+
   /** Default image Decode array for this color space. */
   defaultDecode(index: number): readonly number[] {
     const record = this.getRecord(index);

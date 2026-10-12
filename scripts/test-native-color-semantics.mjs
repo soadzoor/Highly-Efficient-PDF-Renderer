@@ -609,6 +609,13 @@ async function testSeparationAndDeviceN() {
 
   const all = await colors.add(separation("All", name("DeviceRGB"), tint));
   const none = await colors.add(separation("None", name("DeviceRGB"), tint));
+  assert.equal(colors.paints(spot), true);
+  assert.equal(colors.paints(all), true);
+  assert.equal(colors.paints(none), false);
+  const indexedNone = await colors.add(indexed(
+    separation("None", name("DeviceRGB"), tint), 0, pdfString([255])
+  ));
+  assert.equal(colors.paints(indexedNone), false, "Indexed inherits no-paint from its colorant base");
   // Registration /All shows through its tint transform like any spot color.
   closeRgb(colors.convertToSrgb(all, [1]), [0, 0, 1]);
   throwsCode(() => colors.convertToSrgb(none, [1]), "unsupported-color");
@@ -629,6 +636,11 @@ async function testSeparationAndDeviceN() {
     calculator("{ add 2 div }", 2, 1)
   ));
   throwsCode(() => colors.convertToSrgb(repeatedNone, [0, 0]), "unsupported-color");
+  assert.equal(colors.paints(repeatedNone), false);
+  const mixedNone = await colors.add(deviceN(
+    ["None", "Ink"], name("DeviceRGB"), duoFunction
+  ));
+  assert.equal(colors.paints(mixedNone), true);
 
   const nChannel = await colors.add(deviceN(
     ["Spot"],

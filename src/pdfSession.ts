@@ -1829,6 +1829,7 @@ class NativePdfSession implements NativeVectorPdfSession {
     const retainOptionalContent = (options as NativeVectorCompileOptions).retainOptionalContent === true;
     const compileOptions: DensePdfContentInputOptions = {
       onDiagnostic: imageResources.onDiagnostic,
+      ...denseSourcePaintOptions(imageResources),
       retainOptionalContent,
       ...(retainOptionalContent ? { combineOptionalContent: (parent: number, own: number) => this.optionalContent.combineMemberships(parent, own) } : {}),
       pageMatrix,
@@ -2742,6 +2743,21 @@ interface LoadedPageImages {
   ): void;
 }
 
+function denseSourcePaintOptions(resources: LoadedPageImages) {
+  return {
+    imageIsMask(imageIndex: number): boolean {
+      return resources.registry.describe(imageIndex).imageMask;
+    },
+    imagePaints(imageIndex: number): boolean {
+      const image = resources.registry.describe(imageIndex);
+      return image.imageMask || image.colorSpaceIndex < 0 || resources.registry.colors.paints(image.colorSpaceIndex);
+    },
+    shadingPaints(gradientIndex: number): boolean {
+      return resources.shadings.colors.paints(resources.shadings.describe(gradientIndex).colorSpaceIndex);
+    }
+  };
+}
+
 const EMPTY_NATIVE_FORM_DEFINITION_GRAPH: NativePdfFormDefinitionGraph = Object.freeze({
   pageForms: new Map<string, number>(),
   definitions: Object.freeze([]),
@@ -3075,6 +3091,7 @@ async function flattenNativeVectorFormOccurrences(
     }
     const compiled = await compileVectorFormContent(await scopedContent(definition), {
       onDiagnostic: imageResources.onDiagnostic,
+      ...denseSourcePaintOptions(imageResources),
       pageMatrix: transform,
       pageBounds: clipBounds,
       initialGraphicsState: singlePaintGroup ? {
@@ -4818,6 +4835,7 @@ async function compileNativeFormPrograms(
     );
     const compiled = await compileDensePdfContent(await scopedInlineContent(definition), {
       onDiagnostic: imageResources.onDiagnostic,
+      ...denseSourcePaintOptions(imageResources),
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: bounds,
       initialGraphicsState: formInitialGraphicsState,
@@ -5254,6 +5272,7 @@ async function compileNativeType3Programs(
     };
     const compiled = await compileDensePdfContent(contentSegments, {
       onDiagnostic: resources.onDiagnostic,
+      ...denseSourcePaintOptions(resources),
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: bounds,
       initialGraphicsState,
@@ -5539,6 +5558,7 @@ async function compileNativeType3Programs(
     const [minX, minY, maxX, maxY] = glyphBounds;
     const compiled = await compileDensePdfContent(content.bytes, {
       onDiagnostic: resources.onDiagnostic,
+      ...denseSourcePaintOptions(resources),
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: { minX, minY, maxX, maxY },
       initialGraphicsState: inheritedState,
@@ -6590,6 +6610,7 @@ async function compileNativePatternPrograms(
     };
     const compiled = await compileDensePdfContent(contentSegments, {
       onDiagnostic: resources.onDiagnostic,
+      ...denseSourcePaintOptions(resources),
       pageMatrix: [1, 0, 0, 1, 0, 0],
       pageBounds: bounds,
       textOperatorSink,
@@ -6742,9 +6763,11 @@ function formSpecializationKey(
     state.dashPhase,
     state.strokeColorSpace.resourceName,
     state.strokeColorSpace.colorSpaceIndex,
+    state.strokeColorSpace.paints ?? true,
     state.strokeColor,
     state.fillColorSpace.resourceName,
     state.fillColorSpace.colorSpaceIndex,
+    state.fillColorSpace.paints ?? true,
     state.fillColor,
     state.strokePaintInherited ?? false,
     state.fillPaintInherited ?? false,
@@ -6780,8 +6803,10 @@ function type3SpecializationKey(state: DensePdfInitialGraphicsState): string {
     state.dashPhase,
     state.strokeColorSpace.resourceName,
     state.strokeColorSpace.colorSpaceIndex,
+    state.strokeColorSpace.paints ?? true,
     state.fillColorSpace.resourceName,
     state.fillColorSpace.colorSpaceIndex,
+    state.fillColorSpace.paints ?? true,
     state.strokePaintInherited ?? false,
     state.fillPaintInherited ?? false,
     state.strokeAlpha,
@@ -6872,6 +6897,7 @@ async function loadScopedColorResolver(
       definitions.set(resourceName, Object.freeze({
         resourceName,
         colorSpaceIndex,
+        paints: colors.paints(colorSpaceIndex),
         componentCount: description.componentCount,
         initialComponents: Object.freeze(initialComponents),
         convertToSrgb(components: readonly number[]) {
@@ -6998,6 +7024,7 @@ function denseColorSpaceDefinition(
   return Object.freeze({
     resourceName,
     colorSpaceIndex,
+    paints: colors.paints(colorSpaceIndex),
     componentCount: description.componentCount,
     initialComponents: Object.freeze(initialComponents),
     convertToSrgb(components: readonly number[]) {
@@ -7033,6 +7060,7 @@ async function loadPatternDefinitions(
       resourceName,
       patternIndex,
       kind: pattern.kind,
+      paints: pattern.patternType !== 2 || patterns.shadings.colors.paints(pattern.shading.colorSpaceIndex),
       ...(solidColor ? { solidColor } : {}),
       hasExtGState: extGState !== undefined,
       ...(extGState ? { extGState } : {})
@@ -7157,6 +7185,7 @@ async function loadPageImages(
       definitions.set(resourceName, Object.freeze({
         resourceName,
         colorSpaceIndex,
+        paints: colors.paints(colorSpaceIndex),
         componentCount: description.componentCount,
         initialComponents: Object.freeze(initialComponents),
         convertToSrgb(components: readonly number[]) {
@@ -7307,6 +7336,7 @@ async function loadPageImages(
         if (visited.has(index)) return;
         visited.add(index);
         const image = registry.describe(index);
+        if (!image.imageMask && image.colorSpaceIndex >= 0 && !registry.colors.paints(image.colorSpaceIndex)) return;
         if (image.codecRequest) {
           throw new PdfError(
             "unsupported-image",

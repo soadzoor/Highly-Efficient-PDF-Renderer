@@ -27,6 +27,8 @@ export interface NativeTextDrawRun {
   readonly fontIndex: number;
   /** PDF text rendering mode 0..7. */
   readonly renderingMode: number;
+  /** Type3 or PostScript glyph programs may select paint independently of the caller. */
+  readonly hasOwnPaintPrograms?: boolean;
 }
 
 export interface NativeTextCompilation {
@@ -403,7 +405,7 @@ export class NativeTextCompiler {
     const resource = this.currentFont();
     const firstGlyph = this.glyphIds.length;
     this.appendTextBytes(resource, bytes);
-    this.appendRun(firstGlyph, this.glyphIds.length - firstGlyph, resource.fontIndex);
+    this.appendRun(firstGlyph, this.glyphIds.length - firstGlyph, resource);
   }
 
   showAdjustedText(items: readonly NativeTextArrayItem[]): void {
@@ -426,7 +428,7 @@ export class NativeTextCompiler {
         throw invalidText("TJ array entries must be byte strings or numbers.");
       }
     }
-    this.appendRun(firstGlyph, this.glyphIds.length - firstGlyph, resource.fontIndex);
+    this.appendRun(firstGlyph, this.glyphIds.length - firstGlyph, resource);
   }
 
   /** Append indexed OCR/ActualText geometry when no glyph instance exists. */
@@ -837,15 +839,18 @@ export class NativeTextCompiler {
     return Number.isFinite(forwardGap) && forwardGap > threshold;
   }
 
-  private appendRun(first: number, count: number, fontIndex: number): void {
+  private appendRun(first: number, count: number, resource: NativeTextFontResource): void {
     if (count === 0) return;
     // Preserve the text-show boundary. The graphics interpreter may have a
     // backdrop/clip/group barrier between otherwise compatible glyph spans.
     const run = Object.freeze({
       first,
       count,
-      fontIndex,
-      renderingMode: this.state.renderingMode
+      fontIndex: resource.fontIndex,
+      renderingMode: this.state.renderingMode,
+      ...((resource.type3 || resource.font.subtype === "Type3" || resource.font.sfnt?.usesPostScript ||
+        resource.font.cff?.usesPostScript || resource.font.type1?.usesPostScript)
+        ? { hasOwnPaintPrograms: true } : {})
     });
     this.runs.push(run);
     this.onRun?.(run);

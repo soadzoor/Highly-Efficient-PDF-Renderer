@@ -291,9 +291,9 @@ EMC
     }
     await recoveredLayersSession.compilePage(0);
     const warnings = recoveredLayersSession.getDiagnostics().filter(diagnostic =>
-      diagnostic.code === "optional-content.missing-catalog-group");
-    assert.equal(warnings.length, 3,
-      "repeated static and vector compilation emits only one warning per recovered group");
+      diagnostic.code === "optional-content.missing-catalog");
+    assert.equal(warnings.length, 1,
+      "repeated static and vector compilation emits one warning for the absent catalog");
     assert.ok(warnings.every(warning => warning.severity === "warning"));
   } finally {
     await recoveredLayersSession.close();
@@ -330,7 +330,7 @@ EMC
       visibility.dispose();
     }
     assert.equal(recoveredVectorSession.getDiagnostics().filter(diagnostic =>
-      diagnostic.code === "optional-content.missing-catalog-group").length, 3,
+      diagnostic.code === "optional-content.missing-catalog").length, 1,
     "vector-first discovery does not duplicate recovery diagnostics");
   } finally {
     await recoveredVectorSession.close();

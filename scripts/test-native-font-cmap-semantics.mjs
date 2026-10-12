@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
+import { buildTinySfnt } from "./lib/tinySfnt.mjs";
 
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -43,6 +44,8 @@ try {
   await testIdentityAndVerticalResourceLaziness();
   await testBundledPredefinedCMaps();
   await testCidUnicodeFallbackAndRos();
+  await testEmbeddedCidUnicodeFallback();
+  await testPlainToUnicodeProgramReuse();
   await testCidSystemInfoStringRejections();
   await testUseCMapCyclesAndDepth();
   await testSimpleEncodingAndUnicodeSeparation();
@@ -61,6 +64,85 @@ try {
 }
 
 console.log("native font CMap/encoding semantics tests passed");
+
+async function testPlainToUnicodeProgramReuse() {
+  let indexedReads = 0;
+  const countedResolver = {
+    async resolveValue(value) { return value; },
+    async decodeStream(value) {
+      return new Proxy(value.bytes, { get(target, property) {
+        if (typeof property === "string" && /^\d+$/.test(property)) indexedReads++;
+        const result = Reflect.get(target, property, target);
+        return typeof result === "function" ? result.bind(target) : result;
+      } });
+    }
+  };
+  const content = "1 begincodespacerange <00> <ff> endcodespacerange 3 beginbfchar <41> <0041> <42> <d800> <43> <0043> endbfchar";
+  const font = (bytes = content, dictionary) => {
+    const result = simpleFont(name("WinAnsiEncoding"));
+    result.set("ToUnicode", stream(bytes, dictionary));
+    return result;
+  };
+  const first = await parseNativePdfFont(font(), countedResolver);
+  const firstReads = indexedReads;
+  assert(firstReads > 100, "the initial plain ToUnicode program is tokenized");
+  const reused = await parseNativePdfFont(font(), countedResolver);
+  assert.equal(indexedReads, firstReads, "identical decoded programs in distinct font streams share completed parsing");
+  assert.equal(reused.decode(Uint8Array.of(0x42)).unicode, "\ufffd");
+  assert.deepEqual(reused.diagnostics, first.diagnostics, "shared parsing preserves repair diagnostics for each font");
+  const changed = await parseNativePdfFont(font(content.replace("<0043>", "<005a>")), countedResolver);
+  assert.equal(changed.decode(Uint8Array.of(0x43)).unicode, "Z", "different byte contents cannot collide");
+  await assert.rejects(parseNativePdfFont(font(), countedResolver, { parserLimits: { maxCMapMappings: 1 } }),
+    hasPdfError("resource-limit"));
+  await assert.rejects(parseNativePdfFont(font(), countedResolver, { parserLimits: { maxCMapTokens: 5 } }),
+    hasPdfError("resource-limit"));
+  await assert.rejects(parseNativePdfFont(font(content, new Map([["WMode", 2]])), countedResolver),
+    hasPdfError("unsupported-font", /WMode/));
+  const inherited = await parseNativePdfFont(font(content, new Map([["UseCMap", stream(
+    "1 begincodespacerange <00> <ff> endcodespacerange 1 beginbfchar <44> <0044> endbfchar"
+  )]])), countedResolver);
+  assert.equal(inherited.decode(Uint8Array.of(0x44)).unicode, "D", "dictionary inheritance is never confused with plain cached content");
+  const readsBeforeAnotherResolver = indexedReads;
+  await parseNativePdfFont(font(), { ...countedResolver });
+  assert(indexedReads > readsBeforeAnotherResolver, "ToUnicode programs are owned by their resolver/document");
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(parseNativePdfFont(font(), countedResolver, { signal: controller.signal }),
+    hasPdfError("aborted"));
+}
+
+async function testEmbeddedCidUnicodeFallback() {
+  const gidMap = new Uint8Array(16);
+  gidMap[11] = 2;
+  gidMap[15] = 1;
+  const descendant = cidFont("Identity", 0, [
+    ["FontDescriptor", new Map([["FontFile2", stream(buildTinySfnt())]])],
+    ["CIDToGIDMap", stream(gidMap)],
+    ["W", [5, [123], 7, [456]]]
+  ]);
+  const recovered = await parseNativePdfFont(compositeFont(name("Identity-H"), descendant), identityResolver);
+  assert.equal(recovered.decode(Uint8Array.of(0, 5)).unicode, "B", "CIDToGIDMap selects the embedded Unicode glyph");
+  assert.equal(recovered.decode(Uint8Array.of(0, 7)).unicode, "A");
+  assert.equal(recovered.decode(Uint8Array.of(0, 5)).glyphId, 2);
+  assert.equal(recovered.decode(Uint8Array.of(0, 5)).width, 123, "PDF widths retain precedence");
+  assert.equal(recovered.diagnostics[0].code, "font.unicode-from-embedded-cmap");
+  assert.equal(recovered.diagnostics[0].severity, "info");
+  await assert.rejects(parseNativePdfFont(compositeFont(name("Identity-H"), descendant), identityResolver, {
+    parserLimits: { maxCMapMappings: 1 }
+  }), error => error.code === "resource-limit" && error.details.reason === "font-cid-unicode-mapping-limit");
+  const explicit = compositeFont(name("Identity-H"), descendant);
+  explicit.set("ToUnicode", stream("1 begincodespacerange <0000> <ffff> endcodespacerange 1 beginbfchar <0005> <005a> endbfchar"));
+  const authoritative = await parseNativePdfFont(explicit, identityResolver);
+  assert.equal(authoritative.decode(Uint8Array.of(0, 5)).unicode, "Z", "explicit ToUnicode remains authoritative");
+  assert.equal(authoritative.decode(Uint8Array.of(0, 7)).unicode, null, "partial authoritative maps retain their existing semantics");
+  assert.equal(authoritative.decode(Uint8Array.of(0, 5)).glyphId, 2, "Unicode never redirects painted glyphs");
+  assert.deepEqual(authoritative.getGlyphOutline(2), recovered.getGlyphOutline(2));
+  const substitute = await parseNativePdfFont(compositeFont(name("Identity-H"), cidFont("Identity", 0)), identityResolver, {
+    missingFontResolver() { return { sfntBytes: buildTinySfnt(), identifier: "unicode-substitute" }; }
+  });
+  assert.equal(substitute.decode(Uint8Array.of(0, 1)).unicode, null, "a substitute cannot identify original CID glyphs");
+  assert(substitute.diagnostics.some(d => d.code === "font.cid-unicode-fallback-unavailable"));
+}
 
 async function testToUnicodeMetadataCompatibility() {
   for (const identityName of ["Identity-H", "Identity-V"]) {
