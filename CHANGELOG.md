@@ -6,6 +6,8 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+## [0.1.62] - 2026-10-12
+
 ### Changed
 
 - Batch consecutive fills and strokes in one ordered vector draw across native
@@ -256,9 +258,10 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   shadings, and physical press calibration are tracked in the
   [follow-up checklist](docs/development.md#font-local-postscript-follow-ups).
 
-[Unreleased]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.61...HEAD
+[Unreleased]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.62...HEAD
 [0.1.57]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.56...v0.1.57
 [0.1.58]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.57...v0.1.58
 [0.1.59]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.58...v0.1.59
 [0.1.60]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.59...v0.1.60
 [0.1.61]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.60...v0.1.61
+[0.1.62]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.61...v0.1.62
