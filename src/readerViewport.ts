@@ -73,6 +73,10 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   const pageInput = query<HTMLInputElement>(".reader-page-number"), zoomInput = query<HTMLInputElement>(".reader-zoom");
   const pageCount = query<HTMLSpanElement>(".reader-page-count");
   const thumbToggle = query<HTMLButtonElement>('[data-reader="thumbnails"]');
+  const previousButton = query<HTMLButtonElement>('[data-reader="previous"]');
+  const nextButton = query<HTMLButtonElement>('[data-reader="next"]');
+  const fitWidthButton = query<HTMLButtonElement>('[data-reader="fit-width"]');
+  const fitPageButton = query<HTMLButtonElement>('[data-reader="fit-page"]');
   const announcement = query<HTMLSpanElement>(".reader-announcement");
   for (const layout of options.layouts) {
     const option = document.createElement("option"); option.value = layout.value; option.textContent = layout.label;
@@ -95,7 +99,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   let navigationTarget: { page: number; top: number } | null = null;
   let metrics: ReaderMetrics = readerContentMetrics(rects, zoom, 1, 1);
   let logicalScroll = { left: 0, top: 0 }, domScroll = { left: 0, top: 0 };
-  let resizeFrame = 0, scrollFrame = 0, inertiaFrame = 0;
+  let resizeFrame = 0, inertiaFrame = 0;
   let thumbnailRevision = 0, thumbnailRunning = false;
   const thumbnailWanted = new Set<number>(), thumbnailCanvases = new Map<number, HTMLCanvasElement>();
   const thumbnailFailed = new Set<number>(), thumbnailJobs = new Map<number, AbortController>();
@@ -113,16 +117,24 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   }
   function updateToolbar(): void {
     const count = rects.length / 4;
-    if (document.activeElement !== pageInput) pageInput.value = String(currentPage + 1);
-    pageInput.max = String(count);
-    pageCount.textContent = `/ ${count}`;
-    if (document.activeElement !== zoomInput) zoomInput.value = `${Math.round(zoom / READER_ACTUAL_SIZE_ZOOM * 100)}%`;
-    query<HTMLButtonElement>('[data-reader="previous"]').disabled = currentPage <= 0;
-    query<HTMLButtonElement>('[data-reader="next"]').disabled = currentPage >= count - 1;
-    toolbar.classList.toggle("reader-has-document", count > 0);
-    thumbToggle.setAttribute("aria-expanded", String(active && sidebarOpen));
-    query<HTMLButtonElement>('[data-reader="fit-width"]').setAttribute("aria-pressed", String(fit === "width"));
-    query<HTMLButtonElement>('[data-reader="fit-page"]').setAttribute("aria-pressed", String(fit === "page"));
+    const pageText = String(currentPage + 1), countText = String(count);
+    const zoomText = `${Math.round(zoom / READER_ACTUAL_SIZE_ZOOM * 100)}%`;
+    // Scroll changes the camera far more often than these controls. Replacing
+    // identical text/attributes still invalidates browser style and layout.
+    if (document.activeElement !== pageInput && pageInput.value !== pageText) pageInput.value = pageText;
+    if (pageInput.max !== countText) pageInput.max = countText;
+    if (pageCount.textContent !== `/ ${count}`) pageCount.textContent = `/ ${count}`;
+    if (document.activeElement !== zoomInput && zoomInput.value !== zoomText) zoomInput.value = zoomText;
+    if (previousButton.disabled !== (currentPage <= 0)) previousButton.disabled = currentPage <= 0;
+    if (nextButton.disabled !== (currentPage >= count - 1)) nextButton.disabled = currentPage >= count - 1;
+    if (toolbar.classList.contains("reader-has-document") !== (count > 0)) toolbar.classList.toggle("reader-has-document", count > 0);
+    for (const [button, attribute, value] of [
+      [thumbToggle, "aria-expanded", String(active && sidebarOpen)],
+      [fitWidthButton, "aria-pressed", String(fit === "width")],
+      [fitPageButton, "aria-pressed", String(fit === "page")]
+    ] as const) {
+      if (button.getAttribute(attribute) !== value) button.setAttribute(attribute, value);
+    }
   }
   function present(): void {
     if (!active || !rects.length || disposed) return;
@@ -172,15 +184,16 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     // A later scroll event must not feed rounded DOM offsets back into the camera.
     domScroll = { left: scroller.scrollLeft, top: scroller.scrollTop };
   }
-  function readNativeScroll(): void {
-    if (!active) return;
+  function readNativeScroll(): boolean {
+    if (!active) return false;
     const left = scroller.scrollLeft, top = scroller.scrollTop;
-    if (left === domScroll.left && top === domScroll.top) return;
+    if (left === domScroll.left && top === domScroll.top) return false;
     stopInertia();
     const maxLeft = Math.max(0, scroller.scrollWidth - scroller.clientWidth), maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
     if (left !== domScroll.left) logicalScroll.left = maxLeft > 0 ? Math.max(0, Math.min(1, left / maxLeft)) * (metrics.surfaceWidth - metrics.width) : 0;
     if (top !== domScroll.top) logicalScroll.top = maxTop > 0 ? Math.max(0, Math.min(1, top / maxTop)) * (metrics.surfaceHeight - metrics.height) : 0;
     domScroll = { left, top };
+    return true;
   }
   function scrollBy(left: number, top: number): void {
     positionScroll(logicalScroll.left + left, logicalScroll.top + top);
@@ -509,8 +522,10 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   }, { signal: lifetime.signal });
   sidebar.addEventListener("scroll", updateThumbnails, { passive: true, signal: lifetime.signal });
   scroller.addEventListener("scroll", () => {
-    readNativeScroll();
-    if (!scrollFrame) scrollFrame = window.requestAnimationFrame(() => { scrollFrame = 0; present(); });
+    // The host coalesces drawing into its own animation frame. Update the
+    // camera now so native scrolling does not wait through another frame, and
+    // ignore readback from gestures/navigation that already presented it.
+    if (readNativeScroll()) present();
   }, { passive: true, signal: lifetime.signal });
   scroller.addEventListener("wheel", event => {
     stopInertia();
@@ -573,7 +588,6 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   function dispose(): void {
     disposed = true; cancelActiveGesture(); lifetime.abort(); canvasLifetime?.abort(); observer.disconnect();
     if (resizeFrame) window.cancelAnimationFrame(resizeFrame);
-    if (scrollFrame) window.cancelAnimationFrame(scrollFrame);
     for (const job of thumbnailJobs.values()) job.abort();
     releaseScratch();
     for (const canvas of thumbnailCanvases.values()) { canvas.remove(); canvas.width = canvas.height = 0; }

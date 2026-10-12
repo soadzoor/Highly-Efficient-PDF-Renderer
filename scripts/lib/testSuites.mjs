@@ -251,6 +251,7 @@ export const fastTests = [
   "native-paint-compositor",
   "native-direct-rendering",
   "text-lod-core",
+  "text-raster-atlas",
   "lod-worker",
   "text-lod-foreshortening",
   "native-text-lod",

@@ -309,6 +309,46 @@ try {
     }
   }
   {
+    // Rows and Reader columns must make the same overlap decisions when the
+    // sweep changes axes, including pairs near the end of the layout.
+    const count=24,viewport={width:800,height:600},bounds={minX:0,minY:0,maxX:20,maxY:20};
+    const table=new ThreePageTransforms({scene:{drawRuns:[]},pageCount:count,owners:{}});
+    const projection=new THREE.Matrix4().makeScale(.003,.003,1);
+    for(const vertical of [false,true]) {
+      const label=vertical?'vertical Reader column':'horizontal page row',component=vertical?13:12;
+      const makeFrames=(pitch=24,edgePaint=false)=>Array.from({length:count},(_,index)=>{
+        const offset=(index-(count-1)/2)*pitch;
+        const dataToDocument=new THREE.Matrix4().makeTranslation(vertical?-10:offset-10,vertical?offset-10:-10,0);
+        return {scene:{pageBounds:bounds,segmentCount:0,gradientStrokeSegmentCount:0},
+          paintBounds:edgePaint?bounds:{minX:1,minY:1,maxX:19,maxY:19},dataToDocument,
+          dataToClip:projection.clone().multiply(dataToDocument),visible:true,opaque:true};
+      });
+      const overlap=(frames,index)=>{
+        frames[index].dataToDocument.copy(frames[index-1].dataToDocument);
+        frames[index].dataToDocument.elements[component]+=10;
+        frames[index].dataToClip.copy(projection).multiply(frames[index].dataToDocument);
+      };
+      const evaluate=(frames,approximate=false)=>updateThreePageBatchFrame(table,frames,viewport,-1,approximate);
+      let frames=makeFrames(),result=evaluate(frames);
+      assert.deepEqual([result.reason,result.approximated],[null,false],`${label}: separated opaque sheets batch exactly`);
+      assert.equal([...table.visibility].filter(Boolean).length,count,`${label}: every sheet is visible`);
+      frames.forEach(frame=>frame.opaque=false);result=evaluate(frames,true);
+      assert.deepEqual([result.reason,result.approximated],[null,false],`${label}: separated translucent sheets remain exact`);
+      frames=makeFrames();overlap(frames,count-1);result=evaluate(frames);
+      assert.equal(result.reason,'overlapping-page-paints',`${label}: late coplanar overlap keeps page order`);
+      result=evaluate(frames,true);
+      assert.deepEqual([result.reason,result.approximated],[null,true],`${label}: fast mode reports a late opaque overlap`);
+      frames[count-1].dataToClip.elements[14]=.25;result=evaluate(frames);
+      assert.deepEqual([result.reason,result.approximated],[null,false],`${label}: late depth-separated overlap remains exact`);
+      frames=makeFrames();overlap(frames,1);overlap(frames,count-1);frames[count-1].opaque=false;
+      result=evaluate(frames,true);
+      assert.equal(result.reason,'overlapping-page-paints',`${label}: early opaque approximation cannot hide a late translucent overlap`);
+      result=evaluate(makeFrames(20.4,true));
+      assert.deepEqual([result.reason,result.approximated],[null,true],`${label}: disjoint sheets report their overlapping antialiasing fringe`);
+    }
+    table.dispose();
+  }
+  {
     // Page layouts in 3D: opaque pages whose screen boxes and depth ranges
     // overlap still share batches wherever depth orders them exactly.
     const partition=new ScenePageViews(composeVectorScenesInGrid([page,page],2)),table=new ThreePageTransforms(partition);

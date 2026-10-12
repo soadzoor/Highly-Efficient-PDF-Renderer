@@ -623,20 +623,34 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     const documentToClip = this.pageBatchDocumentToClip.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
       .multiply(this.matrixWorld).multiply(this.dataToLocalMatrix);
     this.pageBatchFrameCache ??= new ThreePageBatchFrameCache();
+    const profile = getThreeRenderPerformance();
+    profile?.beginSection("three.pageCache");
     const prepared = this.pageBatchFrameCache.update(this.pageBatchFrameSources, table, documentOrigin, documentToClip,
       camera, viewport, this.pageOverlapMode === "fast");
+    profile?.endSection("three.pageCache");
+    profile?.beginSection("three.pageProjection");
     const frame = !prepared.changed && this.pageBatchFrameResult ? this.pageBatchFrameResult
       : this.pageBatchFrameResult = updateThreePageBatchFrame(table, prepared.frames, viewport,
         camera.coordinateSystem === THREE.WebGPUCoordinateSystem ? 0 : -1, this.pageOverlapMode === "fast");
+    profile?.endSection("three.pageProjection");
+    if (profile) {
+      profile.add("three.pageCount", this.pageViews!.length);
+      profile.add("three.visiblePages", table.visibility.reduce((sum, visible) => sum + visible, 0));
+    }
     this.pageBatchReason = frame.reason;
     this.pageBatchFringesApproximated = frame.approximated;
     return frame.reason ? null : frame;
   }
 
   private prepareBatchedPages(renderer: ThreeHostRenderer, camera: THREE.Camera): boolean {
-    const frame = this.preparePageBatchFrame(renderer, camera);
+    const profile = getThreeRenderPerformance();
+    profile?.beginSection("three.pageBatchFrame");
+    let frame: ReturnType<typeof updateThreePageBatchFrame> | null;
+    try { frame = this.preparePageBatchFrame(renderer, camera); }
+    finally { profile?.endSection("three.pageBatchFrame"); }
     if (!frame) return false;
     const batch = this.pageBatch!;
+    profile?.beginSection("three.pageOverlays");
     for (const { object } of this.pageViews!) {
       if (!this.pageBatchActive) object.configureDormantPipeline();
       object.showPageMesh(false);
@@ -657,6 +671,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     overlays.forEach(({ object }, index) => object.traverse(child => {
       if ((child as THREE.Group).isGroup) child.renderOrder = HEPR_THREE_LAYER_ORDER_PAGE_DEPTH + index;
     }));
+    profile?.endSection("three.pageOverlays");
     batch.pageBatchView = frame.view; batch.visible = true;
     batch.prepareFrameForThreeRenderer(renderer,camera);
     batch.pageMesh.visible = false;
@@ -757,9 +772,12 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   private prepareIndependentPages(renderer: ThreeHostRenderer, camera: THREE.Camera): void {
     // Three already updated world matrices for this frame; batched pages only
     // read their own. Dormant page content is refreshed only when drawn.
+    const profile = getThreeRenderPerformance();
+    profile?.beginSection("three.pageMatrices");
     this.updateWorldMatrix(true, false); camera.updateMatrixWorld();
     for (const { object } of this.pageViews!) object.updateWorldMatrix(false, false);
     this.pageBatch?.updateWorldMatrix(false, true);
+    profile?.endSection("three.pageMatrices");
     if (this.prepareBatchedPages(renderer,camera)) return;
     this.updateWorldMatrix(false, true);
     this.pageBatchActive = false;

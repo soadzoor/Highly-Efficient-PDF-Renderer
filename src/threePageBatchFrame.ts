@@ -99,13 +99,16 @@ export function updateThreePageBatchFrame(table: ThreePageTransforms, pages: rea
         ink.maxX+localMargin <= r.maxX && ink.maxY+localMargin <= r.maxY,
       corners, corner, slope: Infinity });
   });
-  boxes.sort((a, b) => a.x0 - b.x0);
+  // Sweep where pages are more separated relative to their painted widths.
+  // Reader columns share X, so an X sweep would compare every visible pair.
+  const sweepY = sweepAlongY(boxes);
+  boxes.sort(sweepY ? (a, b) => a.y0 - b.y0 : (a, b) => a.x0 - b.x0);
   const opaque = boxes.every(box => box.opaque);
   // Any earlier reason already rejects the batch; skip the pairwise sweep.
   if (!reason) pairs: for (let i=0;i<boxes.length;i++) for (let j=i+1;j<boxes.length;j++) {
     const a=boxes[i],b=boxes[j];
-    if (b.x0 > a.x1) break;
-    if (a.y1 < b.y0 || b.y1 < a.y0) continue;
+    if (sweepY ? b.y0 > a.y1 : b.x0 > a.x1) break;
+    if (sweepY ? a.x1 < b.x0 || b.x1 < a.x0 : a.y1 < b.y0 || b.y1 < a.y0) continue;
     // Translucent overlaps have no depth pass to isolate them.
     if (!a.opaque || !b.opaque) {
       reason ??= "overlapping-page-paints";
@@ -135,6 +138,16 @@ export function updateThreePageBatchFrame(table: ThreePageTransforms, pages: rea
   if (!boxes.length) Object.assign(bounds,{minX:0,minY:0,maxX:0,maxY:0});
   return { reason, approximated: !reason && approximated, view: { viewState: {cameraCenterX:(bounds.minX+bounds.maxX)/2,cameraCenterY:(bounds.minY+bounds.maxY)/2,zoom:1/table.minUnitsPerPixel},
     nativeViewport: viewport, cullingBounds: bounds } };
+}
+
+function sweepAlongY(boxes: readonly PageBox[]): boolean {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, width = 0, height = 0;
+  for (const box of boxes) {
+    minX = Math.min(minX, box.x0); minY = Math.min(minY, box.y0);
+    maxX = Math.max(maxX, box.x1); maxY = Math.max(maxY, box.y1);
+    width += box.x1 - box.x0; height += box.y1 - box.y0;
+  }
+  return (maxY - minY) * width > (maxX - minX) * height;
 }
 
 function planeOf(box: PageBox, viewport: Viewport): PageBox["plane"] {

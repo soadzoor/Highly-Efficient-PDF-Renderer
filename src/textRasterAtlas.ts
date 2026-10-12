@@ -39,17 +39,43 @@ export { TEXT_RASTER_ATLAS_PADDING_PX } from "./textRasterAtlasConstants";
 const GLYPH_PADDING_PX = TEXT_RASTER_ATLAS_PADDING_PX;
 const CONNECTION_EPSILON = 1e-3;
 
+interface GlyphAtlasCacheNode {
+  readonly next: WeakMap<Float32Array, GlyphAtlasCacheNode>;
+  readonly atlases: Map<number, Map<number, TextRasterAtlas>>;
+}
+
+const glyphAtlases = new WeakMap<Float32Array, GlyphAtlasCacheNode>();
+
+/** Glyph stores are immutable and shared by document and extracted page scenes. */
+function glyphAtlasCache(scene: VectorScene): Map<number, Map<number, TextRasterAtlas>> {
+  let entries = glyphAtlases;
+  let node: GlyphAtlasCacheNode | undefined;
+  for (const array of [scene.textGlyphSegmentsA, scene.textGlyphSegmentsB, scene.textGlyphMetaA, scene.textGlyphMetaB]) {
+    node = entries.get(array);
+    if (!node) {
+      node = { next: new WeakMap(), atlases: new Map() };
+      entries.set(array, node);
+    }
+    entries = node.next;
+  }
+  return node!.atlases;
+}
+
 export function buildTextRasterAtlas(scene: VectorScene, maxTextureSize: number): TextRasterAtlas | null {
   if (typeof document === "undefined" || scene.textGlyphCount <= 0) {
     return null;
   }
 
-  const glyphUvRects = new Float32Array(scene.textGlyphCount * 4);
   const atlasSizeLimit = clamp(
     Math.trunc(maxTextureSize) || TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE,
     256,
     TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE
   );
+  const atlases = glyphAtlasCache(scene);
+  const cached = atlases.get(scene.textGlyphCount)?.get(atlasSizeLimit);
+  if (cached) return cached;
+
+  const glyphUvRects = new Float32Array(scene.textGlyphCount * 4);
 
   let selected: { placements: GlyphPlacement[]; width: number; height: number } | null = null;
 
@@ -105,12 +131,16 @@ export function buildTextRasterAtlas(scene: VectorScene, maxTextureSize: number)
     alpha[pixel] = imageData.data[i + 3];
   }
 
-  return {
+  const atlas = {
     width: selected.width,
     height: selected.height,
     alpha,
     glyphUvRects
   };
+  const sizes = atlases.get(scene.textGlyphCount) ?? new Map<number, TextRasterAtlas>();
+  sizes.set(atlasSizeLimit, atlas);
+  atlases.set(scene.textGlyphCount, sizes);
+  return atlas;
 }
 
 function buildPlacements(scene: VectorScene, targetMaxDim: number): GlyphPlacement[] {

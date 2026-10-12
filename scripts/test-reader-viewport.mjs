@@ -284,6 +284,89 @@ try {
     assert(reader.getView().zoom > replacementView.zoom, "replacement canvas receives zoom controls");
     reader.dispose();
   }
+  {
+    const env = environment(), reader = createReaderViewport(env.options), doc = env.document;
+    reader.setDocument({ identity: "toolbar-scroll-writes", pageRects: pageRects(4) }); reader.setLayout("reader");
+    const scroller = doc.querySelector(".reader-scroll"), pageInput = doc.querySelector(".reader-page-number");
+    const zoomInput = doc.querySelector(".reader-zoom"), pageCount = doc.querySelector(".reader-page-count");
+    const button = action => doc.querySelector(`[data-reader="${action}"]`), writes = [];
+    for (const [name, node, properties] of [
+      ["page", pageInput, ["value", "max"]], ["zoom", zoomInput, ["value"]], ["count", pageCount, ["textContent"]],
+      ["previous", button("previous"), ["disabled"]], ["next", button("next"), ["disabled"]],
+      ["toolbar", doc.querySelector(".reader-toolbar"), ["className"]],
+      ["thumbnails", button("thumbnails"), []], ["width", button("fit-width"), []], ["fit", button("fit-page"), []]
+    ]) {
+      for (const property of properties) {
+        let value = node[property];
+        Object.defineProperty(node, property, { configurable: true, get: () => value,
+          set(next) { writes.push(`${name}.${property}`); value = next; } });
+      }
+      const setAttribute = node.setAttribute;
+      node.setAttribute = function(attribute, value) { writes.push(`${name}.${attribute}`); setAttribute.call(this, attribute, value); };
+    }
+    for (let frame = 0; frame < 5; frame++) { scroller.scrollTop += 10; scroller.emit("scroll"); env.flushFrames(); }
+    assert.equal(env.views.at(-1).centerY, reader.getView().centerY, "scrolling still updates the camera without changing toolbar state");
+    assert.deepEqual(writes, [], "scrolling within a page does not rewrite unchanged toolbar text, values, classes or attributes");
+
+    reader.goToPage(3);
+    assert.equal(pageInput.value, "4"); assert.equal(button("previous").disabled, false); assert.equal(button("next").disabled, true);
+    assert(writes.includes("page.value") && writes.includes("next.disabled"), "page navigation updates controls when their values change");
+    writes.length = 0; scroller.emit("scroll"); env.flushFrames();
+    assert.deepEqual(writes, [], "programmatic scroll readback also leaves settled toolbar controls untouched");
+
+    pageInput.focus(); pageInput.value = "2"; writes.length = 0;
+    reader.goToPage(0);
+    assert.equal(pageInput.value, "2", "view updates preserve the page number being edited");
+    assert(!writes.includes("page.value"));
+    env.canvas.focus(); scroller.scrollTop += 1; scroller.emit("scroll"); env.flushFrames();
+    assert.equal(pageInput.value, "1", "the page readout catches up after editing focus leaves the input");
+
+    zoomInput.focus(); zoomInput.value = "150."; writes.length = 0;
+    reader.setView({ ...reader.getView(), zoom: 2 });
+    assert.equal(zoomInput.value, "150.", "zoom updates preserve the percentage being edited");
+    assert(!writes.includes("zoom.value"));
+    env.canvas.focus(); scroller.scrollTop += 1; scroller.emit("scroll"); env.flushFrames();
+    assert.equal(zoomInput.value, `${Math.round(2 / READER_ACTUAL_SIZE_ZOOM * 100)}%`);
+    writes.length = 0;
+    reader.setView({ ...reader.getView(), centerY: reader.getView().centerY - 10 });
+    assert.deepEqual(writes, [], "camera updates at a fixed page and zoom do not mutate toolbar controls");
+
+    reader.setDocument({ identity: "toolbar-new-count", pageRects: pageRects(2) });
+    assert.equal(pageCount.textContent, "/ 2"); assert.equal(pageInput.max, "2", "document replacement updates the page count and maximum");
+    reader.dispose();
+  }
+  {
+    const env = environment(), recordView = env.options.onViewChange, drawnViews = [];
+    let hostFrame = 0;
+    env.options.onViewChange = view => {
+      recordView(view);
+      if (!hostFrame) hostFrame = env.window.requestAnimationFrame(() => {
+        hostFrame = 0; drawnViews.push(env.views.at(-1));
+      });
+    };
+    const reader = createReaderViewport(env.options), scroller = env.document.querySelector(".reader-scroll");
+    reader.setDocument({ identity: "native-scroll-scheduling", pageRects: pageRects(4) }); reader.setLayout("reader");
+    env.flushFrames();
+    const callbacksBeforeScroll = env.views.length, drawsBeforeScroll = drawnViews.length;
+    for (let event = 0; event < 3; event++) {
+      scroller.scrollTop += 10; scroller.emit("scroll");
+      assert.equal(env.views.length, callbacksBeforeScroll + event + 1, "native scroll updates the host camera before an animation frame");
+    }
+    assert.equal(env.frames.size, 1, "the host coalesces native scroll updates without an extra Reader animation frame");
+    env.flushFrames();
+    assert.equal(drawnViews.length, drawsBeforeScroll + 1, "the first host frame draws the latest native scroll position");
+    assert.deepEqual(drawnViews.at(-1), reader.getView());
+    assert.equal(env.frames.size, 0, "native scrolling does not leave a second delayed frame");
+
+    reader.setView({ ...reader.getView(), centerY: reader.getView().centerY - 100 });
+    const callbacksAfterNavigation = env.views.length;
+    for (let event = 0; event < 3; event++) scroller.emit("scroll");
+    assert.equal(env.views.length, callbacksAfterNavigation, "programmatic scroll readback does not present the camera again");
+    assert.equal(env.frames.size, 1, "navigation schedules only the existing host frame");
+    env.flushFrames();
+    assert.equal(env.frames.size, 0);
+    reader.dispose();
+  }
   for (const routing of ["native", "reader"]) {
     for (const compressed of [false, true]) {
       for (const [fit, touchMovement] of [["Fit", null], ["XYZ", null], ["Fit", 0], ["XYZ", 1]]) {
@@ -854,7 +937,7 @@ try {
       assert.deepEqual([...scene.rasterLayers[0].data], [255,0,0,255], "thumbnail replay preserves canonical document pixels");
     } finally { reader.dispose(); }
   }
-  console.log("Reader viewport: bounded scroll/camera mapping, animated internal links, extreme zoom and rounded offsets, toolbar visibility, zoom anchors, sidebar/layout restore, gestures, canvas replacement, lazy thumbnails, cancellation, local failures and GPU-to-2D copies passed.");
+  console.log("Reader viewport: bounded scroll/camera mapping, immediate native scroll scheduling, unchanged toolbar writes, animated internal links, extreme zoom and rounded offsets, toolbar visibility, zoom anchors, sidebar/layout restore, gestures, canvas replacement, lazy thumbnails, cancellation, local failures and GPU-to-2D copies passed.");
 } finally {
   globalThis.ResizeObserver = previousObserver; delete globalThis.__readerViewportGpu; hooks.deregister();
 }

@@ -25,7 +25,12 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   instead of rebuilding it.
 - Reduce Three Reader frame preparation by sharing viewport calculations across
   flat pages, skipping offscreen page projections, and reusing unchanged page
-  matrices and frame results. Preserve the general path for 3D page layouts.
+  matrices and frame results. Check overlaps along the more separated screen
+  axis to avoid comparing every pair in long page columns. Preserve the general
+  path for 3D page layouts, and include page preparation timings in captures.
+- Reuse glyph raster atlases across Reader thumbnails and shared page scenes,
+  avoiding repeated glyph rasterization while scrolling. Skip unchanged toolbar
+  updates and schedule native scroll rendering without an extra animation frame.
 
 ## [0.1.60] - 2026-10-11
 
