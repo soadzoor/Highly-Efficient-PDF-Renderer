@@ -88,6 +88,7 @@ fn heprFillVertexPack(
   metaB: vec4<f32>,
   metaC: vec4<f32>,
   shapeOnly: f32,
+  fillAAScreenPx: f32,
   viewport: vec2<f32>,
   zoom: f32,
   useLocalToClip: f32,
@@ -104,8 +105,14 @@ fn heprFillVertexPack(
   let corner01 = corner * 0.5 + vec2<f32>(0.5);
   // Pixels whose footprint reaches the path need fragments even when the path
   // is thinner than a pixel and falls between pixel centres.
-  let rawMargin = heprCoverageMargin(heprPathToPixel(minBounds + (maxBounds - minBounds) * corner01,
+  var rawMargin = heprCoverageMargin(heprPathToPixel(minBounds + (maxBounds - minBounds) * corner01,
     useLocalToClip, localToClip, zoom, max(viewport, vec2<f32>(1.0))));
+  // Only proven closed contours are bounded by their decoded hull. Keep the
+  // existing projected padding, including per-page and perspective transforms.
+  if (metaC.x >= 0.0 && useLocalToClip < 0.5) {
+    rawMargin = max(rawMargin * (0.5 * fillAAScreenPx), vec2<f32>(0.00005)) +
+      vec2<f32>(0.00001 / max(zoom, 0.0001));
+  }
   let margin = heprBoundCoverageMargin(minBounds + (maxBounds - minBounds) * corner01, rawMargin,
     mat2x2<f32>(1.0, 0.0, 0.0, 1.0), useLocalToClip, localToClip, max(viewport, vec2<f32>(1.0)));
   let world = minBounds - margin + (maxBounds - minBounds + 2.0 * margin) * corner01;
@@ -172,7 +179,10 @@ fn heprFillFragment(
   let box = vec4<f32>(local - 0.5 * footprint, 1.0 / footprint);
   var winding = 0.0;
   let safeWidth = max(i32(segmentTexWidth), 1);
-  if (cells.y > 0.0) {
+  if (metaC.x >= 0.0 && all(box.xy <= metaA.zw) && all(box.xy + footprint >= metaB.xy)) {
+    // Integrate the whole decoded contour without loading any segment records.
+    winding = metaC.y * box.z * box.w;
+  } else if (cells.y > 0.0) {
     winding = heprCellWinding(cells, metaA.zw, box, footprint, segmentTexA, segmentTexB);
   } else {
 ${vectorFillBandLoopWgsl({
@@ -197,7 +207,8 @@ ${vectorFillBandLoopWgsl({
 
   // A companion stroke no longer hides a hard fill edge: thin filled shapes
   // need their own coverage, and wide strokes still cover the edge.
-  let alpha = heprFillCoverage(winding, metaC.x >= 0.5) * alphaStyle;
+  let fillRule = select(metaC.x, -metaC.x - 1.0, metaC.x < 0.0);
+  let alpha = heprFillCoverage(winding, fillRule >= 0.5) * alphaStyle;
   if (alpha <= 0.001) {
     discard;
   }
@@ -260,6 +271,7 @@ export function createThreeWebGpuFillMaterial(
     metaB,
     metaC,
     shapeOnly: shapeOnlyUniform,
+    fillAAScreenPx: fillAAScreenPxUniform,
     viewport: viewportUniform,
     zoom: zoomUniform,
     useLocalToClip: useLocalToClipUniform,

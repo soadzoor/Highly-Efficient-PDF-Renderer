@@ -12,7 +12,7 @@ export const MIXED_VECTOR_VARYING_VECTORS = 10;
 const privateVaryings = new Set([
   "vP0", "vP1", "vP2", "vPrimitiveType", "vIsHairline", "vHalfWidth", "vAAWorld",
   "vClipBounds", "vHasClipBounds", "vSegmentStart", "vSegmentCount", "vFillBands",
-  "vFillCells", "vFillOrigin", "vFillRule", "vFillHasCompanionStroke"
+  "vFillCells", "vFillOrigin", "vFillBoundsMax", "vFillSignedArea", "vFillRule", "vFillHasCompanionStroke"
 ]);
 
 /** Keep the existing geometry/coverage functions as the single source of truth. */
@@ -52,6 +52,7 @@ const vertexFill = branchSource(FILL_VERTEX_SHADER_SOURCE, "heprMixedFillVertex"
  */
 export const MIXED_VECTOR_VERTEX_SHADER_SOURCE = mergeSources(vertexStroke, vertexFill) + `
 layout(location = 5) in float aVectorKind;
+uniform vec2 uMixedVectorEnabled;
 flat out float vVectorKind;
 flat out vec4 vMixedA;
 flat out vec4 vMixedB;
@@ -61,6 +62,14 @@ flat out ivec2 vMixedSegments;
 
 void main() {
   vVectorKind = aVectorKind;
+  if ((aVectorKind < 0.5 ? uMixedVectorEnabled.x : uMixedVectorEnabled.y) < 0.5) {
+    gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
+    vLocal = vec2(0.0); vColor = vec3(0.0); vAlpha = 0.0;
+    vVectorClipIndex = -1.0;
+    vMixedA = vec4(0.0); vMixedB = vec4(0.0);
+    vMixedC = vec4(0.0); vMixedD = vec4(0.0); vMixedSegments = ivec2(0);
+    return;
+  }
   if (aVectorKind < 0.5) {
     heprMixedStrokeVertex();
     vMixedA = vec4(vP0, vP1);
@@ -72,8 +81,8 @@ void main() {
     heprMixedFillVertex();
     vMixedA = vFillBands;
     vMixedB = vFillCells;
-    vMixedC = vec4(vFillOrigin, vFillRule, 0.0);
-    vMixedD = vec4(0.0);
+    vMixedC = vec4(vFillOrigin, vFillRule, vFillSignedArea);
+    vMixedD = vec4(vFillBoundsMax, 0.0, 0.0);
     vMixedSegments = ivec2(vSegmentStart, vSegmentCount);
   }
 }
@@ -120,6 +129,8 @@ void main() {
     vFillCells = vMixedB;
     vFillOrigin = vMixedC.xy;
     vFillRule = vMixedC.z;
+    vFillSignedArea = vMixedC.w;
+    vFillBoundsMax = vMixedD.xy;
     vSegmentStart = vMixedSegments.x;
     vSegmentCount = vMixedSegments.y;
     heprMixedFillFragment();

@@ -565,6 +565,56 @@ Unsupported contexts or shader failures use separate draws and emit a
 diagnostic. WebGPU queue submission batching is separate from this optimization:
 combining command buffers alone still retains every draw inside them.
 
+To isolate GPU fill and stroke work, both viewers also expose
+`heprPerf.vectors("all" | "fills" | "strokes" | "none")`. Changing this mode
+stops the current capture before changing visibility. It leaves the camera,
+LOD settings, page backgrounds, text and raster images in place. Each new
+capture records `context.fillRendering` and `context.strokeRendering`.
+
+```js
+heprPerf.mixedVectors(true);
+heprPerf.vectors("all");
+// Warm up, then capture a small pan at a fixed zoom.
+heprPerf.start({ maxFrames: 1200, maxFrameRecords: 240 });
+// Repeat the same movement for each mode.
+heprPerf.stop();
+copy(heprPerf.json());
+
+heprPerf.vectors("fills"); // Repeat warm-up and capture; save a separate report.
+heprPerf.vectors("strokes"); // Repeat warm-up and capture.
+heprPerf.vectors("none"); // Optional background/text/raster reference.
+heprPerf.vectors("all"); // Restore the drawing when finished.
+```
+
+Use the same starting view, viewport, DPR, layers and movement for all runs.
+Keep mixed batching enabled: compatible paints retain their shared draw while
+the vertex shader rejects the disabled kind, avoiding a return to thousands
+of separate submissions. Check mixed-batch counters after warm-up; unsupported
+or composited paints can still use separate draws. For Three WebGL, pass
+`webglCalls: false` to `start` when comparing GPU load without GL-call wrappers.
+Compare sampled GPU milliseconds and CPU submission time. GPU timings for the
+isolated modes are not additive, and utilization alone does not measure time
+per frame. Library hosts can use the PDF object's `setFillRenderingEnabled`,
+`getFillRenderingEnabled`, `setStrokeRenderingEnabled` and
+`getStrokeRenderingEnabled` methods directly.
+
+Ordinary fill uploads use conservative bounds from the decoded line endpoints
+and quadratic control hulls, shared by culling, paint ordering and spatial
+indexes. Open paths retain the union of the original and decoded bounds.
+Closed paths entirely inside a pixel's filter footprint use their precomputed
+signed area with the existing fill rule;
+partial coverage and open paths keep the segment calculation. Flat views use
+a tighter fill quad margin matched to the filter width. General projected
+views retain their conservative margins.
+
+Segment coverage also integrates a quadratic directly when its control hull
+fits inside the footprint. After clipping a curve to the pixel's rows, its
+remaining piece can use the same exact integral if its control hull stays
+inside the pixel columns. Curves crossing a column boundary retain the
+existing subdivision calculation. The shared GLSL/WGSL helper applies this
+shortcut to ordinary fills, gradients and glyph outlines across both native
+and Three.js backends.
+
 `transitionSections` measures work between frames, including `pageSwap.decode`,
 `pageSwap.rasterPreparation`, `pageSwap.total`, `rasterRefinement.prepare` and
 `rasterUpload.submit`. `rasterUpload.cacheHit` identifies texture reuse, and

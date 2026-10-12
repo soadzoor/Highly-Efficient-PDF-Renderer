@@ -19,10 +19,16 @@ class NativeRenderer {
   view = { cameraCenterX: 0, cameraCenterY: 0, zoom: 1 };
   stats = null;
   mixedVectorBatching = true;
+  fillRendering = true;
+  strokeRendering = true;
   setExternalFrameDriver(value) { calls.push(["external", value]); }
   setStrokeCurveEnabled(value) { calls.push(["curve", value]); }
   setMixedVectorBatchingEnabled(value) { this.mixedVectorBatching = Boolean(value); calls.push(["mixed", value]); }
   getMixedVectorBatchingEnabled() { return this.mixedVectorBatching; }
+  setFillRenderingEnabled(value) { this.fillRendering = Boolean(value); calls.push(["fills", value]); }
+  getFillRenderingEnabled() { return this.fillRendering; }
+  setStrokeRenderingEnabled(value) { this.strokeRendering = Boolean(value); calls.push(["strokes", value]); }
+  getStrokeRenderingEnabled() { return this.strokeRendering; }
   setVectorColorOverride(...rgba) { calls.push(["color", ...rgba]); }
   setInteractionViewportProvider(value) { calls.push(["viewport", value]); }
   setFrameListener(value) { calls.push(["listener", value]); }
@@ -59,6 +65,12 @@ try {
   renderer.setMixedVectorBatchingEnabled(true);
   renderer.setMixedVectorBatchingEnabled(false);
   assert.equal(renderer.getMixedVectorBatchingEnabled(), false);
+  assert.equal(renderer.getFillRenderingEnabled(), true);
+  assert.equal(renderer.getStrokeRenderingEnabled(), true);
+  renderer.setFillRenderingEnabled(false);
+  renderer.setStrokeRenderingEnabled(false);
+  assert.equal(renderer.getFillRenderingEnabled(), false);
+  assert.equal(renderer.getStrokeRenderingEnabled(), false);
   renderer.setVectorColorOverride(-1, 0.3, 2, 0.5);
   renderer.fitToBounds({ minX: 0, minY: 0, maxX: 400, maxY: 300 }, 0);
   renderer.setViewState(initialView, { scheduleFrame: false });
@@ -82,6 +94,10 @@ try {
   assert.deepEqual(calls.filter(([name]) => name === "curve"), [["curve", false]], "only current config is replayed");
   assert.deepEqual(calls.filter(([name]) => name === "mixed"), [["mixed", false]], "the comparison switch stays dormant until fallback and replays its current value");
   assert.equal(renderer.getMixedVectorBatchingEnabled(), false);
+  assert.equal(renderer.getFillRenderingEnabled(), false);
+  assert.equal(renderer.getStrokeRenderingEnabled(), false);
+  assert.deepEqual(calls.filter(([name]) => name === "fills"), [["fills", false]]);
+  assert.deepEqual(calls.filter(([name]) => name === "strokes"), [["strokes", false]]);
   assert.deepEqual(calls.slice(-2), [["scene", scene], ["render", 123]]);
   renderer.setMixedVectorBatchingEnabled(true);
   assert.equal(renderer.getMixedVectorBatchingEnabled(), true, "initialized queries use the actual backend setting");
@@ -106,6 +122,11 @@ try {
   page.setStrokeCurveEnabled(false); page.setViewState(initialView);
   page.setMixedVectorBatchingEnabled(false);
   assert.equal(page.getMixedVectorBatchingEnabled(), false);
+  assert.equal(page.getFillRenderingEnabled(), true);
+  assert.equal(page.getStrokeRenderingEnabled(), true);
+  page.setFillRenderingEnabled(false);
+  assert.equal(page.getFillRenderingEnabled(), false);
+  assert.equal(page.getStrokeRenderingEnabled(), true);
   page.setFrameListener(null); page.resize();
   assert.equal(creations, 1, "independent page capability probes keep the shared fallback dormant");
   assert.deepEqual(page.getViewState(), initialView);

@@ -12,7 +12,7 @@ import { MIXED_VECTOR_VERTEX_SHADER_SOURCE, MIXED_VECTOR_FRAGMENT_SHADER_SOURCE,
 import type { ThreeShaderCompileHost } from "./threeShaderPreparation";
 import { compileThreeMixedVectorRoots } from "./threeMixedVectorPreparation";
 import { getThreeRenderPerformance } from "./threeRenderPerformance";
-import type { ThreeWebGpuStrokeMaterialState } from "./threeWebGpuStrokeMaterial";
+import type { ThreeWebGpuMixedVectorMaterialState } from "./threeWebGpuMixedVectorMaterial";
 
 interface MixedLayerOptions {
   fill: ThreeMaterialFillLayer;
@@ -52,7 +52,7 @@ export class ThreeMixedVectorLayer {
   readonly group = new THREE.Group();
   private readonly options: MixedLayerOptions;
   private material: THREE.Material | null = null;
-  private state: ThreeWebGpuStrokeMaterialState | null = null;
+  private state: ThreeWebGpuMixedVectorMaterialState | null = null;
   private entries: MixedEntry[] = [];
   private snapshot: SourceDraw[] = [];
   private suppressed: DrawMesh[] = [];
@@ -63,6 +63,9 @@ export class ThreeMixedVectorLayer {
   private readonly preparationAbort = new AbortController();
   private renderedStrokes = 0;
   private active = false;
+  private fillRenderingEnabled = true;
+  private strokeRenderingEnabled = true;
+  private readonly vectorEnabled = new THREE.Vector2(1, 1);
 
   constructor(options: MixedLayerOptions) {
     this.options = options;
@@ -78,7 +81,18 @@ export class ThreeMixedVectorLayer {
     this.active = false;
   }
 
-  getRenderedStrokeCount(): number | null { return this.active ? this.renderedStrokes : null; }
+  getRenderedStrokeCount(): number | null { return this.active ? (this.strokeRenderingEnabled ? this.renderedStrokes : 0) : null; }
+
+  /** Reject disabled paint kinds in the vertex stage without rebuilding batches. */
+  setRenderingEnabled(fills: boolean, strokes: boolean): void {
+    this.fillRenderingEnabled = fills;
+    this.strokeRenderingEnabled = strokes;
+    this.vectorEnabled.set(strokes ? 1 : 0, fills ? 1 : 0);
+    if (this.state) {
+      this.state.fillRenderingUniform.value = fills ? 1 : 0;
+      this.state.strokeRenderingUniform.value = strokes ? 1 : 0;
+    }
+  }
 
   update(roots: readonly THREE.Object3D[], host: MixedHost, camera: THREE.Camera): void {
     this.restore();
@@ -118,7 +132,8 @@ export class ThreeMixedVectorLayer {
         source.mesh.visible = false;
         this.suppressed.push(source.mesh);
       }
-      this.group.visible = this.active = true;
+      this.active = true;
+      this.group.visible = this.fillRenderingEnabled || this.strokeRenderingEnabled;
       const profile = getThreeRenderPerformance();
       profile?.add("three.mixedVectorBatches", this.entries.length);
       profile?.add("three.mixedVectorInstances", this.entries.reduce((count, entry) => count + entry.count, 0));
@@ -168,7 +183,8 @@ export class ThreeMixedVectorLayer {
         vertexShader: normalizeThreeRawShaderSource(pdfShapeCoverageGlsl(MIXED_VECTOR_VERTEX_SHADER_SOURCE))
           .replace("uniform int uFillClipBoundsEnabled;", "const int uFillClipBoundsEnabled = 0;"),
         fragmentShader: normalizeThreeStrokeRawFragmentShaderSource(pdfShapeCoverageGlsl(MIXED_VECTOR_FRAGMENT_SHADER_SOURCE)),
-        uniforms: { ...fillMaterial.uniforms, ...strokeMaterial.uniforms },
+        uniforms: { ...fillMaterial.uniforms, ...strokeMaterial.uniforms,
+          uMixedVectorEnabled: { value: this.vectorEnabled } },
         defines: { HEPR_SPLIT_STROKE_STORE: "" }, depthTest: strokeMaterial.depthTest,
         depthWrite: false, side: THREE.DoubleSide, toneMapped: false });
       bindRawPageTransform(material, pageBinding);
@@ -179,6 +195,7 @@ export class ThreeMixedVectorLayer {
     initializeThreeVectorClip(material, stroke.clipTexture);
     const clipped = createThreeInstanceVectorClipMaterial(material);
     if (clipped !== material) { material.dispose(); this.material = clipped; }
+    this.setRenderingEnabled(this.fillRenderingEnabled, this.strokeRenderingEnabled);
   }
 
   private createEntry(sources: SourceDraw[]): void {

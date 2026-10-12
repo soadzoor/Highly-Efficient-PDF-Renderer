@@ -13,9 +13,10 @@
  * contribution is the integral of clamp(u, 0, 1) dv over the rows it spans:
  * rows it passes to the right of count fully, rows it misses not at all.
  * Line edges are exact. A quadratic is split where it turns vertically and
- * clipped exactly to the box rows. Within them it is flattened to 1/64 of the
- * box, and each piece inside the box columns adds its parabolic segment, so
- * only pieces crossing a box side are approximate. `low` and `high` restrict
+ * clipped exactly to the box rows. A curve inside the box columns integrates
+ * its chord and parabolic segment directly. Others are flattened to 1/64 of
+ * the box, with each interior piece adding its parabolic segment, so only
+ * pieces crossing a box side are approximate. `low` and `high` restrict
  * the rows: a band-indexed path integrates each band over its own rows only,
  * and never counts a segment listed in two bands twice.
  *
@@ -65,6 +66,15 @@ vec2 heprQuadraticPoint(vec2 a, vec2 b, vec2 c, float t) {
   );
 }
 
+// The exact integral of x dy when no pixel column clips this quadratic.
+// A direct chord mean avoids dividing differences of nearly equal ramps.
+float heprQuadraticIntegral(vec2 a, vec2 b, vec2 c) {
+  float dx = c.x - a.x;
+  float dy = c.y - a.y;
+  return (a.x + 0.5 * dx) * dy +
+    ((b.x - a.x) * dy - (b.y - a.y) * dx) / 3.0;
+}
+
 float heprQuadraticRoot(float qa, float qb, float qc, float t0, float t1) {
   float root = t0;
   if (qa == 0.0) {
@@ -98,10 +108,25 @@ float heprQuadraticPieceCoverage(vec2 a, vec2 b, vec2 c, float t0, float t1, flo
   float ts = vStart == startPoint.y ? t0 : heprQuadraticRoot(qa, qb, a.y - vStart, t0, t1);
   float te = vEnd == endPoint.y ? t1 : heprQuadraticRoot(qa, qb, a.y - vEnd, t0, t1);
   float span = te - ts;
-  float deviation = 0.25 * max(abs(a.x - 2.0 * b.x + c.x), abs(qa)) * span * span;
-  int pieces = int(clamp(ceil(8.0 * sqrt(deviation)), 1.0, 8.0));
   vec2 previous = heprQuadraticPoint(a, b, c, ts);
   previous.y = vStart;
+  vec2 clippedEnd = heprQuadraticPoint(a, b, c, te);
+  clippedEnd.y = vEnd;
+  float startWeight = 1.0 - ts;
+  float endWeight = 1.0 - te;
+  float clippedBlend = startWeight * te + ts * endWeight;
+  vec2 clippedControl = vec2(
+    startWeight * endWeight * a.x + clippedBlend * b.x + ts * te * c.x,
+    startWeight * endWeight * a.y + clippedBlend * b.y + ts * te * c.y
+  );
+  // Row clipping already isolates a monotonic subcurve. Its control hull
+  // proves that the column clamp is inactive, even if the source hull crosses it.
+  if (min(min(previous.x, clippedEnd.x), clippedControl.x) >= 0.0 &&
+      max(max(previous.x, clippedEnd.x), clippedControl.x) <= 1.0) {
+    return heprQuadraticIntegral(previous, clippedControl, clippedEnd);
+  }
+  float deviation = 0.25 * max(abs(a.x - 2.0 * b.x + c.x), abs(qa)) * span * span;
+  int pieces = int(clamp(ceil(8.0 * sqrt(deviation)), 1.0, 8.0));
   float tPrevious = ts;
   float coverage = 0.0;
   for (int piece = 1; piece <= 8; piece += 1) {
@@ -133,6 +158,11 @@ float heprQuadraticPieceCoverage(vec2 a, vec2 b, vec2 c, float t0, float t1, flo
 float heprQuadraticCoverage(vec2 a, vec2 b, vec2 c, float low, float high) {
   if (max(max(a.y, b.y), c.y) <= low || min(min(a.y, b.y), c.y) >= high || max(max(a.x, b.x), c.x) <= 0.0) {
     return 0.0;
+  }
+  // A contained control hull needs neither row roots nor vertical splitting.
+  if (min(min(a.x, b.x), c.x) >= 0.0 && max(max(a.x, b.x), c.x) <= 1.0 &&
+      min(min(a.y, b.y), c.y) >= low && max(max(a.y, b.y), c.y) <= high) {
+    return heprQuadraticIntegral(a, b, c);
   }
   float qa = a.y - 2.0 * b.y + c.y;
   float turn = qa == 0.0 ? 0.0 : clamp((a.y - b.y) / qa, 0.0, 1.0);
@@ -222,6 +252,15 @@ fn heprQuadraticPoint(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, t: f32) -> vec2<
   );
 }
 
+// The exact integral of x dy when no pixel column clips this quadratic.
+// A direct chord mean avoids dividing differences of nearly equal ramps.
+fn heprQuadraticIntegral(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>) -> f32 {
+  let dx = c.x - a.x;
+  let dy = c.y - a.y;
+  return (a.x + 0.5 * dx) * dy +
+    ((b.x - a.x) * dy - (b.y - a.y) * dx) / 3.0;
+}
+
 fn heprQuadraticRoot(qa: f32, qb: f32, qc: f32, t0: f32, t1: f32) -> f32 {
   var root = t0;
   if (qa == 0.0) {
@@ -264,10 +303,25 @@ fn heprQuadraticPieceCoverage(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, t0: f32,
     te = heprQuadraticRoot(qa, qb, a.y - vEnd, t0, t1);
   }
   let span = te - ts;
-  let deviation = 0.25 * max(abs(a.x - 2.0 * b.x + c.x), abs(qa)) * span * span;
-  let pieces = i32(clamp(ceil(8.0 * sqrt(deviation)), 1.0, 8.0));
   var previous = heprQuadraticPoint(a, b, c, ts);
   previous.y = vStart;
+  var clippedEnd = heprQuadraticPoint(a, b, c, te);
+  clippedEnd.y = vEnd;
+  let startWeight = 1.0 - ts;
+  let endWeight = 1.0 - te;
+  let clippedBlend = startWeight * te + ts * endWeight;
+  let clippedControl = vec2<f32>(
+    startWeight * endWeight * a.x + clippedBlend * b.x + ts * te * c.x,
+    startWeight * endWeight * a.y + clippedBlend * b.y + ts * te * c.y
+  );
+  // Row clipping already isolates a monotonic subcurve. Its control hull
+  // proves that the column clamp is inactive, even if the source hull crosses it.
+  if (min(min(previous.x, clippedEnd.x), clippedControl.x) >= 0.0 &&
+      max(max(previous.x, clippedEnd.x), clippedControl.x) <= 1.0) {
+    return heprQuadraticIntegral(previous, clippedControl, clippedEnd);
+  }
+  let deviation = 0.25 * max(abs(a.x - 2.0 * b.x + c.x), abs(qa)) * span * span;
+  let pieces = i32(clamp(ceil(8.0 * sqrt(deviation)), 1.0, 8.0));
   var tPrevious = ts;
   var coverage = 0.0;
   for (var piece = 1; piece <= 8; piece = piece + 1) {
@@ -299,6 +353,11 @@ fn heprQuadraticPieceCoverage(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, t0: f32,
 fn heprQuadraticCoverage(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, low: f32, high: f32) -> f32 {
   if (max(max(a.y, b.y), c.y) <= low || min(min(a.y, b.y), c.y) >= high || max(max(a.x, b.x), c.x) <= 0.0) {
     return 0.0;
+  }
+  // A contained control hull needs neither row roots nor vertical splitting.
+  if (min(min(a.x, b.x), c.x) >= 0.0 && max(max(a.x, b.x), c.x) <= 1.0 &&
+      min(min(a.y, b.y), c.y) >= low && max(max(a.y, b.y), c.y) <= high) {
+    return heprQuadraticIntegral(a, b, c);
   }
   let qa = a.y - 2.0 * b.y + c.y;
   var turn = 0.0;

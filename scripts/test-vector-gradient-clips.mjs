@@ -240,6 +240,8 @@ try {
       assert.deepEqual([...materials[1].uniforms.uClipBounds.value], [-1e38, -1e38, 1e38, 1e38],
         "the unclipped fill stays unbounded");
       for (const material of materials.slice(0, 2)) {
+        assert.match(material.vertexShader, /vFillRule = metaC.x >= 0.5 \? -2.0 : -1.0;/,
+          "canonical gradient metadata never opts into the solid-fill signed-area shortcut");
         assert.match(material.vertexShader, /vec4 quad = heprClippedPaintQuad\(minBounds, maxBounds, uClipBounds,/);
         assert.match(material.vertexShader, /if \(any\(greaterThan\(quad\.xy, quad\.zw\)\)\)/,
           "a paint and clip too far apart to share a pixel draw nothing");

@@ -64,13 +64,18 @@ try {
     assert.doesNotMatch(text, /i < 2048/, "valid long outlines have no fixed shader ceiling");
     assert.match(text, /i < inData.segmentCount/, "native text traverses the complete glyph");
     frame();
-    assert.deepEqual(device.cameraData.slice(16), [-1, 0, -1, 0, 0, 0, 0, 0], "unindexed fill bindings are disabled");
+    assert.deepEqual(device.cameraData.slice(16, 22), [-1, 0, -1, 0, 0, 0], "unindexed fill bindings are disabled");
+    assert.deepEqual(device.cameraData.slice(22), [1, 1], "mixed vectors enable both kinds by default");
     Object.assign(renderer, { fillBandBase: 41, fillBandEntries: 87, gradientFillBandBase: 91, gradientFillBandEntries: 125,
       fillCellBase: 140, gradientFillCellBase: 170 });
     frame();
     // Cell headers are uploaded plus one, so zero disables them.
-    assert.deepEqual(device.cameraData.slice(16), [41, 87, 91, 125, 141, 171, 0, 0],
+    assert.deepEqual(device.cameraData.slice(16, 22), [41, 87, 91, 125, 141, 171],
       "both fill stores upload distinct band and cell addresses");
+    renderer.setFillRenderingEnabled(false); frame();
+    assert.deepEqual(device.cameraData.slice(22), [1, 0], "stroke-only comparisons reject fills in the mixed vertex stage");
+    renderer.setFillRenderingEnabled(true); renderer.setStrokeRenderingEnabled(false); frame();
+    assert.deepEqual(device.cameraData.slice(22), [0, 1], "fill-only comparisons reject strokes in the mixed vertex stage");
   }
 
   {

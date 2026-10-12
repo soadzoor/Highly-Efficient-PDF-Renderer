@@ -256,6 +256,36 @@ try {
   }
   assert.equal(cellIndexedLayers, 2, "the long circle is cell-indexed in both Three GL layers");
 
+  // Quantized decoded edges can extend beyond the archive's metadata bounds.
+  // The cell index's origin must move together with the renderer's fill origin.
+  {
+    const { vectorFillCoverageMetadata } = await import("../src/vectorFillCoverage.ts");
+    const { vectorFillBandIndex } = await import("../src/vectorFillBands.ts");
+    const webGpu = await import("../src/threeWebGpuBackend.ts");
+    const solid = sceneWith([dashedCircle(12)]);
+    solid.fillPathMetaC = Float32Array.of(0, 0, .25, 1);
+    solid.fillPathMetaA[2] += .125; solid.fillPathMetaA[3] += .125;
+    solid.fillPathMetaB[0] -= .125; solid.fillPathMetaB[1] -= .125;
+    const originalA = solid.fillPathMetaA.slice(), originalB = solid.fillPathMetaB.slice();
+    const coverage = vectorFillCoverageMetadata(solid);
+    const indexed = vectorIndexedPathStore({ ...vectorSceneFillStore(solid), ...coverage }, vectorFillBandIndex(solid));
+    assert(indexed.cellBase >= 0, "fixture exercises a nonempty cell index");
+    for (const materialBackend of ["webgl", "webgpu"]) {
+      const fill = new ThreeMaterialFillLayer(solid, { materialBackend, webGpu, vectorOverride: [0, 0, 0, 0] });
+      const resources = fill.getMixedVectorResources().options;
+      assert.deepEqual(resources.fillPathMetaTextureA.image.data.subarray(0, 4), coverage.pathMetaA);
+      assert.deepEqual(resources.fillPathMetaTextureB.image.data.subarray(0, 4), coverage.pathMetaB);
+      assert.deepEqual(resources.fillPathMetaTextureC.image.data.subarray(0, 4), coverage.pathMetaC);
+      assert.deepEqual(resources.fillSegmentTextureA.image.data.subarray(0, indexed.dataA.length), indexed.dataA,
+        "ordinary and borrowed mixed stores index cells relative to the corrected origin");
+      assert.deepEqual(resources.fillSegmentTextureB.image.data.subarray(0, indexed.dataB.length), indexed.dataB);
+      assert.equal(fill.fillMinX[0], coverage.pathMetaA[2]);
+      assert.equal(fill.fillMaxX[0], coverage.pathMetaB[0], "CPU culling uses the same conservative decoded hull");
+      fill.dispose();
+    }
+    assert.deepEqual(solid.fillPathMetaA, originalA); assert.deepEqual(solid.fillPathMetaB, originalB);
+  }
+
   // The count pass must use the same Float32 band height as the write passes.
   // With double precision, these first eight edges were counted in one band
   // but written into two, leaving the final band's eight entries out of range.

@@ -110,6 +110,10 @@ export class SharedPageRenderer {
       getVectorColorOverride: () => config.get("setVectorColorOverride") ?? [0,0,0,0],
       getMixedVectorBatchingEnabled: () => config.has("setMixedVectorBatchingEnabled")
         ? Boolean(config.get("setMixedVectorBatchingEnabled")![0]) : true,
+      getFillRenderingEnabled: () => config.has("setFillRenderingEnabled")
+        ? Boolean(config.get("setFillRenderingEnabled")![0]) : true,
+      getStrokeRenderingEnabled: () => config.has("setStrokeRenderingEnabled")
+        ? Boolean(config.get("setStrokeRenderingEnabled")![0]) : true,
       setPrimitiveColorUpdates: (updates: readonly PrimitiveColorUpdate[]) => {
         for (const update of updates) colors.set(`${update.ref.kind}:${update.ref.index}`, update); dirty = true;
       },

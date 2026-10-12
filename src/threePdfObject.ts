@@ -316,7 +316,7 @@ interface RendererConfig {
 export interface HeprThreePdfObjectEventMap extends THREE.Object3DEventMap {
   /** Request another frame for asynchronous content, overlays or visible loading animation. */
   change: { reason: "primitive-highlights-ready" | "pages-loaded" | "raster-ready" | "page-loading-animation" |
-    "mixed-vector-batching" | "mixed-vector-ready" };
+    "mixed-vector-batching" | "mixed-vector-ready" | "fill-rendering" | "stroke-rendering" };
 }
 
 /**
@@ -540,6 +540,8 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
         object.setVectorLodMode(config.vectorLodMode); object.setTextLodMode(config.textLodMode);
         object.setStrokeCurveEnabled(config.strokeCurveEnabled);
         object.setMixedVectorBatchingEnabled(this.mixedVectorBatchingEnabled);
+        object.setFillRenderingEnabled(this.fillRenderingEnabled);
+        object.setStrokeRenderingEnabled(this.strokeRenderingEnabled);
         object.setPageBackgroundColor(...config.pageBackground);
         object.setVectorColorOverride(...config.vectorOverride);
         object.applyLayerVisibility(snapshot);
@@ -713,6 +715,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
       const object = page.object, other = object.rendererConfig, b = other.pageBackground, o = other.vectorOverride;
       this.pageBatchIncompatible[index] = other.vectorLodMode !== config.vectorLodMode || other.textLodMode !== config.textLodMode ||
         other.strokeCurveEnabled !== config.strokeCurveEnabled || other.textVectorOnly !== config.textVectorOnly ||
+        object.fillRenderingEnabled !== this.fillRenderingEnabled || object.strokeRenderingEnabled !== this.strokeRenderingEnabled ||
         b[0] !== background[0] || b[1] !== background[1] || b[2] !== background[2] || b[3] !== background[3] ||
         o[0] !== override[0] || o[1] !== override[1] || o[2] !== override[2] || o[3] !== override[3] ||
         PAGE_PRIMITIVE_KINDS.some(kind => object.primitiveAppearance.hasOverrides(kind)) ? 1 : 0;
@@ -761,6 +764,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
       const other = object.rendererConfig, b = other.pageBackground, o = other.vectorOverride;
       if (other.vectorLodMode !== config.vectorLodMode || other.textLodMode !== config.textLodMode ||
           other.strokeCurveEnabled !== config.strokeCurveEnabled || other.textVectorOnly !== config.textVectorOnly ||
+          object.fillRenderingEnabled !== this.fillRenderingEnabled || object.strokeRenderingEnabled !== this.strokeRenderingEnabled ||
           b[0] !== background[0] || b[1] !== background[1] || b[2] !== background[2] || b[3] !== background[3] ||
           o[0] !== override[0] || o[1] !== override[1] || o[2] !== override[2] || o[3] !== override[3] ||
           object.primitiveAppearance.hasAnyOverrides()) return false;
@@ -901,6 +905,9 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   private fillMaterialLayer!: ThreeMaterialFillLayer;
   private mixedVectorLayer: ThreeMixedVectorLayer | null = null;
   private mixedVectorBatchingEnabled = true;
+  private fillRenderingEnabled = true;
+  private strokeRenderingEnabled = true;
+  private vectorVisibilitySuppressed: THREE.Object3D[] = [];
   private strokeMaterialLayer!: ThreeMaterialStrokeLayer | null;
   private triangleStrokeLayer!: ThreeTriangleStrokeLayer | null;
   private vectorLodStrokeLayer!: ThreeVectorLodStrokeLayer | null;
@@ -958,6 +965,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   private lastViewportHeight = 0;
   private textureAnisotropy = 1;
   private materialPipelineActive = false;
+  private nativeTexturePipelineActive = false;
   private paintCompositor: ThreePaintCompositor | null = null;
   private frameListener: ((stats: DrawStats) => void) | null = null;
   private lastNativeDrawStats: DrawStats | null = null;
@@ -1494,6 +1502,8 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
 
   /** Release one generation of content without changing the Group, page handles or controls. */
   private disposeSceneContent(): void {
+    this.restoreVectorRenderingVisibility();
+    this.nativeTexturePipelineActive = false;
     this.disposeMixedVectorLayer();
     this.pageMesh.onBeforeRender = () => {};
     this.renderer.setFrameListener(null);
@@ -1652,6 +1662,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   }
 
   private applyLayerVisibility(snapshot: OptionalContentSnapshot): void {
+    this.restoreVectorRenderingVisibility();
     this.mixedVectorLayer?.restore();
     snapshot = { ...snapshot, rasterPages: this.rasterPages };
     for (const page of this.pageViews ?? []) page.object.applyLayerVisibility(snapshot);
@@ -1674,6 +1685,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     if (this.annotationSelected.length || this.annotationHovered !== null) this.updateAnnotationHighlights(this.annotationSelected, this.annotationHovered);
     this.setSearchHighlights(null);
     this.setTextSelectionHighlights(null);
+    this.applyVectorRenderingVisibility();
   }
 
   private pageHits(camera: THREE.Camera, x: number, y: number, element: HTMLElement) {
@@ -2411,6 +2423,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
    * not expose a separate stroke count.
    */
   getRenderedStrokeSegmentCount(): number | null {
+    if (!this.strokeRenderingEnabled) return 0;
     if (this.pageBatchActive) return this.pageBatch!.getRenderedStrokeSegmentCount();
     if (this.pageViews && !this.pageDocumentMode) return this.pageViews.reduce((sum, page) => sum +
       (page.object.visible ? page.object.getRenderedStrokeSegmentCount() ?? 0 : 0), 0);
@@ -2746,6 +2759,63 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   }
 
   getMixedVectorBatchingEnabled(): boolean { return this.mixedVectorBatchingEnabled; }
+
+  /** Enable ordinary and gradient fills independently of text and images. */
+  setFillRenderingEnabled(enabled: boolean): void {
+    if (this.isDisposed) return;
+    this.restoreVectorRenderingVisibility();
+    this.mixedVectorLayer?.restore();
+    this.fillRenderingEnabled = Boolean(enabled);
+    for (const page of this.pageViews ?? []) page.object.setFillRenderingEnabled(enabled);
+    this.pageBatch?.setFillRenderingEnabled(enabled);
+    if (this.nativeTexturePipelineActive) this.renderer.setFillRenderingEnabled?.(this.fillRenderingEnabled);
+    this.updateVectorRenderingVisibility("fill-rendering");
+  }
+
+  getFillRenderingEnabled(): boolean { return this.fillRenderingEnabled; }
+
+  /** Enable ordinary and gradient strokes independently of text and images. */
+  setStrokeRenderingEnabled(enabled: boolean): void {
+    if (this.isDisposed) return;
+    this.restoreVectorRenderingVisibility();
+    this.mixedVectorLayer?.restore();
+    this.strokeRenderingEnabled = Boolean(enabled);
+    for (const page of this.pageViews ?? []) page.object.setStrokeRenderingEnabled(enabled);
+    this.pageBatch?.setStrokeRenderingEnabled(enabled);
+    if (this.nativeTexturePipelineActive) this.renderer.setStrokeRenderingEnabled?.(this.strokeRenderingEnabled);
+    this.updateVectorRenderingVisibility("stroke-rendering");
+  }
+
+  getStrokeRenderingEnabled(): boolean { return this.strokeRenderingEnabled; }
+
+  private updateVectorRenderingVisibility(reason: "fill-rendering" | "stroke-rendering"): void {
+    this.mixedVectorLayer?.setRenderingEnabled(this.fillRenderingEnabled, this.strokeRenderingEnabled);
+    this.applyVectorRenderingVisibility();
+    this.lastSyncedFrameSerial = -1;
+    this.markPageAppearanceChanged();
+    this.dispatchEvent({ type: "change", reason });
+  }
+
+  private restoreVectorRenderingVisibility(): void {
+    for (const object of this.vectorVisibilitySuppressed) object.visible = true;
+    this.vectorVisibilitySuppressed.length = 0;
+  }
+
+  private applyVectorRenderingVisibility(): void {
+    if (!this.materialPipelineActive || this.deferredMaterials) return;
+    const hide = (object: THREE.Object3D | undefined): void => {
+      if (object?.visible) { object.visible = false; this.vectorVisibilitySuppressed.push(object); }
+    };
+    if (!this.fillRenderingEnabled) hide(this.fillMaterialLayer.mesh);
+    if (!this.strokeRenderingEnabled) {
+      hide(this.strokeMaterialLayer?.mesh); hide(this.triangleStrokeLayer?.mesh);
+      hide(this.vectorLodStrokeLayer?.group); hide(this.compactedStrokeLayer?.group);
+    }
+    for (const paint of this.gradientMaterialLayer.getOrderedPaintMeshes()) {
+      if (paint.primitiveKind === "gradient-fill" && !this.fillRenderingEnabled ||
+          paint.primitiveKind === "gradient-stroke" && !this.strokeRenderingEnabled) hide(paint.mesh);
+    }
+  }
 
   /**
    * Set the page background color.
@@ -3107,6 +3177,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   }
 
   private syncFrame(renderer: ThreeHostRenderer, camera: THREE.Camera, shaderPreparationOnly = false): void {
+    this.restoreVectorRenderingVisibility();
     this.mixedVectorLayer?.restore();
     if (renderer.isWebGPURenderer) installThreeWebGpuSubmissionBatch(renderer);
     this.lastHostRenderer = renderer;
@@ -3416,6 +3487,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     }
     profile?.beginSection("three.mixedVectors");
     this.updateMixedVectorLayer(renderer, camera, cameraDrivenMaterialPipelineEnabled && !this.paintVisibility.requiresCompositing);
+    this.applyVectorRenderingVisibility();
     profile?.endSection("three.mixedVectors");
     if (usePaintCompositor) {
       if (!this.paintCompositor) {
@@ -3423,10 +3495,16 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
         this.add(this.paintCompositor.mesh);
       }
       if (this.pageOwner) this.paintCompositor.setPageDepth(this.clipFromDataMatrix);
-      const roots: THREE.Object3D[] = [this.rasterMaterialLayer.group, this.gradientMaterialLayer.group,
-        this.fillMaterialLayer.mesh, this.textMaterialLayer.mesh];
-      if (this.strokeMaterialLayer) roots.push(this.strokeMaterialLayer.mesh);
-      if (this.vectorLodStrokeLayer) roots.push(this.vectorLodStrokeLayer.group);
+      // Compositor proxies deliberately ignore source visibility. Omit disabled
+      // vector sources explicitly, while keeping unrelated raster/text paints.
+      const roots: THREE.Object3D[] = [this.rasterMaterialLayer.group, this.textMaterialLayer.mesh];
+      if (this.fillRenderingEnabled && this.strokeRenderingEnabled) roots.push(this.gradientMaterialLayer.group);
+      else for (const paint of this.gradientMaterialLayer.getOrderedPaintMeshes()) {
+        if (paint.primitiveKind === "gradient-fill" ? this.fillRenderingEnabled : this.strokeRenderingEnabled) roots.push(paint.mesh);
+      }
+      if (this.fillRenderingEnabled) roots.push(this.fillMaterialLayer.mesh);
+      if (this.strokeRenderingEnabled && this.strokeMaterialLayer) roots.push(this.strokeMaterialLayer.mesh);
+      if (this.strokeRenderingEnabled && this.vectorLodStrokeLayer) roots.push(this.vectorLodStrokeLayer.group);
       if (!shaderPreparationOnly) {
         this.paintCompositor.render(renderer as unknown as ThreePaintHostRenderer, this.sceneData, roots,
           materialLayerViewport.width, materialLayerViewport.height,
@@ -3630,8 +3708,10 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   }
 
   private configureDormantPipeline(): void {
+    this.restoreVectorRenderingVisibility();
     this.mixedVectorLayer?.restore();
     this.materialPipelineActive = false;
+    this.nativeTexturePipelineActive = false;
     if (this.deferredMaterials) return;
     this.rasterMaterialLayer.setVisible(false);
     this.rasterMaterialLayer.setTextureResidency(false);
@@ -3664,9 +3744,11 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   }
 
   private configureNativeTexturePipeline(): void {
+    this.restoreVectorRenderingVisibility();
     this.mixedVectorLayer?.restore();
     const wasMaterialPipelineActive = this.materialPipelineActive;
     this.materialPipelineActive = false;
+    this.nativeTexturePipelineActive = true;
 
     this.rasterMaterialLayer.setVisible(false);
     this.rasterMaterialLayer.setTextureResidency(false);
@@ -3681,8 +3763,8 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     this.detachThreeMaterialObjects();
     this.renderer.setRasterTextureResidency?.(true);
     this.renderer.setRasterRenderingEnabled?.(true);
-    this.renderer.setFillRenderingEnabled?.(true);
-    this.renderer.setStrokeRenderingEnabled?.(true);
+    this.renderer.setFillRenderingEnabled?.(this.fillRenderingEnabled);
+    this.renderer.setStrokeRenderingEnabled?.(this.strokeRenderingEnabled);
     this.renderer.setTextRenderingEnabled?.(true);
 
     if (!this.renderTexture) {
@@ -3714,6 +3796,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
 
     const wasMaterialPipelineActive = this.materialPipelineActive;
     this.materialPipelineActive = true;
+    this.nativeTexturePipelineActive = false;
     // The compositor submits these layers through proxies sharing their GPU
     // geometry and materials. Keep its sources out of the host scene so only
     // the composite is presented, with no redundant matrix traversal. Their
@@ -3882,6 +3965,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
         onPrepared: () => { if (!this.isDisposed) this.dispatchEvent({ type: "change", reason: "mixed-vector-ready" }); } });
       this.add(this.mixedVectorLayer.group);
     }
+    this.mixedVectorLayer.setRenderingEnabled(this.fillRenderingEnabled, this.strokeRenderingEnabled);
     this.mixedVectorLayer.update(this.listThreeMaterialObjects(), renderer, camera);
   }
 

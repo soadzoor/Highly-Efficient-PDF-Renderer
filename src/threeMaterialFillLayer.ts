@@ -5,6 +5,7 @@ import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTrans
 import type { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
 import { vectorFillBandIndex, vectorSceneFillStore } from "./vectorFillBands";
 import { vectorIndexedPathStore } from "./vectorCellIndex";
+import { vectorFillCoverageMetadata } from "./vectorFillCoverage";
 import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
@@ -87,26 +88,27 @@ export class ThreeMaterialFillLayer {
     const fillSegmentCount = Math.max(0, scene.fillSegmentCount | 0);
     this.fillPathCount = fillPathCount;
     const pathTextureSize = chooseTextureSize(fillPathCount);
+    const coverage = vectorFillCoverageMetadata(scene);
     // The band and cell indexes follow the segments in the same store, so the
     // texture is sized for all three. A store too large for one goes without.
-    const store = vectorIndexedPathStore({ ...vectorSceneFillStore(scene), pathCount: fillPathCount,
+    const store = vectorIndexedPathStore({ ...vectorSceneFillStore(scene), ...coverage, pathCount: fillPathCount,
       segmentCount: fillSegmentCount }, vectorFillBandIndex(scene));
     const segmentTextureSize = chooseTextureSize(store.texels);
 
     this.fillPathMetaTextureA = createFloatTexture(
-      scene.fillPathMetaA,
+      coverage.pathMetaA,
       fillPathCount,
       pathTextureSize.width,
       pathTextureSize.height
     );
     this.fillPathMetaTextureB = createFloatTexture(
-      scene.fillPathMetaB,
+      coverage.pathMetaB,
       fillPathCount,
       pathTextureSize.width,
       pathTextureSize.height
     );
     this.fillPathMetaTextureC = createFloatTexture(
-      scene.fillPathMetaC,
+      coverage.pathMetaC,
       fillPathCount,
       pathTextureSize.width,
       pathTextureSize.height
@@ -130,7 +132,8 @@ export class ThreeMaterialFillLayer {
       this.visibleFillPathIds[i] = i;
       this.allFillPathIds[i] = i;
     }
-    const fillBounds = buildFillPathBounds(scene, fillPathCount);
+    const fillBounds = buildFillPathBounds({ ...scene, fillPathMetaA: coverage.pathMetaA,
+      fillPathMetaB: coverage.pathMetaB }, fillPathCount);
     this.fillMinX = fillBounds.minX;
     this.fillMinY = fillBounds.minY;
     this.fillMaxX = fillBounds.maxX;

@@ -14,6 +14,7 @@ import {
   HIGHLIGHT_FRAGMENT_SHADER_SOURCE
 } from "./nativeWebGlCoreShaders";
 import { vectorIndexedPathStore } from "./vectorCellIndex";
+import { vectorFillCoverageMetadata } from "./vectorFillCoverage";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
 import { buildRasterStripBatches } from "./rasterStripBatches";
 import { planRasterTiles, rasterTilePixels, reportRasterTileDownscale, sameRasterTilePlan, type RasterTilePlan } from "./rasterTiles";
@@ -684,6 +685,7 @@ export class WebGlFloorplanRenderer {
   private mixedVectorBatchingEnabled = true;
   private mixedVectorBatchingUnavailable = false;
   private mixedVectorBatches: MixedVectorBatches | null = null;
+  private fillCoverageMetadata: ReturnType<typeof vectorFillCoverageMetadata> | null = null;
   private mixedVectorGpu: { program: WebGLProgram; uniforms: Record<string, WebGLUniformLocation>;
     buffer: WebGLBuffer; vao: WebGLVertexArrayObject; revision: number } | null = null;
   private lastMixedVectorDrawFirst = 0;
@@ -1516,6 +1518,9 @@ export class WebGlFloorplanRenderer {
 
   getMixedVectorBatchingEnabled(): boolean { return this.mixedVectorBatchingEnabled; }
 
+  getFillRenderingEnabled(): boolean { return this.fillRenderingEnabled; }
+  getStrokeRenderingEnabled(): boolean { return this.strokeRenderingEnabled; }
+
   setFillRenderingEnabled(enabled: boolean): void {
     const nextEnabled = Boolean(enabled);
     if (this.fillRenderingEnabled === nextEnabled) {
@@ -1589,6 +1594,11 @@ export class WebGlFloorplanRenderer {
     if (!this.scene) throw new Error("Cannot apply primitive colors before uploading a scene.");
     this.primitiveColors ??= new NativePrimitiveColors(this.scene);
     const patches = this.primitiveColors.update(updates);
+    const coverage = this.fillCoverageMetadata;
+    if (coverage) for (const patch of patches) {
+      const metadata = patch.kind === "fillB" ? coverage.pathMetaB : patch.kind === "fillC" ? coverage.pathMetaC : null;
+      if (metadata) { patch.pixels[0] = metadata[patch.index * 4]; patch.pixels[1] = metadata[patch.index * 4 + 1]; }
+    }
     const widths = { stroke: this.segmentTextureWidth, fillB: this.fillPathMetaTextureWidth,
       fillC: this.fillPathMetaTextureWidth, text: this.textInstanceTextureWidth };
     const rows = coalescePrimitiveColorTexels(patches, widths);
@@ -1841,6 +1851,7 @@ export class WebGlFloorplanRenderer {
     if (this.isDisposed) {
       throw new Error("Cannot upload a scene after the WebGL renderer has been disposed.");
     }
+    this.fillCoverageMetadata = null;
     if (this.scene !== scene) {
       if (options.preserveRasterResolution) {
         this.rasterResolutionPlanner?.invalidate();
@@ -2151,6 +2162,7 @@ export class WebGlFloorplanRenderer {
 
   dispose(): void {
     this.paintCompositor?.dispose(); this.paintCompositor = null;
+    this.fillCoverageMetadata = null;
     this.paintShapeUniforms.clear();
     if (this.isDisposed) {
       return;
@@ -3798,7 +3810,7 @@ export class WebGlFloorplanRenderer {
     // retain their individual programs and surface/fold state.
     let mixed: MixedVectorBatches | null = null;
     if (plan && !paintVisibility.requiresCompositing && this.mixedVectorBatchingEnabled &&
-        this.fillRenderingEnabled && this.strokeRenderingEnabled && !this.mixedVectorBatchingUnavailable) {
+        (this.fillRenderingEnabled || this.strokeRenderingEnabled) && !this.mixedVectorBatchingUnavailable) {
       profile?.beginSection("batchPreparation");
       mixed = this.prepareMixedVectorBatches(plan);
       profile?.endSection("batchPreparation");
@@ -3988,11 +4000,11 @@ export class WebGlFloorplanRenderer {
         flushRaster();
         this.vectorClipIndex = -2;
         this.drawMixedVectorBatch(run, width, height, x, y, zoom);
-        strokes += run.strokeCount;
+        if (this.strokeRenderingEnabled) strokes += run.strokeCount;
         profile?.add("drawBatches");
         profile?.add("mixedVectorBatches");
-        profile?.add("fillInstances", run.fillCount);
-        profile?.add("strokeInstances", run.strokeCount);
+        profile?.add("fillInstances", this.fillRenderingEnabled ? run.fillCount : 0);
+        profile?.add("strokeInstances", this.strokeRenderingEnabled ? run.strokeCount : 0);
         continue;
       }
       if (!run.blendMode) { draw(run); continue; }
@@ -4037,7 +4049,7 @@ export class WebGlFloorplanRenderer {
             "uSegmentTexSize", "uFillPathMetaTexA", "uFillPathMetaTexB", "uFillPathMetaTexC", "uFillSegmentTexA", "uFillSegmentTexB",
             "uFillPathMetaTexSize", "uFillSegmentTexSize", "uFillBandBase", "uFillCellHeaders", "uFillBandEntries",
             "uFillClipBoundsEnabled", "uFillClipBoundsTex", "uViewport", "uCameraCenter", "uZoom", "uAAScreenPx", "uFillAAScreenPx",
-            "uUseLocalToClip", "uLocalToClip", "uLocalUnitsPerPixel", "uStrokeCurveEnabled", "uVectorOverride"]);
+            "uUseLocalToClip", "uLocalToClip", "uLocalUnitsPerPixel", "uStrokeCurveEnabled", "uVectorOverride", "uMixedVectorEnabled"]);
           buffer = this.mustCreateBuffer(); vao = this.createVertexArray();
           gl.bindVertexArray(vao);
           gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuffer);
@@ -4116,6 +4128,7 @@ export class WebGlFloorplanRenderer {
       gl.uniform1i(u.uFillClipBoundsTex, this.fillClipBoundsUnit);
       gl.uniform2f(u.uViewport, width, height); gl.uniform2f(u.uCameraCenter, x, y);
       gl.uniform1f(u.uZoom, zoom); gl.uniform1f(u.uAAScreenPx, 1); gl.uniform1f(u.uFillAAScreenPx, 1);
+      gl.uniform2f(u.uMixedVectorEnabled, this.strokeRenderingEnabled ? 1 : 0, this.fillRenderingEnabled ? 1 : 0);
       gl.uniform1f(u.uUseLocalToClip, this.localToClipRenderingEnabled ? 1 : 0);
       if (this.localToClipRenderingEnabled) gl.uniformMatrix4fv(u.uLocalToClip, false, this.localToClipMatrix);
       gl.uniform1f(u.uLocalUnitsPerPixel, this.localUnitsPerPixel);
@@ -4126,7 +4139,7 @@ export class WebGlFloorplanRenderer {
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, run.count);
     this.frameDrawCalls++;
     const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
-    if (profile?.geometryDiagnostics) this.profileFillQuadAreas(profile, width, height, x, y, zoom,
+    if (this.fillRenderingEnabled && profile?.geometryDiagnostics) this.profileFillQuadAreas(profile, width, height, x, y, zoom,
       run.first, run.count, this.mixedVectorBatches!.floatInstances);
   }
 
@@ -4211,7 +4224,9 @@ export class WebGlFloorplanRenderer {
     const instances = mixedInstances ?? (indirect ? this.orderedBatches?.uintInstances : null);
     if (indirect && !instances) return;
     const bounds = this.vectorClipBounds;
-    const margin = 1 / zoom;
+    const metadata = this.fillCoverageMetadata;
+    const metaA = metadata?.pathMetaA ?? scene.fillPathMetaA;
+    const metaB = metadata?.pathMetaB ?? scene.fillPathMetaB;
     const pixels = (minX: number, minY: number, maxX: number, maxY: number): number =>
       Math.max(0, Math.min(width, Math.ceil((maxX - cameraX) * zoom + width / 2)) -
         Math.max(0, Math.floor((minX - cameraX) * zoom + width / 2))) *
@@ -4225,8 +4240,10 @@ export class WebGlFloorplanRenderer {
       const offset = id * 4;
       if (offset + 3 >= scene.fillPathMetaA.length || !(scene.fillPathMetaA[offset + 1] > 0) ||
         (!this.paintShapeOnly && !(scene.fillPathMetaC[offset + 3] > 0.001))) continue;
-      const minX = scene.fillPathMetaA[offset + 2], minY = scene.fillPathMetaA[offset + 3];
-      const maxX = scene.fillPathMetaB[offset], maxY = scene.fillPathMetaB[offset + 1];
+      const margin = metadata && metadata.pathMetaC[offset] >= 0
+        ? Math.max(0.5 / zoom, 5e-5) + 1e-5 / zoom : 1 / zoom;
+      const minX = metaA[offset + 2], minY = metaA[offset + 3];
+      const maxX = metaB[offset], maxY = metaB[offset + 1];
       let lowX = minX - margin, lowY = minY - margin;
       let highX = maxX + margin, highY = maxY + margin;
       originalPixels += pixels(lowX, lowY, highX, highY);
@@ -5538,9 +5555,12 @@ export class WebGlFloorplanRenderer {
     const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
 
     const pathDims = chooseTextureDimensions(scene.fillPathCount, maxTextureSize);
+    const coverage = vectorFillCoverageMetadata(scene);
+    this.fillCoverageMetadata = scene.fillPathCount > 0 ? coverage : null;
     // The band and cell indexes follow the segments in the same store, so the
     // texture is sized for all three. A store too large for one goes without.
-    const indexed = vectorIndexedPathStore(vectorSceneFillStore(scene), vectorFillBandIndex(scene), maxTextureSize);
+    const indexed = vectorIndexedPathStore({ ...vectorSceneFillStore(scene), pathMetaA: coverage.pathMetaA,
+      pathMetaB: coverage.pathMetaB }, vectorFillBandIndex(scene), maxTextureSize);
     const segmentDims = chooseTextureDimensions(indexed.texels, maxTextureSize);
     this.fillBandBase = indexed.bandBase;
     this.fillBandEntries = indexed.bandEntries;
@@ -5555,13 +5575,13 @@ export class WebGlFloorplanRenderer {
     const segmentTexelCount = segmentDims.width * segmentDims.height;
 
     const pathMetaAData = new Float32Array(pathTexelCount * 4);
-    pathMetaAData.set(scene.fillPathMetaA);
+    pathMetaAData.set(coverage.pathMetaA);
 
     const pathMetaBData = new Float32Array(pathTexelCount * 4);
-    pathMetaBData.set(scene.fillPathMetaB);
+    pathMetaBData.set(coverage.pathMetaB);
 
     const pathMetaCData = new Float32Array(pathTexelCount * 4);
-    pathMetaCData.set(scene.fillPathMetaC);
+    pathMetaCData.set(coverage.pathMetaC);
 
     const segmentDataA = new Float32Array(segmentTexelCount * 4);
     segmentDataA.set(indexed.dataA);

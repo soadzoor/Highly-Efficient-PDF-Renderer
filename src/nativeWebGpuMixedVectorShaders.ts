@@ -77,6 +77,11 @@ struct MixedVectorData {
 fn vsMain(@builtin(vertex_index) vertexIndex: u32, @builtin(instance_index) instanceIndex: u32) -> MixedVectorData {
   var out: MixedVectorData;
   out.kind = uMixedInstances[instanceIndex * 3u + 2u];
+  if ((out.kind == 0u && uCamera.fillCells.z < 0.5) ||
+      (out.kind != 0u && uCamera.fillCells.w < 0.5)) {
+    out.position = vec4f(-2.0, -2.0, 0.0, 1.0);
+    return out;
+  }
   if (out.kind == 0u) {
     let value = MixedStrokeDataVertex(vertexIndex, instanceIndex);
     out.position = value.position; out.local = value.local;
@@ -90,7 +95,8 @@ fn vsMain(@builtin(vertex_index) vertexIndex: u32, @builtin(instance_index) inst
     out.position = value.position; out.local = value.local;
     out.color = value.color; out.alpha = value.alpha; out.vectorClipIndex = value.vectorClipIndex;
     out.data0 = value.bands; out.data1 = value.cells;
-    out.data2 = vec4f(value.origin, value.fillRule, value.fillHasCompanionStroke);
+    out.data2 = vec4f(value.origin, value.fillRule, value.signedArea);
+    out.data3 = vec4f(value.boundsMax, 0.0, 0.0);
     out.indices = vec2i(value.segmentStart, value.segmentCount);
   }
   return out;
@@ -114,7 +120,8 @@ ${footprintMatch[1]}
   value.local = inData.local; value.color = inData.color; value.alpha = inData.alpha;
   value.vectorClipIndex = inData.vectorClipIndex;
   value.bands = inData.data0; value.cells = inData.data1; value.origin = inData.data2.xy;
-  value.fillRule = inData.data2.z; value.fillHasCompanionStroke = inData.data2.w;
+  value.fillRule = inData.data2.z; value.signedArea = inData.data2.w;
+  value.boundsMax = inData.data3.xy;
   value.segmentStart = inData.indices.x; value.segmentCount = inData.indices.y;
   return MixedFillDataFragment(value, footprint);
 }

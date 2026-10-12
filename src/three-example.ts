@@ -60,6 +60,7 @@ import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 import { formatTextLodStats } from "./textLodStatsFormat";
 import { createDrawCallMeter, createThreeDrawCallCounter } from "./drawCallMetrics";
 import { RenderPerformanceProfiler, type RenderPerformanceOptions } from "./renderPerformance";
+import { setVectorRenderComparison, type VectorRenderComparisonMode } from "./vectorRenderComparison";
 import { ThreeWebGpuFrameTimer } from "./threeWebGpuFrameTimer";
 import { describeThreePerformanceCamera, describeThreePerformanceScene, instrumentThreeWebGlCalls, withThreeRenderPerformance } from "./threeRenderPerformance";
 import {
@@ -1570,8 +1571,19 @@ let captureProfiler: RenderPerformanceProfiler | null = null;
 let captureGlCalls: ReturnType<typeof instrumentThreeWebGlCalls> | null = null;
 let captureContext: Record<string, unknown> | null = null;
 const performanceCapture = {
+  vectors(mode: VectorRenderComparisonMode) {
+    if (!currentPdfObject) throw new Error("Load a PDF or HEP before changing fill/stroke rendering.");
+    const result = setVectorRenderComparison(currentPdfObject, mode, () => {
+      captureProfiler?.stop();
+      captureGlCalls?.dispose(); captureGlCalls = null;
+    });
+    requestRender();
+    return result;
+  },
   mixedVectors(enabled: boolean): void {
     if (!currentPdfObject) throw new Error("Load a PDF or HEP before changing mixed vector batching.");
+    captureProfiler?.stop();
+    captureGlCalls?.dispose(); captureGlCalls = null;
     currentPdfObject.setMixedVectorBatchingEnabled(enabled);
     requestRender();
   },
@@ -1595,6 +1607,8 @@ const performanceCapture = {
       scene: currentPdfObject ? describeThreePerformanceScene(currentPdfObject.sceneData) : null,
       backend: `three-${activeThreeRendererBackend}`,
       mixedVectorBatching: currentPdfObject?.getMixedVectorBatchingEnabled() ?? null,
+      fillRendering: currentPdfObject?.getFillRenderingEnabled() ?? null,
+      strokeRendering: currentPdfObject?.getStrokeRenderingEnabled() ?? null,
       canvasPixels: [canvasElement.width, canvasElement.height], dpr: window.devicePixelRatio,
       vectorLod: vectorLodSelectElement.value, textLod: textLodSelectElement.value,
       drawingSelection: drawingSelection.isEnabled(),
@@ -1621,6 +1635,8 @@ const performanceCapture = {
       captureContext.sourceSegments = currentPdfObject?.sceneData.segmentCount ?? 0;
       captureContext.sourcePaints = currentPdfObject?.sceneData.drawRuns?.length ?? 0;
       captureContext.mixedVectorBatching = currentPdfObject?.getMixedVectorBatchingEnabled() ?? null;
+      captureContext.fillRendering = currentPdfObject?.getFillRenderingEnabled() ?? null;
+      captureContext.strokeRendering = currentPdfObject?.getStrokeRenderingEnabled() ?? null;
     }
     return { context: captureContext, ...captureProfiler.getReport() };
   },

@@ -68,15 +68,20 @@ try {
       halfWidth: 14, aaWorld: 15, primitiveType: -3, hasClipBounds: 1, clipBounds: vec(16, 17, 18, 19) };
     const fill = { position: vec(20, 21, 22, 23), local: vec(24, 25), color: vec(.6, .7, .8), alpha: .9,
       vectorClipIndex: 26, bands: vec(27, 28, 29, 30), cells: vec(31, 32, 33, 34), origin: vec(35, 36),
-      fillRule: 1, fillHasCompanionStroke: 1, segmentStart: 16777217, segmentCount: 16777219 };
+      fillRule: 1, signedArea: -.25, boundsMax: vec(37, 38), segmentStart: 16777217, segmentCount: 16777219 };
     for (const [kind, original] of [[0, stroke], [1, fill]]) {
-      const packed = executeWrapper(shader, "vsMain", { uMixedInstances: [0, 0, kind],
+      const packed = executeWrapper(shader, "vsMain", { uMixedInstances: [0, 0, kind], uCamera: { fillCells: vec(0, 0, 1, 1) },
         MixedStrokeDataVertex: () => stroke, MixedFillDataVertex: () => fill }, [0, 0]);
       const restored = executeWrapper(shader, "fsMain", {
         MixedStrokeDataFragment: value => value, MixedFillDataFragment: value => value }, [packed]);
       for (const [name, expected] of Object.entries(original)) {
         if (name !== "position") assert.deepEqual(restored[name], expected, `${name} survives the shared ${kind ? "fill" : "stroke"} payload`);
       }
+      const disabled = executeWrapper(shader, "vsMain", { uMixedInstances: [0, 0, kind],
+        uCamera: { fillCells: kind ? vec(0, 0, 1, 0) : vec(0, 0, 0, 1) },
+        MixedStrokeDataVertex: () => assert.fail("disabled vectors must not fetch stroke geometry"),
+        MixedFillDataVertex: () => assert.fail("disabled vectors must not fetch fill geometry") }, [0, 0]);
+      assert.deepEqual(disabled.position, vec(-2, -2, 0, 1), "disabled vectors leave the viewport before texture reads");
     }
     for (const pattern of [/heprStrokeLodAlpha\(alpha, inData.primitiveType\)/,
       /heprStrokeQuadWorldPosition\(/, /heprCellWinding\(inData.cells/, /heprSegmentCoverage\(primitiveA.xy/,
@@ -114,7 +119,11 @@ try {
     submit(renderer);
     assert.notEqual(renderer.mixedVectorClipBindGroup, oldClipGroup, "scene texture replacement refreshes binding views");
     renderer.fillRenderingEnabled = false;
-    assert.equal(submit(renderer).draws.length, 3, "disabling fills falls back to independent enabled-kind draws");
+    assert.equal(submit(renderer).draws.length, 3, "one-kind comparisons retain their single mixed ranges");
+    assert.equal(renderer.getFillRenderingEnabled(), false);
+    assert.equal(renderer.getStrokeRenderingEnabled(), true);
+    assert.match(shader, /out.kind == 0u && uCamera.fillCells.z < 0.5/);
+    assert.match(shader, /out.kind != 0u && uCamera.fillCells.w < 0.5/);
     renderer.fillRenderingEnabled = true;
     renderer.destroyMixedVectorInstances();
     assert(buffer.destroyed, "scene replacement releases the old instance buffer");

@@ -724,28 +724,24 @@ function withAntialiasedGradientClip(source: string): string {
  * otherwise shade the whole page. Three always projects through its
  * local-to-clip matrix, so the clamp uses a margin all four corners agree on.
  */
-const GRADIENT_FILL_VERTEX_SHADER_SOURCE = replaceShaderSource(replaceShaderSource(CORE_FILL_VERTEX_SHADER_SOURCE,
+const GRADIENT_FILL_VERTEX_SHADER_SOURCE = replaceShaderSource(replaceShaderSource(replaceShaderSource(CORE_FILL_VERTEX_SHADER_SOURCE,
   "void main() {", `uniform vec4 uClipBounds;\n${CLIPPED_PAINT_QUAD_GLSL}\nvoid main() {`),
-  `  vec2 margin = heprCoverageMargin(heprPathToPixel(mix(minBounds, maxBounds, corner01),
-    uUseLocalToClip, uLocalToClip, uZoom, uViewport));
-  margin = heprBoundCoverageMargin(mix(minBounds, maxBounds, corner01), margin, mat2(1.0),
-    uUseLocalToClip, uLocalToClip, uViewport);
-  vec4 quad = heprFillQuadBounds(minBounds, maxBounds, margin,
-    heprFillInstanceClipBounds(vVectorClipIndex));
-  if (quad.x > quad.z || quad.y > quad.w) {
-    heprCullFill();
-    return;
-  }
-  vec2 world = mix(quad.xy, quad.zw, corner01);`,
+  /  vec2 margin = heprCoverageMargin\([\s\S]*?  vec2 world = mix\(quad.xy, quad.zw, corner01\);/,
   `  vec4 quad = heprClippedPaintQuad(minBounds, maxBounds, uClipBounds, uUseLocalToClip, uLocalToClip, uZoom, uViewport);
   if (any(greaterThan(quad.xy, quad.zw))) {
     heprCullFill();
     return;
   }
-  vec2 world = mix(quad.xy, quad.zw, corner01);`);
+  vec2 world = mix(quad.xy, quad.zw, corner01);`),
+  // Gradient metadata keeps the canonical rule and has no signed-area field.
+  // Its shared solid coverage stage must always take the existing edge path.
+  "vFillRule = metaC.x;", "vFillRule = metaC.x >= 0.5 ? -2.0 : -1.0;");
 
 /** Replaces exactly one occurrence, so a changed base shader fails loudly instead of silently. */
-function replaceShaderSource(source: string, from: string, to: string): string {
+function replaceShaderSource(source: string, match: string | RegExp, to: string): string {
+  const matches = typeof match === "string" ? [match] : source.match(new RegExp(match.source, "g"));
+  if (!matches || matches.length !== 1) throw new Error(`Shader source has no unique ${String(match)}.`);
+  const from = matches[0];
   const at = source.indexOf(from);
   if (at < 0 || source.indexOf(from, at + 1) >= 0) throw new Error(`Shader source has no unique ${JSON.stringify(from)}.`);
   return source.slice(0, at) + to + source.slice(at + from.length);

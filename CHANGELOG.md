@@ -20,6 +20,19 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   `geometryDiagnostics: true`, so ordinary performance captures avoid scanning
   every submitted fill and image instance. Identify mixed vector draws and their
   source kinds in GPU operation reports.
+- Reduce GPU fill work across native and Three.js WebGL/WebGPU with cached
+  conservative bounds from decoded geometry and a signed-area shortcut for
+  closed paths wholly inside a pixel's filter footprint. Use those bounds for
+  culling, paint ordering and spatial indexes. Tighten flat fill padding while
+  retaining the existing projected, open-path and glyph coverage paths,
+  clipping, fill rules and canonical HEP data. Integrate individual quadratic
+  curves and row-clipped curve pieces directly when their control hulls stay
+  inside the pixel columns, reducing subdivision work in fill, gradient and
+  glyph coverage while preserving the column-crossing fallback.
+- Add `heprPerf.vectors("all" | "fills" | "strokes" | "none")` in both
+  viewers for controlled GPU comparisons. Retain mixed vector batching when
+  disabling one kind, record fill/stroke visibility in captures, and stop an
+  active capture before changing comparison modes.
 
 ## [0.1.61] - 2026-10-12
 

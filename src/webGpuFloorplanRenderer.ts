@@ -4,6 +4,7 @@ import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageSha
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { vectorFillBandIndex, buildVectorFillBandIndex, vectorSceneFillStore } from "./vectorFillBands";
 import { vectorIndexedPathStore } from "./vectorCellIndex";
+import { vectorFillCoverageMetadata } from "./vectorFillCoverage";
 import { VECTOR_CELL_COVERAGE_WGSL, VECTOR_FILL_CELL_INFO_WGSL } from "./vectorCellShaders";
 import { paintFoldFragmentWgsl } from "./nativePaintFold";
 import { WebGpuPaintFolds } from "./webGpuPaintFold";
@@ -463,10 +464,11 @@ struct VsOut {
   @location(3) @interpolate(flat) color : vec3f,
   @location(4) @interpolate(flat) alpha : f32,
   @location(5) @interpolate(flat) fillRule : f32,
-  @location(6) @interpolate(flat) fillHasCompanionStroke : f32,
+  @location(6) @interpolate(flat) signedArea : f32,
   @location(7) @interpolate(flat) bands : vec4f,
   @location(8) @interpolate(flat) cells : vec4f,
   @location(9) @interpolate(flat) origin : vec2f,
+  @location(10) @interpolate(flat) boundsMax : vec2f,
 };
 
 ${WGSL_OUTPUT_COLOR_HELPERS}
@@ -517,6 +519,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   out.bands = heprFillBandInfo(f32(pathIndex), uCamera.fillBands.x, uFillSegmentTexA);
   out.cells = heprFillCellInfo(f32(pathIndex), uCamera.fillCells.x, uFillSegmentTexA);
   out.origin = metaA.zw;
+  out.boundsMax = metaB.xy;
   out.vectorClipIndex = uVectorClip.x;
   if (uVectorClip.x < -1.5) { out.vectorClipIndex = f32(uOrderedInstances[instanceIndex].y) - 1.0; }
   if (segmentCount <= 0 || alpha <= 0.001) {
@@ -527,7 +530,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
     out.color = vec3f(0.0, 0.0, 0.0);
     out.alpha = 0.0;
     out.fillRule = 0.0;
-    out.fillHasCompanionStroke = 0.0;
+    out.signedArea = 0.0;
     return out;
   }
 
@@ -536,7 +539,11 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let corner01 = cornerFromVertexIndex(vertexIndex) * 0.5 + 0.5;
   // Pixels whose footprint reaches the path need fragments even when the path
   // is thinner than a pixel and falls between pixel centres.
-  let margin = heprCoverageMargin(mat2x2f(uCamera.zoom, 0.0, 0.0, uCamera.zoom));
+  var margin = heprCoverageMargin(mat2x2f(uCamera.zoom, 0.0, 0.0, uCamera.zoom));
+  if (metaC.x >= 0.0) {
+    margin = max(margin * (0.5 * uCamera.fillAAScreenPx), vec2f(5e-5)) +
+      vec2f(1e-5 / max(uCamera.zoom, 1e-4));
+  }
   let world = mix(minBounds - margin, maxBounds + margin, corner01);
 
   let screen = (world - uCamera.cameraCenter) * uCamera.zoom + 0.5 * uCamera.viewport;
@@ -549,7 +556,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   out.color = vec3f(metaB.z, metaB.w, metaC.z);
   out.alpha = alpha;
   out.fillRule = metaC.x;
-  out.fillHasCompanionStroke = metaC.y;
+  out.signedArea = metaC.y;
   return out;
 }
 
@@ -577,7 +584,10 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   // its rows hold every segment that can contribute, each integrating its own.
   let box = vec4f(inData.local - 0.5 * footprint, 1.0 / footprint);
   var winding = 0.0;
-  if (inData.cells.y > 0.0) {
+  if (inData.fillRule >= 0.0 && all(box.xy <= inData.origin) &&
+      all(box.xy + footprint >= inData.boundsMax)) {
+    winding = inData.signedArea * box.z * box.w;
+  } else if (inData.cells.y > 0.0) {
     winding = heprCellWinding(inData.cells, inData.origin, box, footprint, uFillSegmentTexA, uFillSegmentTexB);
   } else {
 ${vectorFillBandLoopWgsl({
@@ -602,7 +612,8 @@ ${vectorFillBandLoopWgsl({
   let color = mix(inData.color, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
   // A companion stroke no longer hides a hard fill edge: thin filled shapes
   // need their own coverage, and wide strokes still cover the edge.
-  let coverage = heprFillCoverage(winding, inData.fillRule >= 0.5);
+  let fillRule = select(inData.fillRule, -inData.fillRule - 1.0, inData.fillRule < 0.0);
+  let coverage = heprFillCoverage(winding, fillRule >= 0.5);
   let alpha = heprLinearCoverageToOutputAlpha(coverage) * inData.alpha;
   if (alpha <= 0.001) {
     discard;
@@ -1387,6 +1398,7 @@ export class WebGpuFloorplanRenderer {
   private mixedVectorClipBindGroup: any = null;
   private mixedVectorTextures: any[] = [];
   private mixedVectorBatches: MixedVectorBatches | null = null;
+  private fillCoverageMetadata: ReturnType<typeof vectorFillCoverageMetadata> | null = null;
   private mixedVectorInstanceBuffer: any = null;
   private mixedVectorInstanceCapacityBytes = 0;
   private mixedVectorUploadedRevision = -1;
@@ -2242,6 +2254,9 @@ export class WebGpuFloorplanRenderer {
 
   getMixedVectorBatchingEnabled(): boolean { return this.mixedVectorBatchingEnabled; }
 
+  getFillRenderingEnabled(): boolean { return this.fillRenderingEnabled; }
+  getStrokeRenderingEnabled(): boolean { return this.strokeRenderingEnabled; }
+
   setStrokeRenderingEnabled(enabled: boolean): void {
     const nextEnabled = Boolean(enabled);
     if (this.strokeRenderingEnabled === nextEnabled) {
@@ -2318,6 +2333,11 @@ export class WebGpuFloorplanRenderer {
     if (!this.scene) throw new Error("Cannot apply primitive colors before uploading a scene.");
     this.primitiveColors ??= new NativePrimitiveColors(this.scene);
     const patches = this.primitiveColors.update(updates);
+    const coverage = this.fillCoverageMetadata;
+    if (coverage) for (const patch of patches) {
+      const metadata = patch.kind === "fillB" ? coverage.pathMetaB : patch.kind === "fillC" ? coverage.pathMetaC : null;
+      if (metadata) { patch.pixels[0] = metadata[patch.index * 4]; patch.pixels[1] = metadata[patch.index * 4 + 1]; }
+    }
     const widths = { stroke: this.segmentTextureWidth, fillB: this.fillPathMetaTextureWidth,
       fillC: this.fillPathMetaTextureWidth, text: this.textInstanceTextureWidth };
     const rows = coalescePrimitiveColorTexels(patches, widths);
@@ -2570,6 +2590,7 @@ export class WebGpuFloorplanRenderer {
     if (this.isDisposed) {
       throw new Error("Cannot upload a scene after the WebGPU renderer has been disposed.");
     }
+    this.fillCoverageMetadata = null;
     if (this.scene !== scene) {
       this.pageRasterVisibility = undefined;
       if (options.preserveRasterResolution) {
@@ -2643,7 +2664,9 @@ export class WebGpuFloorplanRenderer {
     const fillPathDims = chooseTextureDimensions(scene.fillPathCount, maxTextureSize);
     // The band and cell indexes follow the segments in the same store, so the
     // texture is sized for all three. A store too large for one goes without.
-    const fillStore = vectorIndexedPathStore(vectorSceneFillStore(scene), vectorFillBandIndex(scene), maxTextureSize);
+    const coverage = vectorFillCoverageMetadata(scene);
+    const fillStore = vectorIndexedPathStore({ ...vectorSceneFillStore(scene), pathMetaA: coverage.pathMetaA,
+      pathMetaB: coverage.pathMetaB }, vectorFillBandIndex(scene), maxTextureSize);
     this.fillBandBase = fillStore.bandBase;
     this.fillBandEntries = fillStore.bandEntries;
     this.fillCellBase = fillStore.cellBase;
@@ -2663,6 +2686,7 @@ export class WebGpuFloorplanRenderer {
     );
 
     this.destroyDataResources();
+    this.fillCoverageMetadata = scene.fillPathCount > 0 ? coverage : null;
     const vectorLodActive = this.prepareVectorLod(scene);
     const strokeRecords = this.orderedBatches?.strokeRecords ?? sceneStrokeRecords(scene);
     const segmentDims = chooseTextureDimensions(strokeRecords.count, maxTextureSize);
@@ -2709,9 +2733,9 @@ export class WebGpuFloorplanRenderer {
 
     this.createStrokeTextures(this.segmentTextureWidth, this.segmentTextureHeight, strokeRecords);
 
-    this.fillPathMetaTextureA = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, scene.fillPathMetaA);
-    this.fillPathMetaTextureB = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, scene.fillPathMetaB);
-    this.fillPathMetaTextureC = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, scene.fillPathMetaC);
+    this.fillPathMetaTextureA = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, coverage.pathMetaA);
+    this.fillPathMetaTextureB = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, coverage.pathMetaB);
+    this.fillPathMetaTextureC = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, coverage.pathMetaC);
     this.fillSegmentTextureA = this.createFloatTexture(this.fillSegmentTextureWidth, this.fillSegmentTextureHeight, fillStore.dataA);
     this.fillSegmentTextureB = this.createFloatTexture(this.fillSegmentTextureWidth, this.fillSegmentTextureHeight, fillStore.dataB);
 
@@ -3208,6 +3232,7 @@ export class WebGpuFloorplanRenderer {
 
   dispose(): void {
     this.paintCompositor?.dispose(); this.paintCompositor = null;
+    this.fillCoverageMetadata = null;
     this.destroyMixedVectorInstances();
     this.mixedVectorPipeline = null;
     this.orderedInstanceBuffer?.destroy();
@@ -4268,7 +4293,7 @@ export class WebGpuFloorplanRenderer {
       } finally { pass = parentPass; this.vectorClipIndex = -1; }
       return strokes;
     }
-    const mixed = plan && this.mixedVectorBatchingEnabled && this.fillRenderingEnabled && this.strokeRenderingEnabled &&
+    const mixed = plan && this.mixedVectorBatchingEnabled && (this.fillRenderingEnabled || this.strokeRenderingEnabled) &&
       !this.mixedVectorBatchingUnavailable ? this.prepareMixedVectorBatches(plan) : null;
     for (const run of mixed?.batches ?? plan?.batches ?? runs) {
       if (run.kind === "mixed-vector") {
@@ -4277,7 +4302,7 @@ export class WebGpuFloorplanRenderer {
         pass.setBindGroup(1, this.mixedVectorClipBindGroup);
         pass.draw(4, run.count, 0, run.first);
         this.frameDrawCalls++;
-        strokes += run.strokeCount;
+        if (this.strokeRenderingEnabled) strokes += run.strokeCount;
         this.performanceProfiler?.add("mixedVectorBatches");
         continue;
       }
@@ -4409,6 +4434,9 @@ export class WebGpuFloorplanRenderer {
     // Cell headers are stored plus one: zero means the store has none.
     data[20] = this.fillCellBase + 1;
     data[21] = this.gradientFillCellBase + 1;
+    // Mixed vectors retain their single ordered draw during one-kind comparisons.
+    data[22] = this.strokeRenderingEnabled ? 1 : 0;
+    data[23] = this.fillRenderingEnabled ? 1 : 0;
 
     assertUniformBufferSizeMatches(data, CAMERA_UNIFORM_BUFFER_BYTES, "camera");
     this.gpuDevice.queue.writeBuffer(this.cameraUniformBuffer, 0, data);
@@ -5813,6 +5841,7 @@ export class WebGpuFloorplanRenderer {
   }
 
   private destroyDataResources(): void {
+    this.fillCoverageMetadata = null;
     this.destroyVectorLodResources();
     this.vectorLodRuntime = null;
     this.strokeBindGroupAll = null;

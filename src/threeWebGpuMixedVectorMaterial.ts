@@ -13,6 +13,11 @@ import {
 export interface ThreeWebGpuMixedVectorMaterialOptions
   extends ThreeWebGpuStrokeMaterialOptions, ThreeWebGpuFillMaterialOptions {}
 
+export interface ThreeWebGpuMixedVectorMaterialState extends ThreeWebGpuStrokeMaterialState {
+  fillRenderingUniform: { value: number };
+  strokeRenderingUniform: { value: number };
+}
+
 // Keep TSL's recursive proxy types out of the exported material contract.
 function call(fn: unknown, args: Record<string, unknown>): never {
   return (fn as (args: Record<string, unknown>) => never)(args);
@@ -62,13 +67,17 @@ fn heprMixedWorldPack(
   corner: vec2<f32>, kind: f32,
   dataA: vec4<f32>, dataB: vec4<f32>, dataC: vec4<f32>, dataD: vec4<f32>,
   viewport: vec2<f32>, zoom: f32, useLocalToClip: f32,
-  localToClip: mat4x4<f32>, localUnitsPerPixel: f32, aaScreenPx: f32, shapeOnly: f32
+  localToClip: mat4x4<f32>, localUnitsPerPixel: f32, aaScreenPx: f32, shapeOnly: f32,
+  fillEnabled: f32, strokeEnabled: f32
 ) -> vec4<f32> {
+  if (select(fillEnabled, strokeEnabled, kind < 0.5) < 0.5) {
+    return vec4<f32>(-2.0, -2.0, 0.0, 0.0);
+  }
   if (kind < 0.5) {
     return heprStrokeWorldPack(corner, dataA, dataB, dataC, dataD,
       zoom, useLocalToClip, localUnitsPerPixel, aaScreenPx, shapeOnly);
   }
-  let pack = heprFillVertexPack(corner, dataA, dataB, dataC, shapeOnly,
+  let pack = heprFillVertexPack(corner, dataA, dataB, dataC, shapeOnly, aaScreenPx,
     viewport, zoom, useLocalToClip, localToClip);
   // Both branches use W for validity; Z carries a stroke's resolved half width.
   return vec4<f32>(pack.xy, 0.0, pack.z);
@@ -114,7 +123,7 @@ fn heprMixedVectorFragment(
 /** Shared fill/stroke instances preserve the existing page, clip and paint math. */
 export function createThreeWebGpuMixedVectorMaterial(
   options: ThreeWebGpuMixedVectorMaterialOptions
-): ThreeWebGpuStrokeMaterialState {
+): ThreeWebGpuMixedVectorMaterialState {
   const material = new NodeMaterial();
   material.transparent = false;
   material.depthTest = false;
@@ -131,6 +140,8 @@ export function createThreeWebGpuMixedVectorMaterial(
   const useLocalToClipUniform = TSL.uniform(0);
   const localUnitsPerPixelUniform = TSL.uniform(1);
   const curveUniform = TSL.uniform(options.strokeCurveEnabled ? 1 : 0);
+  const fillRenderingUniform = TSL.uniform(1);
+  const strokeRenderingUniform = TSL.uniform(1);
   const page = pageProjectionNode(options.localToClip, options.pageBinding);
   const kind = TSL.attribute("aVectorKind", "float");
   const index = TSL.attribute("aVectorIndex", "float");
@@ -160,7 +171,8 @@ export function createThreeWebGpuMixedVectorMaterial(
     corner: TSL.attribute("aCorner", "vec2"), kind, dataA, dataB, dataC, dataD,
     viewport, zoom: zoomUniform, useLocalToClip: useLocalToClipUniform,
     localToClip: page.matrix, localUnitsPerPixel: page.units ?? localUnitsPerPixelUniform,
-    aaScreenPx: TSL.uniform(1), shapeOnly: shapeOnlyUniform
+    aaScreenPx: TSL.uniform(1), shapeOnly: shapeOnlyUniform,
+    fillEnabled: fillRenderingUniform, strokeEnabled: strokeRenderingUniform
   }));
   const world = worldPack as { xy: unknown; z: unknown };
   material.vertexNode = call(threeWebGpuStrokeShader.clip, {
@@ -176,5 +188,6 @@ export function createThreeWebGpuMixedVectorMaterial(
     vectorOverride: TSL.uniform(options.vectorOverride), shapeOnly: shapeOnlyUniform
   });
   registerThreeNodeClipPosition(material, world.xy);
-  return { material, zoomUniform, useLocalToClipUniform, localUnitsPerPixelUniform, curveUniform };
+  return { material, zoomUniform, useLocalToClipUniform, localUnitsPerPixelUniform, curveUniform,
+    fillRenderingUniform, strokeRenderingUniform };
 }

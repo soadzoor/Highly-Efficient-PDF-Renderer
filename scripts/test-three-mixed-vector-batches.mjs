@@ -86,6 +86,13 @@ try {
   assert.equal(mesh.material.uniforms.uSegmentStyleTex.value, entry.stroke.getMixedVectorResources().options.segmentStyleTexture);
   assert.equal(mesh.material.uniforms.uFillSegmentTexA.value, entry.fill.getMixedVectorResources().options.fillSegmentTextureA);
   assert.equal(mesh.material.uniforms.uVectorClipIndex.value, -2);
+  entry.mixed.setRenderingEnabled(false, true);
+  assert.deepEqual(mesh.material.uniforms.uMixedVectorEnabled.value.toArray(), [1, 0]);
+  entry.refresh(); entry.mixed.update(entry.roots, host, camera);
+  assert.equal(entry.mixed.group.children[0].geometry, geometry, "one-kind comparisons retain the ordered mixed upload");
+  entry.mixed.setRenderingEnabled(true, false);
+  assert.equal(entry.mixed.getRenderedStrokeCount(), 0);
+  entry.mixed.setRenderingEnabled(true, true);
   assert.match(mesh.material.vertexShader, /#ifdef HEPR_SPLIT_STROKE_STORE/);
   assert.match(mesh.material.vertexShader, /const int uFillClipBoundsEnabled = 0/);
   const probes = gl.links;
@@ -282,12 +289,31 @@ try {
   initializing.fill.dispose(); initializing.stroke.dispose();
 
   // Public object switch reaches the native fallback and survives page/material changes.
-  let nativeSetting = true, nativeView = view;
+  let nativeSetting = true, nativeView = view, nativeFills = true, nativeStrokes = true;
   const native = new Proxy({ getViewState: () => nativeView, getPresentedViewState: () => nativeView,
     setViewState: value => { nativeView = value; }, getPresentedFrameSerial: () => 0, getRasterLayerUpdates: () => new Map(),
-    setMixedVectorBatchingEnabled: value => { nativeSetting = value; }, getSceneStats: () => ({}) },
+    setMixedVectorBatchingEnabled: value => { nativeSetting = value; }, getSceneStats: () => ({}),
+    setFillRenderingEnabled: value => { nativeFills = value; },
+    setStrokeRenderingEnabled: value => { nativeStrokes = value; } },
     { get: (target, key) => target[key] ?? (() => {}) });
-  const object = await createThreePdfObject({ scene: sceneOf(), sourceKind: "hep", sourceLabel: "mixed" },
+  const visibilityScene = sceneOf();
+  Object.assign(visibilityScene, {
+    gradientCount: 1, gradientMetaA: Float32Array.of(0, 0, 0, 0), gradientMetaB: Float32Array.of(1, 0, 0, 1),
+    gradientMetaC: Float32Array.of(0, 0, 0, 0), gradientMetaD: Float32Array.of(10, 0, 0, 0),
+    gradientMetaE: new Float32Array(4), gradientLut: new Uint8Array(4096).fill(255),
+    gradientFillPathCount: 1, gradientFillSegmentCount: 4,
+    gradientFillPathMetaA: visibilityScene.fillPathMetaA.slice(0, 4),
+    gradientFillPathMetaB: visibilityScene.fillPathMetaB.slice(0, 4),
+    gradientFillPathMetaC: visibilityScene.fillPathMetaC.slice(0, 4),
+    gradientFillSegmentsA: visibilityScene.fillSegmentsA.slice(0, 16),
+    gradientFillSegmentsB: visibilityScene.fillSegmentsB.slice(0, 16), gradientFillPaintMeta: Float32Array.of(0, -1, 8, 0),
+    gradientStrokeRunCount: 1, gradientStrokeSegmentCount: 1,
+    gradientStrokeRunMetaA: Float32Array.of(0, 1, 0, -1), gradientStrokeRunMetaB: Float32Array.of(9, 0, 0, 0),
+    gradientStrokeEndpoints: Float32Array.of(2, 2, 8, 8), gradientStrokePrimitiveMeta: new Float32Array(4),
+    gradientStrokePrimitiveBounds: Float32Array.of(1, 1, 9, 9), gradientStrokeStyles: Float32Array.of(.2, 0, 0, 0)
+  });
+  visibilityScene.drawRuns.push({ kind: "gradient-fill", first: 0, count: 1 }, { kind: "gradient-stroke", first: 0, count: 1 });
+  const object = await createThreePdfObject({ scene: visibilityScene, sourceKind: "hep", sourceLabel: "mixed" },
     { rendererType: "webgl", vectorLod: "off", textLod: "off", threeColorCompositing: "display" },
     undefined, undefined, () => native);
   const world = new THREE.Scene(); world.add(object); world.updateMatrixWorld(true);
@@ -297,6 +323,38 @@ try {
     domElement: { getBoundingClientRect: () => ({ left: 0, top: 0, width: 800, height: 600 }) } };
   object.prepareFrameForThreeRenderer(objectHost, camera);
   assert(object.mixedVectorLayer?.group.visible, "public frame integration activates prepared mixed draws");
+  const gradientPaints = object.gradientMaterialLayer.getOrderedPaintMeshes();
+  assert.deepEqual(gradientPaints.map(paint => paint.mesh.visible), [true, true]);
+  const selectedGeometry = object.mixedVectorLayer.group.children[0].geometry;
+  object.setFillRenderingEnabled(false); object.prepareFrameForThreeRenderer(objectHost, camera);
+  assert.equal(object.getFillRenderingEnabled(), false); assert.equal(object.getStrokeRenderingEnabled(), true);
+  assert.equal(object.fillMaterialLayer.mesh.visible, false);
+  assert.deepEqual(gradientPaints.map(paint => paint.mesh.visible), [false, true], "fill comparisons hide gradient and pattern fills");
+  assert.equal(object.mixedVectorLayer.group.visible, true, "stroke-only comparison retains mixed draws");
+  assert.equal(object.mixedVectorLayer.group.children[0].geometry, selectedGeometry);
+  assert.deepEqual(object.mixedVectorLayer.group.children[0].material.uniforms.uMixedVectorEnabled.value.toArray(), [1, 0]);
+  assert.equal(nativeFills, false); assert.equal(nativeStrokes, false, "independent material mode keeps the native vectors suppressed");
+  object.setStrokeRenderingEnabled(false); object.prepareFrameForThreeRenderer(objectHost, camera);
+  assert.equal(object.getRenderedStrokeSegmentCount(), 0);
+  assert.equal(object.mixedVectorLayer.group.visible, false);
+  assert.deepEqual(gradientPaints.map(paint => paint.mesh.visible), [false, false]);
+  object.configureNativeTexturePipeline();
+  assert.equal(nativeFills, false); assert.equal(nativeStrokes, false, "native fallback honors persistent comparison flags");
+  object.setStrokeRenderingEnabled(true); assert.equal(nativeStrokes, true);
+  object.prepareFrameForThreeRenderer(objectHost, camera);
+  assert.deepEqual(gradientPaints.map(paint => paint.mesh.visible), [false, true]);
+  // Transparency proxies ignore Object3D.visible; verify the public comparison
+  // also filters their source roots rather than allowing disabled paints back.
+  let compositeRoots;
+  const compositorMesh = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial());
+  object.paintCompositor = { mesh: compositorMesh, render(_host, _scene, roots) { compositeRoots = roots; },
+    dispose() { compositorMesh.geometry.dispose(); compositorMesh.material.dispose(); } };
+  object.paintVisibility.requiresCompositing = true;
+  object.prepareFrameForThreeRenderer(objectHost, camera);
+  assert(!compositeRoots.includes(object.fillMaterialLayer.mesh));
+  assert(!compositeRoots.includes(object.gradientMaterialLayer.group));
+  assert(!compositeRoots.includes(gradientPaints[0].mesh)); assert(compositeRoots.includes(gradientPaints[1].mesh));
+  object.paintVisibility.requiresCompositing = false;
   object.setMixedVectorBatchingEnabled(false);
   assert.equal(object.getMixedVectorBatchingEnabled(), false); assert.equal(nativeSetting, false);
   assert.equal(object.mixedVectorLayer.group.visible, false);
@@ -305,6 +363,10 @@ try {
   assert.equal(object.getMixedVectorBatchingEnabled(), false, "stroke material rebuilds retain the user setting");
   const children = await object.getPages();
   assert(children.every(page => !page.getMixedVectorBatchingEnabled()), "new page handles inherit the setting");
+  assert(children.every(page => !page.getFillRenderingEnabled() && page.getStrokeRenderingEnabled()),
+    "new page handles inherit independent vector rendering flags");
+  object.setFillRenderingEnabled(true);
+  assert(children.every(page => page.getFillRenderingEnabled()));
   object.setMixedVectorBatchingEnabled(true);
   assert(children.every(page => page.getMixedVectorBatchingEnabled()));
   object.dispose();

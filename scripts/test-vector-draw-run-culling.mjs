@@ -77,6 +77,52 @@ try {
     "zooming back refreshes the nonempty overview list too");
   assert.deepEqual(vectorViewBounds(20, 40, 5, 6, 2), { minX: 0, minY: -4, maxX: 10, maxY: 16 });
 
+  // HEP decodes segment coordinates separately from the path metadata. At
+  // high zoom their small difference can exceed the culler's pixel padding.
+  const decodedFill = { ...createEmptyVectorScene(), fillPathCount: 1, fillSegmentCount: 4,
+    drawRuns: [{ kind: "fill", first: 0, count: 1 }],
+    fillPathMetaA: Float32Array.of(0, 4, 0, 0), fillPathMetaB: Float32Array.of(1, 1, 1, 0),
+    fillPathMetaC: Float32Array.of(0, 0, 0, 1),
+    fillSegmentsA: Float32Array.of(0,0,0,0, 1.02,0,1.02,0, 1.02,1,1.02,1, 0,1,0,1),
+    fillSegmentsB: Float32Array.of(1.02,0,0,0, 1.02,1,0,0, 0,1,0,0, 0,0,0,0) };
+  const originalMetaA = decodedFill.fillPathMetaA.slice(), originalMetaB = decodedFill.fillPathMetaB.slice();
+  const sliver = { minX: 1.014, minY: .4, maxX: 1.018, maxY: .6 };
+  assert.deepEqual([...new VectorDrawRunCuller(decodedFill).select(sliver, 1e-5)], decodedFill.drawRuns,
+    "a decoded fill's visible sliver survives run culling beyond its original metadata bounds");
+  assert.deepEqual(decodedFill.fillPathMetaA, originalMetaA);
+  assert.deepEqual(decodedFill.fillPathMetaB, originalMetaB, "run culling leaves canonical/exported bounds unchanged");
+  const invalidFill = { ...decodedFill, fillSegmentsB: decodedFill.fillSegmentsB.slice() };
+  invalidFill.fillSegmentsB[0] = NaN;
+  assert.equal(new VectorDrawRunCuller(invalidFill).select(sliver, 1e-5).length, 0,
+    "invalid decoded geometry retains its canonical fallback bounds");
+  const missingFill = { ...decodedFill, fillSegmentsA: undefined, fillSegmentsB: undefined };
+  assert.equal(new VectorDrawRunCuller(missingFill).select(sliver, 1e-5).length, 0,
+    "partial legacy scenes without decoded geometry retain their canonical bounds");
+  const gradientOnly = { ...decodedFill, drawRuns: [{ kind: "gradient-fill", first: 0, count: 1 }] };
+  assert.equal(new VectorDrawRunCuller(gradientOnly).select(sliver, 1e-5).length, 1,
+    "gradient runs keep their existing conservative visibility policy");
+
+  // The scheduler shares this culler. It must not move the later blue stroke
+  // ahead of the red fill when their decoded geometry overlaps, even though
+  // the original fill metadata claims that it is elsewhere on the page.
+  const overlapping = { ...decodedFill, pageCount: 1, pageRects: Float32Array.of(0,0,100,100),
+    segmentCount: 2, maxHalfWidth: .1,
+    drawRuns: [{ kind: "stroke", first: 0, count: 1 }, { kind: "fill", first: 0, count: 1 },
+      { kind: "stroke", first: 1, count: 1 }],
+    endpoints: Float32Array.of(0,.5,1,.5, 10,.5,11,.5),
+    primitiveMeta: Float32Array.of(1,.5,0,1, 11,.5,0,1),
+    primitiveBounds: Float32Array.of(0,.5,1,.5, 10,.5,11,.5),
+    styles: Float32Array.of(.1,0,0,0, .1,0,0,1),
+    fillPathMetaA: Float32Array.of(0,4,20,0), fillPathMetaB: Float32Array.of(21,1,1,0),
+    fillSegmentsA: Float32Array.of(10,0,10,0, 11,0,11,0, 11,1,11,1, 10,1,10,1),
+    fillSegmentsB: Float32Array.of(11,0,0,0, 11,1,0,0, 10,1,0,0, 10,0,0,0) };
+  const overlappingPlan = new VectorOrderedBatches(overlapping, null);
+  overlappingPlan.setColorCommutationEnabled(false);
+  overlappingPlan.update(overlapping.drawRuns, 1e-5);
+  assert.deepEqual(overlappingPlan.batches.map(run => run.kind), ["stroke", "fill", "stroke"],
+    "decoded overlap prevents unsafe stroke regrouping across the intervening fill");
+  assert.deepEqual([...overlappingPlan.uintInstances.subarray(0, overlappingPlan.instanceCount * 2)], [0,0,0,0,1,0]);
+
   // A merged line belongs to its first paint, but reaches through many later
   // singleton paints. Panning onto its far end must retain that first paint
   // even after its canonical source segment has left the viewport.

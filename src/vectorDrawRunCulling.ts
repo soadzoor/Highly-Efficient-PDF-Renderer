@@ -2,6 +2,7 @@ import type { TextLodBuildData } from "./textGreekLod";
 import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { retainedRasterBounds } from "./retainedRasterBounds";
 import { strokeSourceRecords, type StrokeRecordSource } from "./strokeRecords";
+import { vectorFillCoverageMetadata } from "./vectorFillCoverage";
 
 const GUARDED_RUN_COUNT = 1024;
 const VISIBILITY_GUARD_PIXELS = 64;
@@ -33,6 +34,14 @@ export class VectorDrawRunCuller {
   constructor(scene: VectorScene, strokes?: StrokeRecordSource & { sourceRuns: Uint32Array }) {
     this.scene = scene;
     const runs = scene.drawRuns ?? [];
+    // Rendered fills use decoded hulls. Use the same bounds for visibility and
+    // the scheduler's overlap dependencies, including with Vector LOD off.
+    // Legacy partial scenes without geometry retain their canonical extents;
+    // malformed decoded paths fall back individually in the metadata helper.
+    const fillCoverage = scene.fillPathCount > 0 && scene.fillSegmentsA && scene.fillSegmentsB && scene.fillPathMetaC
+      ? vectorFillCoverageMetadata(scene) : null;
+    const fillMetaA = fillCoverage?.pathMetaA ?? scene.fillPathMetaA;
+    const fillMetaB = fillCoverage?.pathMetaB ?? scene.fillPathMetaB;
     this.bounds = new Float64Array(runs.length * 4);
     const clipBounds = (scene.clipPaths ?? []).map(clip => {
       const result = [Infinity, Infinity, -Infinity, -Infinity];
@@ -63,8 +72,8 @@ export class VectorDrawRunCuller {
           include(scene.endpoints[offset + 2], scene.endpoints[offset + 3], margin);
           include(scene.primitiveMeta[offset], scene.primitiveMeta[offset + 1], margin);
         } else if (run.kind === "fill") {
-          include(scene.fillPathMetaA[offset + 2], scene.fillPathMetaA[offset + 3]);
-          include(scene.fillPathMetaB[offset], scene.fillPathMetaB[offset + 1]);
+          include(fillMetaA[offset + 2], fillMetaA[offset + 3]);
+          include(fillMetaB[offset], fillMetaB[offset + 1]);
         } else if (run.kind === "text") {
           const glyph = Math.round(scene.textInstanceB[offset + 2]) * 4;
           for (const x of [scene.textGlyphMetaA[glyph + 2], scene.textGlyphMetaB[glyph]]) {

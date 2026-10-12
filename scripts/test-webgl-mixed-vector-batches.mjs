@@ -122,10 +122,15 @@ try {
     r.setMixedVectorBatchingEnabled(true); h.frame(); assert.equal(mock.draws.length, 2);
     assert.equal(mock.calls.filter(([name]) => name === "bufferData").length, 0, "reenabling reuses unchanged mixed data");
     r.setFillRenderingEnabled(false); h.frame();
-    assert.equal(mock.draws.length, 2_049, "hidden fills never reach the mixed shader");
-    assert(mock.draws.every(draw => draw.program !== gpu.program));
+    assert.equal(mock.draws.length, 2, "one-kind comparisons retain the single ordered mixed draw");
+    assert.equal(counters.get("fillInstances"), 0);
+    assert.deepEqual(mock.draws[1].uniforms.get("uMixedVectorEnabled"), [1, 0]);
     r.setFillRenderingEnabled(true); r.setStrokeRenderingEnabled(false); h.frame();
-    assert.equal(mock.draws.length, 2_049, "hidden strokes never reach the mixed shader");
+    assert.equal(mock.draws.length, 2, "fill-only comparisons keep the original mixed submission");
+    assert.equal(counters.get("strokeInstances"), 0);
+    assert.deepEqual(mock.draws[1].uniforms.get("uMixedVectorEnabled"), [0, 1]);
+    assert.equal(r.getFillRenderingEnabled(), true);
+    assert.equal(r.getStrokeRenderingEnabled(), false);
     r.setStrokeRenderingEnabled(true);
     const previousPlan = r.mixedVectorBatches;
     const replacement = makeScene();

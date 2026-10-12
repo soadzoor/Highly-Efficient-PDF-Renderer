@@ -170,6 +170,75 @@ const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
 } });
 try {
   const { buildVectorFillBandIndex } = await import("../src/vectorFillBands.ts");
+  const { vectorFillCoverageMetadata } = await import("../src/vectorFillCoverage.ts");
+  const { FILL_VERTEX_SHADER_SOURCE, FILL_FRAGMENT_SHADER_SOURCE } = await import("../src/nativeWebGlCoreShaders.ts");
+  const gpuSource = await readFile(new URL("../src/webGpuFloorplanRenderer.ts", import.meta.url), "utf8");
+  const gpuFillSource = gpuSource.slice(gpuSource.indexOf("const FILL_SHADER_SOURCE"), gpuSource.indexOf("const TEXT_SHADER_SOURCE"));
+  // Execute each shipped native padding block on one axis. Open paths cannot
+  // take the tighter support bound: their winding may extend outside the hull.
+  for (const [name, source, pattern] of [
+    ["GLSL", FILL_VERTEX_SHADER_SOURCE, /if \(uUseLocalToClip < 0\.5 && metaC\.x >= 0\.0\) \{[^}]*\}/],
+    ["WGSL", gpuFillSource, /if \(metaC\.x >= 0\.0\) \{[^}]*\}/]
+  ]) {
+    const block = source.match(pattern)?.[0];
+    assert(block, `${name} tight padding requires eligible closed metadata`);
+    const body = block.replace(/uUseLocalToClip/g, "projected").replace(/metaC\.x/g, "rule")
+      .replace(/(?:uCamera\.zoom|uZoom)/g, "zoom").replace(/(?:uCamera\.fillAAScreenPx|uFillAAScreenPx)/g, "aa")
+      .replace(/\bvec2f?\(/g, "(");
+    const padding = new Function("zoom", "aa", "rule", "projected", "max", `let margin = 1 / zoom; ${body} return margin;`);
+    for (const zoom of [0.001, 0.308313, 1, 10000]) for (const aa of [0.5, 1, 2, 4]) {
+      const expected = Math.max(0.5 * aa / zoom, 5e-5) + 1e-5 / Math.max(zoom, 1e-4);
+      assert.equal(padding(zoom, aa, -1, 0, Math.max), 1 / zoom, `${name} open nonzero paths keep original padding`);
+      assert.equal(padding(zoom, aa, -2, 0, Math.max), 1 / zoom, `${name} open even-odd paths keep original padding`);
+      assert(Math.abs(padding(zoom, aa, 0, 0, Math.max) - expected) < 1e-10, `${name} padding tracks the filter and minimum footprint`);
+      if (name === "GLSL") assert.equal(padding(zoom, aa, 0, 1, Math.max), 1 / zoom, "projected fills keep conservative padding");
+    }
+  }
+  // Compile the actual whole-hull dispatch predicates/assignments with scalar
+  // vector operations, then compare their result to the existing edge filter.
+  const areaDispatches = [
+    ["GLSL", FILL_FRAGMENT_SHADER_SOURCE.match(/if \(vFillRule >= 0\.0[\s\S]*?\n  }/)?.[0], text => text
+      .replace(/all\(lessThanEqual\(box.xy, vFillOrigin\)\)/g, "(box.x <= origin.x && box.y <= origin.y)")
+      .replace(/all\(greaterThanEqual\(box.xy \+ footprint, vFillBoundsMax\)\)/g, "(box.x + footprint.x >= upper.x && box.y + footprint.y >= upper.y)")
+      .replace(/vFillRule/g, "rule").replace(/vFillSignedArea/g, "area")],
+    ["WGSL", gpuFillSource.match(/if \(inData.fillRule >= 0\.0[\s\S]*?\n  }/)?.[0], text => text
+      .replace(/all\(box.xy <= inData.origin\)/g, "(box.x <= origin.x && box.y <= origin.y)")
+      .replace(/all\(box.xy \+ footprint >= inData.boundsMax\)/g, "(box.x + footprint.x >= upper.x && box.y + footprint.y >= upper.y)")
+      .replace(/inData.fillRule/g, "rule").replace(/inData.signedArea/g, "area")]
+  ].map(([name, block, translate]) => {
+    assert(block, `${name} whole-hull shortcut exists`);
+    return [name, new Function("rule", "area", "origin", "upper", "box", "footprint",
+      `let winding = null; ${translate(block)} return winding;`)];
+  });
+  const contained = [
+    ["dot", rect(.2, .3, .4, .5)],
+    ["reversed", polygon([[.2, .3], [.2, .5], [.4, .5], [.4, .3]])],
+    ["curved lens", [quad(.2, .3, .3, .5, .4, .3), quad(.4, .3, .3, .1, .2, .3)]],
+    ["hole", [...rect(.1, .1, .8, .8), ...polygon([[.3, .3], [.3, .5], [.5, .5], [.5, .3]])]],
+    ["disconnected", [...rect(.1, .1, .2, .2), ...rect(.7, .7, .8, .8)]],
+    ["self-intersection", polygon([[.1, .1], [.8, .8], [.1, .8], [.8, .1]])],
+    ["same-direction overlap", [...rect(.1, .1, .6, .6), ...rect(.3, .3, .8, .8)]]
+  ];
+  for (const [label, segments] of contained) for (const rule of [0, 1]) {
+    const a = Float32Array.from(segments.flatMap(({ p0, p1 }) => [...p0, ...p1]));
+    const b = Float32Array.from(segments.flatMap(({ p2, quadratic }) => [...p2, quadratic ? 1 : 0, 0]));
+    const meta = vectorFillCoverageMetadata({ fillPathCount: 1, fillSegmentCount: segments.length,
+      fillPathMetaA: Float32Array.of(0, segments.length, 0, 0), fillPathMetaB: Float32Array.of(1, 1, 0, 0),
+      fillPathMetaC: Float32Array.of(rule, 0, 0, 1), fillSegmentsA: a, fillSegmentsB: b });
+    const decoded = segments.map((segment, i) => ({ ...segment, p0: [...a.slice(i * 4, i * 4 + 2)],
+      p1: [...a.slice(i * 4 + 2, i * 4 + 4)], p2: [...b.slice(i * 4, i * 4 + 2)] }));
+    const origin = { x: meta.pathMetaA[2], y: meta.pathMetaA[3] }, upper = { x: meta.pathMetaB[0], y: meta.pathMetaB[1] };
+    for (const [name, dispatch] of areaDispatches) {
+      const shader = variants.find(([variant]) => variant === name)[1];
+      const winding = dispatch(rule, meta.pathMetaC[1], origin, upper, box, { x: 1, y: 1 });
+      assert.notEqual(winding, null, `${name} ${label} uses precomputed area inside the footprint`);
+      assert(Math.abs(shader.heprFillCoverage(winding, rule === 1) - coverage(shader, decoded, rule === 1)) < 1e-7,
+        `${name} ${label} preserves the existing ${rule ? "even-odd" : "nonzero"} area filter`);
+      assert.equal(dispatch(-(rule + 1), 999, origin, upper, box, { x: 1, y: 1 }), null, "ineligible paths scan their edges");
+      assert.equal(dispatch(rule, 999, origin, upper, { ...box, x: origin.x + .001 }, { x: 1, y: 1 }), null,
+        "a partially contained hull scans its edges");
+    }
+  }
   const path = [];
   for (let i = 0; i < 48; i += 1) {
     const angle = i * Math.PI / 24, next = (i + 1) * Math.PI / 24;

@@ -64,6 +64,7 @@ try {
     let frames = 0, invalidations = 0;
     const instance = Object.assign(Object.create(Renderer.prototype), {
       scene, gl, gpuDevice: device, primitiveGradientLayout: {}, primitiveColors: null,
+      fillCoverageMetadata: { pathMetaB: floats([10.25, 20.5, 0.2, 0.3]), pathMetaC: floats([-2, .125, 0.4, 0.5]) },
       segmentTextureC: "stroke", fillPathMetaTextureB: "fillB", fillPathMetaTextureC: "fillC", textInstanceTextureC: "text",
       segmentTextureWidth: 2, fillPathMetaTextureWidth: 1, textInstanceTextureWidth: 1,
       vectorLodRuntime: { setForceExact(value) { forceExact.push(value); } },
@@ -86,12 +87,20 @@ try {
     assert.equal(texels.length, 5, `${backend}: base stroke and ordered LOD prefix are both patched`);
     assert(texels.some(write => write.texture === "combined"));
     assert.deepEqual(texels.find(write => write.texture === "text").data, [255, 0, 191, 128]);
+    assert.deepEqual(texels.find(write => write.texture === "fillB").data, [10.25, 20.5, 1, 0],
+      `${backend}: recoloring preserves decoded conservative bounds`);
+    assert.deepEqual(texels.find(write => write.texture === "fillC").data, [-2, .125, .75, scene.fillPathMetaC[3]],
+      `${backend}: recoloring preserves the area and fallback marker`);
     writes.length = 0;
     instance.setPrimitiveColorUpdates(updates.map(update => ({ ref: update.ref, color: null })));
     assert.deepEqual(forceExact, [true, false]);
     assert.deepEqual(textModes, ["off", "auto"]);
     assert.deepEqual(colorCommutation, [false, true], "clearing colors restores same-color batching");
     assert.equal(instance.primitiveColors.updates().length, 0);
+    assert.deepEqual(writes.find(write => write.texture === "fillB").data,
+      [10.25, 20.5, scene.fillPathMetaB[2], scene.fillPathMetaB[3]], `${backend}: restoring RGB preserves decoded bounds`);
+    assert.deepEqual(writes.find(write => write.texture === "fillC").data,
+      [-2, .125, scene.fillPathMetaC[2], scene.fillPathMetaC[3]], `${backend}: restoring RGB preserves coverage metadata`);
     instance.setVectorColorOverride(0.4, 0.5, 0.6, 0.25);
     instance.setVectorColorOverride(0, 0, 0, 0.75);
     instance.setVectorColorOverride(0.4, 0.5, 0.6, 0);

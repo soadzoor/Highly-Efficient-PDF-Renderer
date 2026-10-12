@@ -163,6 +163,10 @@ assert.match(source, /diagnosticsVersion: 3/);
 assert.match(source, /initialCamera: describeThreePerformanceCamera\(camera, controls.target\)/);
 assert.match(source, /withThreeRenderPerformance\(profile/);
 assert.match(source, /profile && !profile.enabled\) \{ captureGlCalls\?\.dispose/);
-assert.equal((source.match(/captureGlCalls\?\.dispose\(\); captureGlCalls = null;/g) ?? []).length, 5);
+assert.equal((source.match(/captureGlCalls\?\.dispose\(\); captureGlCalls = null;/g) ?? []).length, 7,
+  "comparison switches also detach GL wrappers when ending the current capture");
+assert.match(source, /vectors\(mode:[\s\S]*?captureProfiler\?\.stop\(\);\s*captureGlCalls\?\.dispose\(\); captureGlCalls = null;/);
+assert.match(source, /fillRendering: currentPdfObject\?\.getFillRenderingEnabled\(\) \?\? null/);
+assert.match(source, /strokeRendering: currentPdfObject\?\.getStrokeRenderingEnabled\(\) \?\? null/);
 profile.dispose();
 console.log("Three capture: scoped GL timing, no added queries, exception/stop cleanup, bounded stall events, camera snapshots and scene comparison passed.");

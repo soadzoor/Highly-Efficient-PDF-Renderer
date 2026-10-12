@@ -74,6 +74,7 @@ import { createTextSelectionController } from "./textSelection";
 import { createPrimitiveInteractionController } from "./primitiveInteraction";
 import { createDrawingSelectionControls } from "./drawingSelectionControls";
 import type { RenderPerformanceOptions, RenderPerformanceProfiler } from "./renderPerformance";
+import { setVectorRenderComparison, type VectorRenderComparisonMode } from "./vectorRenderComparison";
 import {
   formatSceneSegmentAccounting,
   getSceneSegmentAccounting
@@ -801,8 +802,12 @@ let lastParsedSceneLabel: string | null = null;
 let captureProfiler: RenderPerformanceProfiler | null = null;
 let captureContext: Record<string, unknown> | null = null;
 const performanceCapture = {
+  vectors(mode: VectorRenderComparisonMode) {
+    return setVectorRenderComparison(renderer, mode, () => { captureProfiler?.stop(); });
+  },
   mixedVectors(enabled: boolean): void {
     if (!renderer.setMixedVectorBatchingEnabled) throw new Error("This renderer does not support mixed vector batching.");
+    captureProfiler?.stop();
     renderer.setMixedVectorBatchingEnabled(enabled);
   },
   start(options: RenderPerformanceOptions = {}): string {
@@ -813,7 +818,10 @@ const performanceCapture = {
     captureProfiler = renderer.getPerformanceProfiler();
     captureContext = {
       document: lastParsedSceneLabel, backend: renderer instanceof WebGlFloorplanRenderer ? "webgl" : "webgpu",
+      browser: navigator.userAgent,
       mixedVectorBatching: renderer.getMixedVectorBatchingEnabled?.() ?? null,
+      fillRendering: renderer.getFillRenderingEnabled?.() ?? null,
+      strokeRendering: renderer.getStrokeRenderingEnabled?.() ?? null,
       canvasPixels: [canvasElement.width, canvasElement.height], dpr: window.devicePixelRatio,
       viewAtStart: renderer.getViewState(),
       vectorLod: uiControlManager.readVectorLodModeInput(), textLod: uiControlManager.readTextLodModeInput(),

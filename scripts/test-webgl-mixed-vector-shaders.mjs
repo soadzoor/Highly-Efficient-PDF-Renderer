@@ -27,19 +27,28 @@ try {
     vP0: vec(1, 2), vP1: vec(3, 4), vP2: vec(5, 6), vPrimitiveType: -3,
     vIsHairline: 1, vHalfWidth: 0.75, vHasClipBounds: 1, vClipBounds: vec(-4, -5, 8, 9),
     vFillBands: vec(12, 13, 14, 15), vFillCells: vec(16, 17, 18, 19),
-    vFillOrigin: vec(20, 21), vFillRule: 1, vSegmentStart: 16777217, vSegmentCount: 16777219,
+    vFillOrigin: vec(20, 21), vFillBoundsMax: vec(22, 23), vFillSignedArea: -.25,
+    vFillRule: 1, vSegmentStart: 16777217, vSegmentCount: 16777219,
     vMixedA: null, vMixedB: null, vMixedC: null, vMixedD: null, vMixedSegments: null,
-    vVectorKind: 0, vLocal: vec(2, 3), heprMixedLocalPerPixel: null
+    vVectorKind: 0, vLocal: vec(2, 3), heprMixedLocalPerPixel: null,
+    uMixedVectorEnabled: vec(1, 1), gl_Position: vec(0, 0, 0, 1),
+    vColor: vec(1, 1, 1), vAlpha: 1, vVectorClipIndex: -1
   };
   for (const kind of [0, 1]) {
     const packed = runEntry(vertex, { ...fields, aVectorKind: kind });
     const restored = runEntry(fragment, { ...fields, ...packed });
     assert.equal(restored.painted, kind ? "fill" : "stroke");
     for (const name of kind
-      ? ["vFillBands", "vFillCells", "vFillOrigin", "vFillRule", "vSegmentStart", "vSegmentCount"]
+      ? ["vFillBands", "vFillCells", "vFillOrigin", "vFillBoundsMax", "vFillSignedArea", "vFillRule", "vSegmentStart", "vSegmentCount"]
       : ["vP0", "vP1", "vP2", "vPrimitiveType", "vIsHairline", "vHalfWidth", "vHasClipBounds", "vClipBounds"]) {
       assert.deepEqual(restored[name], fields[name], `${name} survives the shared payload`);
     }
+  }
+  for (const kind of [0, 1]) {
+    const disabled = runEntry(vertex, { ...fields, aVectorKind: kind,
+      uMixedVectorEnabled: kind ? vec(1, 0) : vec(0, 1) });
+    assert.deepEqual(disabled.gl_Position, vec(-2, -2, 0, 1), "disabled vectors leave the viewport before geometry fetches");
+    assert.equal(disabled.painted, undefined, "disabled vectors do not call either geometry branch");
   }
 
   const main = functionBody(fragment, "main");
@@ -54,6 +63,8 @@ try {
   assert.match(fragment, /heprStrokeLodAlpha\(alpha, vPrimitiveType\)/);
   assert.match(fragment, /heprCellWinding\(vFillCells, vFillOrigin, box, footprint\)/);
   assert.match(fragment, /heprSegmentCoverage\(primitiveA.xy, primitiveA.zw, primitiveB.xy,/);
+  assert.match(fragment, /vFillRule >= 0.0 && all\(lessThanEqual\(box.xy, vFillOrigin\)\)/);
+  assert.match(fragment, /winding = vFillSignedArea \* box.z \* box.w;/);
   assert.doesNotMatch(fragment, /\bpacked\b/, "the mixed shader avoids a reserved GLES identifier");
 
   const shapedVertex = pdfShapeCoverageGlsl(vertex), shapedFragment = pdfShapeCoverageGlsl(fragment);
@@ -106,17 +117,17 @@ function runEntry(source, fields) {
   };
   const constructor = (...values) => swizzled(vec(...values));
   const keys = Object.keys(fields).filter(name => name !== "painted");
-  return new Function(...keys, "vec2", "vec4", "ivec2", "length", `
+  return new Function(...keys, "vec2", "vec3", "vec4", "ivec2", "length", `
     let painted;
-    function heprMixedStrokeVertex() {}
-    function heprMixedFillVertex() {}
+    function heprMixedStrokeVertex() { painted = "stroke"; }
+    function heprMixedFillVertex() { painted = "fill"; }
     function heprMixedStrokeFragment() { painted = "stroke"; }
     function heprMixedFillFragment() { painted = "fill"; }
     function dFdx() { return 0.25; }
     function dFdy() { return 0.5; }
-    ${functionBody(source, "main")}
+    ${functionBody(source, "main").replace(/\breturn;/g, "return { gl_Position, painted };")}
     return { ${keys.join(", ")}, painted };
-  `)(...keys.map(name => swizzled(fields[name])), constructor, constructor,
+  `)(...keys.map(name => swizzled(fields[name])), constructor, constructor, constructor,
     (...values) => constructor(...(values.length === 1 ? [values[0], values[0]] : values)),
     value => Math.hypot(...Object.values(value)));
 }

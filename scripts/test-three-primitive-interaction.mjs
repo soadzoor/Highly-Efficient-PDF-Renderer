@@ -18,6 +18,7 @@ try {
   const { ThreeMaterialFillLayer } = await import("../src/threeMaterialFillLayer.ts");
   const { ThreeMaterialTextLayer } = await import("../src/threeMaterialTextLayer.ts");
   const { ThreeMaterialGradientLayer } = await import("../src/threeMaterialGradientLayer.ts");
+  const { vectorFillCoverageMetadata } = await import("../src/vectorFillCoverage.ts");
   const { ThreePrimitiveHighlightLayer } = await import("../src/threePrimitiveHighlightLayer.ts");
   const { buildPrimitiveHighlights } = await import("../src/primitiveAppearance.ts");
   const floats = values => new Float32Array(values);
@@ -46,6 +47,7 @@ try {
   });
   const original = Object.fromEntries(Object.entries(scene).filter(([, v]) => ArrayBuffer.isView(v))
     .map(([key, value]) => [key, value.slice()]));
+  const fillCoverage = vectorFillCoverageMetadata(scene);
 
   for (const backend of ["webgl", "webgpu"]) {
     const options = { materialBackend: backend, webGpu, strokeCurveEnabled: true, textVectorOnly: true,
@@ -58,8 +60,9 @@ try {
     for (const layer of [stroke, fill, text]) layer.setPrimitiveColorUpdates(updates, scene);
     gradient.setPrimitiveColorUpdates(updates);
     assert.deepEqual([...stroke.segmentStyleTexture.image.data], [scene.styles[0], 1, 0, 0.75]);
-    assert.deepEqual([...fill.fillPathMetaTextureB.image.data], [10, 10, 1, 0]);
-    assert.deepEqual([...fill.fillPathMetaTextureC.image.data], [0, 0, 0.75, 0.5]);
+    assert.deepEqual([...fill.fillPathMetaTextureB.image.data], [...fillCoverage.pathMetaB.subarray(0, 2), 1, 0]);
+    assert.deepEqual([...fill.fillPathMetaTextureC.image.data], [...fillCoverage.pathMetaC.subarray(0, 2), 0.75, 0.5],
+      "recoloring preserves conservative geometry and the open-path area sentinel");
     assert.deepEqual([...text.textInstanceTextureC.image.data], [255, 0, 191, 128]);
     assert.deepEqual(gradient.entries[0].primitiveColor.toArray(), [1, 0, 0.75, 1]);
     if (backend === "webgl") {
@@ -73,8 +76,8 @@ try {
     for (const layer of [stroke, fill, text]) layer.setPrimitiveColorUpdates(restores, scene);
     gradient.setPrimitiveColorUpdates(restores);
     assert.deepEqual([...stroke.segmentStyleTexture.image.data], [...scene.styles]);
-    assert.deepEqual([...fill.fillPathMetaTextureB.image.data], [...scene.fillPathMetaB]);
-    assert.deepEqual([...fill.fillPathMetaTextureC.image.data], [...scene.fillPathMetaC]);
+    assert.deepEqual([...fill.fillPathMetaTextureB.image.data], [...fillCoverage.pathMetaB]);
+    assert.deepEqual([...fill.fillPathMetaTextureC.image.data], [...fillCoverage.pathMetaC]);
     assert.deepEqual([...text.textInstanceTextureC.image.data], [...scene.textInstanceC].map(value => Math.round(value * 255)));
     assert.equal(gradient.entries[0].primitiveColor.w, 0);
     const overlay = new ThreePrimitiveHighlightLayer(backend, "linear", webGpu);

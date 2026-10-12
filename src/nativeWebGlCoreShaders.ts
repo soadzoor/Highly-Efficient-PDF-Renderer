@@ -349,6 +349,7 @@ uniform int uFillCellHeaders;
 // clip texture without disabling quad shrinking.
 uniform int uFillClipBoundsEnabled;
 uniform highp sampler2D uFillClipBoundsTex;
+uniform float uFillAAScreenPx;
 uniform float uVectorClipIndex;
 uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
@@ -363,6 +364,8 @@ flat out vec4 vFillBands;
 /** (first level texel, level count, finest cell size, level step); zero count uses the bands. */
 flat out vec4 vFillCells;
 flat out vec2 vFillOrigin;
+flat out vec2 vFillBoundsMax;
+flat out float vFillSignedArea;
 flat out vec3 vColor;
 flat out float vAlpha;
 flat out float vFillRule;
@@ -408,6 +411,8 @@ void heprCullFill() {
   vFillBands = vec4(0.0);
   vFillCells = vec4(0.0);
   vFillOrigin = vec2(0.0);
+  vFillBoundsMax = vec2(0.0);
+  vFillSignedArea = 0.0;
   vColor = vec3(0.0);
   vAlpha = 0.0;
   vFillRule = 0.0;
@@ -436,6 +441,13 @@ void main() {
   // is thinner than a pixel and falls between pixel centres.
   vec2 margin = heprCoverageMargin(heprPathToPixel(mix(minBounds, maxBounds, corner01),
     uUseLocalToClip, uLocalToClip, uZoom, uViewport));
+  // Native box-filter support reaches half its width past the decoded hull.
+  // Match wider filters and the fragment footprint's minimum local extent;
+  // projected callers retain their conservative per-corner padding.
+  if (uUseLocalToClip < 0.5 && metaC.x >= 0.0) {
+    margin = max(margin * (0.5 * uFillAAScreenPx), vec2(5e-5)) +
+      vec2(1e-5 / max(uZoom, 1e-4));
+  }
   margin = heprBoundCoverageMargin(mix(minBounds, maxBounds, corner01), margin, mat2(1.0),
     uUseLocalToClip, uLocalToClip, uViewport);
   vec4 quad = heprFillQuadBounds(minBounds, maxBounds, margin,
@@ -461,6 +473,8 @@ void main() {
   vFillCells = uFillCellHeaders <= 0 ? vec4(0.0)
     : texelFetch(uFillSegmentTexA, coordFromIndex(uFillCellHeaders - 1 + pathIndex, uFillSegmentTexSize), 0);
   vFillOrigin = minBounds;
+  vFillBoundsMax = maxBounds;
+  vFillSignedArea = metaC.y;
   vColor = vec3(metaB.z, metaB.w, metaC.z);
   vAlpha = alpha;
   vFillRule = metaC.x;
@@ -489,6 +503,8 @@ flat in int vSegmentCount;
 flat in vec4 vFillBands;
 flat in vec4 vFillCells;
 flat in vec2 vFillOrigin;
+flat in vec2 vFillBoundsMax;
+flat in float vFillSignedArea;
 flat in vec3 vColor;
 flat in float vAlpha;
 flat in float vFillRule;
@@ -537,7 +553,13 @@ void main() {
   // segment listed in two bands contributes each part once.
   vec4 box = vec4(vLocal - 0.5 * footprint, 1.0 / footprint);
   float winding = 0.0;
-  if (vFillCells.y > 0.0) {
+  // C.x is negative only for paths whose decoded contours cannot use area.
+  // A box containing the whole control hull integrates the full signed area,
+  // including holes and quadratic curves, without reading any edge records.
+  if (vFillRule >= 0.0 && all(lessThanEqual(box.xy, vFillOrigin)) &&
+      all(greaterThanEqual(box.xy + footprint, vFillBoundsMax))) {
+    winding = vFillSignedArea * box.z * box.w;
+  } else if (vFillCells.y > 0.0) {
     // The cell index bounds this to the geometry near the pixel at any zoom.
     winding = heprCellWinding(vFillCells, vFillOrigin, box, footprint);
   } else {
@@ -579,7 +601,8 @@ void main() {
   vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
   // A companion stroke no longer hides a hard fill edge: thin filled shapes
   // need their own coverage, and wide strokes still cover the edge.
-  float coverage = heprFillCoverage(winding, vFillRule >= 0.5);
+  float fillRule = vFillRule < 0.0 ? -vFillRule - 1.0 : vFillRule;
+  float coverage = heprFillCoverage(winding, fillRule >= 0.5);
   float alpha = heprThreeLinearCoverageToOutputAlpha(coverage) * vAlpha;
   if (alpha <= 0.001) {
     discard;

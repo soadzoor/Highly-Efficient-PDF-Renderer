@@ -48,6 +48,8 @@ try {
     assert.equal(state.material.depthTest, false); assert.equal(state.material.depthWrite, false);
     state.zoomUniform.value = 2.5; state.useLocalToClipUniform.value = 1;
     state.localUnitsPerPixelUniform.value = .4; state.curveUniform.value = 0;
+    assert.equal(state.fillRenderingUniform.value, 1); assert.equal(state.strokeRenderingUniform.value, 1);
+    state.fillRenderingUniform.value = 0; state.strokeRenderingUniform.value = 1;
     const shaders = build(state.material, geometry), vertex = shaders.vertexShader, fragment = shaders.fragmentShader;
     assert.match(vertex, /aVectorIndex/); assert.match(vertex, /aVectorKind/);
     assert.match(vertex, /fn heprMixedTextureField\s*\(/);
@@ -71,7 +73,19 @@ try {
     assert.equal(fetch.heprMixedCellField(1, 3, fillTexture, 4, 20), "fill:23");
     assert.match(vertex, /heprStrokeWorldPack\(/); assert.match(vertex, /heprFillVertexPack\(/);
     assert.match(vertex, /return vec4<f32>\(pack.xy, 0.0, pack.z\)/, "fill validity becomes the shared W sentinel");
+    assert.match(vertex, /select\(fillEnabled, strokeEnabled, kind < 0.5\) < 0.5/,
+      "disabled paint kinds reject their vertices without replacing mixed geometry");
+    assert.match(vertex, /metaC.x >= 0.0 && useLocalToClip < 0.5/,
+      "tighter fill padding requires a closed contour and the ordinary screen transform");
+    assert.match(vertex, /0.5 \* fillAAScreenPx/, "wide box filters retain their full half-footprint support");
     assert.match(fragment, /heprCellWinding\(cells, metaA.zw, box, footprint/);
+    const fillBody = fnBody(fragment, "heprMixedFillFragment");
+    assert.match(fillBody, /metaC.x >= 0.0 && all\(box.xy <= metaA.zw\) && all\(box.xy \+ footprint >= metaB.xy\)/,
+      "whole-pixel signed area requires the entire decoded control hull inside the footprint");
+    assert(fillBody.indexOf("winding = metaC.y * box.z * box.w") < fillBody.indexOf("heprCellWinding("),
+      "whole-contour integration avoids the segment and cell textures");
+    assert.match(fillBody, /select\(metaC.x, -metaC.x - 1.0, metaC.x < 0.0\)/,
+      "ineligible open contours retain their original nonzero or even-odd fill rule");
     assert.match(fragment, /heprStrokeLodAlpha\(alpha, primitiveType\)/);
     const mixed = fnBody(fragment, "heprMixedVectorFragment");
     assert(mixed.indexOf("dpdx(local.x)") < mixed.indexOf("if (kind"), "derivatives precede kind selection");

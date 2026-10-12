@@ -80,6 +80,10 @@ export function deferRendererInitialization(
     getPresentedFrameSerial: () => 0,
     getOptionalContentVisibility: () => config.get("setOptionalContentVisibility")?.[0] ?? null,
     getVectorColorOverride: () => config.get("setVectorColorOverride")?.map(value => clamp(Number(value), 0, 1)) ?? [0, 0, 0, 0],
+    getFillRenderingEnabled: () => config.has("setFillRenderingEnabled")
+      ? Boolean(config.get("setFillRenderingEnabled")![0]) : true,
+    getStrokeRenderingEnabled: () => config.has("setStrokeRenderingEnabled")
+      ? Boolean(config.get("setStrokeRenderingEnabled")![0]) : true,
     getMixedVectorBatchingEnabled: () => config.has("setMixedVectorBatchingEnabled")
       ? Boolean(config.get("setMixedVectorBatchingEnabled")![0]) : true,
     getRasterLayerUpdates: () => new Map(),
