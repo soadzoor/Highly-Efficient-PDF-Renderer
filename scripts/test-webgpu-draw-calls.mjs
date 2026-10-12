@@ -47,14 +47,24 @@ try {
 
   {
     const { renderer, device, frame } = create();
-    const banded = device.shaders.filter(source => source.includes("heprFillBandInfo"));
+    assert.deepEqual(renderer.fillBindGroupLayout.entries.slice(1).map(entry => entry.visibility), [1, 1, 1, 2, 2],
+      "solid fills read both segment stores only in the fragment stage");
+    const banded = device.shaders.filter(source => source.includes("heprFillIndexedWinding") || source.includes("heprFillBandInfo"));
     assert.equal(banded.length, 2, "solid and gradient native pipelines include the shared band lookup");
     for (const source of banded) {
       assert.match(source, /heprBandRows\(bandInfo, band, bandCount, box\)/, "each band integrates only its own rows, so neighbouring bands cannot duplicate winding");
       assert.match(source, /packedIndex & 3/, "band entries use packed component addressing");
-      assert.match(source, /heprFillCellInfo\(f32\(pathIndex\), uCamera\.fillCells\.[xy]/, "each path loads its cell header");
-      assert.match(source, /heprCellWinding\(inData\.cells, inData\.origin, box, footprint/,
-        "an indexed path reads only the cells under the pixel");
+      if (source.includes("heprFillIndexedWinding")) {
+        assert.match(source, /let header = i32\(uCamera.fillCells.x\) - 1 \+ pathIndex;/,
+          "partial solid-fill pixels preserve integer path addresses when loading a cell header");
+        assert.match(source, /heprCellWinding\(cells, origin, box, footprint/,
+          "an indexed solid fill reads only the cells under the pixel");
+      } else {
+        assert.match(source, /heprFillCellInfo\(f32\(pathIndex\), uCamera\.fillCells\.[xy]/,
+          "gradient paths retain their cell-header lookup");
+        assert.match(source, /heprCellWinding\(inData\.cells, inData\.origin, box, footprint/,
+          "an indexed gradient fill reads only the cells under the pixel");
+      }
       assert.match(source, /fn heprUnfoldedPaint\(inData: \w+\) -> vec4f/, "a folded group chain scales the paint itself");
     }
     assert.deepEqual(banded.map(source => /@group\((\d)\) @binding\(0\) var<uniform> uPaintFold/.exec(source)?.[1]), ["2", "3"],

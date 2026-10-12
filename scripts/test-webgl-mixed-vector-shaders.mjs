@@ -19,14 +19,14 @@ try {
   const outputs = declarations(vertex, "out"), inputs = declarations(fragment, "in");
   assert.equal(outputs.size, MIXED_VECTOR_VARYING_VECTORS);
   assert.deepEqual(inputs, outputs, "packed varying names, integer types and interpolation agree across stages");
-  assert.equal(inputs.get("vMixedSegments"), "flat ivec2", "fill addresses retain integer precision above 2^24");
+  assert.equal(inputs.get("vMixedSegments"), "flat ivec3", "fill addresses and path IDs retain integer precision above 2^24");
 
   // Execute the generated pack/unpack entry points, including both kinds and
   // integer fill addresses that cannot be represented by a float varying.
   const fields = {
     vP0: vec(1, 2), vP1: vec(3, 4), vP2: vec(5, 6), vPrimitiveType: -3,
     vIsHairline: 1, vHalfWidth: 0.75, vHasClipBounds: 1, vClipBounds: vec(-4, -5, 8, 9),
-    vFillBands: vec(12, 13, 14, 15), vFillCells: vec(16, 17, 18, 19),
+    vFillPathIndex: 16777221,
     vFillOrigin: vec(20, 21), vFillBoundsMax: vec(22, 23), vFillSignedArea: -.25,
     vFillRule: 1, vSegmentStart: 16777217, vSegmentCount: 16777219,
     vMixedA: null, vMixedB: null, vMixedC: null, vMixedD: null, vMixedSegments: null,
@@ -39,7 +39,7 @@ try {
     const restored = runEntry(fragment, { ...fields, ...packed });
     assert.equal(restored.painted, kind ? "fill" : "stroke");
     for (const name of kind
-      ? ["vFillBands", "vFillCells", "vFillOrigin", "vFillBoundsMax", "vFillSignedArea", "vFillRule", "vSegmentStart", "vSegmentCount"]
+      ? ["vFillPathIndex", "vFillOrigin", "vFillBoundsMax", "vFillSignedArea", "vFillRule", "vSegmentStart", "vSegmentCount"]
       : ["vP0", "vP1", "vP2", "vPrimitiveType", "vIsHairline", "vHalfWidth", "vHasClipBounds", "vClipBounds"]) {
       assert.deepEqual(restored[name], fields[name], `${name} survives the shared payload`);
     }
@@ -61,7 +61,9 @@ try {
       `${name} has one shared definition`);
   }
   assert.match(fragment, /heprStrokeLodAlpha\(alpha, vPrimitiveType\)/);
-  assert.match(fragment, /heprCellWinding\(vFillCells, vFillOrigin, box, footprint\)/);
+  assert.match(fragment, /heprCellWinding\(vFillCells, origin, box, footprint\)/);
+  assert.doesNotMatch(vertex, /uniform (?:sampler2D uFillSegmentTexA|int uFillBandBase|int uFillCellHeaders)/,
+    "the vertex stage needs no fill spatial-index store");
   assert.match(fragment, /heprSegmentCoverage\(primitiveA.xy, primitiveA.zw, primitiveB.xy,/);
   assert.match(fragment, /vFillRule >= 0.0 && all\(lessThanEqual\(box.xy, vFillOrigin\)\)/);
   assert.match(fragment, /winding = vFillSignedArea \* box.z \* box.w;/);
@@ -117,7 +119,7 @@ function runEntry(source, fields) {
   };
   const constructor = (...values) => swizzled(vec(...values));
   const keys = Object.keys(fields).filter(name => name !== "painted");
-  return new Function(...keys, "vec2", "vec3", "vec4", "ivec2", "length", `
+  return new Function(...keys, "vec2", "vec3", "vec4", "ivec3", "length", `
     let painted;
     function heprMixedStrokeVertex() { painted = "stroke"; }
     function heprMixedFillVertex() { painted = "fill"; }
@@ -128,6 +130,6 @@ function runEntry(source, fields) {
     ${functionBody(source, "main").replace(/\breturn;/g, "return { gl_Position, painted };")}
     return { ${keys.join(", ")}, painted };
   `)(...keys.map(name => swizzled(fields[name])), constructor, constructor, constructor,
-    (...values) => constructor(...(values.length === 1 ? [values[0], values[0]] : values)),
+    (...values) => constructor(...(values.length === 1 ? [values[0], values[0], values[0]] : values)),
     value => Math.hypot(...Object.values(value)));
 }

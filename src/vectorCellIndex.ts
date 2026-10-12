@@ -1,4 +1,5 @@
-import { vectorFillBandStore, type VectorFillBandIndex, type VectorPathSegmentStore } from "./vectorFillBands";
+import { MIN_VECTOR_INDEXED_PATH_SEGMENTS, vectorFillBandStore, type VectorFillBandIndex,
+  type VectorPathSegmentStore } from "./vectorFillBands";
 
 /**
  * Multi-level cell index over a path's segments, for coverage at any zoom.
@@ -29,8 +30,6 @@ import { vectorFillBandStore, type VectorFillBandIndex, type VectorPathSegmentSt
  * rounding. Optional index storage uses the caller's available texture capacity.
  */
 
-/** A path needs this many segments before an index is shorter than its scan. */
-const MIN_INDEXED_SEGMENTS = 24;
 /** The finest level stops refining once its cells average this many pieces. */
 const TARGET_PIECES_PER_CELL = 8;
 /** Absolute addresses are stored as exact Float32 integers in the GPU format. */
@@ -88,7 +87,7 @@ export interface VectorPathCells {
  */
 export function buildVectorPathCells(segmentsA: Float32Array, segmentsB: Float32Array, start: number,
   count: number, bounds: readonly number[], curveThreshold = 0.5, options: VectorCellOptions = {}): VectorPathCells | null {
-  if (count < MIN_INDEXED_SEGMENTS) return null;
+  if (count < MIN_VECTOR_INDEXED_PATH_SEGMENTS) return null;
   const target = options.targetPieces ?? TARGET_PIECES_PER_CELL, step = options.levelStep ?? 1;
   if (!Number.isInteger(step) || step < 1 || !Number.isFinite(target) || target < 0) {
     throw new RangeError("Invalid vector cell refinement options.");
@@ -432,7 +431,7 @@ export function vectorPathCellStore(store: VectorPathSegmentStore, maxTextureSiz
   const cellOptions = { ...STORE_DEFAULTS, ...options };
   const curveThreshold = options.curveThreshold ?? 0.5;
   const order = Array.from({ length: pathCount }, (_, path) => path)
-    .filter(path => store.pathMetaA[path * 4 + 1] >= MIN_INDEXED_SEGMENTS)
+    .filter(path => store.pathMetaA[path * 4 + 1] >= MIN_VECTOR_INDEXED_PATH_SEGMENTS)
     .sort((a, b) => store.pathMetaA[b * 4 + 1] - store.pathMetaA[a * 4 + 1] || a - b);
   const indexes: (VectorPathCells | null)[] = new Array(pathCount).fill(null);
   let pieces = 0, levels = 0, cells = 0, pairs = 0, indexed = 0;

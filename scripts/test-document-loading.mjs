@@ -211,6 +211,8 @@ assert.equal(exports.at(-1).source, undefined);
 assert.equal(context.pendingSourceLoadCount, 0);
 assert.equal(context.activeSceneLoadToken, null);
 assert.equal(context.sourceLoadController, null);
+await testNativeSupersededSceneLoadTokens();
+testNativePerformanceStatus();
 // HEP orchestration must leave Vector LOD announcements to the eligibility-aware helper.
 const beforeTextHepProgress = loaderProgress.length;
 nextParse = async () => [{ ...scene(77), segmentCount: 0, textInstanceCount: 20 }];
@@ -344,6 +346,104 @@ await testRoomDocumentReplacement();
 await testNativeBackendLoading();
 testNativePageDemandFrames();
 console.log("Document replacement, export ownership, upload rollback, and superseded-load cancellation passed.");
+
+async function testNativeSupersededSceneLoadTokens() {
+  for (const kind of ["pdf", "hep"]) for (const replacement of ["unreadable", "scene"]) {
+    const previousScene = context.lastParsedScene;
+    const previousSource = context.lastLoadedSource;
+    const statuses = [];
+    let replacementLoad, replacementSourceToken, replacementSceneToken;
+    const host = vm.createContext({
+      performance, AbortController, Uint8Array, waitForLoad,
+      loadToken: 0, activeSceneLoadToken: null, pendingSourceLoadCount: 0, sourceLoadSerial: 0,
+      sourceLoadController: null, lastParsedScene: previousScene, lastLoadedSource: previousSource,
+      lastParsedSceneLabel: "new.hep", lastDownloadablePdf: null,
+      cancelActiveHepExport: noop,
+      updateBackendSelectDisabledState: noop,
+      cloneSourceBytes: buffer => new Uint8Array(buffer).slice(),
+      createParseBuffer: bytes => bytes.slice().buffer,
+      setStatus: message => statuses.push(message), setParsingLoader: noop,
+      setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop,
+      exampleDropdown: { setDisabled: noop }
+    });
+    host.backendSwitcher = { async runWhenIdle(action) {
+      const token = action();
+      // Supersede after beginSceneLoad but before its caller resumes from await.
+      queueMicrotask(() => {
+        if (replacement === "unreadable") {
+          replacementLoad = host.loadHepFile({
+            name: "unreadable-replacement.hep",
+            arrayBuffer: async () => { throw new Error("replacement read failed"); }
+          });
+        } else {
+          replacementSourceToken = host.beginSourceLoad();
+          replacementSceneToken = ++host.loadToken;
+          host.beginSceneLoad(replacementSceneToken);
+        }
+      });
+      return token;
+    } };
+    for (const name of [
+      "beginSourceLoad", "finishSourceLoad", "isCurrentSourceLoad", "beginSceneLoad", "finishSceneLoad",
+      "loadPdfFile", "loadHepFile", "loadPdfBuffer", "loadHepBuffer"
+    ]) vm.runInContext(sourceFunction(source, name), host);
+
+    await (kind === "pdf" ? host.loadPdfFile : host.loadHepFile)(file(`superseded.${kind}`, 1));
+    await replacementLoad;
+    assert.equal(host.lastParsedScene, previousScene, "superseding an unstarted parse retains the visible HEP");
+    assert.equal(host.lastLoadedSource, previousSource, "the retained HEP keeps its source ownership");
+    assert.equal(previousSource.kind, "hep");
+    if (replacement === "unreadable") {
+      assert.match(statuses.at(-1), /replacement read failed/);
+      assert.equal(host.activeSceneLoadToken, null, `${kind} releases its stale scene token when replacement reading fails`);
+      assert.equal(host.pendingSourceLoadCount, 0);
+      assert.equal(host.sourceLoadController, null);
+    } else {
+      assert.equal(host.activeSceneLoadToken, replacementSceneToken,
+        `${kind} cleanup cannot release the newer active scene token`);
+      assert.equal(host.pendingSourceLoadCount, 1, "only the current source remains pending");
+      assert.notEqual(host.sourceLoadController, null);
+      host.finishSceneLoad(replacementSceneToken);
+      host.finishSourceLoad(replacementSourceToken);
+      assert.equal(host.activeSceneLoadToken, null);
+      assert.equal(host.pendingSourceLoadCount, 0);
+      assert.equal(host.sourceLoadController, null);
+    }
+  }
+}
+
+function testNativePerformanceStatus() {
+  const host = vm.createContext({
+    lastParsedScene: scene(77), lastParsedSceneLabel: "loaded.hep",
+    loadToken: 8, activeSceneLoadToken: null, pendingSourceLoadCount: 0,
+    sourceLoadController: null, layoutChangeRunning: false,
+    backendSwitcher: { isSwitchInFlight: () => false }
+  });
+  vm.runInContext(sourceFunction(source, "nativePerformanceStatus"), host);
+  const read = () => JSON.parse(JSON.stringify(host.nativePerformanceStatus()));
+  const idle = read();
+  assert.deepEqual(idle, {
+    ready: true, document: "loaded.hep", blockers: [], pendingSourceLoads: 0,
+    sourceLoading: false, sceneLoadToken: null, loadToken: 8,
+    layoutChanging: false, backendSwitching: false
+  });
+  host.nativePerformanceStatus().blockers.push("caller mutation");
+  assert.deepEqual(read(), idle, "loading diagnostics return a fresh snapshot");
+  for (const [patch, blocker] of [
+    [{ lastParsedScene: null }, "no committed document"],
+    [{ pendingSourceLoadCount: 1 }, "source read/preparation still running"],
+    [{ activeSceneLoadToken: 8 }, "scene load still running"],
+    [{ layoutChangeRunning: true }, "layout change still running"],
+    [{ backendSwitcher: { isSwitchInFlight: () => true } }, "renderer backend switch still running"]
+  ]) {
+    const previous = Object.fromEntries(Object.keys(patch).map(key => [key, host[key]]));
+    Object.assign(host, patch);
+    assert.equal(read().ready, false);
+    assert.deepEqual(read().blockers, [blocker]);
+    Object.assign(host, previous);
+  }
+  assert.deepEqual(read(), idle, "inspecting loading state leaves it unchanged");
+}
 
 async function testNativeVectorLodProgress() {
   const hooks = registerHooks({ resolve(specifier, context, next) {

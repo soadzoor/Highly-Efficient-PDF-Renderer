@@ -2,6 +2,7 @@ import { TEXT_RASTER_ATLAS_PADDING_PX } from "./textRasterAtlasConstants";
 import { STROKE_COVERAGE_GLSL, STROKE_DENSITY_GLSL } from "./strokeCoverageShaders";
 import { FILL_COVERAGE_GLSL, FILL_COVERAGE_VERTEX_GLSL } from "./fillCoverageShaders";
 import { VECTOR_CELL_COVERAGE_GLSL } from "./vectorCellShaders";
+import { MIN_VECTOR_INDEXED_PATH_SEGMENTS } from "./vectorFillBands";
 import { RASTER_CLIP_GLSL } from "./rasterClipShaders";
 import { VECTOR_INSTANCE_CLIP_GLSL } from "./vectorClipShaders";
 
@@ -337,14 +338,6 @@ uniform sampler2D uFillPathMetaTexA;
 uniform sampler2D uFillPathMetaTexB;
 uniform sampler2D uFillPathMetaTexC;
 uniform ivec2 uFillPathMetaTexSize;
-// The band index rides in the segment store, after the segments themselves, so
-// it costs no sampler unit of its own. A negative base means there is none.
-uniform sampler2D uFillSegmentTexA;
-uniform ivec2 uFillSegmentTexSize;
-uniform int uFillBandBase;
-// Per-path cell headers follow in the same store, from one less than this
-// texel: zero, the value of a uniform the host never sets, means none.
-uniform int uFillCellHeaders;
 // Bounds have their own small store: optional clip indexes can fill the main
 // clip texture without disabling quad shrinking.
 uniform int uFillClipBoundsEnabled;
@@ -359,10 +352,7 @@ uniform mat4 uLocalToClip;
 
 flat out int vSegmentStart;
 flat out int vSegmentCount;
-/** (first band texel, band count, first band's y, band height); zero count scans linearly. */
-flat out vec4 vFillBands;
-/** (first level texel, level count, finest cell size, level step); zero count uses the bands. */
-flat out vec4 vFillCells;
+flat out int vFillPathIndex;
 flat out vec2 vFillOrigin;
 flat out vec2 vFillBoundsMax;
 flat out float vFillSignedArea;
@@ -408,8 +398,7 @@ void heprCullFill() {
   gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
   vSegmentStart = 0;
   vSegmentCount = 0;
-  vFillBands = vec4(0.0);
-  vFillCells = vec4(0.0);
+  vFillPathIndex = 0;
   vFillOrigin = vec2(0.0);
   vFillBoundsMax = vec2(0.0);
   vFillSignedArea = 0.0;
@@ -468,10 +457,7 @@ void main() {
 
   vSegmentStart = int(metaA.x);
   vSegmentCount = segmentCount;
-  vFillBands = uFillBandBase < 0 ? vec4(0.0)
-    : texelFetch(uFillSegmentTexA, coordFromIndex(uFillBandBase + pathIndex, uFillSegmentTexSize), 0);
-  vFillCells = uFillCellHeaders <= 0 ? vec4(0.0)
-    : texelFetch(uFillSegmentTexA, coordFromIndex(uFillCellHeaders - 1 + pathIndex, uFillSegmentTexSize), 0);
+  vFillPathIndex = pathIndex;
   vFillOrigin = minBounds;
   vFillBoundsMax = maxBounds;
   vFillSignedArea = metaC.y;
@@ -497,11 +483,14 @@ uniform ivec2 uFillSegmentTexSize;
 uniform float uFillAAScreenPx;
 uniform vec4 uVectorOverride;
 uniform int uFillBandEntries;
+// Header stores share the segment texture. Negative band base or zero cell
+// headers disable their lookup; cells are considered before bands.
+uniform int uFillBandBase;
+uniform int uFillCellHeaders;
 
 flat in int vSegmentStart;
 flat in int vSegmentCount;
-flat in vec4 vFillBands;
-flat in vec4 vFillCells;
+flat in int vFillPathIndex;
 flat in vec2 vFillOrigin;
 flat in vec2 vFillBoundsMax;
 flat in float vFillSignedArea;
@@ -536,6 +525,62 @@ ${VECTOR_CELL_COVERAGE_GLSL}
 
 ${VECTOR_INSTANCE_CLIP_GLSL}
 
+// Only partial-path pixels need spatial indexes. Small paths have no indexes;
+// larger paths read a band header only when they have no cell index.
+float heprFillIndexedWinding(int pathIndex, int segmentStart, int segmentCount,
+    vec2 origin, vec4 box, vec2 footprint) {
+  vec4 vFillCells = vec4(0.0);
+  vec4 vFillBands = vec4(0.0);
+  if (segmentCount >= ${MIN_VECTOR_INDEXED_PATH_SEGMENTS}) {
+    if (uFillCellHeaders > 0) {
+      vFillCells = texelFetch(uFillSegmentTexA,
+        coordFromIndex(uFillCellHeaders - 1 + pathIndex, uFillSegmentTexSize), 0);
+    }
+    if (vFillCells.y > 0.0) {
+      return heprCellWinding(vFillCells, origin, box, footprint);
+    }
+    if (uFillBandBase >= 0) {
+      vFillBands = texelFetch(uFillSegmentTexA,
+        coordFromIndex(uFillBandBase + pathIndex, uFillSegmentTexSize), 0);
+    }
+  }
+  float winding = 0.0;
+  int bandCount = int(vFillBands.y);
+  int firstBand = 0;
+  int lastBand = 0;
+  if (bandCount > 0) {
+    float bandHeight = vFillBands.w;
+    firstBand = clamp(int(floor((box.y - vFillBands.z) / bandHeight)), 0, bandCount - 1);
+    lastBand = clamp(int(floor((box.y + footprint.y - vFillBands.z) / bandHeight)), 0, bandCount - 1);
+  }
+
+  for (int band = firstBand; band <= lastBand; band += 1) {
+    int count = segmentCount;
+    int entry = 0;
+    if (bandCount > 0) {
+      vec4 range = texelFetch(uFillSegmentTexA,
+        coordFromIndex(int(vFillBands.x) + band, uFillSegmentTexSize), 0);
+      entry = int(range.x);
+      count = int(range.y);
+    }
+    vec2 rows = heprBandRows(vFillBands, band, bandCount, box);
+    for (int i = 0; i < count; i += 1) {
+      int segment = segmentStart + i;
+      if (bandCount > 0) {
+        int packedIndex = entry + i;
+        vec4 packed = texelFetch(uFillSegmentTexA,
+          coordFromIndex(uFillBandEntries + (packedIndex >> 2), uFillSegmentTexSize), 0);
+        segment = int(packed[packedIndex & 3]);
+      }
+      vec4 primitiveA = texelFetch(uFillSegmentTexA, coordFromIndex(segment, uFillSegmentTexSize), 0);
+      vec4 primitiveB = texelFetch(uFillSegmentTexB, coordFromIndex(segment, uFillSegmentTexSize), 0);
+      winding += heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
+        primitiveB.z >= FILL_PRIMITIVE_QUADRATIC, box, rows.x, rows.y);
+    }
+  }
+  return winding;
+}
+
 void main() {
   // The path-space footprint of this pixel, taken before any discard.
   vec2 footprint = max(vec2(
@@ -559,43 +604,8 @@ void main() {
   if (vFillRule >= 0.0 && all(lessThanEqual(box.xy, vFillOrigin)) &&
       all(greaterThanEqual(box.xy + footprint, vFillBoundsMax))) {
     winding = vFillSignedArea * box.z * box.w;
-  } else if (vFillCells.y > 0.0) {
-    // The cell index bounds this to the geometry near the pixel at any zoom.
-    winding = heprCellWinding(vFillCells, vFillOrigin, box, footprint);
   } else {
-    int bandCount = int(vFillBands.y);
-    int firstBand = 0;
-    int lastBand = 0;
-    if (bandCount > 0) {
-      float bandHeight = vFillBands.w;
-      firstBand = clamp(int(floor((box.y - vFillBands.z) / bandHeight)), 0, bandCount - 1);
-      lastBand = clamp(int(floor((box.y + footprint.y - vFillBands.z) / bandHeight)), 0, bandCount - 1);
-    }
-
-    for (int band = firstBand; band <= lastBand; band += 1) {
-      int count = vSegmentCount;
-      int entry = 0;
-      if (bandCount > 0) {
-        vec4 range = texelFetch(uFillSegmentTexA,
-          coordFromIndex(int(vFillBands.x) + band, uFillSegmentTexSize), 0);
-        entry = int(range.x);
-        count = int(range.y);
-      }
-      vec2 rows = heprBandRows(vFillBands, band, bandCount, box);
-      for (int i = 0; i < count; i += 1) {
-        int segment = vSegmentStart + i;
-        if (bandCount > 0) {
-          int packedIndex = entry + i;
-          vec4 packed = texelFetch(uFillSegmentTexA,
-            coordFromIndex(uFillBandEntries + (packedIndex >> 2), uFillSegmentTexSize), 0);
-          segment = int(packed[packedIndex & 3]);
-        }
-        vec4 primitiveA = texelFetch(uFillSegmentTexA, coordFromIndex(segment, uFillSegmentTexSize), 0);
-        vec4 primitiveB = texelFetch(uFillSegmentTexB, coordFromIndex(segment, uFillSegmentTexSize), 0);
-        winding += heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
-          primitiveB.z >= FILL_PRIMITIVE_QUADRATIC, box, rows.x, rows.y);
-      }
-    }
+    winding = heprFillIndexedWinding(vFillPathIndex, vSegmentStart, vSegmentCount, vFillOrigin, box, footprint);
   }
 
   vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));

@@ -1,11 +1,12 @@
 import { buildCompactMonochromeAtlas, type CompactMonochromeAtlas } from "./compactMonochromeRaster";
 import { STROKE_COVERAGE_WGSL, STROKE_DENSITY_WGSL } from "./strokeCoverageShaders";
 import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
-import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
-import { vectorFillBandIndex, buildVectorFillBandIndex, vectorSceneFillStore } from "./vectorFillBands";
+import { vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
+import { MIN_VECTOR_INDEXED_PATH_SEGMENTS, vectorFillBandIndex, buildVectorFillBandIndex,
+  vectorSceneFillStore } from "./vectorFillBands";
 import { vectorIndexedPathStore } from "./vectorCellIndex";
 import { vectorFillCoverageMetadata } from "./vectorFillCoverage";
-import { VECTOR_CELL_COVERAGE_WGSL, VECTOR_FILL_CELL_INFO_WGSL } from "./vectorCellShaders";
+import { VECTOR_CELL_COVERAGE_WGSL } from "./vectorCellShaders";
 import { paintFoldFragmentWgsl } from "./nativePaintFold";
 import { WebGpuPaintFolds } from "./webGpuPaintFold";
 import { WebGpuFrameTimer } from "./webGpuFrameTimer";
@@ -465,15 +466,12 @@ struct VsOut {
   @location(4) @interpolate(flat) alpha : f32,
   @location(5) @interpolate(flat) fillRule : f32,
   @location(6) @interpolate(flat) signedArea : f32,
-  @location(7) @interpolate(flat) bands : vec4f,
-  @location(8) @interpolate(flat) cells : vec4f,
+  @location(7) @interpolate(flat) pathIndex : i32,
   @location(9) @interpolate(flat) origin : vec2f,
   @location(10) @interpolate(flat) boundsMax : vec2f,
 };
 
 ${WGSL_OUTPUT_COLOR_HELPERS}
-${VECTOR_FILL_BAND_INFO_WGSL}
-${VECTOR_FILL_CELL_INFO_WGSL}
 
 const FILL_PRIMITIVE_QUADRATIC : f32 = 1.0;
 fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
@@ -516,8 +514,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let alpha = metaC.w;
 
   var out : VsOut;
-  out.bands = heprFillBandInfo(f32(pathIndex), uCamera.fillBands.x, uFillSegmentTexA);
-  out.cells = heprFillCellInfo(f32(pathIndex), uCamera.fillCells.x, uFillSegmentTexA);
+  out.pathIndex = pathIndex;
   out.origin = metaA.zw;
   out.boundsMax = metaB.xy;
   out.vectorClipIndex = uVectorClip.x;
@@ -565,6 +562,47 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
 @group(1) @binding(2) var<storage, read> uOrderedInstances: array<vec2u>;
 ${VECTOR_CLIP_WGSL}
 
+// Whole-path area pixels and small paths need no index headers. Other partial
+// pixels prefer cells, then fetch bands only when the path has no cell index.
+fn heprFillIndexedWinding(pathIndex: i32, segmentStart: i32, segmentCount: i32,
+    origin: vec2f, box: vec4f, footprint: vec2f, localY: f32) -> f32 {
+  let fillSegDims = textureDimensions(uFillSegmentTexA);
+  var cells = vec4f(0.0);
+  var bands = vec4f(0.0);
+  if (segmentCount >= ${MIN_VECTOR_INDEXED_PATH_SEGMENTS}) {
+    if (uCamera.fillCells.x > 0.0) {
+      let header = i32(uCamera.fillCells.x) - 1 + pathIndex;
+      cells = textureLoad(uFillSegmentTexA, coordFromIndex(header, i32(fillSegDims.x)), 0);
+    }
+    if (cells.y > 0.0) {
+      return heprCellWinding(cells, origin, box, footprint, uFillSegmentTexA, uFillSegmentTexB);
+    }
+    if (uCamera.fillBands.x >= 0.0) {
+      let header = i32(uCamera.fillBands.x) + pathIndex;
+      bands = textureLoad(uFillSegmentTexA, coordFromIndex(header, i32(fillSegDims.x)), 0);
+    }
+  }
+  var winding = 0.0;
+${vectorFillBandLoopWgsl({
+    bands: "bands",
+    y: "localY",
+    radius: "0.5 * footprint.y",
+    count: "segmentCount",
+    start: "segmentStart",
+    texture: "uFillSegmentTexA",
+    entries: "uCamera.fillBands.y",
+    setup: "let rows = heprBandRows(bandInfo, band, bandCount, box);",
+    edge: `
+    let coord = coordFromIndex(segmentIndex, i32(fillSegDims.x));
+    let primitiveA = textureLoad(uFillSegmentTexA, coord, 0);
+    let primitiveB = textureLoad(uFillSegmentTexB, coord, 0);
+    winding = winding + heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
+      primitiveB.z >= FILL_PRIMITIVE_QUADRATIC, box, rows.x, rows.y);
+`
+  })}
+  return winding;
+}
+
 @fragment
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
   // The path-space footprint of this pixel, taken before any discard.
@@ -577,8 +615,6 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     discard;
   }
 
-  let fillSegDims = textureDimensions(uFillSegmentTexA);
-
   // Average the winding number over the footprint box. A path with a cell
   // index reads only the cells under the box; otherwise the bands spanning
   // its rows hold every segment that can contribute, each integrating its own.
@@ -587,26 +623,9 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   if (inData.fillRule >= 0.0 && all(box.xy <= inData.origin) &&
       all(box.xy + footprint >= inData.boundsMax)) {
     winding = inData.signedArea * box.z * box.w;
-  } else if (inData.cells.y > 0.0) {
-    winding = heprCellWinding(inData.cells, inData.origin, box, footprint, uFillSegmentTexA, uFillSegmentTexB);
   } else {
-${vectorFillBandLoopWgsl({
-    bands: "inData.bands",
-    y: "inData.local.y",
-    radius: "0.5 * footprint.y",
-    count: "inData.segmentCount",
-    start: "inData.segmentStart",
-    texture: "uFillSegmentTexA",
-    entries: "uCamera.fillBands.y",
-    setup: "let rows = heprBandRows(bandInfo, band, bandCount, box);",
-    edge: `
-    let coord = coordFromIndex(segmentIndex, i32(fillSegDims.x));
-    let primitiveA = textureLoad(uFillSegmentTexA, coord, 0);
-    let primitiveB = textureLoad(uFillSegmentTexB, coord, 0);
-    winding = winding + heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
-      primitiveB.z >= FILL_PRIMITIVE_QUADRATIC, box, rows.x, rows.y);
-`
-  })}
+    winding = heprFillIndexedWinding(inData.pathIndex, inData.segmentStart, inData.segmentCount,
+      inData.origin, box, footprint, inData.local.y);
   }
 
   let color = mix(inData.color, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
@@ -1694,7 +1713,7 @@ export class WebGpuFloorplanRenderer {
         },
         {
           binding: 4,
-          visibility: gpuShaderStage.VERTEX | gpuShaderStage.FRAGMENT,
+          visibility: gpuShaderStage.FRAGMENT,
           texture: { sampleType: "unfilterable-float" }
         },
         {
@@ -4051,7 +4070,7 @@ export class WebGpuFloorplanRenderer {
         { binding: 0, visibility: stage.VERTEX | stage.FRAGMENT,
           buffer: { type: "uniform", minBindingSize: CAMERA_UNIFORM_BUFFER_BYTES } },
         ...Array.from({ length: 9 }, (_, index) => ({ binding: index + 1,
-          visibility: index === 7 ? stage.VERTEX | stage.FRAGMENT : index === 8 ? stage.FRAGMENT : stage.VERTEX,
+          visibility: index >= 7 ? stage.FRAGMENT : stage.VERTEX,
           texture: { sampleType: "unfilterable-float" } }))
       ] });
       const layout = device.createPipelineLayout({ bindGroupLayouts: [this.mixedVectorBindGroupLayout, this.vectorClipBindGroupLayout] });

@@ -11,8 +11,8 @@ export const MIXED_VECTOR_VARYING_VECTORS = 10;
 
 const privateVaryings = new Set([
   "vP0", "vP1", "vP2", "vPrimitiveType", "vIsHairline", "vHalfWidth", "vAAWorld",
-  "vClipBounds", "vHasClipBounds", "vSegmentStart", "vSegmentCount", "vFillBands",
-  "vFillCells", "vFillOrigin", "vFillBoundsMax", "vFillSignedArea", "vFillRule", "vFillHasCompanionStroke"
+  "vClipBounds", "vHasClipBounds", "vSegmentStart", "vSegmentCount", "vFillPathIndex",
+  "vFillOrigin", "vFillBoundsMax", "vFillSignedArea", "vFillRule", "vFillHasCompanionStroke"
 ]);
 
 /** Keep the existing geometry/coverage functions as the single source of truth. */
@@ -58,7 +58,7 @@ flat out vec4 vMixedA;
 flat out vec4 vMixedB;
 flat out vec4 vMixedC;
 flat out vec4 vMixedD;
-flat out ivec2 vMixedSegments;
+flat out ivec3 vMixedSegments;
 
 void main() {
   vVectorKind = aVectorKind;
@@ -67,7 +67,7 @@ void main() {
     vLocal = vec2(0.0); vColor = vec3(0.0); vAlpha = 0.0;
     vVectorClipIndex = -1.0;
     vMixedA = vec4(0.0); vMixedB = vec4(0.0);
-    vMixedC = vec4(0.0); vMixedD = vec4(0.0); vMixedSegments = ivec2(0);
+    vMixedC = vec4(0.0); vMixedD = vec4(0.0); vMixedSegments = ivec3(0);
     return;
   }
   if (aVectorKind < 0.5) {
@@ -76,14 +76,14 @@ void main() {
     vMixedB = vec4(vP2, vPrimitiveType, vIsHairline);
     vMixedC = vec4(vHalfWidth, vHasClipBounds, 0.0, 0.0);
     vMixedD = vClipBounds;
-    vMixedSegments = ivec2(0);
+    vMixedSegments = ivec3(0);
   } else {
     heprMixedFillVertex();
-    vMixedA = vFillBands;
-    vMixedB = vFillCells;
+    vMixedA = vec4(0.0);
+    vMixedB = vec4(0.0);
     vMixedC = vec4(vFillOrigin, vFillRule, vFillSignedArea);
     vMixedD = vec4(vFillBoundsMax, 0.0, 0.0);
-    vMixedSegments = ivec2(vSegmentStart, vSegmentCount);
+    vMixedSegments = ivec3(vSegmentStart, vSegmentCount, vFillPathIndex);
   }
 }
 `;
@@ -106,7 +106,7 @@ flat in vec4 vMixedA;
 flat in vec4 vMixedB;
 flat in vec4 vMixedC;
 flat in vec4 vMixedD;
-flat in ivec2 vMixedSegments;
+flat in ivec3 vMixedSegments;
 
 void main() {
   // Derivatives precede the kind branch and either paint's early discards.
@@ -125,14 +125,13 @@ void main() {
     vClipBounds = vMixedD;
     heprMixedStrokeFragment();
   } else {
-    vFillBands = vMixedA;
-    vFillCells = vMixedB;
     vFillOrigin = vMixedC.xy;
     vFillRule = vMixedC.z;
     vFillSignedArea = vMixedC.w;
     vFillBoundsMax = vMixedD.xy;
     vSegmentStart = vMixedSegments.x;
     vSegmentCount = vMixedSegments.y;
+    vFillPathIndex = vMixedSegments.z;
     heprMixedFillFragment();
   }
 }

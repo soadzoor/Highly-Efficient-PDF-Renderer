@@ -268,7 +268,7 @@ export class ThreeMixedVectorLayer {
       const gl = host.getContext?.() as WebGL2RenderingContext | null;
       if (!gl?.createShader) throw new Error("A WebGL 2 context is required to prepare mixed vector shaders.");
       const pages = !!this.options.stroke.getMixedVectorResources().pageBinding;
-      if (gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS) < (pages ? 14 : 12) ||
+      if (gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS) < (pages ? 13 : 11) ||
           gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS) < 3 ||
           gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS) < (pages ? 16 : 14) ||
           gl.getParameter(gl.MAX_VARYING_VECTORS) < MIXED_VECTOR_VARYING_VECTORS) {

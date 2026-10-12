@@ -1,6 +1,7 @@
 import { pageProjectionNode } from "./threeWebGpuPageTransforms";
 import type { ThreePageBinding } from "./threePageTransforms";
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
+import { MIN_VECTOR_INDEXED_PATH_SEGMENTS } from "./vectorFillBands";
 import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
 import { VECTOR_CELL_COVERAGE_WGSL, VECTOR_FILL_CELL_INFO_WGSL } from "./vectorCellShaders";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
@@ -145,6 +146,46 @@ fn heprFillClipPosition(
 }
 `);
 
+const fillIndexedWindingFn = TSL.wgslFn(`
+fn heprFillIndexedWinding(
+  pathIndex: i32, segmentStart: i32, segmentCount: i32,
+  origin: vec2<f32>, localY: f32, box: vec4<f32>, footprint: vec2<f32>,
+  segmentTexA: texture_2d<f32>, segmentTexB: texture_2d<f32>, segmentTexWidth: f32,
+  bandBase: f32, bandEntries: f32, cellHeaders: f32
+) -> f32 {
+  // Header reads belong to the fragment fallback: whole-contour integration
+  // needs neither index, and paths with cells never need a band header.
+  var bands = vec4<f32>(0.0);
+  // Both builders leave small paths unindexed. Their original direct loop
+  // therefore needs neither header, even when other paths use these stores.
+  if (segmentCount >= ${MIN_VECTOR_INDEXED_PATH_SEGMENTS}) {
+    let cells = heprFillCellInfo(f32(pathIndex), cellHeaders, segmentTexA);
+    if (cells.y > 0.0) {
+      return heprCellWinding(cells, origin, box, footprint, segmentTexA, segmentTexB);
+    }
+    bands = heprFillBandInfo(f32(pathIndex), bandBase, segmentTexA);
+  }
+  let safeWidth = max(i32(segmentTexWidth), 1);
+  var winding = 0.0;
+${vectorFillBandLoopWgsl({
+    bands: "bands",
+    y: "localY",
+    radius: "0.5 * footprint.y",
+    count: "segmentCount",
+    start: "segmentStart",
+    texture: "segmentTexA",
+    entries: "bandEntries",
+    setup: "let rows = heprBandRows(bandInfo, band, bandCount, box);",
+    edge: `    let coord = vec2<i32>(segmentIndex % safeWidth, segmentIndex / safeWidth);
+    let primitiveA = textureLoad(segmentTexA, coord, 0);
+    let primitiveB = textureLoad(segmentTexB, coord, 0);
+    winding = winding + heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
+      primitiveB.z >= 1.0, box, rows.x, rows.y);`
+  })}
+  return winding;
+}
+`, [includeNode(fillBandInfoFn), includeNode(fillCellInfoFn), includeNode(fillCoverageFn), includeNode(cellCoverageFn)]);
+
 const fillFragmentSource = `
 fn heprFillFragment(
   local: vec2<f32>,
@@ -154,9 +195,10 @@ fn heprFillFragment(
   segmentTexA: texture_2d<f32>,
   segmentTexB: texture_2d<f32>,
   segmentTexWidth: f32,
-  bands: vec4<f32>,
+  pathIndex: i32,
+  bandBase: f32,
   bandEntries: f32,
-  cells: vec4<f32>,
+  cellHeaders: f32,
   fillAAScreenPx: f32,
   vectorOverride: vec4<f32>,
   shapeOnly: f32
@@ -178,28 +220,12 @@ fn heprFillFragment(
   // its rows hold every segment that can contribute, each integrating its own.
   let box = vec4<f32>(local - 0.5 * footprint, 1.0 / footprint);
   var winding = 0.0;
-  let safeWidth = max(i32(segmentTexWidth), 1);
   if (metaC.x >= 0.0 && all(box.xy <= metaA.zw) && all(box.xy + footprint >= metaB.xy)) {
     // Integrate the whole decoded contour without loading any segment records.
     winding = metaC.y * box.z * box.w;
-  } else if (cells.y > 0.0) {
-    winding = heprCellWinding(cells, metaA.zw, box, footprint, segmentTexA, segmentTexB);
   } else {
-${vectorFillBandLoopWgsl({
-    bands: "bands",
-    y: "local.y",
-    radius: "0.5 * footprint.y",
-    count: "segmentCount",
-    start: "segmentStart",
-    texture: "segmentTexA",
-    entries: "bandEntries",
-    setup: "let rows = heprBandRows(bandInfo, band, bandCount, box);",
-    edge: `    let coord = vec2<i32>(segmentIndex % safeWidth, segmentIndex / safeWidth);
-    let primitiveA = textureLoad(segmentTexA, coord, 0);
-    let primitiveB = textureLoad(segmentTexB, coord, 0);
-    winding = winding + heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
-      primitiveB.z >= 1.0, box, rows.x, rows.y);`
-  })}
+    winding = heprFillIndexedWinding(pathIndex, segmentStart, segmentCount, metaA.zw, local.y,
+      box, footprint, segmentTexA, segmentTexB, segmentTexWidth, bandBase, bandEntries, cellHeaders);
   }
   let mixAmount = clamp(vectorOverride.a, 0.0, 1.0);
   let baseColor = vec3<f32>(metaB.z, metaB.w, metaC.z);
@@ -216,7 +242,7 @@ ${vectorFillBandLoopWgsl({
   return vec4<f32>(heprThreeOutputColor(color), alpha);
 }
 `;
-const fillFragmentDependencies = [includeNode(fillCoverageFn), includeNode(cellCoverageFn)];
+const fillFragmentDependencies = [includeNode(fillCoverageFn), includeNode(fillIndexedWindingFn)];
 const fillFragmentFns = createThreeWebGpuOutputFragmentFns(fillFragmentSource, fillFragmentDependencies);
 
 /** Shared exact paint math; mixed materials provide derivatives before branching. */
@@ -255,14 +281,7 @@ export function createThreeWebGpuFillMaterial(
   const metaA = varyingNode(TSL.textureLoad(options.fillPathMetaTextureA, pathCoord, 0), true);
   const metaB = varyingNode(TSL.textureLoad(options.fillPathMetaTextureB, pathCoord, 0), true);
   const metaC = varyingNode(TSL.textureLoad(options.fillPathMetaTextureC, pathCoord, 0), true);
-  const bands = varyingNode(callNode(fillBandInfoFn, {
-    pathIndex: fillPathIndex, base: TSL.uniform(options.fillBandBase ?? -1),
-    segments: TSL.textureLoad(options.fillSegmentTextureA)
-  }), true);
-  const cells = varyingNode(callNode(fillCellInfoFn, {
-    pathIndex: fillPathIndex, headers: TSL.uniform((options.fillCellBase ?? -1) + 1),
-    segments: TSL.textureLoad(options.fillSegmentTextureA)
-  }), true);
+  const pathIndex = varyingNode(TSL.int(fillPathIndex), true);
   const viewportUniform = TSL.uniform(options.viewport);
   const localToClipUniform = pageProjection.matrix;
   const vertexPack = varyingNode(callNode(fillVertexPackFn, {
@@ -296,8 +315,9 @@ export function createThreeWebGpuFillMaterial(
     segmentTexA: TSL.textureLoad(options.fillSegmentTextureA),
     segmentTexB: TSL.textureLoad(options.fillSegmentTextureB),
     segmentTexWidth: fillSegmentTextureWidthUniform,
-    bands, bandEntries: TSL.uniform(options.fillBandEntries ?? 0),
-    cells,
+    pathIndex, bandBase: TSL.uniform(options.fillBandBase ?? -1),
+    bandEntries: TSL.uniform(options.fillBandEntries ?? 0),
+    cellHeaders: TSL.uniform((options.fillCellBase ?? -1) + 1),
     fillAAScreenPx: fillAAScreenPxUniform,
     vectorOverride: TSL.uniform(options.vectorOverride),
     shapeOnly: shapeOnlyUniform

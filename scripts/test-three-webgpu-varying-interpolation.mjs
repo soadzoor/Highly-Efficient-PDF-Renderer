@@ -60,7 +60,7 @@ try {
     ["split stroke", createThreeWebGpuStrokeMaterial({ ...common, ...splitStrokeTextures }),
       quadGeometry("aSegmentIndex"), { flat: 4, interpolated: 1 }],
     ["fill", createThreeWebGpuFillMaterial({ ...common, ...fillTextures }),
-      quadGeometry("aFillPathIndex"), { flat: 5, interpolated: 1 }],
+      quadGeometry("aFillPathIndex"), { flat: 4, interpolated: 1 }],
     ["text", createThreeWebGpuTextMaterial({
       ...common,
       textInstanceTextureA: dataTexture(), textInstanceTextureB: dataTexture(), textInstanceTextureC: dataTexture(),
@@ -84,11 +84,19 @@ try {
     const shaders = build(state.material, geometry);
     const vertex = shaders.vertexShader;
     if (name.includes("fill") || name === "gradient patch mesh") {
-      assert.match(vertex, /heprFillBandInfo/, `${name}: vertex loads per-path band metadata`);
+      if (name === "fill") {
+        assert.doesNotMatch(vertex, /heprFill(?:Band|Cell)Info/, "fill: vertex leaves both index headers to fragment fallback");
+        assert.match(shaders.fragmentShader, /heprFillBandInfo\(f32\(pathIndex\), bandBase, segmentTexA\)/);
+        assert.match(shaders.fragmentShader, /heprFillCellInfo\(f32\(pathIndex\), cellHeaders, segmentTexA\)/);
+        assert.equal((vertex.match(/var \w+ : texture_2d<f32>/g) ?? []).length, 3,
+          "fill: only the three metadata textures are bound to the vertex stage");
+      } else {
+        assert.match(vertex, /heprFillBandInfo/, `${name}: vertex loads per-path band metadata`);
+        assert.match(vertex, /heprFillCellInfo/, `${name}: vertex loads per-path cell headers`);
+      }
       assert.match(shaders.fragmentShader, /heprBandRows\(bandInfo, band, bandCount, box\)/, `${name}: each band integrates only its own rows`);
       assert.match(shaders.fragmentShader, /packedIndex & 3/, `${name}: packed segment addressing is shared`);
-      assert.match(vertex, /heprFillCellInfo/, `${name}: vertex loads per-path cell headers`);
-      assert.match(shaders.fragmentShader, /heprCellWinding\(cells, metaA\.zw, box, footprint/,
+      assert.match(shaders.fragmentShader, name === "fill" ? /heprCellWinding\(cells, origin, box, footprint/ : /heprCellWinding\(cells, metaA\.zw, box, footprint/,
         `${name}: an indexed path reads only the cells under the pixel`);
     }
     if (name === "split stroke") {
@@ -113,6 +121,8 @@ try {
     assert.equal(flat.length, expected.flat, `${name}: per-primitive varyings are flat`);
     assert.equal(locations.length - flat.length, expected.interpolated,
       `${name}: only positions (and patch-mesh colors) interpolate`);
+    if (name === "fill") assert.equal(flat.filter(line => /: i32,/.test(line)).length, 1,
+      "fill: its path address remains an integer flat varying");
     // The position pack must never be flat: the fragment shader reconstructs
     // page-space coordinates and screen-space derivatives from it.
     assert.doesNotMatch(locations[0], /@interpolate/, `${name}: the position pack stays interpolated`);

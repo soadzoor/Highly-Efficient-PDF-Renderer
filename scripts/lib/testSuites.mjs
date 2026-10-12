@@ -71,6 +71,7 @@ export const fastTests = [
   "webgl-fill-clip-bounds",
   "subpixel-stroke-coverage",
   "fill-area-coverage",
+  "fill-index-deferral",
   "quadratic-fill-integral",
   "vector-fill-coverage",
   "vector-render-comparison",

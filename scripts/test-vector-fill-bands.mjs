@@ -237,6 +237,14 @@ try {
     assert.match(gradient.group.children[0].material.vertexShader, /heprClippedPaintQuad\(minBounds, maxBounds, uClipBounds/,
       "Three gradients retain their projected clip-bound quad expansion");
     for (const mesh of [fill.mesh, gradient.group.children[0]]) {
+      assert.doesNotMatch(mesh.material.vertexShader, /vFill(?:Bands|Cells)|uFillBandBase|uFillCellHeaders|uFillSegmentTex[AB]/,
+        "solid and gradient GL vertices leave segment/index textures to their fragments");
+      assert.match(mesh.material.vertexShader, /flat out int vFillPathIndex;/,
+        "solid and gradient GL vertices preserve a flat integer path address");
+      assert.match(mesh.material.fragmentShader, /uniform int uFillBandBase;/);
+      assert.match(mesh.material.fragmentShader, /uniform int uFillCellHeaders;/);
+      assert.match(mesh.material.fragmentShader, /heprFillIndexedWinding\(vFillPathIndex/,
+        "solid and gradient fragment fallbacks fetch indexes using the paint's own path address");
       const uniforms = mesh.material.uniforms;
       assert.equal(uniforms.uFillBandBase.value, expectedBase,
         "solid and gradient GL materials initialize the band binding, even without an index");

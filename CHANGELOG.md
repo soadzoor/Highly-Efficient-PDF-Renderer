@@ -28,11 +28,25 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   clipping, fill rules and canonical HEP data. Integrate individual quadratic
   curves and row-clipped curve pieces directly when their control hulls stay
   inside the pixel columns, reducing subdivision work in fill, gradient and
-  glyph coverage while preserving the column-crossing fallback.
+  glyph coverage while preserving the column-crossing fallback. Defer ordinary
+  fill spatial-index header reads until segment coverage is needed, checking
+  cells before bands, and reduce mixed-shader vertex texture requirements.
+  Skip both headers for paths below the index builders' shared segment threshold,
+  preserving the existing direct scan for small paths.
+- Expose native `heprPerf.status()` to inspect document loading state and pending
+  operations. Document performance report export without the DevTools `copy()`
+  helper.
 - Add `heprPerf.vectors("all" | "fills" | "strokes" | "none")` in both
   viewers for controlled GPU comparisons. Retain mixed vector batching when
   disabling one kind, record fill/stroke visibility in captures, and stop an
   active capture before changing comparison modes.
+
+### Fixed
+
+- Clear native PDF/HEP loading state when a source is superseded before its
+  scene-load continuation resumes, so a failed replacement read cannot leave
+  the previous document marked as loading with backend switching and export
+  blocked.
 
 ## [0.1.61] - 2026-10-12
 

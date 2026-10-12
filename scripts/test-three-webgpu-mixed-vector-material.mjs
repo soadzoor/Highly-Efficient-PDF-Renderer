@@ -11,6 +11,7 @@ try {
   const { createThreeWebGpuMixedVectorMaterial } = await import("../src/threeWebGpuBackend.ts");
   const { createThreeWebGpuStrokeMaterial } = await import("../src/threeWebGpuStrokeMaterial.ts");
   const { createThreeWebGpuFillMaterial } = await import("../src/threeWebGpuFillMaterial.ts");
+  const { MIN_VECTOR_INDEXED_PATH_SEGMENTS } = await import("../src/vectorFillBands.ts");
   const { initializeThreeVectorClip, createThreeInstanceVectorClipMaterial } = await import("../src/threeVectorClips.ts");
   const { setThreePdfShapeOnly } = await import("../src/threePdfShape.ts");
   const textures = [];
@@ -57,7 +58,7 @@ try {
     assert.match(vertex, /index >= split/, "stroke fields preserve split LOD addressing");
     const reads = [], headTexture = { name: "head", width: 4 }, tailTexture = { name: "tail", width: 3 };
     const fillTexture = { name: "fill", width: 4 };
-    const fetch = evaluateWgsl(fnSource(vertex, "heprMixedTextureField") + fnSource(vertex, "heprMixedCellField"), {
+    const fetch = evaluateWgsl(fnSource(vertex, "heprMixedTextureField"), {
       textureLoad: (source, coordinate) => { reads.push(source.name); return source.name + ":" + (coordinate.y * source.width + coordinate.x); },
       vec4: value => ({ x: value, y: value, z: value, w: value })
     });
@@ -68,9 +69,9 @@ try {
     assert.deepEqual(reads, ["head", "tail", "tail", "fill"], "each instance reads only its selected head, tail or fill store");
     reads.length = 0;
     assert.deepEqual(field(1, 3, -1), { x: 0, y: 0, z: 0, w: 0 });
-    assert.deepEqual(fetch.heprMixedCellField(0, 3, fillTexture, 4, 20), { x: 0, y: 0, z: 0, w: 0 });
-    assert.deepEqual(reads, [], "missing fill indexes and stroke cell records need no texture reads");
-    assert.equal(fetch.heprMixedCellField(1, 3, fillTexture, 4, 20), "fill:23");
+    assert.deepEqual(reads, [], "a fill does not need the stroke-only bounds record");
+    assert.doesNotMatch(vertex, /hepr(?:MixedCellField|FillBandInfo|FillCellInfo)/,
+      "the vertex shader leaves all fill index reads to fragment fallback");
     assert.match(vertex, /heprStrokeWorldPack\(/); assert.match(vertex, /heprFillVertexPack\(/);
     assert.match(vertex, /return vec4<f32>\(pack.xy, 0.0, pack.z\)/, "fill validity becomes the shared W sentinel");
     assert.match(vertex, /select\(fillEnabled, strokeEnabled, kind < 0.5\) < 0.5/,
@@ -78,12 +79,17 @@ try {
     assert.match(vertex, /metaC.x >= 0.0 && useLocalToClip < 0.5/,
       "tighter fill padding requires a closed contour and the ordinary screen transform");
     assert.match(vertex, /0.5 \* fillAAScreenPx/, "wide box filters retain their full half-footprint support");
-    assert.match(fragment, /heprCellWinding\(cells, metaA.zw, box, footprint/);
+    assert.match(fragment, /heprCellWinding\(cells, origin, box, footprint/);
     const fillBody = fnBody(fragment, "heprMixedFillFragment");
     assert.match(fillBody, /metaC.x >= 0.0 && all\(box.xy <= metaA.zw\) && all\(box.xy \+ footprint >= metaB.xy\)/,
       "whole-pixel signed area requires the entire decoded control hull inside the footprint");
-    assert(fillBody.indexOf("winding = metaC.y * box.z * box.w") < fillBody.indexOf("heprCellWinding("),
-      "whole-contour integration avoids the segment and cell textures");
+    assert(fillBody.indexOf("winding = metaC.y * box.z * box.w") < fillBody.indexOf("heprFillIndexedWinding("),
+      "whole-contour integration avoids both index headers and segment textures");
+    const indexedBody = fnBody(fragment, "heprFillIndexedWinding");
+    assert(indexedBody.indexOf("heprFillCellInfo(") < indexedBody.indexOf("heprCellWinding("));
+    assert(indexedBody.indexOf("return heprCellWinding(") < indexedBody.indexOf("heprFillBandInfo("),
+      "cell-indexed paths never fetch the band header");
+    verifyLazyHeaderReads(fragment, MIN_VECTOR_INDEXED_PATH_SEGMENTS);
     assert.match(fillBody, /select\(metaC.x, -metaC.x - 1.0, metaC.x < 0.0\)/,
       "ineligible open contours retain their original nonzero or even-odd fill rule");
     assert.match(fragment, /heprStrokeLodAlpha\(alpha, primitiveType\)/);
@@ -107,13 +113,17 @@ try {
     const varyingStruct = vertex.match(/struct VaryingsStruct \{[\s\S]*?\n\};/)[0];
     const slots = varyingStruct.split("\n").filter(line => line.includes("@location("));
     assert.equal(slots.filter(line => line.includes("@interpolate( flat )")).length, 6,
-      "five union records and the primitive kind remain flat");
+      "four union records, the primitive kind and integer path address remain flat");
+    assert.equal(slots.filter(line => /: i32,/.test(line)).length, 1, "the path address is an integer varying");
     assert.equal(slots.length, 7, "only the shared world pack interpolates");
     if (withPagesAndTail) {
       assert.match(vertex, /heprPageProjection\(/); assert.match(vertex, /heprPageClip\(/);
       assert.match(vertex, /aPageIndex/); assert.doesNotMatch(vertex, /heprPrimitivePage\(/);
-      assert.equal((vertex.match(/var \w+ : texture_2d<f32>/g) ?? []).length, 14,
+      assert.equal((vertex.match(/var \w+ : texture_2d<f32>/g) ?? []).length, 13,
         "split stores, per-page matrices and fill fields stay within the sixteen-texture vertex limit");
+    } else {
+      assert.equal((vertex.match(/var \w+ : texture_2d<f32>/g) ?? []).length, 7,
+        "without split stores only four stroke and three fill metadata textures reach vertices");
     }
     const clipTexture = texture(); initializeThreeVectorClip(state.material, clipTexture);
     const clipped = createThreeInstanceVectorClipMaterial(state.material);
@@ -137,6 +147,71 @@ function fnSource(source, name) {
   const match = source.match(new RegExp(`fn ${name}\\s*\\([^]*?\\n}`));
   assert(match, `generated shader includes ${name}`);
   return match[0];
+}
+function verifyLazyHeaderReads(source, minimumIndexedSegments) {
+  // Execute the helpers emitted by the real material. Coverage is stubbed here
+  // because this regression checks dispatch/addressing and unnecessary reads;
+  // the independent scalar coverage tests check the edge integration itself.
+  const reads = [], cells = [], edges = [], poisoned = new Set();
+  const vec4 = (x = 0, y = x, z = x, w = x) => ({ x, y, z, w,
+    xy: { x, y }, zw: { x: z, y: w } });
+  const a = { name: "A", width: 4, records: new Map() }, b = { name: "B", width: 4, records: new Map() };
+  const segmentStart = 100;
+  for (let offset = 0; offset < minimumIndexedSegments; offset++) {
+    const id = segmentStart + offset;
+    a.records.set(id, vec4(id, 0, id + 1, 1)); b.records.set(id, vec4(id + .5, .5, 1, 0));
+  }
+  const helper = evaluateWgsl(["heprFillBandInfo", "heprFillCellInfo", "heprFillIndexedWinding"]
+    .map(name => fnSource(source, name)).join("\n"), {
+    vec4,
+    textureDimensions: texture => ({ x: texture.width }),
+    textureLoad: (texture, coordinate) => {
+      const id = coordinate.y * texture.width + coordinate.x;
+      reads.push(`${texture.name}:${id}`);
+      assert(!poisoned.has(`${texture.name}:${id}`), `poisoned index header fetched ${texture.name}:${id}`);
+      assert(texture.records.has(id), `unexpected texture read ${texture.name}:${id}`);
+      return texture.records.get(id);
+    },
+    heprCellWinding: (...args) => { cells.push(args); return .375; },
+    heprBandRows: (_header, band) => ({ x: .5 * band, y: .5 * (band + 1) }),
+    heprSegmentCoverage: (...args) => { edges.push(args); return .125; }
+  }).heprFillIndexedWinding;
+  const origin = { x: 10, y: 20 }, box = vec4(0, 0, 1, 1), footprint = { x: 1, y: 1 };
+  const run = (bandBase = 8, cellHeaders = 21, segmentCount = minimumIndexedSegments) => {
+    reads.length = 0; cells.length = 0; edges.length = 0;
+    return helper(3, segmentStart, segmentCount, origin, .75, box, footprint, a, b, 4, bandBase, 12, cellHeaders);
+  };
+  const directReads = count => Array.from({ length: count }, (_, offset) =>
+    [`A:${segmentStart + offset}`, `B:${segmentStart + offset}`]).flat();
+  a.records.set(23, vec4(40, 2, 1, 1));
+  assert.equal(run(), .375);
+  assert.deepEqual(reads, ["A:23"], `the ${minimumIndexedSegments}-segment boundary retains cell indexing and skips the band header`);
+  assert.equal(cells[0][0], a.records.get(23)); assert.equal(cells[0][1], origin);
+  assert.equal(edges.length, 0, "cell dispatch skips linear segment reads");
+
+  a.records.set(23, vec4(0)); a.records.set(11, vec4(0));
+  assert.equal(run(), .125 * minimumIndexedSegments);
+  assert.deepEqual(reads, ["A:23", "A:11", ...directReads(minimumIndexedSegments)],
+    "a missing cell index loads the band header before the original segment range");
+  assert.equal(cells.length, 0); assert.equal(edges.length, minimumIndexedSegments);
+
+  assert.equal(run(-1, 0), .125 * minimumIndexedSegments);
+  assert.deepEqual(reads, directReads(minimumIndexedSegments), "absent global indexes fetch neither header");
+
+  a.records.set(11, vec4(30, 2, 0, 1));
+  a.records.set(30, vec4(0, 1, 0, 0)); a.records.set(31, vec4(1, 1, 0, 0));
+  a.records.set(12, [segmentStart, segmentStart + 1, 0, 0]);
+  assert.equal(run(), .25);
+  assert.deepEqual(reads, ["A:23", "A:11", "A:30", "A:12", `A:${segmentStart}`, `B:${segmentStart}`,
+    "A:31", "A:12", `A:${segmentStart + 1}`, `B:${segmentStart + 1}`],
+    "band dispatch preserves packed segment addresses and visits each contributing row");
+  assert.deepEqual(edges.map(args => args.slice(-2)), [[0, .5], [.5, 1]]);
+
+  poisoned.add("A:23"); poisoned.add("A:11");
+  assert.equal(run(8, 21, minimumIndexedSegments - 1), .125 * (minimumIndexedSegments - 1));
+  assert.deepEqual(reads, directReads(minimumIndexedSegments - 1),
+    `a ${minimumIndexedSegments - 1}-segment path skips poisoned index headers and keeps its original segment range`);
+  assert.equal(cells.length, 0); assert.equal(edges.length, minimumIndexedSegments - 1);
 }
 function build(material, geometry) {
   const renderer = {

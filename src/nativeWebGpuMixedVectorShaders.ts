@@ -1,8 +1,8 @@
 /** Native ordered vectors share the existing coverage math and only pack their varyings differently. */
-export const MIXED_VECTOR_WGPU_VERTEX_TEXTURES = 8;
+export const MIXED_VECTOR_WGPU_VERTEX_TEXTURES = 7;
 export const MIXED_VECTOR_WGPU_FRAGMENT_TEXTURES = 3;
 export const MIXED_VECTOR_WGPU_VARYING_VARIABLES = 10;
-export const MIXED_VECTOR_WGPU_VARYING_COMPONENTS = 26;
+export const MIXED_VECTOR_WGPU_VARYING_COMPONENTS = 27;
 
 function removeBlock(source: string, prefix: string): string {
   const start = source.indexOf(prefix);
@@ -70,7 +70,7 @@ struct MixedVectorData {
   @location(6) @interpolate(flat) data1: vec4f,
   @location(7) @interpolate(flat) data2: vec4f,
   @location(8) @interpolate(flat) data3: vec4f,
-  @location(9) @interpolate(flat) indices: vec2i,
+  @location(9) @interpolate(flat) indices: vec3i,
 };
 
 @vertex
@@ -94,10 +94,9 @@ fn vsMain(@builtin(vertex_index) vertexIndex: u32, @builtin(instance_index) inst
     let value = MixedFillDataVertex(vertexIndex, instanceIndex);
     out.position = value.position; out.local = value.local;
     out.color = value.color; out.alpha = value.alpha; out.vectorClipIndex = value.vectorClipIndex;
-    out.data0 = value.bands; out.data1 = value.cells;
     out.data2 = vec4f(value.origin, value.fillRule, value.signedArea);
     out.data3 = vec4f(value.boundsMax, 0.0, 0.0);
-    out.indices = vec2i(value.segmentStart, value.segmentCount);
+    out.indices = vec3i(value.segmentStart, value.segmentCount, value.pathIndex);
   }
   return out;
 }
@@ -119,10 +118,10 @@ ${footprintMatch[1]}
   var value: MixedFillData;
   value.local = inData.local; value.color = inData.color; value.alpha = inData.alpha;
   value.vectorClipIndex = inData.vectorClipIndex;
-  value.bands = inData.data0; value.cells = inData.data1; value.origin = inData.data2.xy;
+  value.origin = inData.data2.xy;
   value.fillRule = inData.data2.z; value.signedArea = inData.data2.w;
   value.boundsMax = inData.data3.xy;
-  value.segmentStart = inData.indices.x; value.segmentCount = inData.indices.y;
+  value.segmentStart = inData.indices.x; value.segmentCount = inData.indices.y; value.pathIndex = inData.indices.z;
   return MixedFillDataFragment(value, footprint);
 }
 `;

@@ -801,7 +801,20 @@ let loadedCompressScansPreference = compressScansCheckbox.checked;
 let lastParsedSceneLabel: string | null = null;
 let captureProfiler: RenderPerformanceProfiler | null = null;
 let captureContext: Record<string, unknown> | null = null;
+function nativePerformanceStatus() {
+  const backendSwitching = backendSwitcher?.isSwitchInFlight() ?? false;
+  const blockers: string[] = [];
+  if (!lastParsedScene) blockers.push("no committed document");
+  if (pendingSourceLoadCount > 0) blockers.push("source read/preparation still running");
+  if (activeSceneLoadToken !== null) blockers.push("scene load still running");
+  if (layoutChangeRunning) blockers.push("layout change still running");
+  if (backendSwitching) blockers.push("renderer backend switch still running");
+  return { ready: blockers.length === 0, document: lastParsedSceneLabel, blockers,
+    pendingSourceLoads: pendingSourceLoadCount, sourceLoading: sourceLoadController !== null,
+    sceneLoadToken: activeSceneLoadToken, loadToken, layoutChanging: layoutChangeRunning, backendSwitching };
+}
 const performanceCapture = {
+  status: nativePerformanceStatus,
   vectors(mode: VectorRenderComparisonMode) {
     return setVectorRenderComparison(renderer, mode, () => { captureProfiler?.stop(); });
   },
@@ -1348,6 +1361,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     return nextLoadToken;
   });
   if (activeLoadToken !== loadToken || options.signal.aborted) {
+    finishSceneLoad(activeLoadToken);
     return;
   }
   const loadStart = performance.now();
@@ -1528,6 +1542,7 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     return nextLoadToken;
   });
   if (activeLoadToken !== loadToken) {
+    finishSceneLoad(activeLoadToken);
     return;
   }
   const loadStart = performance.now();

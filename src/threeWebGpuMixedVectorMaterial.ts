@@ -53,15 +53,6 @@ fn heprMixedTextureField(
 }
 `);
 
-const cellFieldFn: unknown = TSL.wgslFn(`
-fn heprMixedCellField(kind: f32, index: f32, segments: texture_2d<f32>, width: f32, base: f32) -> vec4<f32> {
-  if (kind < 0.5 || base < 0.0) { return vec4<f32>(0.0); }
-  let i = i32(base + index);
-  let safeWidth = max(i32(width), 1);
-  return textureLoad(segments, vec2<i32>(i % safeWidth, i / safeWidth), 0);
-}
-`);
-
 const worldPackFn: unknown = TSL.wgslFn(`
 fn heprMixedWorldPack(
   corner: vec2<f32>, kind: f32,
@@ -102,10 +93,11 @@ const fillFragmentFn: unknown = TSL.wgslFn(
 );
 const fragmentFns = createThreeWebGpuOutputFragmentFns(`
 fn heprMixedVectorFragment(
-  local: vec2<f32>, kind: f32,
-  dataA: vec4<f32>, dataB: vec4<f32>, dataC: vec4<f32>, dataD: vec4<f32>, dataE: vec4<f32>,
+  local: vec2<f32>, kind: f32, pathIndex: i32,
+  dataA: vec4<f32>, dataB: vec4<f32>, dataC: vec4<f32>, dataD: vec4<f32>,
   halfWidth: f32, segmentTexA: texture_2d<f32>, segmentTexB: texture_2d<f32>, segmentWidth: f32,
-  bandEntries: f32, fillAAScreenPx: f32, strokeAAScreenPx: f32, curveEnabled: f32,
+  bandBase: f32, bandEntries: f32, cellHeaders: f32,
+  fillAAScreenPx: f32, strokeAAScreenPx: f32, curveEnabled: f32,
   vectorOverride: vec4<f32>, shapeOnly: f32
 ) -> vec4<f32> {
   // Both paints can discard. Evaluate derivatives before their divergent branch.
@@ -116,7 +108,8 @@ fn heprMixedVectorFragment(
       curveEnabled, strokeAAScreenPx, vectorOverride, shapeOnly, pixelFootprint);
   }
   return heprMixedFillFragment(local, dataA, dataB, dataC, segmentTexA, segmentTexB,
-    segmentWidth, dataD, bandEntries, dataE, fillAAScreenPx, vectorOverride, shapeOnly, pixelFootprint);
+    segmentWidth, pathIndex, bandBase, bandEntries, cellHeaders,
+    fillAAScreenPx, vectorOverride, shapeOnly, pixelFootprint);
 }
 `, [strokeFragmentFn, fillFragmentFn]);
 
@@ -161,12 +154,10 @@ export function createThreeWebGpuMixedVectorMaterial(
   const dataA = load(options.segmentTextureA, tail?.textureA, options.fillPathMetaTextureA, fillMetaWidth, 0);
   const dataB = load(options.segmentTextureB, tail?.textureB, options.fillPathMetaTextureB, fillMetaWidth, 0);
   const dataC = load(options.segmentStyleTexture, tail?.styleTexture, options.fillPathMetaTextureC, fillMetaWidth, 0);
-  const dataD = load(options.segmentBoundsTexture, tail?.boundsTexture, options.fillSegmentTextureA,
-    fillWidth, options.fillBandBase ?? -1);
-  const dataE = flat(call(cellFieldFn, {
-    kind, index, segments: TSL.textureLoad(options.fillSegmentTextureA),
-    width: fillWidth, base: TSL.uniform(options.fillCellBase ?? -1)
-  }));
+  // Only strokes need this record. Reusing their already bound texture for
+  // the unused fill argument keeps fill segment/index textures fragment-only.
+  const dataD = load(options.segmentBoundsTexture, tail?.boundsTexture, options.segmentBoundsTexture,
+    segmentWidth, -1);
   const worldPack = varying(call(worldPackFn, {
     corner: TSL.attribute("aCorner", "vec2"), kind, dataA, dataB, dataC, dataD,
     viewport, zoom: zoomUniform, useLocalToClip: useLocalToClipUniform,
@@ -181,9 +172,12 @@ export function createThreeWebGpuMixedVectorMaterial(
   });
   page.finish(material);
   material.fragmentNode = call(fragmentFns[options.colorCompositing], {
-    local: world.xy, kind: flat(kind), dataA, dataB, dataC, dataD, dataE, halfWidth: world.z,
+    local: world.xy, kind: flat(kind), pathIndex: flat(TSL.int(index)),
+    dataA, dataB, dataC, dataD, halfWidth: world.z,
     segmentTexA: TSL.textureLoad(options.fillSegmentTextureA), segmentTexB: TSL.textureLoad(options.fillSegmentTextureB),
-    segmentWidth: fillWidth, bandEntries: TSL.uniform(options.fillBandEntries ?? 0),
+    segmentWidth: fillWidth, bandBase: TSL.uniform(options.fillBandBase ?? -1),
+    bandEntries: TSL.uniform(options.fillBandEntries ?? 0),
+    cellHeaders: TSL.uniform((options.fillCellBase ?? -1) + 1),
     fillAAScreenPx: TSL.uniform(1), strokeAAScreenPx: TSL.uniform(1), curveEnabled: curveUniform,
     vectorOverride: TSL.uniform(options.vectorOverride), shapeOnly: shapeOnlyUniform
   });

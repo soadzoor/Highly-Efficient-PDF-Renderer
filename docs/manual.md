@@ -498,6 +498,16 @@ heprPerf.stop();          // CPU timing and batch-counter tables, plus the repor
 copy(heprPerf.json());    // Chrome DevTools helper: copy the report for comparison
 ```
 
+`copy()` is a DevTools utility, rather than a browser JavaScript function. If it
+is unavailable in your console context, evaluate `heprPerf.json()` as a separate
+command, then right-click the returned string and choose **Copy string contents**
+in Chrome/Edge DevTools.
+
+In the native viewer, `heprPerf.status()` reports whether a document is committed
+and source preparation, scene loading, layout changes or backend switching are
+still active. It includes the loading tokens and pending source count for
+diagnosing a document that remains marked as loading after it becomes visible.
+
 Capture panning and zooming separately, with the same viewport, DPR, LOD settings,
 and visible layers when comparing versions. Capture is off by default, stops after
 the requested number of rendered frames (600 by default), and also stops when the
@@ -587,6 +597,8 @@ heprPerf.vectors("all"); // Restore the drawing when finished.
 ```
 
 Use the same starting view, viewport, DPR, layers and movement for all runs.
+Reset to the same fitted view before warm-up and keep zoom fixed during pan
+comparisons: fractional-pixel camera alignment changes subpixel fill work.
 Keep mixed batching enabled: compatible paints retain their shared draw while
 the vertex shader rejects the disabled kind, avoiding a return to thousands
 of separate submissions. Check mixed-batch counters after warm-up; unsupported
@@ -606,6 +618,18 @@ signed area with the existing fill rule;
 partial coverage and open paths keep the segment calculation. Flat views use
 a tighter fill quad margin matched to the filter width. General projected
 views retain their conservative margins.
+
+Ordinary native and Three.js fills also defer spatial-index header reads until
+the whole-path area shortcut fails. Segment coverage checks the cell index
+first and reads a band header only when the path has no cell index; paths
+without either index retain their direct segment scan. This avoids index reads
+for pixels answered by the area shortcut and reduces vertex texture inputs in
+mixed fill/stroke draws.
+
+Paths with fewer than 24 segments skip both headers even when the document has
+indexes for other paths. Both index builders already leave these small paths
+unindexed; the builders and shaders share that threshold so the direct scan
+uses the same geometry and coverage calculation.
 
 Segment coverage also integrates a quadratic directly when its control hull
 fits inside the footprint. After clipping a curve to the pixel's rows, its

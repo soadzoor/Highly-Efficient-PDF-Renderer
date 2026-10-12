@@ -73,7 +73,8 @@ try {
     .filter(mesh => mesh.visible && mesh.geometry.instanceCount > 0);
 
   // Actual selected source layers: 4096 interleaved paints become one mixed mesh.
-  const entry = layers(sceneOf(2048)), gl = mockGl(), host = { getContext: () => gl };
+  const entry = layers(sceneOf(2048)), gl = mockGl(undefined, { vertex: 11, fragment: 3, combined: 14 }),
+    host = { getContext: () => gl };
   assert.equal(activeSources(entry).length, 4096);
   entry.mixed.update(entry.roots, host, camera);
   assert.equal(entry.mixed.group.children.length, 1);
@@ -95,6 +96,12 @@ try {
   entry.mixed.setRenderingEnabled(true, true);
   assert.match(mesh.material.vertexShader, /#ifdef HEPR_SPLIT_STROKE_STORE/);
   assert.match(mesh.material.vertexShader, /const int uFillClipBoundsEnabled = 0/);
+  assert.doesNotMatch(mesh.material.vertexShader, /uniform highp sampler2D uFillSegmentTex[AB]/,
+    "mixed vertices no longer bind a fill segment/index texture");
+  assert.match(mesh.material.vertexShader, /flat out ivec3 vMixedSegments/,
+    "fill start/count/path addresses share one integer varying");
+  assert.match(mesh.material.fragmentShader, /heprFillIndexedWinding\(vFillPathIndex/,
+    "mixed fragment fallback uses its own path's lazy index headers");
   const probes = gl.links;
   for (let i = 0; i < 20; i++) { entry.refresh(); entry.mixed.update(entry.roots, host, camera); }
   assert.equal(entry.mixed.group.children[0].geometry, geometry, "stable selections reuse mixed geometry");
@@ -171,7 +178,8 @@ try {
   const pagesScene = composeVectorScenesInGrid([sceneOf(2), sceneOf(2)], 2);
   const table = new ThreePageTransforms(new ScenePageViews(pagesScene));
   const pages = layers(pagesScene, { pageTransforms: table });
-  pages.mixed.update(pages.roots, host, camera);
+  pages.mixed.update(pages.roots, { getContext: () => mockGl(undefined, { vertex: 13, fragment: 3, combined: 16 }) }, camera);
+  assert.equal(pages.mixed.group.visible, true, "page batching needs only thirteen vertex texture units");
   const pageMesh = pages.mixed.group.children[0], pageAttribute = pageMesh.geometry.getAttribute("aPageIndex");
   assert.deepEqual(Array.from({ length: pageMesh.geometry.instanceCount }, (_, i) => pageAttribute.getX(i)),
     [0, 0, 0, 0, 1, 1, 1, 1], "mixed IDs carry the correct page across both primitive stores");
@@ -373,11 +381,12 @@ try {
   console.log("Three mixed vectors: 4096 paints to one draw, order/clips/pages/OCG, stable uploads, LOD resources, lifecycle, GL/GPU fallbacks and public comparison switch passed");
 } finally { globalThis.document = previousDocument; hooks.deregister(); }
 
-function mockGl(failure) {
+function mockGl(failure, limits = {}) {
   const live = new Set();
   return { live, links: 0, VERTEX_SHADER: 1, FRAGMENT_SHADER: 2, COMPILE_STATUS: 3, LINK_STATUS: 4,
     MAX_VERTEX_TEXTURE_IMAGE_UNITS: 5, MAX_TEXTURE_IMAGE_UNITS: 6, MAX_COMBINED_TEXTURE_IMAGE_UNITS: 7, MAX_VARYING_VECTORS: 8,
-    getParameter: key => failure === "caps" ? 0 : key === 8 ? 16 : 32,
+    getParameter: key => failure === "caps" ? 0 : ({ 5: limits.vertex, 6: limits.fragment,
+      7: limits.combined, 8: limits.varyings ?? 16 })[key] ?? 32,
     createShader(kind) { const shader = { kind }; live.add(shader); return shader; }, shaderSource() {}, compileShader() {},
     getShaderParameter: shader => !(failure === "vertex" && shader.kind === 1 || failure === "fragment" && shader.kind === 2),
     getShaderInfoLog: () => "shader failure", deleteShader: shader => live.delete(shader),

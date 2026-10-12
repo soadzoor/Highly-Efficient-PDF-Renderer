@@ -13,16 +13,17 @@ try {
   const { vectorPathCellStore, vectorIndexedPathStore, buildVectorPathCells } = await import("../src/vectorCellIndex.ts");
   const { buildVectorFillBandIndex } = await import("../src/vectorFillBands.ts");
   const { packVectorClips } = await import("../src/vectorClips.ts");
-  const { CORE_FILL_VERTEX_SHADER_SOURCE } = await import("../src/webGlFloorplanRenderer.ts");
+  const { CORE_FILL_FRAGMENT_SHADER_SOURCE } = await import("../src/webGlFloorplanRenderer.ts");
   const { GRADIENT_FILL_VERTEX_SHADER_SOURCE } = await import("../src/nativeGradientWebGlShaders.ts");
 
   // Hosts reuse the core fill shader without knowing about cells (Three's
   // materials, adapters): an integer uniform they never set reads zero, which
   // must mean that no path has cells.
-  for (const [name, source, uniform] of [["core fill", CORE_FILL_VERTEX_SHADER_SOURCE, "uFillCellHeaders"],
+  for (const [name, source, uniform] of [["core fill", CORE_FILL_FRAGMENT_SHADER_SOURCE, "uFillCellHeaders"],
     ["native gradient fill", GRADIENT_FILL_VERTEX_SHADER_SOURCE, "uCellHeaders"]]) {
     assert.match(source, new RegExp(`uniform int ${uniform};`), `${name}: declares ${uniform}`);
-    assert.match(source, new RegExp(`${uniform} <= 0 \\? vec4\\(0\\.0\\)`), `${name}: zero disables cells`);
+    assert.match(source, new RegExp(name === "core fill" ? `if \\(${uniform} > 0\\)` : `${uniform} <= 0 \\? vec4\\(0\\.0\\)`),
+      `${name}: zero disables cells`);
     assert.match(source, new RegExp(`${uniform} - 1 \\+ pathIndex`), `${name}: headers start one texel lower`);
   }
 

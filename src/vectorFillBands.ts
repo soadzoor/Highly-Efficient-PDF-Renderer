@@ -24,8 +24,8 @@ export interface VectorFillBandIndex {
   readonly segments: Uint32Array;
 }
 
-/** Below this a path's whole segment list is already shorter than a band lookup. */
-const MIN_INDEXED_SEGMENTS = 24;
+/** Smaller paths use a direct scan; index builders and shaders share this boundary. */
+export const MIN_VECTOR_INDEXED_PATH_SEGMENTS = 24;
 /** Segments per band, traded against the index's own size. */
 const TARGET_SEGMENTS_PER_BAND = 8;
 const MAX_BANDS_PER_PATH = 512;
@@ -103,7 +103,7 @@ export function buildVectorFillBandIndex(store: VectorPathSegmentStore): VectorF
     const start = metaA[path * 4], count = metaA[path * 4 + 1];
     const minY = metaA[path * 4 + 3], maxY = metaB[path * 4 + 1];
     const height = maxY - minY;
-    if (count < MIN_INDEXED_SEGMENTS || !(height > 0) || !Number.isFinite(height)) continue;
+    if (count < MIN_VECTOR_INDEXED_PATH_SEGMENTS || !(height > 0) || !Number.isFinite(height)) continue;
     let bands = Math.min(MAX_BANDS_PER_PATH, Math.max(1, Math.round(count / TARGET_SEGMENTS_PER_BAND)));
     let entries = 0;
     while (bands > 1) {

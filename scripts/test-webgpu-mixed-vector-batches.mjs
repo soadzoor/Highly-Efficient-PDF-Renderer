@@ -57,8 +57,8 @@ try {
     assert.equal((shader.match(/@fragment/g) ?? []).length, 1);
     const output = shader.match(/struct MixedVectorData \{([\s\S]*?)\};/)[1];
     assert.equal((output.match(/@location/g) ?? []).length, MIXED_VECTOR_WGPU_VARYING_VARIABLES);
-    assert.equal(MIXED_VECTOR_WGPU_VARYING_COMPONENTS, 26);
-    assert.match(output, /@interpolate\(flat\) indices: vec2i/, "fill addresses retain integer precision");
+    assert.equal(MIXED_VECTOR_WGPU_VARYING_COMPONENTS, 27);
+    assert.match(output, /@interpolate\(flat\) indices: vec3i/, "fill addresses and path IDs retain integer precision");
     const fragment = shader.slice(shader.lastIndexOf("@fragment"));
     assert(fragment.indexOf("dpdx(") < fragment.indexOf("if (inData.kind"));
     assert.equal((shader.match(/dpdx\(/g) ?? []).length, 2);
@@ -67,7 +67,7 @@ try {
       vectorClipIndex: 7, p0: vec(8, 9), p1: vec(10, 11), p2: vec(12, 13),
       halfWidth: 14, aaWorld: 15, primitiveType: -3, hasClipBounds: 1, clipBounds: vec(16, 17, 18, 19) };
     const fill = { position: vec(20, 21, 22, 23), local: vec(24, 25), color: vec(.6, .7, .8), alpha: .9,
-      vectorClipIndex: 26, bands: vec(27, 28, 29, 30), cells: vec(31, 32, 33, 34), origin: vec(35, 36),
+      vectorClipIndex: 26, pathIndex: 16777221, origin: vec(35, 36),
       fillRule: 1, signedArea: -.25, boundsMax: vec(37, 38), segmentStart: 16777217, segmentCount: 16777219 };
     for (const [kind, original] of [[0, stroke], [1, fill]]) {
       const packed = executeWrapper(shader, "vsMain", { uMixedInstances: [0, 0, kind], uCamera: { fillCells: vec(0, 0, 1, 1) },
@@ -84,11 +84,12 @@ try {
       assert.deepEqual(disabled.position, vec(-2, -2, 0, 1), "disabled vectors leave the viewport before texture reads");
     }
     for (const pattern of [/heprStrokeLodAlpha\(alpha, inData.primitiveType\)/,
-      /heprStrokeQuadWorldPosition\(/, /heprCellWinding\(inData.cells/, /heprSegmentCoverage\(primitiveA.xy/,
+      /heprStrokeQuadWorldPosition\(/, /heprCellWinding\(cells/, /heprSegmentCoverage\(primitiveA.xy/,
       /heprVectorClip\(inData.local, inData.vectorClipIndex, uVectorClipTex\)/]) assert.match(shader, pattern);
     const entries = pipeline.descriptor.layout.bindGroupLayouts[0].entries;
     assert.equal(entries.length, 10);
-    assert.deepEqual(entries.slice(1).map(entry => entry.visibility), [1, 1, 1, 1, 1, 1, 1, 3, 2]);
+    assert.deepEqual(entries.slice(1).map(entry => entry.visibility), [1, 1, 1, 1, 1, 1, 1, 2, 2],
+      "fill segment stores are fragment-only after lazy header loading");
     assert.equal(pipeline.descriptor.layout.bindGroupLayouts[1], renderer.vectorClipBindGroupLayout);
     assert.equal(pipeline.descriptor.fragment.targets[0].blend.color.srcFactor, "src-alpha");
     const submitted = submit(renderer);
@@ -135,7 +136,7 @@ try {
   }
   for (const failure of ["limits", "pipeline", "allocation"]) {
     const { renderer, device } = create();
-    if (failure === "limits") device.limits.maxSampledTexturesPerShaderStage = 7;
+    if (failure === "limits") device.limits.maxSampledTexturesPerShaderStage = 6;
     if (failure === "pipeline") device.failPipeline = true;
     const warnings = [], warn = console.warn;
     console.warn = (...args) => warnings.push(args);
@@ -232,7 +233,7 @@ function executeWrapper(source, name, scope, args) {
     .replace(/let footprint = max\([\s\S]*?vec2f\(1e-4\)\);/, "let footprint = vec2f(1, 1);")
     .replace(/\bvar (\w+): \w+;/g, "let $1 = {};")
     .replace(/\b(\d+)u\b/g, "$1");
-  const context = { vec2f: vec, vec2i: vec, vec4f: vec, ...scope };
+  const context = { vec2f: vec, vec2i: vec, vec3i: vec, vec4f: vec, ...scope };
   const parameters = name === "vsMain" ? ["vertexIndex", "instanceIndex"] : ["inData"];
   return new Function(...Object.keys(context), ...parameters, body)(...Object.values(context), ...args);
 }

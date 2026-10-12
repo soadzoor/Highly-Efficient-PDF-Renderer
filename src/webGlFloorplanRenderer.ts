@@ -4036,7 +4036,7 @@ export class WebGlFloorplanRenderer {
       let gpu = this.mixedVectorGpu;
       if (!gpu) {
         const gl = this.gl;
-        if (gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS) < 9 ||
+        if (gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS) < 8 ||
             gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS) < 3 ||
             gl.getParameter(gl.MAX_VARYING_VECTORS) < MIXED_VECTOR_VARYING_VECTORS ||
             gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS) < (this.orderedDedicatedTextureUnits ? 19 : 16)) {

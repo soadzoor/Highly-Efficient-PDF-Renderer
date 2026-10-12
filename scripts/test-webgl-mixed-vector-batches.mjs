@@ -181,7 +181,14 @@ try {
     "compositing keeps the ordinary surface and paint submission path");
   barriers.renderer.dispose();
 
-  const limits = [{ vertex: 8 }, { fragment: 2 }, { varying: 9 }];
+  const eightVertexTextures = setup({}, { vertex: 8 });
+  eightVertexTextures.install(makePlan()); eightVertexTextures.frame();
+  assert.equal(eightVertexTextures.mock.draws.length, 2,
+    "fragment-only fill index reads allow mixed batching with eight vertex texture units");
+  assert(eightVertexTextures.renderer.mixedVectorGpu);
+  eightVertexTextures.renderer.dispose();
+
+  const limits = [{ vertex: 7 }, { fragment: 2 }, { varying: 9 }];
   for (const limit of limits) checkFallback(limit);
   for (const failure of ["vertex", "fragment", "link", "buffer", "vao", "uniform", "upload"]) checkFallback({}, failure);
   function checkFallback(limit, failure) {
