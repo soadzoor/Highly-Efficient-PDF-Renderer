@@ -344,7 +344,9 @@ function extractFunction(source, name) {
   const declarationMatch = declarationPattern.exec(source);
   assert.ok(declarationMatch, `expected to find the ${name}() declaration`);
   const declarationIndex = declarationMatch.index;
-  const bodyStart = source.indexOf("{", declarationIndex);
+  // A return type can contain object literals; the body brace ends its line.
+  const lineEnd = /\{[ \t]*\r?\n/.exec(source.slice(declarationIndex));
+  const bodyStart = lineEnd ? declarationIndex + lineEnd.index : source.indexOf("{", declarationIndex);
   assert.notEqual(bodyStart, -1, `expected ${name}() to have a body`);
   const bodyEnd = findMatchingBrace(source, bodyStart);
   assert.notEqual(bodyEnd, -1, `expected ${name}() to have balanced braces`);

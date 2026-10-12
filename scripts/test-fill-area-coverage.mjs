@@ -194,22 +194,38 @@ try {
       if (name === "GLSL") assert.equal(padding(zoom, aa, 0, 1, Math.max), 1 / zoom, "projected fills keep conservative padding");
     }
   }
-  // Compile the actual whole-hull dispatch predicates/assignments with scalar
-  // vector operations, then compare their result to the existing edge filter.
+  // Compile the actual small-hull dispatch predicates/assignments with scalar
+  // vector operations and the shipped helper, then compare them to the edge filter.
   const areaDispatches = [
     ["GLSL", FILL_FRAGMENT_SHADER_SOURCE.match(/if \(vFillRule >= 0\.0[\s\S]*?\n  }/)?.[0], text => text
-      .replace(/all\(lessThanEqual\(box.xy, vFillOrigin\)\)/g, "(box.x <= origin.x && box.y <= origin.y)")
-      .replace(/all\(greaterThanEqual\(box.xy \+ footprint, vFillBoundsMax\)\)/g, "(box.x + footprint.x >= upper.x && box.y + footprint.y >= upper.y)")
-      .replace(/vFillRule/g, "rule").replace(/vFillSignedArea/g, "area")],
+      .replace(/all\(lessThanEqual\(vFillBoundsMax - vFillOrigin, footprint\)\)/g,
+        "(upper.x - origin.x <= footprint.x && upper.y - origin.y <= footprint.y)")
+      .replace(/vFillRule/g, "rule").replace(/vFillSignedArea/g, "area")
+      .replace(/vFillOrigin/g, "origin").replace(/vFillBoundsMax/g, "upper")],
     ["WGSL", gpuFillSource.match(/if \(inData.fillRule >= 0\.0[\s\S]*?\n  }/)?.[0], text => text
-      .replace(/all\(box.xy <= inData.origin\)/g, "(box.x <= origin.x && box.y <= origin.y)")
-      .replace(/all\(box.xy \+ footprint >= inData.boundsMax\)/g, "(box.x + footprint.x >= upper.x && box.y + footprint.y >= upper.y)")
-      .replace(/inData.fillRule/g, "rule").replace(/inData.signedArea/g, "area")]
+      .replace(/all\(inData.boundsMax - inData.origin <= footprint\)/g,
+        "(upper.x - origin.x <= footprint.x && upper.y - origin.y <= footprint.y)")
+      .replace(/inData.fillRule/g, "rule").replace(/inData.signedArea/g, "area")
+      .replace(/inData.origin/g, "origin").replace(/inData.boundsMax/g, "upper")]
   ].map(([name, block, translate]) => {
-    assert(block, `${name} whole-hull shortcut exists`);
-    return [name, new Function("rule", "area", "origin", "upper", "box", "footprint",
-      `let winding = null; ${translate(block)} return winding;`)];
+    assert(block, `${name} small-hull shortcut exists`);
+    const shader = variants.find(([variant]) => variant === name)[1];
+    const dispatch = new Function("heprHullAreaWinding", "rule", "area", "origin", "upper", "box", "footprint",
+      `let winding = null; ${translate(block)} return winding;`);
+    return [name, shader, (...args) => dispatch(shader.heprHullAreaWinding, ...args)];
   });
+  const decodePath = (segments, rule) => {
+    const a = Float32Array.from(segments.flatMap(({ p0, p1 }) => [...p0, ...p1]));
+    const b = Float32Array.from(segments.flatMap(({ p2, quadratic }) => [...p2, quadratic ? 1 : 0, 0]));
+    const meta = vectorFillCoverageMetadata({ fillPathCount: 1, fillSegmentCount: segments.length,
+      fillPathMetaA: Float32Array.of(0, segments.length, 0, 0), fillPathMetaB: Float32Array.of(1, 1, 0, 0),
+      fillPathMetaC: Float32Array.of(rule, 0, 0, 1), fillSegmentsA: a, fillSegmentsB: b });
+    return { area: meta.pathMetaC[1],
+      decoded: segments.map((segment, i) => ({ ...segment, p0: [...a.slice(i * 4, i * 4 + 2)],
+        p1: [...a.slice(i * 4 + 2, i * 4 + 4)], p2: [...b.slice(i * 4, i * 4 + 2)] })),
+      origin: { x: meta.pathMetaA[2], y: meta.pathMetaA[3] }, upper: { x: meta.pathMetaB[0], y: meta.pathMetaB[1] } };
+  };
+  const unit = { x: 1, y: 1 };
   const contained = [
     ["dot", rect(.2, .3, .4, .5)],
     ["reversed", polygon([[.2, .3], [.2, .5], [.4, .5], [.4, .3]])],
@@ -220,23 +236,53 @@ try {
     ["same-direction overlap", [...rect(.1, .1, .6, .6), ...rect(.3, .3, .8, .8)]]
   ];
   for (const [label, segments] of contained) for (const rule of [0, 1]) {
-    const a = Float32Array.from(segments.flatMap(({ p0, p1 }) => [...p0, ...p1]));
-    const b = Float32Array.from(segments.flatMap(({ p2, quadratic }) => [...p2, quadratic ? 1 : 0, 0]));
-    const meta = vectorFillCoverageMetadata({ fillPathCount: 1, fillSegmentCount: segments.length,
-      fillPathMetaA: Float32Array.of(0, segments.length, 0, 0), fillPathMetaB: Float32Array.of(1, 1, 0, 0),
-      fillPathMetaC: Float32Array.of(rule, 0, 0, 1), fillSegmentsA: a, fillSegmentsB: b });
-    const decoded = segments.map((segment, i) => ({ ...segment, p0: [...a.slice(i * 4, i * 4 + 2)],
-      p1: [...a.slice(i * 4 + 2, i * 4 + 4)], p2: [...b.slice(i * 4, i * 4 + 2)] }));
-    const origin = { x: meta.pathMetaA[2], y: meta.pathMetaA[3] }, upper = { x: meta.pathMetaB[0], y: meta.pathMetaB[1] };
-    for (const [name, dispatch] of areaDispatches) {
-      const shader = variants.find(([variant]) => variant === name)[1];
-      const winding = dispatch(rule, meta.pathMetaC[1], origin, upper, box, { x: 1, y: 1 });
+    const { area, decoded, origin, upper } = decodePath(segments, rule);
+    for (const [name, shader, dispatch] of areaDispatches) {
+      const winding = dispatch(rule, area, origin, upper, box, unit);
       assert.notEqual(winding, null, `${name} ${label} uses precomputed area inside the footprint`);
       assert(Math.abs(shader.heprFillCoverage(winding, rule === 1) - coverage(shader, decoded, rule === 1)) < 1e-7,
         `${name} ${label} preserves the existing ${rule ? "even-odd" : "nonzero"} area filter`);
-      assert.equal(dispatch(-(rule + 1), 999, origin, upper, box, { x: 1, y: 1 }), null, "ineligible paths scan their edges");
-      assert.equal(dispatch(rule, 999, origin, upper, { ...box, x: origin.x + .001 }, { x: 1, y: 1 }), null,
-        "a partially contained hull scans its edges");
+      assert.equal(dispatch(-(rule + 1), 999, origin, upper, box, unit), null, "ineligible paths scan their edges");
+      assert.equal(dispatch(rule, 999, origin, upper, box, { x: .05, y: 1 }), null, "a hull wider than the footprint scans its edges");
+      assert.equal(dispatch(rule, 999, origin, upper, box, { x: 1, y: .05 }), null, "a hull taller than the footprint scans its edges");
+    }
+  }
+  // Footprints reaching part of a small hull share its area by their overlap
+  // with the hull's width and height. Neighbouring footprints sum to the whole
+  // area, axis-aligned rectangles stay exact, and other shapes only move ink
+  // between those neighbours. maxError bounds that move as a share of the area.
+  for (const [label, segments, maxError] of [
+    ["dot", rect(.2, .3, .4, .5), 1e-9],
+    ["reversed", polygon([[.2, .3], [.2, .5], [.4, .5], [.4, .3]]), 1e-9],
+    ["one-footprint square", rect(0, 0, 1, 1), 1e-9],
+    ["thin rule", rect(.1, .45, .9, .47), 1e-9],
+    ["circle", circle(.5, .5, .3), .07],
+    // A right triangle's ink sits in one corner: at most a third of it moves.
+    ["triangle", polygon([[.1, .1], [.7, .1], [.1, .7]]), 1 / 3 + 1e-6],
+    ["hole", [...rect(.1, .1, .8, .8), ...polygon([[.3, .3], [.3, .5], [.5, .5], [.5, .3]])], .07]
+  ]) for (const rule of [0, 1]) {
+    const { area, decoded, origin, upper } = decodePath(segments, rule);
+    for (const [name, shader, dispatch] of areaDispatches) {
+      for (const [dx, dy] of [[.05, .1], [.37, .62], [.5, .5], [.9, .15], [.71, .97]]) {
+        let ink = 0;
+        for (let px = -1; px <= 1; px += 1) for (let py = -1; py <= 1; py += 1) {
+          const filter = { x: dx + px - 1, y: dy + py - 1, z: 1, w: 1 };
+          const winding = dispatch(rule, area, origin, upper, filter, unit);
+          assert.notEqual(winding, null, `${name} ${label} uses its area for a partly covered small hull`);
+          ink += winding;
+          const exact = averaged(shader, decoded, 0, 1, filter);
+          assert(Math.abs(winding - exact) <= maxError * Math.abs(area) + 1e-9,
+            `${name} ${label} at (${dx + px}, ${dy + py}) stays within ${maxError} of its area: ${winding} vs ${exact}`);
+        }
+        assert(Math.abs(ink - area) < 1e-9, `${name} ${label} keeps its whole area across footprints: ${ink} vs ${area}`);
+      }
+      // Footprints smaller than a path unit map through box.zw like the edge filter.
+      const scaled = { x: origin.x - .1, y: origin.y - .2, z: 1 / 2, w: 1 / 4 };
+      assert(Math.abs(dispatch(rule, area, origin, upper, scaled, { x: 2, y: 4 }) - area / 8) < 1e-9,
+        `${name} ${label} divides its area by the footprint`);
+      const degenerate = { x: .25, y: .25 };
+      assert.equal(dispatch(rule, 0, degenerate, degenerate, { ...box, x: .5 }, unit), 0,
+        `${name} a zero-size hull outside the footprint adds nothing`);
     }
   }
   const path = [];

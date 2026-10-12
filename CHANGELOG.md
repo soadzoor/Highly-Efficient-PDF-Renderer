@@ -22,7 +22,12 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   source kinds in GPU operation reports.
 - Reduce GPU fill work across native and Three.js WebGL/WebGPU with cached
   conservative bounds from decoded geometry and a signed-area shortcut for
-  closed paths wholly inside a pixel's filter footprint. Use those bounds for
+  closed paths no larger than a pixel's filter footprint. Pixels covering
+  only part of such a path share its area by overlap with its bounds, which is
+  exact for axis-aligned rectangles and preserves total ink; other subpixel
+  shapes may shift some ink between the neighbouring pixels they touch. This
+  removes the per-segment loop from nearly every fill at overview zooms of
+  dense drawings. Use those bounds for
   culling, paint ordering and spatial indexes. Tighten flat fill padding while
   retaining the existing projected, open-path and glyph coverage paths,
   clipping, fill rules and canonical HEP data. Integrate individual quadratic

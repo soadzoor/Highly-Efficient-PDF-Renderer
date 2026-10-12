@@ -65,8 +65,8 @@ try {
   assert.doesNotMatch(vertex, /uniform (?:sampler2D uFillSegmentTexA|int uFillBandBase|int uFillCellHeaders)/,
     "the vertex stage needs no fill spatial-index store");
   assert.match(fragment, /heprSegmentCoverage\(primitiveA.xy, primitiveA.zw, primitiveB.xy,/);
-  assert.match(fragment, /vFillRule >= 0.0 && all\(lessThanEqual\(box.xy, vFillOrigin\)\)/);
-  assert.match(fragment, /winding = vFillSignedArea \* box.z \* box.w;/);
+  assert.match(fragment, /vFillRule >= 0.0 && all\(lessThanEqual\(vFillBoundsMax - vFillOrigin, footprint\)\)/);
+  assert.match(fragment, /winding = heprHullAreaWinding\(vFillSignedArea, vFillOrigin, vFillBoundsMax, box, footprint\);/);
   assert.doesNotMatch(fragment, /\bpacked\b/, "the mixed shader avoids a reserved GLES identifier");
 
   const shapedVertex = pdfShapeCoverageGlsl(vertex), shapedFragment = pdfShapeCoverageGlsl(fragment);

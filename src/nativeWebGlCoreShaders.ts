@@ -599,11 +599,11 @@ void main() {
   vec4 box = vec4(vLocal - 0.5 * footprint, 1.0 / footprint);
   float winding = 0.0;
   // C.x is negative only for paths whose decoded contours cannot use area.
-  // A box containing the whole control hull integrates the full signed area,
+  // A control hull no larger than the box integrates its signed area,
   // including holes and quadratic curves, without reading any edge records.
-  if (vFillRule >= 0.0 && all(lessThanEqual(box.xy, vFillOrigin)) &&
-      all(greaterThanEqual(box.xy + footprint, vFillBoundsMax))) {
-    winding = vFillSignedArea * box.z * box.w;
+  // At overview zooms this covers almost every small path in a drawing.
+  if (vFillRule >= 0.0 && all(lessThanEqual(vFillBoundsMax - vFillOrigin, footprint))) {
+    winding = heprHullAreaWinding(vFillSignedArea, vFillOrigin, vFillBoundsMax, box, footprint);
   } else {
     winding = heprFillIndexedWinding(vFillPathIndex, vSegmentStart, vSegmentCount, vFillOrigin, box, footprint);
   }

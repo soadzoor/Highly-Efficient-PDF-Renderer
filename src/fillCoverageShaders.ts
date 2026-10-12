@@ -213,6 +213,22 @@ float heprFillCoverage(float winding, bool evenOdd) {
     ? abs(magnitude - 2.0 * floor(0.5 * magnitude + 0.5))
     : min(magnitude, 1.0);
 }
+
+// A closed path whose decoded hull is no larger than the footprint needs only
+// its signed area. A box containing the hull takes all of it, exactly; one
+// reaching part of the hull takes the share of the hull's width and height it
+// overlaps. That is exact for axis-aligned rectangles, and footprints tiling
+// the plane still sum to the whole area. Other shapes can only move ink
+// between the at most 2x2 pixels whose footprints reach the hull.
+float heprHullAreaWinding(float signedArea, vec2 lower, vec2 upper, vec4 box, vec2 footprint) {
+  float spanX = upper.x - lower.x;
+  float spanY = upper.y - lower.y;
+  float overlapX = min(box.x + footprint.x, upper.x) - max(box.x, lower.x);
+  float overlapY = min(box.y + footprint.y, upper.y) - max(box.y, lower.y);
+  float shareX = overlapX >= spanX ? 1.0 : max(overlapX, 0.0) / max(spanX, 1e-30);
+  float shareY = overlapY >= spanY ? 1.0 : max(overlapY, 0.0) / max(spanY, 1e-30);
+  return signedArea * box.z * box.w * shareX * shareY;
+}
 `;
 
 export const FILL_COVERAGE_WGSL = /* wgsl */ `
@@ -403,6 +419,22 @@ fn heprBandRows(bandInfo: vec4<f32>, band: i32, bandCount: i32, box: vec4<f32>) 
 fn heprFillCoverage(winding: f32, evenOdd: bool) -> f32 {
   let magnitude = abs(winding);
   return select(min(magnitude, 1.0), abs(magnitude - 2.0 * floor(0.5 * magnitude + 0.5)), evenOdd);
+}
+
+// A closed path whose decoded hull is no larger than the footprint needs only
+// its signed area. A box containing the hull takes all of it, exactly; one
+// reaching part of the hull takes the share of the hull's width and height it
+// overlaps. That is exact for axis-aligned rectangles, and footprints tiling
+// the plane still sum to the whole area. Other shapes can only move ink
+// between the at most 2x2 pixels whose footprints reach the hull.
+fn heprHullAreaWinding(signedArea: f32, lower: vec2<f32>, upper: vec2<f32>, box: vec4<f32>, footprint: vec2<f32>) -> f32 {
+  let spanX = upper.x - lower.x;
+  let spanY = upper.y - lower.y;
+  let overlapX = min(box.x + footprint.x, upper.x) - max(box.x, lower.x);
+  let overlapY = min(box.y + footprint.y, upper.y) - max(box.y, lower.y);
+  let shareX = select(max(overlapX, 0.0) / max(spanX, 1e-30), 1.0, overlapX >= spanX);
+  let shareY = select(max(overlapY, 0.0) / max(spanY, 1e-30), 1.0, overlapY >= spanY);
+  return signedArea * box.z * box.w * shareX * shareY;
 }
 `;
 

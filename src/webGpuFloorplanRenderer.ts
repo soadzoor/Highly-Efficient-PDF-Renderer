@@ -620,9 +620,9 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   // its rows hold every segment that can contribute, each integrating its own.
   let box = vec4f(inData.local - 0.5 * footprint, 1.0 / footprint);
   var winding = 0.0;
-  if (inData.fillRule >= 0.0 && all(box.xy <= inData.origin) &&
-      all(box.xy + footprint >= inData.boundsMax)) {
-    winding = inData.signedArea * box.z * box.w;
+  // A control hull no larger than the box integrates its signed area alone.
+  if (inData.fillRule >= 0.0 && all(inData.boundsMax - inData.origin <= footprint)) {
+    winding = heprHullAreaWinding(inData.signedArea, inData.origin, inData.boundsMax, box, footprint);
   } else {
     winding = heprFillIndexedWinding(inData.pathIndex, inData.segmentStart, inData.segmentCount,
       inData.origin, box, footprint, inData.local.y);

@@ -613,14 +613,21 @@ per frame. Library hosts can use the PDF object's `setFillRenderingEnabled`,
 Ordinary fill uploads use conservative bounds from the decoded line endpoints
 and quadratic control hulls, shared by culling, paint ordering and spatial
 indexes. Open paths retain the union of the original and decoded bounds.
-Closed paths entirely inside a pixel's filter footprint use their precomputed
-signed area with the existing fill rule;
-partial coverage and open paths keep the segment calculation. Flat views use
+Closed paths whose decoded hull is no larger than a pixel's filter footprint
+use their precomputed signed area with the existing fill rule, without reading
+any segments. A footprint containing the whole hull takes the exact area. One
+reaching only part of the hull takes the share of the hull's width and height
+that it overlaps. That share is exact for axis-aligned rectangles and keeps each
+path's total ink, but other subpixel shapes may move some ink between the at
+most 2×2 pixels they touch: up to a third of a right triangle's area, or about
+6% of a circle's. At overview zooms of dense drawings, this removes the segment
+loop from nearly every fill fragment. Larger paths and open paths keep the
+segment calculation. Flat views use
 a tighter fill quad margin matched to the filter width. General projected
 views retain their conservative margins.
 
 Ordinary native and Three.js fills also defer spatial-index header reads until
-the whole-path area shortcut fails. Segment coverage checks the cell index
+the area shortcut does not apply. Segment coverage checks the cell index
 first and reads a band header only when the path has no cell index; paths
 without either index retain their direct segment scan. This avoids index reads
 for pixels answered by the area shortcut and reduces vertex texture inputs in

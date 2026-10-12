@@ -220,9 +220,9 @@ fn heprFillFragment(
   // its rows hold every segment that can contribute, each integrating its own.
   let box = vec4<f32>(local - 0.5 * footprint, 1.0 / footprint);
   var winding = 0.0;
-  if (metaC.x >= 0.0 && all(box.xy <= metaA.zw) && all(box.xy + footprint >= metaB.xy)) {
-    // Integrate the whole decoded contour without loading any segment records.
-    winding = metaC.y * box.z * box.w;
+  if (metaC.x >= 0.0 && all(metaB.xy - metaA.zw <= footprint)) {
+    // A hull no larger than the box needs only its signed area, not its segment records.
+    winding = heprHullAreaWinding(metaC.y, metaA.zw, metaB.xy, box, footprint);
   } else {
     winding = heprFillIndexedWinding(pathIndex, segmentStart, segmentCount, metaA.zw, local.y,
       box, footprint, segmentTexA, segmentTexB, segmentTexWidth, bandBase, bandEntries, cellHeaders);

@@ -126,9 +126,9 @@ function buildGeometry(scene: VectorScene): FillGeometryMetadata {
  * original 0/1 fill rule when that integral is usable; otherwise it is
  * `-(rule + 1)` and C.y is zero. Decode the rule with `x < 0 ? -x - 1 : x`.
  * An open path keeps the union of its original bounds and finite decoded hull,
- * while invalid geometry retains its original bounds. Only a pixel footprint
- * containing the entire hull may use the integral instead of evaluating the
- * individual segments.
+ * while invalid geometry retains its original bounds. Only a hull no larger
+ * than a pixel footprint may use the integral instead of evaluating the
+ * individual segments (see heprHullAreaWinding).
  *
  * Cached by source array identities and counts. Scene stores are immutable:
  * replace an array when changing geometry or colors. Geometry is cached apart

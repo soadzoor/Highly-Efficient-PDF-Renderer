@@ -81,10 +81,11 @@ try {
     assert.match(vertex, /0.5 \* fillAAScreenPx/, "wide box filters retain their full half-footprint support");
     assert.match(fragment, /heprCellWinding\(cells, origin, box, footprint/);
     const fillBody = fnBody(fragment, "heprMixedFillFragment");
-    assert.match(fillBody, /metaC.x >= 0.0 && all\(box.xy <= metaA.zw\) && all\(box.xy \+ footprint >= metaB.xy\)/,
-      "whole-pixel signed area requires the entire decoded control hull inside the footprint");
-    assert(fillBody.indexOf("winding = metaC.y * box.z * box.w") < fillBody.indexOf("heprFillIndexedWinding("),
-      "whole-contour integration avoids both index headers and segment textures");
+    assert.match(fillBody, /metaC.x >= 0.0 && all\(metaB.xy - metaA.zw <= footprint\)/,
+      "signed-area coverage requires a decoded control hull no larger than the footprint");
+    assert(fillBody.indexOf("winding = heprHullAreaWinding(metaC.y, metaA.zw, metaB.xy, box, footprint)") >= 0 &&
+      fillBody.indexOf("winding = heprHullAreaWinding(") < fillBody.indexOf("heprFillIndexedWinding("),
+      "small-hull integration avoids both index headers and segment textures");
     const indexedBody = fnBody(fragment, "heprFillIndexedWinding");
     assert(indexedBody.indexOf("heprFillCellInfo(") < indexedBody.indexOf("heprCellWinding("));
     assert(indexedBody.indexOf("return heprCellWinding(") < indexedBody.indexOf("heprFillBandInfo("),

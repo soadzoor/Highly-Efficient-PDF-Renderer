@@ -171,12 +171,12 @@ float heprTestWinding(int pathIndex, int segmentStart, int segmentCount, vec2 or
   assert.doesNotMatch(gpuMain, /textureLoad\(uFillSegmentTex[AB]/, "WGSL's main defers all segment-store reads to its helper");
   assert.doesNotMatch(functionSource(gpuFill, "vsMain"), /textureLoad\(uFillSegmentTex[AB]/,
     "WGSL fill vertices do not read either index store");
-  for (const [name, source, area] of [["GLSL", glMain, "winding = vFillSignedArea * box.z * box.w"],
-    ["WGSL", gpuMain, "winding = inData.signedArea * box.z * box.w"]]) {
+  for (const [name, source, area] of [["GLSL", glMain, "winding = heprHullAreaWinding(vFillSignedArea,"],
+    ["WGSL", gpuMain, "winding = heprHullAreaWinding(inData.signedArea,"]]) {
     assert(source.indexOf(area) >= 0 && source.indexOf(area) < source.indexOf("heprFillIndexedWinding("),
-      `${name}: whole-path area is evaluated before any index lookup`);
+      `${name}: small-hull area is evaluated before any index lookup`);
     assert.match(source, /\}\s*else\s*\{\s*winding = heprFillIndexedWinding\(/,
-      `${name}: only the missed whole-area case enters the index helper`);
+      `${name}: only hulls larger than the footprint enter the index helper`);
   }
   assert.doesNotMatch(vertex, /uFillBandBase|uFillCellHeaders/, "fill vertices do not load either index header");
 
