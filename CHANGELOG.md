@@ -18,6 +18,7 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   previews available after selecting a link without replacing pinned comments.
 - Improve the Examples dropdown's count, arrow and hover contrast in the shared
   toolbar, including the Three demo's light toolbar.
+- Show a pointer cursor over the Reader toolbar's Layout dropdown in both demos.
 - Skip the native demo's Vector LOD loading stage when no stroke LOD work is
   needed, including the bundled WarAndPeace example.
 - Reuse stored Text LOD when opening HEPs in native Reader mode and switching

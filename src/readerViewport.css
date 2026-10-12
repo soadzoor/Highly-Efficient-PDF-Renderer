@@ -57,8 +57,10 @@
 }
 
 .reader-toolbar button { cursor: pointer; white-space: nowrap; }
+.reader-toolbar select { cursor: pointer; }
 .reader-toolbar button:hover, .reader-toolbar button[aria-pressed="true"] { background: #e2e8f0; }
 .reader-toolbar button:disabled { opacity: .45; cursor: default; }
+.reader-toolbar select:disabled { cursor: default; }
 .reader-toolbar input { text-align: center; }
 .reader-toolbar .reader-page-number { width: 58px; }
 .reader-toolbar .reader-zoom { width: 66px; }
