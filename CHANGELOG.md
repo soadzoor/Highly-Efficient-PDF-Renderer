@@ -16,6 +16,15 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   frames no longer revisit every batch. On a 217k-fill drawing panned at
   fit-all, CPU time per frame in `renderer.render` fell from 6.2 ms to 0.3 ms
   in a headless Chrome profile, with identical pixels.
+- Make Three.js culling and LOD selection changes proportional to the visible
+  paints rather than the whole drawing. Ordered batches merge the sorted
+  selection with their paint ranges instead of scanning every paint, detect
+  unchanged selections without per-record lookup tables, and the mixed layer
+  rewrites its instance buffer in place. Large drawings keep the native
+  renderer's 64-pixel culling margin for fills, so small pans reuse the
+  selection. Panning the same drawing zoomed in took about half the CPU time
+  per frame in a headless profile, with identical pixels; frames that change
+  the stroke LOD selection still cost more.
 
 ### Fixed
 

@@ -80,8 +80,15 @@ interface DrawRunRange {
   first: number;
   count: number;
   ids?: Uint32Array;
-  /** First static paint rank of this LOD range. */
-  rankFirst: number;
+  /**
+   * The range's selection keys, [keyFirst, keyEnd): canonical IDs, or for
+   * stored LOD records their static paint ranks (`ids` in rank order).
+   */
+  keyFirst: number;
+  keyEnd: number;
+  /** This update's slice of the sorted selected keys. */
+  selectionFirst: number;
+  selectionEnd: number;
 }
 
 interface DrawRunEntry {
@@ -100,7 +107,8 @@ export class ThreeVectorDrawRuns {
   private readonly visibility: ScenePaintVisibility;
   private snapshot: OptionalContentSnapshot;
   private readonly clipMaterials = new Map<string, THREE.Material>();
-  private readonly visibleIds: Uint8Array;
+  /** Source instance capacity: the selection never exceeds it. */
+  private readonly selectionCapacity: number;
   private readonly strokeRedundancy: VectorStrokeRedundancy | null;
   /** Visible IDs that may be culled; only strokes sharing a line qualify. */
   private strokeCandidates: Uint32Array | null;
@@ -123,10 +131,17 @@ export class ThreeVectorDrawRuns {
   private readonly origins: Uint32Array | undefined;
   private readonly idsByRun = new Map<number, Uint32Array>();
   private readonly lodIdToRank: Uint32Array | null = null;
-  private readonly selectedRankBits: Uint32Array | null = null;
-  private readonly selectedRankWords: Uint32Array | null = null;
-  private selectedRanks = new Uint32Array(0);
-  private selectedRankCount = 0;
+  /** Two-level bitset that sorts the selected keys without scanning every paint. */
+  private readonly selectedKeyBits: Uint32Array;
+  private readonly selectedKeyWords: Uint32Array;
+  private selectedKeys = new Uint32Array(0);
+  private selectedKeyCount = 0;
+  /** Receives the next sorted selection, so an unchanged one is detected by comparison. */
+  private nextKeys = new Uint32Array(0);
+  /** Whether the batches reflect the current selection; rebuilt batches do not yet. */
+  private entriesCurrent = false;
+  /** Every range once, ordered by keyFirst, for one merge with the selected keys. */
+  private rangesByKey: DrawRunRange[] = [];
   private textSelection: OrderedTextLodSelection | null = null;
   private textSelectionRevision = -1;
 
@@ -150,7 +165,9 @@ export class ThreeVectorDrawRuns {
     this.snapshot = createDefaultOptionalContentSnapshot(scene);
     this.visibility.setVisibility(this.snapshot);
     const source = parent.geometry.getAttribute(attribute);
-    this.visibleIds = new Uint8Array(source.count);
+    this.selectionCapacity = source.count;
+    this.selectedKeyBits = new Uint32Array(Math.ceil(source.count / 32));
+    this.selectedKeyWords = new Uint32Array(Math.ceil(this.selectedKeyBits.length / 32));
     this.strokeRedundancy = kind === "stroke" && !origins && !this.visibility.requiresCompositing
       ? new VectorStrokeRedundancy(scene) : null;
     this.strokeCandidates = this.strokeRedundancy ? new Uint32Array(this.strokeRedundancy.candidateCount) : null;
@@ -159,8 +176,6 @@ export class ThreeVectorDrawRuns {
     this.plan = plan ?? getThreeVectorDrawPlan(scene);
     if (origins) {
       this.lodIdToRank = new Uint32Array(source.count);
-      this.selectedRankBits = new Uint32Array(Math.ceil(source.count / 32));
-      this.selectedRankWords = new Uint32Array(Math.ceil(this.selectedRankBits.length / 32));
       const sourceRuns = new Uint32Array(scene.segmentCount);
       scene.drawRuns!.forEach((run, index) => {
         if (run.kind === kind) sourceRuns.fill(index, run.first, run.first + run.count);
@@ -218,39 +233,32 @@ export class ThreeVectorDrawRuns {
       return;
     }
     if (!replanned && source.version === this.sourceVersion && count === this.sourceCount) return;
+    this.sourceVersion = source.version;
+    this.sourceCount = count;
     // Spatial culling can repack the same IDs in a different order. The ordered
     // batches only depend on membership, so reuse their buffers and redundancy
     // decision when no primitive actually entered or left the candidate set.
-    const selected = source.array as Float32Array;
-    let unchanged = !replanned && this.sourceVersion >= 0 && count === this.sourceCount;
-    if (unchanged) {
-      for (let i = 0; i < count; i++) {
-        if (!this.visibleIds[selected[i]]) { unchanged = false; break; }
-      }
-    }
-    this.sourceVersion = source.version;
-    this.sourceCount = count;
-    if (unchanged) return;
-    this.visibleIds.fill(0);
-    for (let i = 0; i < count; i++) this.visibleIds[selected[i]] = 1;
-    if (this.lodIdToRank) this.updateSelectedRanks(selected, count);
+    if (!this.updateSelectedKeys(source.array as Float32Array, count) && this.entriesCurrent) return;
     this.updateEntries();
   }
 
-  /** Filter the static LOD paint order without scanning every stored level. */
-  private updateSelectedRanks(selected: Float32Array, count: number): void {
-    if (this.selectedRanks.length < count) {
-      this.selectedRanks = new Uint32Array(Math.min(this.visibleIds.length,
-        Math.max(count, this.selectedRanks.length * 2)));
+  /**
+   * Sort the selection into paint-order keys without scanning every paint:
+   * canonical IDs, or the static paint ranks of stored LOD records.
+   */
+  private updateSelectedKeys(selected: Float32Array, count: number): boolean {
+    if (this.nextKeys.length < count) {
+      this.nextKeys = new Uint32Array(Math.min(this.selectionCapacity, Math.max(count, this.nextKeys.length * 2)));
     }
-    const bits = this.selectedRankBits!, groups = this.selectedRankWords!;
+    const next = this.nextKeys;
+    const bits = this.selectedKeyBits, groups = this.selectedKeyWords, ranks = this.lodIdToRank;
     for (let index = 0; index < count; index++) {
-      const rank = this.lodIdToRank![selected[index]], word = rank >>> 5;
-      bits[word] |= 1 << (rank & 31);
+      const key = ranks ? ranks[selected[index]] : selected[index], word = key >>> 5;
+      bits[word] |= 1 << (key & 31);
       groups[word >>> 5] |= 1 << (word & 31);
     }
     // The upper bitset skips invisible ranges; the lower one visits only the
-    // selected IDs in paint order, including ties between LOD representatives.
+    // selected keys in paint order, including ties between LOD representatives.
     let out = 0;
     for (let group = 0; group < groups.length; group++) {
       let words = groups[group];
@@ -260,23 +268,35 @@ export class ThreeVectorDrawRuns {
         let selectedBits = bits[word];
         bits[word] = 0;
         while (selectedBits !== 0) {
-          this.selectedRanks[out++] = word * 32 + 31 - Math.clz32(selectedBits & -selectedBits);
+          next[out++] = word * 32 + 31 - Math.clz32(selectedBits & -selectedBits);
           selectedBits = (selectedBits & (selectedBits - 1)) >>> 0;
         }
         words = (words & (words - 1)) >>> 0;
       }
     }
-    this.selectedRankCount = out;
+    let changed = out !== this.selectedKeyCount;
+    for (let index = 0; !changed && index < out; index++) changed = next[index] !== this.selectedKeys[index];
+    if (!changed) return false;
+    this.nextKeys = this.selectedKeys;
+    this.selectedKeys = next;
+    this.selectedKeyCount = out;
+    return true;
   }
 
-  private selectedRankOffset(rank: number): number {
-    let low = 0, high = this.selectedRankCount;
-    while (low < high) {
-      const middle = (low + high) >>> 1;
-      if (this.selectedRanks[middle] < rank) low = middle + 1;
-      else high = middle;
+  /**
+   * Give every range its slice of the sorted selected keys in one merge, so an
+   * update costs the ranges plus the selection rather than every paint.
+   */
+  private assignSelectionSlices(): void {
+    const keys = this.selectedKeys, count = this.selectedKeyCount;
+    let start = 0;
+    for (const range of this.rangesByKey) {
+      while (start < count && keys[start] < range.keyFirst) start++;
+      let end = start;
+      while (end < count && keys[end] < range.keyEnd) end++;
+      range.selectionFirst = start;
+      range.selectionEnd = end;
     }
-    return low;
   }
 
   /**
@@ -327,6 +347,9 @@ export class ThreeVectorDrawRuns {
       }
       this.createEntry(ranges, start);
     }
+    // Multiply passes share their range; slice each range once.
+    this.rangesByKey = [...new Set(this.entries.flatMap(entry => entry.ranges))]
+      .sort((a, b) => a.keyFirst - b.keyFirst);
     profile?.add("three.batchesCreated", this.entries.length);
     profile?.endSection("three.batchRebuild");
   }
@@ -348,7 +371,11 @@ export class ThreeVectorDrawRuns {
     const allIds = this.idsByRun.get(index);
     const ids = allIds && (first === run.first && count === run.count
       ? allIds : allIds.filter(id => this.origins![id] >= first && this.origins![id] < first + count));
-    return { run, index, first, count, ids, rankFirst: ids?.length ? this.lodIdToRank![ids[0]] : 0 };
+    // Stored records of one paint have consecutive ranks, ordered by origin;
+    // a paint without stored records selects nothing.
+    const keyFirst = this.lodIdToRank ? (ids?.length ? this.lodIdToRank[ids[0]] : 0) : first;
+    const keyEnd = this.lodIdToRank ? keyFirst + (ids?.length ?? 0) : first + count;
+    return { run, index, first, count, ids, keyFirst, keyEnd, selectionFirst: 0, selectionEnd: 0 };
   }
 
   private createEntry(ranges: readonly DrawRunRange[], order: number, pass?: 0 | 1): void {
@@ -409,21 +436,26 @@ export class ThreeVectorDrawRuns {
     this.entries.push({ mesh, ranges, ids, idValues: ids.array as Float32Array,
       clipCodes, clipValues: (clipCodes?.array as Float32Array | undefined) ?? null });
     this.visibilityApplied = false;
+    this.entriesCurrent = false;
     this.revision = ++revisions;
   }
 
   private updateEntries(): void {
     const profile = getThreeRenderPerformance();
     profile?.beginSection("three.batchUpdate");
+    const text = this.textSelection;
+    if (!text) this.assignSelectionSlices();
+    const keys = this.selectedKeys;
     const redundancy = this.strokeRedundancy;
     if (redundancy && this.strokeCandidates && this.strokeRedundancyEnabled) {
       let count = 0, candidates = this.strokeCandidates;
       for (const entry of this.entries) {
         for (const range of entry.ranges) {
           if (!this.visibility.isRunVisible(range.run)) continue;
-          const end = range.first + range.count;
-          for (let id = range.first; id < end; id++) {
-            if (!this.visibleIds[id] || !redundancy.isCandidate(id)) continue;
+          // Redundancy applies to canonical strokes only, whose keys are IDs.
+          for (let item = range.selectionFirst; item < range.selectionEnd; item++) {
+            const id = keys[item];
+            if (!redundancy.isCandidate(id)) continue;
             // Overlapping runs can list an ID twice; update() counts it once.
             if (count === candidates.length) {
               const grown = new Uint32Array(count * 2 + 16);
@@ -436,7 +468,7 @@ export class ThreeVectorDrawRuns {
       }
       redundancy.update(candidates, count);
     }
-    let modified = false, rendered = 0;
+    let modified = false, rendered = 0, considered = 0;
     for (const entry of this.entries) {
       let visible = 0;
       let changed = false;
@@ -446,10 +478,9 @@ export class ThreeVectorDrawRuns {
           ? range.run.optionalContent !== undefined && this.snapshot.conditions[range.run.optionalContent] === 0
           : !this.visibility.isRunVisible(range.run)) continue;
         const clipCode = (range.run.clipIndex ?? -1) + 1;
-        const sparse = range.ids !== undefined && this.lodIdToRank !== null;
-        const text = this.textSelection;
-        let first = sparse ? this.selectedRankOffset(range.rankFirst) : 0;
-        let end = sparse ? this.selectedRankOffset(range.rankFirst + range.ids!.length) : range.count;
+        const stored = this.lodIdToRank !== null ? range.ids : undefined;
+        let first = range.selectionFirst;
+        let end = range.selectionEnd;
         if (text) {
           first = text.ranges[range.index * 2];
           end = first + text.ranges[range.index * 2 + 1];
@@ -461,11 +492,9 @@ export class ThreeVectorDrawRuns {
           }
         }
         const ids = entry.idValues, clips = entry.clipValues;
-        profile?.add("three.batchCandidateInstances", end - first);
+        considered += end - first;
         for (let item = first; item < end; item++) {
-          const rangeIndex = sparse ? this.selectedRanks[item] - range.rankFirst : item;
-          const id = text ? text.instanceIds[item] : range.ids ? range.ids[rangeIndex] : range.first + rangeIndex;
-          if (!text && !this.visibleIds[id]) continue;
+          const id = text ? text.instanceIds[item] : stored ? stored[keys[item] - range.keyFirst] : keys[item];
           if (this.strokeRedundancyEnabled && this.strokeRedundancy && !this.strokeRedundancy.isRetained(id)) continue;
           if (ids[visible] !== id) { ids[visible] = id; changed = true; }
           if (clips && clips[visible] !== clipCode) { clips[visible] = clipCode; clipsChanged = true; }
@@ -482,7 +511,9 @@ export class ThreeVectorDrawRuns {
     }
     this.renderedCount = rendered;
     this.visibilityApplied = true;
+    this.entriesCurrent = true;
     if (modified) this.revision = ++revisions;
+    profile?.add("three.batchCandidateInstances", considered);
     profile?.endSection("three.batchUpdate");
   }
 

@@ -43,7 +43,7 @@ interface SourceDraw {
   order: number;
   groupOrder: number;
 }
-interface MixedEntry { mesh: DrawMesh; sources: SourceDraw[]; count: number; }
+interface MixedEntry { mesh: DrawMesh; data: THREE.InstancedInterleavedBuffer; sources: SourceDraw[]; count: number; }
 /** The batches under one ordinary layer mesh, valid while its revision holds. */
 interface CollectedBatches {
   revision: number;
@@ -76,6 +76,8 @@ export class ThreeMixedVectorLayer {
   private groups: SourceDraw[][] = [];
   private hiddenParents: HiddenParent[] = [];
   private hiddenMeshes: DrawMesh[] = [];
+  /** Batch-only layer meshes from the last collection and how many batches each draws. */
+  private batchParentDraws = new Map<THREE.Object3D, number>();
   private ready = false;
   private failed = false;
   private disposed = false;
@@ -137,9 +139,10 @@ export class ThreeMixedVectorLayer {
       if (this.preparing && !this.ready) return;
       if (!this.material) this.createMaterial();
       if (!sameDraws(this.snapshot, draws)) {
-        this.disposeEntries();
         this.snapshot = draws;
-        for (const sources of groups) if (sources[0].groupOrder === groupOrder) this.createEntry(sources);
+        let index = 0;
+        for (const sources of groups) if (sources[0].groupOrder === groupOrder) this.writeEntry(index++, sources);
+        for (const entry of this.entries.splice(index)) disposeEntry(entry);
         this.planSuppression();
       }
       this.syncMaterialState();
@@ -165,22 +168,24 @@ export class ThreeMixedVectorLayer {
   private collect(roots: readonly THREE.Object3D[]): SourceDraw[] {
     const draws: SourceDraw[] = [];
     const strokeRoot = this.options.stroke.mesh, fillRoot = this.options.fill.mesh;
+    const parentDraws = this.batchParentDraws;
+    parentDraws.clear();
+    const record = (mesh: DrawMesh, sourceKind: 0 | 1 | -1, groupOrder: number): void => {
+      const run = mesh.userData.heprDrawRun;
+      const count = mesh.geometry instanceof THREE.InstancedBufferGeometry ? mesh.geometry.instanceCount : 1;
+      if (count <= 0 || !run) return;
+      const ids = sourceKind < 0 ? undefined : mesh.geometry.getAttribute(sourceKind === 0 ? "aSegmentIndex" : "aFillPathIndex");
+      const clips = mesh.geometry.getAttribute("aVectorClipIndex");
+      const kind = ids && run.blendMode === undefined && !Array.isArray(mesh.material) ? sourceKind : -1;
+      draws.push({ mesh, kind, sourceKind, ids, clips, count, clipCode: (run.clipIndex ?? -1) + 1,
+        version: attributeVersion(ids), clipVersion: attributeVersion(clips), order: mesh.renderOrder, groupOrder });
+    };
     const visit = (object: THREE.Object3D, sourceKind: 0 | 1 | -1, groupOrder: number): void => {
       if (!object.visible || object === this.group) return;
       if ((object as THREE.Group).isGroup) groupOrder = object.renderOrder;
       if (object === strokeRoot) sourceKind = 0;
       else if (object === fillRoot) sourceKind = 1;
-      if ((object as THREE.Mesh).isMesh) {
-        const mesh = object as DrawMesh, run = mesh.userData.heprDrawRun;
-        const count = mesh.geometry instanceof THREE.InstancedBufferGeometry ? mesh.geometry.instanceCount : 1;
-        if (count > 0 && run) {
-          const ids = sourceKind < 0 ? undefined : mesh.geometry.getAttribute(sourceKind === 0 ? "aSegmentIndex" : "aFillPathIndex");
-          const clips = mesh.geometry.getAttribute("aVectorClipIndex");
-          const kind = ids && run.blendMode === undefined && !Array.isArray(mesh.material) ? sourceKind : -1;
-          draws.push({ mesh, kind, sourceKind, ids, clips, count, clipCode: (run.clipIndex ?? -1) + 1,
-            version: attributeVersion(ids), clipVersion: attributeVersion(clips), order: mesh.renderOrder, groupOrder });
-        }
-      }
+      if ((object as THREE.Mesh).isMesh) record(object as DrawMesh, sourceKind, groupOrder);
       const revision = threeVectorDrawRunsRevision(object);
       if (revision === undefined) {
         for (const child of object.children) visit(child, sourceKind, groupOrder);
@@ -190,17 +195,22 @@ export class ThreeMixedVectorLayer {
       if (cached && cached.revision === revision && cached.sourceKind === sourceKind && cached.groupOrder === groupOrder &&
           cached.childCount === object.children.length) {
         for (const draw of cached.draws) draws.push(draw);
+        parentDraws.set(object, cached.draws.length);
         return;
       }
       const first = draws.length;
       let batchesOnly = true;
       for (const child of object.children) {
-        if (child.children.length > 0 || !child.userData.heprDrawRun) batchesOnly = false;
-        visit(child, sourceKind, groupOrder);
+        // Batches have no children or ordering scopes of their own.
+        if (child.children.length > 0 || !child.userData.heprDrawRun || !(child as THREE.Mesh).isMesh) {
+          batchesOnly = false;
+          visit(child, sourceKind, groupOrder);
+        } else if (child.visible) record(child as DrawMesh, sourceKind, groupOrder);
       }
       if (batchesOnly) {
         this.collectedBatches.set(object, { revision, sourceKind, groupOrder, childCount: object.children.length,
           draws: draws.slice(first) });
+        parentDraws.set(object, draws.length - first);
       } else this.collectedBatches.delete(object);
     };
     for (const root of roots) visit(root, -1, ancestorGroupOrder(root));
@@ -226,12 +236,10 @@ export class ThreeMixedVectorLayer {
     }
     this.hiddenParents = [];
     for (const [parent, meshes] of byParent) {
-      // Batch visibility and counts change only with a new collection, which
-      // replans this. Any other child keeps the parent visible.
-      const batchesOnly = parent.children.every(child => child.userData.heprDrawRun && child.children.length === 0);
-      const drawing = parent.children.reduce((count, child) => count + (drawsSomething(child) ? 1 : 0), 0);
-      if (batchesOnly && drawing === meshes.length) this.hiddenParents.push({ parent, meshes });
-      else this.hiddenMeshes.push(...meshes);
+      // The collection counted every batch a batch-only layer would draw. Any
+      // other child, or a batch left out of the mixed draw, keeps it visible.
+      if (this.batchParentDraws.get(parent) === meshes.length) this.hiddenParents.push({ parent, meshes });
+      else for (const mesh of meshes) this.hiddenMeshes.push(mesh);
     }
   }
 
@@ -276,40 +284,66 @@ export class ThreeMixedVectorLayer {
     this.setRenderingEnabled(this.fillRenderingEnabled, this.strokeRenderingEnabled);
   }
 
-  private createEntry(sources: SourceDraw[]): void {
-    const geometry = new THREE.InstancedBufferGeometry(), sourceGeometry = sources[0].mesh.geometry;
+  /**
+   * Fill mixed entry `index` with `sources`. Panning changes the selection
+   * every frame, so an entry keeps its geometry and buffer while they fit and
+   * rewrites only the instances in use.
+   */
+  private writeEntry(index: number, sources: SourceDraw[]): void {
+    const sourceGeometry = sources[0].mesh.geometry;
     const count = sources.reduce((total, source) => total + source.count, 0);
-    geometry.setAttribute("aCorner", sourceGeometry.getAttribute("aCorner"));
-    geometry.setIndex(sourceGeometry.index);
-    const values = new Float32Array(count * 4);
+    let entry: MixedEntry | undefined = this.entries[index];
+    if (entry && entry.data.array.length < count * 4) { disposeEntry(entry); entry = undefined; }
+    const reused = entry !== undefined;
+    if (!entry) {
+      const geometry = new THREE.InstancedBufferGeometry();
+      // Headroom keeps a slowly growing selection from reallocating every frame.
+      const data = new THREE.InstancedInterleavedBuffer(new Float32Array(Math.max(4, Math.ceil(count * 1.25) * 4)), 4)
+        .setUsage(THREE.StreamDrawUsage);
+      geometry.setAttribute("aVectorIndex", new THREE.InterleavedBufferAttribute(data, 1, 0));
+      geometry.setAttribute("aVectorClipIndex", new THREE.InterleavedBufferAttribute(data, 1, 1));
+      geometry.setAttribute("aVectorKind", new THREE.InterleavedBufferAttribute(data, 1, 2));
+      if (this.options.stroke.getMixedVectorResources().pageBinding) {
+        geometry.setAttribute("aPageIndex", new THREE.InterleavedBufferAttribute(data, 1, 3));
+      }
+      const mesh = new THREE.Mesh(geometry, this.material!);
+      mesh.frustumCulled = false;
+      mesh.userData.heprMixedVector = true;
+      this.group.add(mesh);
+      entry = { mesh, data, sources, count };
+      this.entries[index] = entry;
+    }
+    const geometry = entry.mesh.geometry;
+    if (geometry.getAttribute("aCorner") !== sourceGeometry.getAttribute("aCorner")) {
+      geometry.setAttribute("aCorner", sourceGeometry.getAttribute("aCorner"));
+    }
+    if (geometry.index !== sourceGeometry.index) geometry.setIndex(sourceGeometry.index);
+    const values = entry.data.array as Float32Array;
     const strokePages = this.options.stroke.getMixedVectorResources().pageBinding?.owners?.image.data;
     const fillPages = this.options.fill.getMixedVectorResources().pageBinding?.owners?.image.data;
     let offset = 0;
     for (const source of sources) {
       const pages = (source.kind === 0 ? strokePages : fillPages) as Float32Array | undefined;
-      for (let index = 0; index < source.count; index++) {
-        const id = source.ids!.getX(index);
+      const ids = plainValues(source.ids!), clips = source.clips ? plainValues(source.clips) : null;
+      for (let item = 0; item < source.count; item++) {
+        const id = ids ? ids[item] : source.ids!.getX(item);
         values[offset++] = id;
-        values[offset++] = source.clips ? source.clips.getX(index) : source.clipCode;
+        values[offset++] = source.clips ? clips ? clips[item] : source.clips.getX(item) : source.clipCode;
         values[offset++] = source.kind;
         values[offset++] = pages?.[id] ?? 0;
       }
     }
-    const data = new THREE.InstancedInterleavedBuffer(values, 4).setUsage(THREE.StreamDrawUsage);
-    geometry.setAttribute("aVectorIndex", new THREE.InterleavedBufferAttribute(data, 1, 0));
-    geometry.setAttribute("aVectorClipIndex", new THREE.InterleavedBufferAttribute(data, 1, 1));
-    geometry.setAttribute("aVectorKind", new THREE.InterleavedBufferAttribute(data, 1, 2));
-    if (this.options.stroke.getMixedVectorResources().pageBinding) {
-      geometry.setAttribute("aPageIndex", new THREE.InterleavedBufferAttribute(data, 1, 3));
+    // A new buffer uploads whole on first use.
+    if (reused) {
+      entry.data.clearUpdateRanges();
+      entry.data.addUpdateRange(0, count * 4);
+      entry.data.needsUpdate = true;
     }
     geometry.instanceCount = count;
-    const mesh = new THREE.Mesh(geometry, this.material!);
-    mesh.frustumCulled = false;
-    mesh.renderOrder = sources[0].order;
-    mesh.userData.heprMixedVector = true;
-    this.group.add(mesh);
-    this.entries.push({ mesh, sources, count });
-    getThreeRenderPerformance()?.add("three.mixedVectorInstanceUploadBytes", values.byteLength);
+    entry.mesh.renderOrder = sources[0].order;
+    entry.sources = sources;
+    entry.count = count;
+    getThreeRenderPerformance()?.add("three.mixedVectorInstanceUploadBytes", count * 16);
   }
 
   private syncUniforms(): void {
@@ -377,12 +411,7 @@ export class ThreeMixedVectorLayer {
   }
 
   private disposeEntries(): void {
-    for (const entry of this.entries) {
-      entry.mesh.removeFromParent();
-      entry.mesh.geometry.deleteAttribute("aCorner");
-      entry.mesh.geometry.setIndex(null);
-      entry.mesh.geometry.dispose();
-    }
+    for (const entry of this.entries) disposeEntry(entry);
     this.entries = [];
   }
 
@@ -421,14 +450,23 @@ function mixableGroups(draws: readonly SourceDraw[]): SourceDraw[][] {
   return groups;
 }
 
+/** Borrowed corner/index buffers detach first: Three frees every buffer a disposed geometry lists. */
+function disposeEntry(entry: MixedEntry): void {
+  entry.mesh.removeFromParent();
+  entry.mesh.geometry.deleteAttribute("aCorner");
+  entry.mesh.geometry.setIndex(null);
+  entry.mesh.geometry.dispose();
+}
+
+/** A one-component attribute's own values, for reading without per-item accessors. */
+function plainValues(attribute: InstanceAttribute): ArrayLike<number> | null {
+  return attribute instanceof THREE.InterleavedBufferAttribute || attribute.itemSize !== 1 ? null : attribute.array;
+}
+
 function sameDrawObjects(previous: readonly SourceDraw[], next: readonly SourceDraw[]): boolean {
   if (previous.length !== next.length) return false;
   for (let index = 0; index < next.length; index++) if (previous[index] !== next[index]) return false;
   return true;
-}
-
-function drawsSomething(object: THREE.Object3D): boolean {
-  return object.visible && drawsItself(object);
 }
 
 function drawsItself(object: THREE.Object3D): boolean {

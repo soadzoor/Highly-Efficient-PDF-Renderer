@@ -146,12 +146,12 @@ try {
   // The owning layer revises its batches with every selection change.
   const withoutFirst = Uint32Array.from({ length: 2047 }, (_, i) => i + 1);
   entry.stroke.updateFrameWithVisibleSegmentIds(view, viewport, withoutFirst, withoutFirst.length);
-  let retired = 0;
-  const retiredGeometry = entry.mixed.group.children[0].geometry;
-  retiredGeometry.addEventListener("dispose", () => { retired++; assert.equal(retiredGeometry.getAttribute("aCorner"), undefined);
-    assert.equal(retiredGeometry.index, null, "borrowed corner/index buffers detach before geometry disposal"); });
+  const reusedGeometry = entry.mixed.group.children[0].geometry;
+  const reusedData = reusedGeometry.getAttribute("aVectorIndex").data, reusedVersion = reusedData.version;
   entry.mixed.update(entry.roots, host, camera);
-  assert.equal(retired, 1);
+  assert.equal(entry.mixed.group.children[0].geometry, reusedGeometry, "a changed selection rewrites the mixed buffer in place");
+  assert.equal(reusedData.version, reusedVersion + 1);
+  assert.deepEqual(reusedData.updateRanges, [{ start: 0, count: 4095 * 4 }], "only instances in use upload");
   assert.deepEqual(records(entry.mixed)[0], [0, 0, 1], "changed selected IDs invalidate mixed data");
   assert.equal(records(entry.mixed).filter(record => record[2] === 0).length, 2047);
   entry.refresh();
@@ -181,7 +181,12 @@ try {
   entry.refresh(); entry.mixed.update(entry.roots, host, camera);
   const clips = entry.stroke.getMixedVectorResources().clipTexture;
   let textureDisposals = 0; clips.addEventListener("dispose", () => textureDisposals++);
+  let retired = 0;
+  const retiredGeometry = entry.mixed.group.children[0].geometry;
+  retiredGeometry.addEventListener("dispose", () => { retired++; assert.equal(retiredGeometry.getAttribute("aCorner"), undefined);
+    assert.equal(retiredGeometry.index, null, "borrowed corner/index buffers detach before geometry disposal"); });
   entry.mixed.dispose(); assert.equal(activeSources(entry).length, 4096); assert.equal(textureDisposals, 0);
+  assert.equal(retired, 1);
   entry.fill.dispose(); assert.equal(textureDisposals, 0, "the surviving source still owns shared clipping");
   entry.stroke.dispose(); assert.equal(textureDisposals, 1, "mixed disposal never frees borrowed textures");
   barrier.geometry.dispose(); barrier.material.dispose();

@@ -12,6 +12,7 @@ import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
 import { acquireThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
 import { enableThreeRawPaintFold, threePaintFoldFragmentGlsl } from "./threePaintFold";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
+import { GUARDED_RUN_COUNT, VISIBILITY_GUARD_PIXELS } from "./vectorDrawRunCulling";
 import * as THREE from "three";
 
 import type { VectorScene } from "./pdfVectorExtractor";
@@ -81,6 +82,8 @@ export class ThreeMaterialFillLayer {
   private readonly sceneMaxY: number;
   private webGpuState: ThreeWebGpuFillMaterialState | null = null;
   private usingAllFillPaths = true;
+  /** The culling window of the current selection; null when it must be rebuilt. */
+  private selectionBounds: CullingBounds | null = null;
   private useLocalToClip = false;
 
   constructor(scene: VectorScene, options: FillLayerOptions) {
@@ -355,13 +358,28 @@ export class ThreeMaterialFillLayer {
       return;
     }
 
+    // As in native run culling, large drawings select a margin beyond the view
+    // and keep that selection while the view stays inside it, so panning does
+    // not rebuild every batch each frame. The window may exceed the view by at
+    // most four margins, so zooming into a detail refreshes it.
+    const guard = this.fillPathCount >= GUARDED_RUN_COUNT ? VISIBILITY_GUARD_PIXELS / safeZoom : 0;
+    const previous = this.selectionBounds;
+    if (guard > 0 && previous && !this.usingAllFillPaths &&
+        viewMinX >= previous.minX && viewMinY >= previous.minY && viewMaxX <= previous.maxX && viewMaxY <= previous.maxY &&
+        previous.maxX - previous.minX <= viewMaxX - viewMinX + guard * 4 &&
+        previous.maxY - previous.minY <= viewMaxY - viewMinY + guard * 4) {
+      return;
+    }
+    const minX = viewMinX - guard, minY = viewMinY - guard, maxX = viewMaxX + guard, maxY = viewMaxY + guard;
+    this.selectionBounds = guard > 0 && [minX, minY, maxX, maxY].every(Number.isFinite) ? { minX, minY, maxX, maxY } : null;
+
     let outCount = 0;
     for (let i = 0; i < this.fillPathCount; i += 1) {
       if (
-        this.fillMaxX[i] < viewMinX ||
-        this.fillMinX[i] > viewMaxX ||
-        this.fillMaxY[i] < viewMinY ||
-        this.fillMinY[i] > viewMaxY
+        this.fillMaxX[i] < minX ||
+        this.fillMinX[i] > maxX ||
+        this.fillMaxY[i] < minY ||
+        this.fillMinY[i] > maxY
       ) {
         continue;
       }
@@ -377,6 +395,7 @@ export class ThreeMaterialFillLayer {
   }
 
   private setAllFillPathsVisible(): void {
+    this.selectionBounds = null;
     if (!this.usingAllFillPaths) {
       this.visibleFillPathIds.set(this.allFillPathIds.subarray(0, this.fillPathCount), 0);
       this.fillPathIndexAttribute.addUpdateRange(0, this.fillPathCount);
