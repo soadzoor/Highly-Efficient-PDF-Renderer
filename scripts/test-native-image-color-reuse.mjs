@@ -113,6 +113,19 @@ try {
     assert.deepEqual(source, snapshot);
   }
 
+  // A retained ICC lattice converts as a leaf; it must equal the general branch
+  // exactly, including clipping to /Range and lattice nodes with zero weights.
+  let seed = 99;
+  const unit = () => { seed = (Math.imul(seed, 1103515245) + 12345) >>> 0; return seed / 2 ** 32; };
+  for (const [count, range] of [[1], [3], [4], [3, [-1, 2, 0, .5, .25, .75]], [4, [0, 2, 0, 1, -1, 1, 0, 1]]]) {
+    const { colorSpaceIndex } = images.describe(await images.add(image(257, 1, 8, icc(count, range), new Uint8Array(257 * count))));
+    for (let trial = 0; trial < 3000; trial++) {
+      const components = Array.from({ length: count }, () => trial % 3 === 0 ? Math.round(unit() * 32) / 32 : unit() * 3.2 - 1.1);
+      assert.deepEqual(scalar(colorSpaceIndex, components), colors.convertInternal(colorSpaceIndex, components, new Set(), 0),
+        `${count}-component ICC lattice leaf matches the general conversion`);
+    }
+  }
+
   // More distinct colors than the conversion memo has slots: collisions and
   // repeats must reproduce the per-pixel scalar conversion exactly.
   for (const components of [3, 4]) {

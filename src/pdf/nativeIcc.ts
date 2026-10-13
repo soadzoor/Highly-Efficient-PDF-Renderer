@@ -361,6 +361,75 @@ export function sampleNativeIccTransform(
   return [red / 255, green / 255, blue / 255];
 }
 
+/**
+ * normalizeIccComponents followed by sampleNativeIccTransform for one color,
+ * with the same arithmetic in the same order but no intermediate arrays.
+ * Returns null where either step would reject the vector, so callers can
+ * report that through the general path.
+ */
+export function sampleNativeIccTransformComponents(
+  transform: Readonly<NativeIccTransformResult>,
+  inputComponents: NativeIccComponentCount,
+  components: readonly number[],
+  range: ArrayLike<number>,
+  mode: number
+): [number, number, number] | null {
+  if (components.length !== inputComponents) return null;
+  const grid = NATIVE_ICC_GRID_POINTS[inputComponents];
+  const samples = transform.samples;
+  // Per axis: lower lattice index, upper index, and the two interpolation
+  // weights, in normalizeIccComponents/sampleNativeIccTransform arithmetic.
+  let l0 = 0, h0 = 0, f0 = 0, l1 = 0, h1 = 0, f1 = 0, l2 = 0, h2 = 0, f2 = 0, l3 = 0, h3 = 0, f3 = 0;
+  for (let index = 0; index < inputComponents; index += 1) {
+    const low = range[index * 2], high = range[index * 2 + 1];
+    const clipped = Math.max(low, Math.min(high, components[index]));
+    const normalized = mode === 2 ? high === low ? 0 : (clipped - low) / (high - low)
+      : mode === 4 ? index === 0 ? clipped / 100 : (clipped + 128) / 255 : clipped;
+    if (!Number.isFinite(normalized)) return null;
+    const position = Math.max(0, Math.min(1, normalized)) * (grid - 1);
+    const lower = Math.floor(position);
+    const upper = Math.min(lower + 1, grid - 1);
+    const fraction = position - lower;
+    if (index === 0) { l0 = lower; h0 = upper; f0 = fraction; }
+    else if (index === 1) { l1 = lower; h1 = upper; f1 = fraction; }
+    else if (index === 2) { l2 = lower; h2 = upper; f2 = fraction; }
+    else { l3 = lower; h3 = upper; f3 = fraction; }
+  }
+  if (inputComponents === 1) {
+    const lowOffset = l0 * 3;
+    const highOffset = h0 * 3;
+    return [
+      (samples[lowOffset] * (1 - f0) + samples[highOffset] * f0) / 255,
+      (samples[lowOffset + 1] * (1 - f0) + samples[highOffset + 1] * f0) / 255,
+      (samples[lowOffset + 2] * (1 - f0) + samples[highOffset + 2] * f0) / 255
+    ];
+  }
+  // Corner weights multiply left to right exactly as the scalar sampler does:
+  // ((w0 * w1) * w2) * w3. Sharing the leading products keeps every rounding.
+  const g0 = 1 - f0, g1 = 1 - f1, g2 = 1 - f2, g3 = 1 - f3;
+  const w00 = g0 * g1, w10 = f0 * g1, w01 = g0 * f1, w11 = f0 * f1;
+  const i00 = l0 * grid + l1, i10 = h0 * grid + l1, i01 = l0 * grid + h1, i11 = h0 * grid + h1;
+  let red = 0;
+  let green = 0;
+  let blue = 0;
+  for (let corner = 0; corner < (1 << inputComponents); corner += 1) {
+    const pair = corner & 3;
+    let weight = (pair === 0 ? w00 : pair === 1 ? w10 : pair === 2 ? w01 : w11) * ((corner & 4) !== 0 ? f2 : g2);
+    let sampleIndex = (pair === 0 ? i00 : pair === 1 ? i10 : pair === 2 ? i01 : i11) * grid + ((corner & 4) !== 0 ? h2 : l2);
+    if (inputComponents === 4) {
+      const upper3 = (corner & 8) !== 0;
+      sampleIndex = sampleIndex * grid + (upper3 ? h3 : l3);
+      weight *= upper3 ? f3 : g3;
+    }
+    if (weight === 0) continue;
+    const offset = sampleIndex * 3;
+    red += samples[offset] * weight;
+    green += samples[offset + 1] * weight;
+    blue += samples[offset + 2] * weight;
+  }
+  return [red / 255, green / 255, blue / 255];
+}
+
 function transformShape(
   inputComponents: NativeIccComponentCount,
   gridPointsPerComponent: number,

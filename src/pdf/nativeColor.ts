@@ -21,6 +21,7 @@ import {
   createNativeIccTransformRequest,
   resolveNativeIccTransformThroughCaller,
   sampleNativeIccTransform,
+  sampleNativeIccTransformComponents,
   validateIccEngine,
   normalizeIccComponents,
   normalizeNativeIccTransformResult,
@@ -283,6 +284,17 @@ export class NativePdfColorRegistry {
         return [clamp01(components[0]), clamp01(components[1]), clamp01(components[2])];
       }
       return convertDeviceCmykToSrgb(components[0], components[1], components[2], components[3]);
+    }
+    // A retained ICC lattice is a leaf too; its general branch would allocate a
+    // traversal set and normalized vector for every distinct image color.
+    if (record.kind === "ICCBased" && record.iccTransform && this.maxColorDepth > 0 &&
+        components.length === record.componentCount && finiteComponents(components)) {
+      const rgb = sampleNativeIccTransformComponents(record.iccTransform,
+        record.componentCount as NativeIccComponentCount, components, record.parameters, record.iccTransformMode ?? 2);
+      if (rgb && Number.isFinite(rgb[0]) && Number.isFinite(rgb[1]) && Number.isFinite(rgb[2])) {
+        this.reportIccFallback(index, record);
+        return [clamp01(rgb[0]), clamp01(rgb[1]), clamp01(rgb[2])];
+      }
     }
     return this.convertInternal(index, components, new Set(), 0, signal);
   }
@@ -1690,6 +1702,11 @@ function normalizePairs(values: readonly number[], pairs: readonly number[]): nu
     if (low === high) return 0;
     return (clamp(value, low, high) - low) / (high - low);
   });
+}
+
+function finiteComponents(components: readonly number[]): boolean {
+  for (let index = 0; index < components.length; index += 1) if (!Number.isFinite(components[index])) return false;
+  return true;
 }
 
 function clamp01(value: number): number {

@@ -57,6 +57,16 @@ try {
     const recipes = await packVectorLodWithPointRecipes(scene, packed);
     assert(recipes.pointRecipes, `${precision}: source-point references should reduce this geometry`);
     assert.deepEqual(packed, snapshot, "encoding does not mutate the original cache");
+    assert.deepEqual([recipes.pointRecipes.start.references, recipes.pointRecipes.end.references],
+      referencePointCodes(scene, packed), `${precision}: references match the scalar nearest-point search`);
+    // Many scene points sharing one grid position exercise the nearest-id choice.
+    const crowded = { ...scene, endpoints: scene.endpoints.slice(), primitiveMeta: scene.primitiveMeta.slice() };
+    for (let i = 0; i < crowded.segmentCount; i += 3) crowded.endpoints.set(crowded.primitiveMeta.subarray(i * 4 % 4096, i * 4 % 4096 + 2), i * 4);
+    const crowdedPacked = packVectorLod(crowded, data), crowdedRecipes = await packVectorLodWithPointRecipes(crowded, crowdedPacked);
+    assert(crowdedRecipes.pointRecipes, `${precision}: crowded geometry still selects recipes`);
+    assert.deepEqual([crowdedRecipes.pointRecipes.start.references, crowdedRecipes.pointRecipes.end.references],
+      referencePointCodes(crowded, crowdedPacked), `${precision}: duplicate points keep the scalar nearest-id choice`);
+    assert.deepEqual(decodeVectorLodPointRecipes(crowded, crowdedRecipes), crowdedPacked);
     assert.deepEqual(decodeVectorLodPointRecipes(scene, recipes), packed, "recipes recover every original residual word");
     const restored = unpackVectorLod(scene, recipes);
     for (const field of fields) assert.deepEqual(words(restored.literals[field]), words(data.literals[field]),
@@ -141,5 +151,44 @@ try {
   try { await readHepLod(disk, corruptScene, manifest); } finally { console.warn = originalWarn; }
   assert.equal(getStoredVectorStrokeLod(corruptScene), null);
   assert(warnings.some(message => message.includes("invalid vector LOD point recipe")), "corrupt optional recipes retain canonical rendering with diagnostics");
-  console.log("HEP source-point recipes: compact/lossless/legacy bit parity, origins, curves, density, size selection and validation passed.");
+  console.log("HEP source-point recipes: compact/lossless/legacy bit parity, origins, curves, density, nearest-point choice, size selection and validation passed.");
 } finally { hooks.deregister(); }
+
+/** The original string-keyed search: exact grid matches, nearest scene point id, ties to the lower id. */
+function referencePointCodes(scene, data) {
+  const count = data.literals.segmentCount, compact = data.positionQuanta !== undefined || data.positionQuantum !== undefined;
+  const words = array => new Uint32Array(array.buffer, array.byteOffset, array.length);
+  const canonical = [words(scene.endpoints), words(scene.primitiveMeta)], codes = [new Uint32Array(count), new Uint32Array(count)];
+  const groups = new Map();
+  for (let i = 0; i < count; i++) {
+    const q = compact ? data.positionQuanta?.[i] ?? data.positionQuantum : 0;
+    if (!groups.has(q)) groups.set(q, []);
+    groups.get(q).push(i);
+  }
+  for (const [q, records] of groups) {
+    const points = new Map();
+    for (let i = 0; i < scene.segmentCount; i++) for (let kind = 0; kind < 2; kind++) {
+      const source = kind === 0 ? scene.endpoints : scene.primitiveMeta;
+      const x = compact ? Math.round(source[i * 4] / q) | 0 : canonical[kind][i * 4];
+      const y = compact ? Math.round(source[i * 4 + 1] / q) | 0 : canonical[kind][i * 4 + 1];
+      if (!points.has(`${x},${y}`)) points.set(`${x},${y}`, []);
+      points.get(`${x},${y}`).push(i * 2 + kind);
+    }
+    for (const i of records) for (let kind = 0; kind < 2; kind++) {
+      const field = kind === 0 ? "endpoints" : "primitiveMeta", origin = data.origins[i];
+      const source = kind === 0 ? scene.endpoints : scene.primitiveMeta;
+      const px = compact ? Math.round(source[origin * 4] / q) | 0 : canonical[kind][origin * 4];
+      const py = compact ? Math.round(source[origin * 4 + 1] / q) | 0 : canonical[kind][origin * 4 + 1];
+      const x = compact ? (data.literals[field][i] + px) | 0 : (data.literals[field][i] ^ px) >>> 0;
+      const y = compact ? (data.literals[field][count + i] + py) | 0 : (data.literals[field][count + i] ^ py) >>> 0;
+      const matches = points.get(`${x},${y}`), predicted = origin * 2 + kind;
+      if (!matches) continue;
+      let id = matches[0];
+      for (const candidate of matches) if (Math.abs(candidate - predicted) < Math.abs(id - predicted)) id = candidate;
+      if (x === px && y === py) id = predicted;
+      const delta = id - predicted;
+      codes[kind][i] = delta >= 0 ? delta * 2 + 1 : -delta * 2;
+    }
+  }
+  return codes;
+}

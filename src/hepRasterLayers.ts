@@ -141,10 +141,14 @@ export class IdenticalRasterFinder {
 
   /** Returns the index of the first identical image added, or -1 after adding this one. */
   findOrAdd(index: number, width: number, height: number, rgba: Uint8Array): number {
-    // FNV-1a; collisions are resolved by comparing the pixels themselves.
+    // FNV-1a over whole pixels when aligned; collisions are resolved by
+    // comparing the pixels themselves, so the hash only needs consistency.
     let hash = 0x811c9dc5;
-    for (let offset = 0; offset < rgba.length; offset += 1) {
-      hash = Math.imul(hash ^ rgba[offset], 0x01000193);
+    const words = wordView(rgba);
+    if (words) {
+      for (let offset = 0; offset < words.length; offset += 1) hash = Math.imul(hash ^ words[offset], 0x01000193);
+    } else {
+      for (let offset = 0; offset < rgba.length; offset += 1) hash = Math.imul(hash ^ rgba[offset], 0x01000193);
     }
     hash = (hash ^ width ^ Math.imul(height, 0x9e3779b1)) >>> 0;
     let candidates = this.candidatesByHash.get(hash);
@@ -162,8 +166,18 @@ export class IdenticalRasterFinder {
   }
 }
 
+function wordView(bytes: Uint8Array): Uint32Array | null {
+  return bytes.byteOffset % 4 === 0 && bytes.length % 4 === 0
+    ? new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.length / 4) : null;
+}
+
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
+  const aWords = wordView(a), bWords = wordView(b);
+  if (aWords && bWords) {
+    for (let offset = 0; offset < aWords.length; offset += 1) if (aWords[offset] !== bWords[offset]) return false;
+    return true;
+  }
   for (let offset = 0; offset < a.length; offset += 1) {
     if (a[offset] !== b[offset]) return false;
   }

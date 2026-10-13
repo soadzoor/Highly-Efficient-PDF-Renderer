@@ -62,6 +62,32 @@ function createRasterScene(seedScene, width, height, data) {
   };
 }
 
+/** Large images encode whole-image PNG only when a row-band probe says it could win. */
+async function assertLargeImagePngProbe(rasterImageCodec) {
+  const width = 1024, height = 1100;
+  const photo = new Uint8Array(width * height * 4);
+  let state = 1;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      state = (Math.imul(state, 1103515245) + 12345) >>> 0;
+      photo.set([(x >> 2) + (state >>> 29), (y >> 2) + ((state >>> 26) & 7), ((x + y) >> 3) + ((state >>> 23) & 7), 255],
+        (y * width + x) * 4);
+    }
+  }
+  const photoCandidates = await rasterImageCodec.encodeRasterRgbaCandidates(width, height, photo);
+  assert.ok(photoCandidates.webp);
+  assert.equal(photoCandidates.png, null, "a noisy photograph skips a whole-image PNG that cannot beat WebP");
+
+  // Sharp one-pixel detail is where lossless PNG beats lossy WebP outright.
+  const drawing = new Uint8Array(width * height * 4).fill(255);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) if (((x ^ y) & 1) === 0) drawing.fill(0, (y * width + x) * 4, (y * width + x) * 4 + 3);
+  }
+  const drawingCandidates = await rasterImageCodec.encodeRasterRgbaCandidates(width, height, drawing);
+  assert.ok(drawingCandidates.png, "sharp drawings still encode PNG for the exact size comparison");
+  assert.equal(rasterImageCodec.pickBestRasterImage(width, height, drawingCandidates)?.encoding, "png");
+}
+
 async function assertRasterWebpQualityParity(rasterImageCodec) {
   const width = 192;
   const height = 128;
@@ -337,6 +363,7 @@ try {
   );
 
   await assertRasterWebpQualityParity(rasterImageCodec);
+  await assertLargeImagePngProbe(rasterImageCodec);
 
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const seedScene = createEmptyVectorScene();
