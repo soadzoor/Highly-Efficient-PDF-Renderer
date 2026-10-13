@@ -35,6 +35,7 @@ export interface ThreeRasterTileRect {
 
 interface ThreeWebGpuRasterMaterialOptions {
   instancedPageBackground?: boolean;
+  instancedRasterRepeat?: boolean;
   opacity?: number;
   colorCompositing: ThreeColorCompositing;
   texture: THREE.Texture;
@@ -211,8 +212,8 @@ export function createThreeWebGpuRasterMaterial(
     ? callNode(pageBackgroundPackFn, { corner, pageRect: TSL.attribute("aPageRect", "vec4") })
     : callNode(rasterPackFn, {
       corner,
-      matrixABCD: TSL.uniform(options.matrixABCD),
-      matrixEF: TSL.uniform(options.matrixEF),
+      matrixABCD: options.instancedRasterRepeat ? TSL.attribute("aRasterRepeatABCD", "vec4") : TSL.uniform(options.matrixABCD),
+      matrixEF: options.instancedRasterRepeat ? TSL.attribute("aRasterRepeatEF", "vec2") : TSL.uniform(options.matrixEF),
       tileQuad: TSL.uniform(tileQuad),
       tileUv: TSL.uniform(tileUv)
     }));

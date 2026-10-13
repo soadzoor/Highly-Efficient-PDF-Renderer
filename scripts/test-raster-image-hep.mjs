@@ -62,6 +62,115 @@ function createRasterScene(seedScene, width, height, data) {
   };
 }
 
+/** Large and mid-size images encode whole-image PNG only when a row-band probe says it could win. */
+async function assertLargeImagePngProbe(rasterImageCodec) {
+  for (const [width, height] of [[1024, 1100], [512, 384]]) await assertPngProbe(rasterImageCodec, width, height);
+}
+
+async function assertPngProbe(rasterImageCodec, width, height) {
+  const photo = new Uint8Array(width * height * 4);
+  let state = 1;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      state = (Math.imul(state, 1103515245) + 12345) >>> 0;
+      photo.set([(x >> 2) + (state >>> 29), (y >> 2) + ((state >>> 26) & 7), ((x + y) >> 3) + ((state >>> 23) & 7), 255],
+        (y * width + x) * 4);
+    }
+  }
+  const photoCandidates = await rasterImageCodec.encodeRasterRgbaCandidates(width, height, photo);
+  assert.ok(photoCandidates.webp);
+  assert.equal(photoCandidates.png, null, `a ${width}x${height} noisy photograph skips a whole-image PNG that cannot beat WebP`);
+
+  // Sharp one-pixel detail is where lossless PNG beats lossy WebP outright.
+  const drawing = new Uint8Array(width * height * 4).fill(255);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) if (((x ^ y) & 1) === 0) drawing.fill(0, (y * width + x) * 4, (y * width + x) * 4 + 3);
+  }
+  const drawingCandidates = await rasterImageCodec.encodeRasterRgbaCandidates(width, height, drawing);
+  assert.ok(drawingCandidates.png, `${width}x${height} sharp drawings still encode PNG for the exact size comparison`);
+  assert.equal(rasterImageCodec.pickBestRasterImage(width, height, drawingCandidates)?.encoding, "png");
+}
+
+/**
+ * Exactly two colors are stored packed and exact, so readers restore the
+ * renderers' 1-bit textures. Atlas-sized images keep sharing their atlas.
+ */
+async function assertTwoColorPackedStorage(zipBuilder, parsedData, rasterSections, readRasterTable, seedScene) {
+  const twoColor = (width, height, ink) => {
+    const rgba = new Uint8Array(width * height * 4);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) if ((x * 7 + y * 3) % 11 < 4) rgba.set(ink, (y * width + x) * 4);
+    }
+    return rgba;
+  };
+  const large = twoColor(200, 120, [10, 120, 200, 255]);
+  const small = twoColor(90, 90, [250, 10, 10, 255]), smallOther = twoColor(90, 90, [10, 250, 10, 255]);
+  const base = createRasterScene(seedScene, 200, 120, large).rasterLayers[0];
+  const scene = { ...createRasterScene(seedScene, 200, 120, large), rasterLayers: [
+    base,
+    { ...base, data: large.slice(), paintOrder: 5 },
+    { ...base, width: 90, height: 90, data: small, matrix: new Float32Array([90, 0, 0, 90, 0, 0]), paintOrder: 6 },
+    { ...base, width: 90, height: 90, data: smallOther, matrix: new Float32Array([90, 0, 0, 90, 100, 0]), paintOrder: 7 }
+  ] };
+  const bytes = await (await zipBuilder.buildHep(scene, { compression: "store" })).arrayBuffer();
+  const archive = await HepArchive.loadAsync(bytes);
+  const table = await readRasterTable(archive);
+  const storages = table.layers.map(layer => layer.storage);
+  assert.ok(["binary", "mono"].includes(storages[0]), "a two-color image is stored packed instead of WebP or PNG");
+  assert.equal(storages[1], storages[0]);
+  assert.equal(table.layers[1].source, 0, "an identical copy references the packed section");
+  assert.equal(archive.file(rasterSections.rasterLayerFile(1, storages[1])), null, "the copy stores no section of its own");
+  assert.equal(rasterSections.rasterLayerSectionFile(table, 1), rasterSections.rasterLayerFile(0, storages[0]));
+  assert.deepEqual(storages.slice(2), ["atlas", "atlas"], "atlas-sized two-color images keep their lossless atlas");
+  const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
+  assert.equal(manifest.formatVersion, 15, "a shared section advertises scene v15");
+  const restored = await parsedData.loadSceneFromHep(bytes);
+  scene.rasterLayers.forEach((layer, index) => assert.deepEqual(restored.rasterLayers[index].data, layer.data,
+    `two-color layer ${index} restores exact pixels`));
+  assert.ok(restored.rasterLayers[0].monochrome, "readers restore packed 1-bit storage for renderers");
+  assert.strictEqual(restored.rasterLayers[1].monochrome, restored.rasterLayers[0].monochrome,
+    "a shared section decodes once for both placements");
+  assert.deepEqual([...restored.rasterLayers[1].matrix], [...scene.rasterLayers[1].matrix]);
+  assert.equal(restored.rasterLayers[1].paintOrder, 5);
+}
+
+/** Scene v15 shared sections: table validation, round trip and the version gate. */
+async function assertSharedSectionFormat(zipBuilder, parsedData, rasterSections, seedScene) {
+  const record = (storage, extra = {}) => ({ width: 40, height: 30, matrix: Float32Array.of(1, 0, 0, 1, 0, 0),
+    paintOrder: 0, pageIndex: 0, storage, ...extra });
+  const limits = { maxLayers: 16, maxAtlases: 1, maxDimension: 4096 };
+  const table = { atlases: [], layers: [record("webp"), record("png"), record("webp", { source: 0 }), record("webp", { source: 0 })] };
+  const decoded = rasterSections.decodeRasterLayerTable(rasterSections.encodeRasterLayerTable(table), limits);
+  assert.deepEqual(decoded.layers.map(layer => layer.source), [undefined, undefined, 0, 0]);
+  assert.equal(rasterSections.rasterLayerSectionFile(decoded, 3), "raster/layer-0.webp");
+  for (const [label, layers] of [
+    ["a forward reference", [record("webp", { source: 1 }), record("webp")]],
+    ["a different storage", [record("png"), record("webp", { source: 0 })]],
+    ["a different size", [record("webp"), { ...record("webp", { source: 0 }), width: 41 }]],
+    ["a chained reference", [record("webp"), record("webp", { source: 0 }), record("webp", { source: 1 })]]
+  ]) {
+    assert.throws(() => rasterSections.encodeRasterLayerTable({ atlases: [], layers }), /shares an incompatible section|out of range/, label);
+  }
+  // Corrupt the one-byte distance of the third layer (0 is never valid).
+  const bytes = rasterSections.encodeRasterLayerTable({ atlases: [], layers: [record("webp"), record("webp", { source: 0 })] });
+  const flagsAt = bytes.indexOf(2 | 64);
+  assert.ok(flagsAt > 0);
+  const corrupted = bytes.slice();
+  corrupted[flagsAt + 5] = 0;
+  assert.throws(() => rasterSections.decodeRasterLayerTable(corrupted, limits), /shared section distance/);
+
+  const photo = new Uint8Array(200 * 150 * 4);
+  for (let offset = 0; offset < photo.length; offset += 4) photo.set([offset % 251, offset % 241, offset % 239, 255], offset);
+  const base = createRasterScene(seedScene, 200, 150, photo);
+  const scene = { ...base, rasterLayers: [base.rasterLayers[0], { ...base.rasterLayers[0], data: photo.slice(), paintOrder: 9 }] };
+  const archive = await HepArchive.loadAsync(await (await zipBuilder.buildHep(scene, { compression: "store" })).arrayBuffer());
+  const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
+  assert.equal(manifest.formatVersion, 15);
+  archive.file("manifest.json", JSON.stringify({ ...manifest, formatVersion: 14 }));
+  await assert.rejects(parsedData.loadSceneFromHep(await archive.generateAsync({ type: "arraybuffer", compression: "STORE" })),
+    /Shared raster layer sections require HEP scene format v15/);
+}
+
 async function assertRasterWebpQualityParity(rasterImageCodec) {
   const width = 192;
   const height = 128;
@@ -109,26 +218,39 @@ async function assertRasterWebpQualityParity(rasterImageCodec) {
     nodeEncoded.bytes.byteLength < quality92Webp.byteLength,
     "the parity quality must avoid @napi-rs/canvas's larger quality-92 default"
   );
+  const padded = new Uint8Array(rgba.length + 19).fill(99);
+  padded.set(rgba, 7);
+  const offsetPixels = padded.subarray(7, 7 + rgba.length);
+  const candidates = await rasterImageCodec.encodeRasterRgbaCandidates(width, height, offsetPixels);
+  assert.deepEqual(candidates.webp, new Uint8Array(quality80Webp));
+  assert.deepEqual(candidates.png, new Uint8Array(png));
+  assert.deepEqual(offsetPixels, rgba, "encoding must not mutate source pixels");
+  assert.equal(padded[6], 99);
+  assert.equal(padded.at(-1), 99);
 
   const previousDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
   const previousImageData = Object.getOwnPropertyDescriptor(globalThis, "ImageData");
   const browserCalls = [];
+  const browserCanvases = [];
+  const browserUploads = [];
   try {
     Object.defineProperty(globalThis, "document", {
       configurable: true,
       value: {
         createElement(tagName) {
           assert.equal(tagName, "canvas");
-          return {
+          const canvas = {
             width: 0,
             height: 0,
-            getContext: () => ({ putImageData() {} }),
+            getContext: () => ({ putImageData(image) { browserUploads.push(image); } }),
             toBlob(callback, mimeType, quality) {
               browserCalls.push({ mimeType, quality });
               const bytes = mimeType === "image/webp" ? quality80Webp : png;
               callback(new Blob([bytes], { type: mimeType }));
             }
           };
+          browserCanvases.push(canvas);
+          return canvas;
         }
       }
     });
@@ -146,13 +268,29 @@ async function assertRasterWebpQualityParity(rasterImageCodec) {
     const browserEncoded = await rasterImageCodec.encodeRasterRgbaAsBestImage(
       width,
       height,
-      rgba
+      offsetPixels
     );
     assert.equal(browserEncoded?.encoding, "webp");
     assert.deepEqual(browserCalls, [
       { mimeType: "image/webp", quality: 0.8 },
       { mimeType: "image/png", quality: undefined }
     ]);
+    assert.equal(browserCanvases.length, 1, "candidate encoders share one prepared canvas");
+    assert.equal(browserUploads.length, 1, "pixels are uploaded once for both encoders");
+    assert.equal(browserUploads[0].data.buffer, offsetPixels.buffer);
+    assert.equal(browserUploads[0].data.byteOffset, offsetPixels.byteOffset);
+    assert.equal(browserUploads[0].data.byteLength, rgba.byteLength);
+    assert.equal(browserCanvases[0].width, 0);
+    assert.equal(browserCanvases[0].height, 0);
+
+    if (typeof SharedArrayBuffer === "function") {
+      const shared = new Uint8Array(new SharedArrayBuffer(rgba.length));
+      shared.set(rgba);
+      await rasterImageCodec.encodeRasterRgbaCandidates(width, height, shared);
+      assert.ok(browserUploads[1].data.buffer instanceof ArrayBuffer,
+        "ImageData receives a private ordinary buffer for shared-memory pixels");
+      assert.deepEqual(new Uint8Array(browserUploads[1].data), rgba);
+    }
   } finally {
     if (previousDocument) {
       Object.defineProperty(globalThis, "document", previousDocument);
@@ -244,19 +382,12 @@ async function assertRasterAtlasRoundTrip(seedScene, zipBuilder, parsedData, ras
     );
     assert.notEqual(table.layers[300].storage, "atlas", "large layers keep their own section");
     assert.equal(table.layers[301].storage, table.layers[300].storage, "a repeated large image reuses its encoding");
-    assert.deepEqual(
-      await archive.file(rasterSections.rasterLayerFile(301, table.layers[301].storage)).async("uint8array"),
-      await archive.file(rasterSections.rasterLayerFile(300, table.layers[300].storage)).async("uint8array"),
-      "a repeated large image is encoded once"
-    );
+    assert.equal(table.layers[301].source, 300, "a repeated large image references its first copy's section");
+    assert.equal(manifest.formatVersion, 15);
     assert.deepEqual(
       Object.keys(archive.files).filter(name => name.startsWith("raster/")).sort(),
-      [
-        `raster/atlas-0.${atlasEncoding}`,
-        rasterSections.rasterLayerFile(300, table.layers[300].storage),
-        rasterSections.rasterLayerFile(301, table.layers[301].storage)
-      ].sort(),
-      "atlas members have no sections of their own"
+      [`raster/atlas-0.${atlasEncoding}`, rasterSections.rasterLayerFile(300, table.layers[300].storage)].sort(),
+      "atlas members and repeated large images have no sections of their own"
     );
 
     const roundTrip = await parsedData.loadSceneFromHep(bytes);
@@ -271,12 +402,19 @@ async function assertRasterAtlasRoundTrip(seedScene, zipBuilder, parsedData, ras
       assert.equal(loaded.paintOrder, source.paintOrder);
       assert.equal(loaded.pageIndex, 0);
       assert.equal(loaded.opacity, source.opacity);
+      if (index % 3 === 2) {
+        assert.equal(loaded.data, roundTrip.rasterLayers[index - 2].data,
+          "repeated atlas cells retain one canonical pixel resource");
+        assert.notEqual(loaded, roundTrip.rasterLayers[index - 2], "placements remain separate");
+        assert.notEqual(loaded.matrix, roundTrip.rasterLayers[index - 2].matrix, "placement transforms remain separate");
+      }
     }
+    assert.notEqual(roundTrip.rasterLayers[0].data, roundTrip.rasterLayers[1].data, "different atlas cells remain independent");
     assert.equal(roundTrip.rasterLayers[300].width, 200);
     assert.equal(roundTrip.rasterLayers[300].height, 150);
-    assert.deepEqual(roundTrip.rasterLayers[301].data, roundTrip.rasterLayers[300].data);
-    assert.notEqual(roundTrip.rasterLayers[301].data, roundTrip.rasterLayers[300].data,
-      "repeated layers still own separate pixel buffers");
+    assert.strictEqual(roundTrip.rasterLayers[301].data, roundTrip.rasterLayers[300].data,
+      "a shared section decodes to one canonical pixel resource, like repeated atlas cells");
+    assert.notEqual(roundTrip.rasterLayers[301], roundTrip.rasterLayers[300], "placements remain separate");
     assert.equal(roundTrip.rasterLayers[301].matrix[5], 600);
   }
 }
@@ -301,9 +439,12 @@ try {
   );
 
   await assertRasterWebpQualityParity(rasterImageCodec);
+  await assertLargeImagePngProbe(rasterImageCodec);
 
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const seedScene = createEmptyVectorScene();
+  await assertTwoColorPackedStorage(zipBuilder, parsedData, rasterSections, readRasterTable, seedScene);
+  await assertSharedSectionFormat(zipBuilder, parsedData, rasterSections, seedScene);
 
   const samplingPixels = Uint8Array.of(255, 0, 0, 255, 0, 0, 255, 255);
   const samplingScene = createRasterScene(seedScene, 2, 1, samplingPixels);

@@ -69,7 +69,7 @@ try {
   assert(mock.peakBytes <= budget.peakBytes, "old/new texture staging stays within the heuristic peak allowance");
   staged.commit(); staged.dispose();
   assert.equal(renderer.rasterStagedBytes, 0, "committed textures leave the staging ledger");
-  assert(!mock.alive.has(old));
+  assert(mock.alive.has(old), "replacing one placement keeps the texture used by unchanged placements alive");
   assert.deepEqual(renderer.rasterLayers.slice(1), untouched, "unaffected textures keep their resolution and ownership");
   assert(renderer.estimatedRasterResidentBytes() <= budget.bytes);
   assert.equal(scene.rasterLayers[0].data, data, "retained replacements preserve canonical document pixels");
@@ -146,6 +146,24 @@ try {
     assert.equal(expanded, 0);
     current.renderer.destroyRasterLayerTextures();
     assert.equal(current.mock.textureBytes(), 0);
+  }
+  {
+    const tiles = [image(4097, 2, rgbaData(4097, 2), 0), image(4097, 2, rgbaData(4097, 2), 1)];
+    tiles[1].matrix[4] = 4097.125;
+    const scene = Object.assign(createEmptyVectorScene(), { rasterLayers: tiles,
+      drawRuns: [{ kind: "raster", first: 0, count: 2 }] });
+    const { renderer, mock } = fixture(WebGlFloorplanRenderer, scene, estimateRasterTextureBytes);
+    Object.assign(renderer, { rasterResolutionPlanner: new RasterResolutionPlanner(), rasterResolutionView: null,
+      rasterRenderingEnabled: true, canvas: { width: 512, height: 512 }, cameraCenterX: 4097, cameraCenterY: 1, zoom: .1 });
+    renderer.uploadRasterLayers(scene);
+    assert.equal(renderer.rasterTileSeams.size, 2, "whole-texture previews share the opaque image seam");
+    renderer.zoom = 1;
+    await refine(renderer);
+    assert(renderer.rasterLayers.some(layer => layer.extraTiles?.length), "full detail crosses the hardware texture width");
+    assert.equal(renderer.rasterTileSeams.size, 0,
+      "refinement to hardware tiles removes both unsupported seam halves atomically");
+    renderer.destroyRasterLayerTextures();
+    assert.equal(mock.textureBytes(), 0);
   }
   {
     const scene = Object.assign(createEmptyVectorScene(), { rasterLayers: [image(24, 24, rgbaData(24, 24), 0), image(24, 24, rgbaData(24, 24), 1)] });

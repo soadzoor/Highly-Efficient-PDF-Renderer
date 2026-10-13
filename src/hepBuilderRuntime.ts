@@ -1,4 +1,5 @@
 import { loadPdfSceneFromSource, type PdfObjectSource } from "./pdfObjectGenerator";
+import { createHepRasterPagePreparer } from "./hepRasterPreparation";
 import { buildHepBlobForLayout } from "./hepWriter";
 import { listSceneRasterLayers } from "./hepShared";
 import type { SceneTextureStats } from "./hepTypes";
@@ -37,7 +38,9 @@ async function buildHepFromPdf(
     embeddedFontPaint: options.embeddedFontPaint,
     sourceKind: "pdf",
     onProgress: (payload) => forwardParseProgress(parseProgress, payload)
-  }, options.signal);
+  }, options.signal, false,
+  // Stream larger images: each page is encoded once parsed and its pixels released.
+  options.encodeRasterImages === false ? undefined : createHepRasterPagePreparer());
   options.signal?.throwIfAborted();
   const rasterLayers = listSceneRasterLayers(loaded.scene);
   const result = await buildSceneHep(

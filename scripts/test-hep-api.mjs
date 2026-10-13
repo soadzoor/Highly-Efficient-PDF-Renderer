@@ -126,6 +126,17 @@ try {
 
 async function testPdfColorOptionForwarding() {
   const source = await readFile(new URL("../src/hepBuilderRuntime.ts", import.meta.url), "utf8");
+  const streamingPreparer = async () => {};
+  const rawContext = vm.createContext({
+    createLoadProgressReporter,
+    createHepRasterPagePreparer: () => streamingPreparer,
+    loadPdfSceneFromSource: async (_source, _options, _signal, _demandLoading, preparePage) => {
+      assert.equal(preparePage, undefined, "raw RGBA exports have nothing to encode early");
+      throw new Error("raw export checked");
+    }
+  });
+  vm.runInContext(sourceFunction(source, "buildHepFromPdf"), rawContext);
+  await assert.rejects(rawContext.buildHepFromPdf(new Uint8Array(), { encodeRasterImages: false }), /raw export checked/);
   const stopBeforeConversion = new Error("stop after checking PDF loader options");
   for (const iccEngine of [undefined, "qcms", "lcms", "alternate", "none"]) {
     const iccTransformResolver = () => {};
@@ -133,7 +144,10 @@ async function testPdfColorOptionForwarding() {
     const onDiagnostic = () => {};
     const context = vm.createContext({
       createLoadProgressReporter,
-      loadPdfSceneFromSource: async (_source, options) => {
+      createHepRasterPagePreparer: () => streamingPreparer,
+      loadPdfSceneFromSource: async (_source, options, _signal, demandLoading, preparePage) => {
+        assert.equal(demandLoading, false);
+        assert.equal(preparePage, streamingPreparer, "PDF exports stream their larger images page by page");
         assert.equal(options.iccEngine, iccEngine);
         assert.equal(options.iccTransformResolver, iccTransformResolver);
         assert.equal(options.imageCodecResolver, imageCodecResolver);
@@ -153,6 +167,7 @@ async function testPdfSizeBudgetForwarding() {
   for (const requestedBudget of [undefined, 1, 999_999]) {
     const context = vm.createContext({
       createLoadProgressReporter,
+      createHepRasterPagePreparer: () => async () => {},
       loadPdfSceneFromSource: async () => ({ scene: {}, sourceKind: "pdf", sourceLabel: "source.pdf", sourceBytes: new Uint8Array(4096) }),
       listSceneRasterLayers: () => [],
       normalizeSourceLabel: (_value, fallback) => fallback,
@@ -168,6 +183,7 @@ async function testPdfSizeBudgetForwarding() {
     const scene = { sourcePdfByteLength: 16_384 };
     const context = vm.createContext({
       createLoadProgressReporter,
+      createHepRasterPagePreparer: () => async () => {},
       loadPdfSceneFromSource: async () => ({ scene, sourceKind: "hep", sourceLabel: "source.hep", sourceBytes: new Uint8Array(4096) }),
       listSceneRasterLayers: () => [],
       normalizeSourceLabel: (_value, fallback) => fallback,

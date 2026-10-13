@@ -82,6 +82,14 @@ try {
   assert(many.estimatedBytes <= many.availableBytes);
   assert.equal(many.unscaledBytes, estimateRasterTextureBytes(4096, 4096, false) * 4);
   assert.equal(many.estimatedBytes, many.plans.reduce((sum, plan) => sum + estimateRasterTilePlanBytes(plan, false), 0));
+  const repeatedSources = Array.from({ length: 10_000 }, () => ({ width: 8, height: 8 }));
+  const repeated = planSceneRasterMemory(repeatedSources, 8192, 1_000_000);
+  assert.equal(repeated.plans.length, repeatedSources.length, "every pattern placement keeps its index-aligned plan");
+  assert.equal(new Set(repeated.plans).size, 1, "repeated sizes share readonly tile geometry during budget searches");
+  assert(repeated.estimatedBytes <= repeated.availableBytes);
+  assert.equal(repeated.estimatedBytes, repeatedSources.length * estimateRasterTilePlanBytes(repeated.plans[0], false),
+    "geometry sharing still charges every independently allocated image");
+  assert.deepEqual(repeated.plans[0], planRasterTiles(repeated.plans[0].width, repeated.plans[0].height, 8192));
   const duplicated = planSceneRasterMemory([{ ...largeSource, allocationCopies: 2 }], 8192);
   assert.equal(duplicated.unscaledBytes, lowRam.unscaledBytes * 2);
   assert(duplicated.plans[0].width < lowRam.plans[0].width, "resident batching duplicates consume real budget");

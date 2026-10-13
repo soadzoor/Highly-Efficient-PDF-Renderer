@@ -51,6 +51,7 @@ import {
   HEP_JBIG2_NO_GLOBALS, HEP_JBIG2_MAX_DECODE_BYTES, hepJbig2GlobalsFile
 } from "./hepJbig2Raster";
 import { createMonochromeRasterLayer } from "./monochromeRaster";
+import { decodeHepRasterRepeats, hepRasterRepeatsByteLength, SCENE_RASTER_REPEATS_PATH } from "./hepRasterRepeats";
 import {
   SCENE_RASTER_LAYERS_PATH,
   copyRasterRect,
@@ -76,6 +77,8 @@ import {
   PARSED_DATA_JBIG2_FORMAT_VERSION,
   PARSED_DATA_BINARY_FORMAT_VERSION,
   PARSED_DATA_GROUP_RUN_FORMAT_VERSION,
+  PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION,
+  PARSED_DATA_SHARED_RASTER_FORMAT_VERSION,
   readTexturePayloadAsFloat32,
   readNonNegativeInt,
   preparedStrokeGeometry,
@@ -477,9 +480,11 @@ async function loadSceneFromHepInternal(
       manifest.formatVersion !== PARSED_DATA_MONOCHROME_FORMAT_VERSION &&
       manifest.formatVersion !== PARSED_DATA_JBIG2_FORMAT_VERSION &&
       manifest.formatVersion !== PARSED_DATA_BINARY_FORMAT_VERSION &&
-      manifest.formatVersion !== PARSED_DATA_GROUP_RUN_FORMAT_VERSION) {
+      manifest.formatVersion !== PARSED_DATA_GROUP_RUN_FORMAT_VERSION &&
+      manifest.formatVersion !== PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION &&
+      manifest.formatVersion !== PARSED_DATA_SHARED_RASTER_FORMAT_VERSION) {
     throw new Error(
-      `HEP format v${String(manifest.formatVersion)} is not supported; expected v${PARSED_DATA_FORMAT_VERSION}–v${PARSED_DATA_GROUP_RUN_FORMAT_VERSION}. Re-export the HEP file with the current version.`
+      `HEP format v${String(manifest.formatVersion)} is not supported; expected v${PARSED_DATA_FORMAT_VERSION}–v${PARSED_DATA_SHARED_RASTER_FORMAT_VERSION}. Re-export the HEP file with the current version.`
     );
   }
 
@@ -1318,7 +1323,11 @@ async function readRasterLayersFromParsedData(
   if (formatVersion < PARSED_DATA_BINARY_FORMAT_VERSION && table.layers.some(layer => layer.storage === "binary")) {
     throw new Error("Transposed binary raster layers require HEP scene format v12.");
   }
+  if (formatVersion < PARSED_DATA_SHARED_RASTER_FORMAT_VERSION && table.layers.some(layer => layer.source !== undefined)) {
+    throw new Error("Shared raster layer sections require HEP scene format v15.");
+  }
   validateRasterLayerPayloads(archive, table);
+  const repeats = await readRasterRepeatsFromParsedData(archive, meta.repeats, count, formatVersion, signal);
 
   // Decode an atlas when its first cell is needed and release it after its last.
   const lastCellIndex = new Map<number, number>();
@@ -1326,18 +1335,30 @@ async function readRasterLayersFromParsedData(
     if (layer.cell) lastCellIndex.set(layer.cell.atlas, index);
   });
   const atlasPixels = new Map<number, Uint8Array>();
+  // A repeated cell is one immutable image resource with independent placements.
+  const atlasCells = new Map<string, Uint8Array>();
   // Decode shared legacy JBIG2 globals once across layers.
   const jbig2Globals = new Map<number, Uint8Array>();
   const layers: RasterLayer[] = [];
   for (let i = 0; i < table.layers.length; i += 1) {
     signal?.throwIfAborted();
     const record = table.layers[i];
+    if (record.source !== undefined) {
+      // A v15 shared section was decoded for its owner; reuse those pixels,
+      // so renderers can share one texture between the placements.
+      const owner = layers[record.source];
+      const shared = owner.monochrome ? { monochrome: owner.monochrome } : { data: owner.data };
+      layers.push(placeSharedRasterLayer(owner, record, shared, repeats?.get(i),
+        typeof interpolation === "string" ? interpolation[i] : "-"));
+      continue;
+    }
     const base = {
       width: record.width,
       height: record.height,
       matrix: record.matrix,
       paintOrder: record.paintOrder,
       pageIndex: record.pageIndex,
+      ...(repeats?.has(i) ? { repeat: repeats.get(i)! } : {}),
       ...(typeof interpolation === "string" && interpolation[i] !== "-" ? { interpolate: interpolation[i] === "1" } : {}),
       ...(record.opacity === undefined ? {} : { opacity: record.opacity })
     };
@@ -1382,14 +1403,20 @@ async function readRasterLayersFromParsedData(
     if (record.storage === "atlas") {
       const cell = record.cell!;
       const atlas = table.atlases[cell.atlas];
-      let pixels = atlasPixels.get(cell.atlas);
-      if (!pixels) {
-        pixels = await readRasterImageSection(archive, rasterAtlasFile(cell.atlas, atlas.encoding), atlas.width, atlas.height);
-        signal?.throwIfAborted();
-        atlasPixels.set(cell.atlas, pixels);
+      const key = `${cell.atlas}:${cell.x}:${cell.y}:${record.width}:${record.height}`;
+      const cached = atlasCells.get(key);
+      if (cached) data = cached;
+      else {
+        let pixels = atlasPixels.get(cell.atlas);
+        if (!pixels) {
+          pixels = await readRasterImageSection(archive, rasterAtlasFile(cell.atlas, atlas.encoding), atlas.width, atlas.height);
+          signal?.throwIfAborted();
+          atlasPixels.set(cell.atlas, pixels);
+        }
+        data = new Uint8Array(record.width * record.height * 4);
+        copyRasterRect(pixels, atlas.width, cell.x, cell.y, data, record.width, 0, 0, record.width, record.height);
+        atlasCells.set(key, data);
       }
-      data = new Uint8Array(record.width * record.height * 4);
-      copyRasterRect(pixels, atlas.width, cell.x, cell.y, data, record.width, 0, 0, record.width, record.height);
       if (lastCellIndex.get(cell.atlas) === i) atlasPixels.delete(cell.atlas);
     } else {
       data = await readRasterImageSection(archive, rasterLayerFile(i, record.storage), record.width, record.height);
@@ -1399,6 +1426,45 @@ async function readRasterLayersFromParsedData(
   }
 
   return layers;
+}
+
+/** A layer placement that reuses another layer's decoded pixels or packed bits. */
+function placeSharedRasterLayer(
+  owner: RasterLayer,
+  record: RasterLayerTable["layers"][number],
+  pixels: { monochrome: NonNullable<RasterLayer["monochrome"]> } | { data: Uint8Array },
+  repeat: RasterLayer["repeat"] | undefined,
+  interpolation: string
+): RasterLayer {
+  const base = {
+    width: owner.width,
+    height: owner.height,
+    matrix: record.matrix,
+    paintOrder: record.paintOrder,
+    pageIndex: record.pageIndex,
+    ...(repeat ? { repeat } : {}),
+    ...(interpolation !== "-" && interpolation !== undefined ? { interpolate: interpolation === "1" } : {}),
+    ...(record.opacity === undefined ? {} : { opacity: record.opacity })
+  };
+  return "monochrome" in pixels ? createMonochromeRasterLayer(base, pixels.monochrome) : { ...base, data: pixels.data };
+}
+
+async function readRasterRepeatsFromParsedData(archive: HepArchive, value: unknown, layerCount: number,
+  formatVersion: number, signal?: AbortSignal) {
+  if (value === undefined) return undefined;
+  if (formatVersion < PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION) {
+    throw new Error(`Raster repeats require HEP scene format v${PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION}.`);
+  }
+  const meta = readSceneSectionDescriptor(value, SCENE_RASTER_REPEATS_PATH, "raster repeats");
+  const count = readSceneSectionCount(meta, "count", "raster repeats");
+  const translationCount = readSceneSectionCount(meta, "translationCount", "raster repeats");
+  if (count > layerCount) throw new Error("Scene raster repeat count exceeds its layers.");
+  const entry = archive.file(SCENE_RASTER_REPEATS_PATH);
+  if (!entry || readHepEntryUncompressedSize(entry) !== hepRasterRepeatsByteLength(count, translationCount)) {
+    throw new Error("Scene raster repeats are missing or do not match their declared byte length.");
+  }
+  return decodeHepRasterRepeats(await readSceneSectionBytes(archive, SCENE_RASTER_REPEATS_PATH, signal),
+    layerCount, count, translationCount, signal);
 }
 
 /** Straight-alpha RGBA8 of one raw, PNG or WebP section with known dimensions. */
@@ -1476,7 +1542,8 @@ function validateRasterLayerPayloads(archive: HepArchive, table: RasterLayerTabl
     const monochrome = layer.storage === "mono" || layer.storage === "binary" || layer.storage === "jbig2";
     const decodedBytes = monochrome ? hepMonochromeRasterByteLength(layer.width, layer.height) : texels * 4;
     addTexels(texels, `Raster layer ${index}`, decodedBytes);
-    if (layer.storage !== "atlas") {
+    // A shared layer's section was validated for the layer that owns it.
+    if (layer.storage !== "atlas" && layer.source === undefined) {
       const encodedMono = layer.storage === "binary" || layer.storage === "jbig2";
       const byteLength = addSection(rasterLayerFile(index, layer.storage), encodedMono ? null : decodedBytes, `Raster layer ${index}`);
       if (layer.storage === "binary" && (byteLength < HEP_BINARY_RASTER_HEADER_BYTES + 2 ||

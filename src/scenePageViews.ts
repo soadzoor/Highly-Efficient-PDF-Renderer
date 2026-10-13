@@ -6,6 +6,7 @@ import { defaultVectorDrawRuns, validateVectorDrawRuns } from "./vectorDrawOrder
 import { validateScenePaintGraph } from "./scenePaintGraph";
 import { selectSceneMarkedContent } from "./structureData";
 import { copyRasterLayer } from "./monochromeRaster";
+import { rasterRepeatCount } from "./rasterRepeat";
 
 export const PAGE_PRIMITIVE_KINDS = ["stroke", "fill", "text", "raster", "gradient-fill", "gradient-stroke"] as const;
 export const PAGE_PRIMITIVE_RANGE_STRIDE = PAGE_PRIMITIVE_KINDS.length * 2;
@@ -239,7 +240,7 @@ export class ScenePageViews {
     scene.rasterLayerWidth = raster?.width ?? 0; scene.rasterLayerHeight = raster?.height ?? 0;
     Object.defineProperty(scene, "rasterLayerData", { enumerable: true, configurable: true, get: () => raster?.data ?? emptyRasterData });
     scene.rasterLayerMatrix = raster?.matrix ?? Float32Array.of(1,0,0,1,0,0);
-    scene.imagePaintOpCount = scene.rasterLayers.length;
+    scene.imagePaintOpCount = scene.rasterLayers.reduce((sum, layer) => sum + (layer.repeat ? rasterRepeatCount(layer.repeat) : 1), 0);
 
     const runs = source.drawRuns ?? defaultVectorDrawRuns(source), runMap = new Map<number, number[]>();
     scene.drawRuns = [];

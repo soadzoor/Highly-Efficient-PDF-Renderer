@@ -132,6 +132,18 @@ export function estimateRasterSourcePlanBytes(source: RasterMemorySource, plan: 
   return estimateRasterTilePlanBytes(plan, packed, format, !!source.monochrome && !!source.reducedMonochrome && !packed);
 }
 
+/** Placement-independent, readonly tile geometry, shared within one planning pass. */
+function sharedTilePlanner(maxTextureSize: number): (width: number, height: number) => RasterTilePlan {
+  const dimensions = new Map<number, Map<number, RasterTilePlan>>();
+  return (width, height) => {
+    let heights = dimensions.get(width);
+    if (!heights) dimensions.set(width, heights = new Map());
+    let plan = heights.get(height);
+    if (!plan) { plan = planRasterTiles(width, height, maxTextureSize); heights.set(height, plan); }
+    return plan;
+  };
+}
+
 /**
  * Fit aggregate display demand before GPU allocation. Screen-sized requests share
  * a resolution scale, including binary images. Legacy requests without display
@@ -148,12 +160,13 @@ export function planSceneRasterMemory(
   const available = availableBytes === undefined || !Number.isFinite(availableBytes)
     ? budget.bytes
     : Math.max(0, Math.min(budget.bytes, Math.floor(availableBytes)));
+  const originalTilePlan = sharedTilePlanner(maxTextureSize);
   const originalPlans = sources.map(source => {
     validateDimensions(source.width, source.height);
     const width = source.displayWidth === undefined ? source.width : Math.max(1, Math.min(source.width, Math.floor(source.displayWidth)));
     const height = source.displayHeight === undefined ? source.height : Math.max(1, Math.min(source.height, Math.floor(source.displayHeight)));
     validateDimensions(width, height);
-    return planRasterTiles(width, height, maxTextureSize);
+    return originalTilePlan(width, height);
   });
   const packed = sources.map((source, index) => !!source.monochrome && source.displayWidth === undefined &&
     !isRasterTilePlanDownscaled(source, originalPlans[index]));
@@ -188,10 +201,12 @@ export function planSceneRasterMemory(
   if (compressed.bytes <= available) return result(originalPlans, compressed.bytes, 1, compressed.compressionFormats);
 
   const atScale = (scale: number) => {
-    const plans = originalPlans.map((plan, index) => packed[index] ? plan : planRasterTiles(
+    // Do not accumulate plans from discarded search trials. Repeated pattern
+    // images need one geometry description per size, rather than per cell.
+    const tilePlan = sharedTilePlanner(maxTextureSize);
+    const plans = originalPlans.map((plan, index) => packed[index] ? plan : tilePlan(
       Math.max(1, Math.floor(plan.width * scale)),
-      Math.max(1, Math.floor(plan.height * scale)),
-      maxTextureSize
+      Math.max(1, Math.floor(plan.height * scale))
     ));
     return price(plans);
   };

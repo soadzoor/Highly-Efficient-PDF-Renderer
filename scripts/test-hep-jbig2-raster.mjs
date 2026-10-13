@@ -306,11 +306,15 @@ try {
 
   const standaloneTable = sections.encodeRasterLayerTable({ atlases: [], layers: [storedTable.layers[0]] });
   assert.equal(standaloneTable[2], 16 | 4, "original JBIG2 has its own flag and retains opacity");
-  for (const flag of [16 | 1, 16 | 2, 16 | 3, 16 | 8, 16 | 32, 64, 128]) {
+  for (const flag of [16 | 1, 16 | 2, 16 | 3, 16 | 8, 16 | 32, 128]) {
     const invalid = standaloneTable.slice();
     invalid[2] = flag;
     assert.throws(() => sections.decodeRasterLayerTable(invalid, limits), /flag|storage/i);
   }
+  // Bit 6 marks a v15 shared section, which the first layer cannot reference.
+  const unsharedFirst = standaloneTable.slice();
+  unsharedFirst[2] = 16 | 64;
+  assert.throws(() => sections.decodeRasterLayerTable(unsharedFirst, limits), /shared section/);
 
   for (const version of [9, 10]) await assert.rejects(loadSceneFromHep(await editArchive(storedBytes, async archive => {
     const manifest = JSON.parse(await archive.file("manifest.json").async("string"));

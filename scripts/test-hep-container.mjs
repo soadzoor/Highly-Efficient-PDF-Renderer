@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { deflateSync, inflateSync } from "node:zlib";
 import { HepArchive, crc32, hasHepSignature, hasLegacyZipSignature,
   encodeFloat32Palette, decodeFloat32Palette } from "./lib/hepContainer.mjs";
+const { writeOwnedHepImageSection } = await import("../src/hepContainerOwnedSections.ts");
 
 // Independent bit-at-a-time CRC and fixture layout do not use the production writer.
 function referenceCrc(bytes) {
@@ -158,6 +159,36 @@ for (const compression of ["STORE", "DEFLATE"]) {
 }
 assert.equal((await source.generateAsync({ type: "blob", compression: "STORE" })).type, "application/x-hep");
 assert.ok(await source.generateAsync({ type: "arraybuffer", compression: "STORE" }) instanceof ArrayBuffer);
+
+// Only internally transferred image bytes can bypass public copy-on-read.
+const ownedImage = new HepArchive();
+const encodedImage = randomBytes(8193);
+const imageName = "raster/layer-0.png";
+writeOwnedHepImageSection(ownedImage, imageName, encodedImage);
+const ownedEntry = ownedImage.file(imageName);
+const publicImage = await ownedEntry.async("uint8array");
+publicImage.fill(0);
+assert.deepEqual(await ownedEntry.async("uint8array"), new Uint8Array(encodedImage),
+  "public reads of transferred images retain copy isolation");
+let publicReadsDuringWrite = 0;
+const originalOwnedRead = ownedEntry.async.bind(ownedEntry);
+ownedEntry.async = (...args) => { publicReadsDuringWrite++; return originalOwnedRead(...args); };
+const transferredBytes = await ownedImage.generateAsync({ type: "uint8array" });
+assert.equal(publicReadsDuringWrite, 0, "writer retains transferred STORE image bytes without copying");
+const ordinaryImage = await new HepArchive().file(imageName, encodedImage, { compression: "STORE" })
+  .generateAsync({ type: "uint8array" });
+assert.deepEqual(transferredBytes, ordinaryImage, "ownership transfer changes no container bytes");
+assert.deepEqual(await (await HepArchive.loadAsync(transferredBytes)).file(imageName).async("uint8array"),
+  new Uint8Array(encodedImage));
+
+const mutablePixels = Uint8Array.of(1, 2, 3, 4);
+const publicStore = new HepArchive().file("raster/public.rgba", mutablePixels, { compression: "STORE" })
+  .file("last", "done");
+const publicStoreBytes = await publicStore.generateAsync({ type: "uint8array" }, event => {
+  if (event.percent > 0) mutablePixels.fill(99);
+});
+assert.deepEqual(await (await HepArchive.loadAsync(publicStoreBytes)).file("raster/public.rgba").async("uint8array"),
+  Uint8Array.of(1, 2, 3, 4), "public STORE input is snapshotted before progress callbacks can mutate it");
 const empty = await new HepArchive().generateAsync({ type: "uint8array" });
 assert.equal(empty.length, 32);
 assert.deepEqual(Object.keys((await HepArchive.loadAsync(empty)).files), []);

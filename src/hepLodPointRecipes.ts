@@ -1,5 +1,6 @@
 import type { VectorScene } from "./pdfVectorExtractor";
 import { HepArchive } from "./hepContainer";
+import { SMALL_ENTRY_BYTES } from "./hepContainerShared";
 
 interface PointRecipe {
   /** Zero stores two residuals; otherwise zigzag(source point - predicted point) + 1. */
@@ -49,19 +50,7 @@ export async function encodeVectorLodPointRecipes<T extends PointRecipeData>(
   // Hold only one grid's point table at a time. A file can have many different grids.
   for (const [q, records] of groups) {
     signal?.throwIfAborted();
-    const points = new Map<string, number | number[]>();
-    for (let i = 0; i < scene.segmentCount; i++) {
-      if ((i & 4095) === 0) await yieldIfNeeded();
-      for (let kind = 0; kind < 2; kind++) {
-        const source = kind === 0 ? scene.endpoints : scene.primitiveMeta, at = i * 4;
-        const x = compact ? Math.round(source[at] / q) | 0 : canonical[kind][at];
-        const y = compact ? Math.round(source[at + 1] / q) | 0 : canonical[kind][at + 1];
-        const key = `${x},${y}`, id = i * 2 + kind, previous = points.get(key);
-        if (previous === undefined) points.set(key, id);
-        else if (typeof previous === "number") points.set(key, [previous, id]);
-        else previous.push(id);
-      }
-    }
+    const points = await buildPointTable(scene, canonical, compact, q, yieldIfNeeded);
     for (const i of records) {
       if ((i & 4095) === 0) await yieldIfNeeded();
       for (let kind = 0; kind < 2; kind++) {
@@ -72,9 +61,9 @@ export async function encodeVectorLodPointRecipes<T extends PointRecipeData>(
         const x = compact ? (data.literals[field][i] + px) | 0 : (data.literals[field][i] ^ px) >>> 0;
         const y = compact ? (data.literals[field][count + i] + py) | 0 : (data.literals[field][count + i] ^ py) >>> 0;
         const predicted = origin * 2 + kind;
-        const matches = points.get(`${x},${y}`);
-        if (matches === undefined) continue;
-        const id = x === px && y === py ? predicted : closestPoint(matches, predicted);
+        const key = points.find(x | 0, y | 0);
+        if (key < 0) continue;
+        const id = x === px && y === py ? predicted : points.closest(key, predicted);
         const delta = id - predicted;
         const code = delta >= 0 ? delta * 2 + 1 : -delta * 2;
         if (Number.isSafeInteger(code) && code <= 0xffffffff) references[kind][i] = code;
@@ -95,9 +84,20 @@ export async function encodeVectorLodPointRecipes<T extends PointRecipeData>(
   const candidate: T = { ...data, literals: { ...data.literals,
     endpoints: data.literals.endpoints.slice(count * 2), primitiveMeta: data.literals.primitiveMeta.slice(count * 2) },
     pointRecipes: { version: 1, start: recipes[0], end: recipes[1] } };
-  const before = await pointRecipeStorageBytes(data, signal);
-  const after = await pointRecipeStorageBytes(candidate, signal);
+  // Every other section is the same array in both forms and, once larger than
+  // a shared small-section chunk, compresses identically on its own. Compare
+  // only the replaced residuals and recipes then; small caches compare whole.
+  const differential = [candidate.literals.endpoints, candidate.literals.primitiveMeta,
+    ...recipes.flatMap(recipe => [recipe.references, recipe.residuals])].every(array => array.byteLength > SMALL_ENTRY_BYTES);
+  const before = await pointRecipeStorageBytes(differential ? replacedSections(data) : data, signal);
+  const after = await pointRecipeStorageBytes(differential ? replacedSections(candidate) : candidate, signal);
   return after < before ? candidate : data;
+}
+
+/** The sections point recipes replace or add, laid out as in the whole cache. */
+function replacedSections(data: PointRecipeData): object {
+  return { literals: { endpoints: data.literals.endpoints, primitiveMeta: data.literals.primitiveMeta },
+    ...(data.pointRecipes ? { pointRecipes: data.pointRecipes } : {}) };
 }
 
 /** Expand original packed residuals, before the existing Float32 decoder runs. */
@@ -135,7 +135,7 @@ export function decodeVectorLodPointRecipes<T extends PointRecipeData>(scene: Po
 }
 
 /** Compare actual container compression, descriptors, section records and padding. */
-export async function pointRecipeStorageBytes(data: PointRecipeData, signal?: AbortSignal): Promise<number> {
+export async function pointRecipeStorageBytes(data: PointRecipeData | object, signal?: AbortSignal): Promise<number> {
   const archive = new HepArchive();
   let next = 0;
   const json = JSON.stringify(data, (_key, value: unknown) => {
@@ -158,13 +158,65 @@ export async function pointRecipeStorageBytes(data: PointRecipeData, signal?: Ab
   return result.byteLength;
 }
 
-function closestPoint(points: number | number[], predicted: number): number {
-  if (typeof points === "number") return points;
-  let lo = 0, hi = points.length;
-  while (lo < hi) { const middle = (lo + hi) >>> 1; if (points[middle] < predicted) lo = middle + 1; else hi = middle; }
-  if (lo === 0) return points[0];
-  if (lo === points.length) return points[lo - 1];
-  return predicted - points[lo - 1] <= points[lo] - predicted ? points[lo - 1] : points[lo];
+interface PointTable {
+  /** Index of the exact grid point, or -1. Coordinates are int32 or uint32 word bits. */
+  find(x: number, y: number): number;
+  /** The scene point id with this grid point that is nearest `predicted`; ties prefer the lower id. */
+  closest(key: number, predicted: number): number;
+}
+
+/**
+ * Every scene start (`2i`) and end (`2i + 1`) point on one grid, keyed by its
+ * exact integer coordinates. Ids per point stay ascending in one flat array,
+ * so a lookup is a typed-array probe instead of building a string per point.
+ */
+async function buildPointTable(
+  scene: PointSource,
+  canonical: readonly Uint32Array[],
+  compact: boolean,
+  q: number,
+  yieldIfNeeded: () => Promise<void>
+): Promise<PointTable> {
+  const pointCount = scene.segmentCount * 2;
+  let capacity = 1;
+  while (capacity < pointCount * 2) capacity *= 2;
+  const mask = capacity - 1;
+  const slots = new Int32Array(capacity).fill(-1);
+  const keyX = new Int32Array(pointCount), keyY = new Int32Array(pointCount);
+  const counts = new Int32Array(pointCount + 1), pointKeys = new Int32Array(pointCount);
+  let keyCount = 0;
+  const slotOf = (x: number, y: number): number => {
+    let slot = (Math.imul(x, 0x9e3779b1) ^ Math.imul(y ^ (y >>> 16), 0x85ebca6b)) >>> 0;
+    slot = (slot ^ (slot >>> 15)) & mask;
+    while (slots[slot] >= 0 && (keyX[slots[slot]] !== x || keyY[slots[slot]] !== y)) slot = (slot + 1) & mask;
+    return slot;
+  };
+  for (let i = 0; i < scene.segmentCount; i++) {
+    if ((i & 4095) === 0) await yieldIfNeeded();
+    for (let kind = 0; kind < 2; kind++) {
+      const source = kind === 0 ? scene.endpoints : scene.primitiveMeta, at = i * 4;
+      const x = compact ? Math.round(source[at] / q) | 0 : canonical[kind][at] | 0;
+      const y = compact ? Math.round(source[at + 1] / q) | 0 : canonical[kind][at + 1] | 0;
+      const slot = slotOf(x, y);
+      if (slots[slot] < 0) { slots[slot] = keyCount; keyX[keyCount] = x; keyY[keyCount++] = y; }
+      pointKeys[i * 2 + kind] = slots[slot];
+      counts[slots[slot] + 1]++;
+    }
+  }
+  for (let key = 0; key < keyCount; key++) counts[key + 1] += counts[key];
+  const ids = new Int32Array(pointCount), cursor = counts.slice(0, keyCount);
+  for (let id = 0; id < pointCount; id++) ids[cursor[pointKeys[id]]++] = id;
+  return {
+    find(x, y) { return slots[slotOf(x, y)]; },
+    closest(key, predicted) {
+      const first = counts[key], end = counts[key + 1];
+      let lo = first, hi = end;
+      while (lo < hi) { const middle = (lo + hi) >>> 1; if (ids[middle] < predicted) lo = middle + 1; else hi = middle; }
+      if (lo === first) return ids[first];
+      if (lo === end) return ids[end - 1];
+      return predicted - ids[lo - 1] <= ids[lo] - predicted ? ids[lo - 1] : ids[lo];
+    }
+  };
 }
 function quantum(data: PointRecipeData, i: number): number { return data.positionQuanta?.[i] ?? data.positionQuantum!; }
 function validate(data: PointRecipeData, scene: PointSource, recipes: boolean): void {

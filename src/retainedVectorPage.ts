@@ -1,7 +1,7 @@
 import { computeNativePdfPageGeometry } from "./pdf/nativePageGeometry";
 import { placeSceneAnnotation } from "./annotationData";
 import { createEmptyVectorScene } from "./emptyVectorScene";
-import { HEPR_ANNOTATION_MARKED_CONTENT_TAG, HEPR_COLOR_SPACE_KIND, HEPR_IMAGE_FORMAT, HEPR_PAINT_KIND, HEPR_STROKE_FLAG,
+import { HEPR_ANNOTATION_MARKED_CONTENT_TAG, HEPR_COLOR_SPACE_KIND, HEPR_IMAGE_FORMAT, HEPR_PAINT_KIND, HEPR_PATH_VERB, HEPR_STROKE_FLAG,
   expandHeprImageToRgba8, type HeprPageData, type PdfMatrix } from "./heprDocumentData";
 import { executeHeprDisplayProgram, multiplyHeprMatrices, resolveHeprPatternPaint, type HeprDisplayBackend,
   type HeprDrawRunExecution, type HeprExecutionClipScope, type HeprExecutionIndexScope, type HeprExecutionState,
@@ -29,10 +29,36 @@ import type { DensePdfTextClip } from "./pdf/nativeContentCompiler";
 import { PdfError } from "./pdf/nativeTypes";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import { createMonochromeRasterLayer, type MonochromeRaster } from "./monochromeRaster";
+import { rasterRepeatBounds, rasterRepeatCount, validateRasterRepeat, type RasterRepeat } from "./rasterRepeat";
 
 const IDENTITY: PdfMatrix = [1, 0, 0, 1, 0, 0];
 type Color = readonly [number, number, number, number];
 interface Geometry { a: number[]; b: number[]; bounds: Bounds }
+
+/** Strict clip proof: one ordered rectangle, with no curves, holes or crossing edges. */
+function retainedRectangleBounds(page: HeprPageData, pathIndex: number, matrix: PdfMatrix): Bounds | null {
+  const paths = page.stores.paths, start = paths.pathVerbOffsets[pathIndex], end = paths.pathVerbOffsets[pathIndex + 1];
+  if (end - start !== 4 && !(end - start === 5 && paths.verbs[end - 1] === HEPR_PATH_VERB.Close)) return null;
+  const points: number[] = [];
+  for (let index = 0; index < 4; index++) {
+    if (paths.verbs[start + index] !== (index ? HEPR_PATH_VERB.LineTo : HEPR_PATH_VERB.MoveTo)) return null;
+    const offset = paths.verbCoordinateOffsets[start + index], x = paths.coordinates[offset], y = paths.coordinates[offset + 1];
+    const px = matrix[0] * x + matrix[2] * y + matrix[4], py = matrix[1] * x + matrix[3] * y + matrix[5];
+    if (!Number.isFinite(px) || !Number.isFinite(py)) return null;
+    points.push(px, py);
+  }
+  let previousVertical: boolean | undefined;
+  for (let index = 0; index < 4; index++) {
+    const next = (index + 1) % 4, vertical = points[index * 2] === points[next * 2],
+      horizontal = points[index * 2 + 1] === points[next * 2 + 1];
+    if (vertical === horizontal || vertical === previousVertical) return null;
+    previousVertical = vertical;
+  }
+  return { minX: Math.min(points[0], points[2], points[4], points[6]),
+    minY: Math.min(points[1], points[3], points[5], points[7]),
+    maxX: Math.max(points[0], points[2], points[4], points[6]),
+    maxY: Math.max(points[1], points[3], points[5], points[7]) };
+}
 
 /** Append-only final stroke values; no page-sized boxed arrays or growth copies. */
 class RetainedStrokeBuffer {
@@ -285,9 +311,10 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const fail = (message: string, reason = "vector-retained-program"): never => {
     throw new PdfError("unsupported-content", `VectorScene retained program: ${message}`, { details: { reason } });
   };
-  const budget = (added: number): void => {
+  const budget = (added: number, primitives = 1): void => {
     signal.throwIfAborted(); coordinates += added;
-    if (++count > maximum || coordinates > maxCoordinates) throw new PdfError("resource-limit", "Retained vector expansion exceeds its geometry budget.", { details: { reason: "vector-expansion-limit" } });
+    count += primitives;
+    if (count > maximum || coordinates > maxCoordinates) throw new PdfError("resource-limit", "Retained vector expansion exceeds its geometry budget.", { details: { reason: "vector-expansion-limit" } });
   };
   const transform = (index: number): PdfMatrix => Array.from(page.stores.transforms.values.subarray(index * 6, index * 6 + 6)) as unknown as PdfMatrix;
   const inverseMatrix = (matrix: PdfMatrix): PdfMatrix => {
@@ -812,6 +839,45 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     return !clip || !glyphClipTester.isFullyOutside(reach, clip, signal);
   };
   const patternActive = new Set<number>();
+  const stencilCells = new Map<number, { image: number; bounds: Bounds } | null>();
+  const simpleStencilCell = (resolved: HeprResolvedPatternPaint): { image: number; bounds: Bounds } | null => {
+    if (resolved.kind !== "uncolored-tiling" || resolved.basePaintIndex < 0) return null;
+    const cached = stencilCells.get(resolved.programIndex);
+    if (cached !== undefined) return cached;
+    const reject = (): null => { stencilCells.set(resolved.programIndex, null); return null; };
+    const program = page.displayProgram.programs[resolved.programIndex], command = program.commands[0];
+    if (program.kind !== "pattern" || !program.clipToBounds || !program.bounds || program.commands.length !== 1 ||
+        !transform(program.matrixIndex).every((value, index) => value === IDENTITY[index]) ||
+        command.kind !== "draw" || command.source !== "images" || command.count !== 1 || command.paintIndex >= 0 ||
+        command.optionalContentIndex >= 0 || command.markedContentIndex >= 0) return reject();
+    const images = page.stores.images, image = command.first,
+      samples = images.data.subarray(images.dataOffsets[image], images.dataOffsets[image + 1]);
+    if (!images.imageMask[image] || images.softMaskImageIndices[image] >= 0 || images.formats[image] !== HEPR_IMAGE_FORMAT.Gray8 ||
+        samples.length !== images.widths[image] * images.heights[image]) return reject();
+    for (let sample = 0; sample < samples.length; sample++) {
+      if ((sample & 65535) === 0) signal.throwIfAborted();
+      if (samples[sample] !== 255) return reject();
+    }
+    const imageMatrix = transform(command.transformIndex), [a, b, c, d, e, f] = imageMatrix;
+    if (!((b === 0 && c === 0 && a !== 0 && d !== 0) || (a === 0 && d === 0 && b !== 0 && c !== 0))) return reject();
+    const bounds: Bounds = { minX: Math.max(program.bounds[0], Math.min(e, a + e, c + e, a + c + e)),
+      minY: Math.max(program.bounds[1], Math.min(f, b + f, d + f, b + d + f)),
+      maxX: Math.min(program.bounds[2], Math.max(e, a + e, c + e, a + c + e)),
+      maxY: Math.min(program.bounds[3], Math.max(f, b + f, d + f, b + d + f)) };
+    const clips = page.stores.clips;
+    for (let index = command.clipIndex; index >= 0; index = clips.parentIndices[index]) {
+      signal.throwIfAborted();
+      if (clips.pathCounts[index] !== 1 || clips.glyphCounts[index] !== 0) return reject();
+      const clip = retainedRectangleBounds(page, clips.firstPaths[index], transform(clips.transformIndices[index]));
+      if (!clip) return reject();
+      bounds.minX = Math.max(bounds.minX, clip.minX); bounds.minY = Math.max(bounds.minY, clip.minY);
+      bounds.maxX = Math.min(bounds.maxX, clip.maxX); bounds.maxY = Math.min(bounds.maxY, clip.maxY);
+    }
+    if (![bounds.minX, bounds.minY, bounds.maxX, bounds.maxY].every(Number.isFinite) ||
+        bounds.maxX <= bounds.minX || bounds.maxY <= bounds.minY) return reject();
+    const result = { image, bounds }; stencilCells.set(resolved.programIndex, result); return result;
+  };
+  let glyphsByTransform: Map<number, number[]> | undefined;
   let draw: (execution: HeprDrawRunExecution, inheritedClip?: DensePdfTextClip | null, inheritedCondition?: number,
     inheritedItem?: number) => Promise<void>;
   const pattern = async (paint: number, g: Geometry, matrix: PdfMatrix, clip: DensePdfTextClip | null, rule: number, condition?: number): Promise<void> => {
@@ -847,10 +913,74 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     cells += amount; patternActive.add(p);
     const paintedClip = clipFromGeometry(g, clip, rule);
     const cellPage = buildRetainedPatternCellPage(page, resolved), { transforms, cellOffset } = cellPage;
+    // Polygon clips and image quads have different edge coverage in the GPU
+    // backends. Fold clipping only when the final cell axes stay axis aligned.
+    const cellMatrix = transforms.subarray(cellOffset, cellOffset + 6), stencilCell =
+      ((b === 0 && c === 0) || (a === 0 && d === 0)) ? simpleStencilCell(resolved) : null;
     const group: ScenePaintGroup = { kind: "group", children: [], alpha: page.stores.paints.alphas[paint],
       isolated: true, knockout: false, blendMode: "Normal", optionalContent: condition };
     stack.at(-1)!.push(group); stack.push(group.children);
     try {
+      if (stencilCell) {
+        // A single uniform stencil has constant pixels throughout its quad.
+        // Crop that quad to the cell's exact rectangles once, retaining real
+        // inter-cell gaps in the placements rather than allocating clip nodes
+        // and synthetic execution groups for every repetition.
+        flushStencil();
+        const { image, bounds } = stencilCell, images = page.stores.images, rgba = color(resolved.basePaintIndex),
+          key = `${image}:${rgba.join(",")}`;
+        let pixels = imagePixels.get(key);
+        if (!pixels) {
+          pixels = tintHeprStencilMask(images.data.subarray(images.dataOffsets[image], images.dataOffsets[image + 1]),
+            images.widths[image], images.heights[image], rgba, stencilScale, signal);
+          imagePixels.set(key, pixels);
+        }
+        const first = scene.rasterLayers.length, cropped: PdfMatrix = [bounds.maxX - bounds.minX, 0, 0,
+          bounds.minY - bounds.maxY, bounds.minX, bounds.maxY];
+        let repeat: RasterRepeat | undefined, repeatMatrix: Float32Array | undefined;
+        if (amount > 0 && bounds.maxX - bounds.minX <= Math.abs(xs) && bounds.maxY - bounds.minY <= Math.abs(ys)) {
+          const candidate: RasterRepeat = { transform: Float64Array.from(toScene),
+            bounds: Float64Array.of(bounds.minX, bounds.minY, bounds.maxX, bounds.maxY),
+            xStep: xs, yStep: ys, xFirst: x0, xLast: x1, yFirst: y0, yLast: y1 };
+          // An affine grid reaches its coordinate extrema at its corner cells.
+          // Keep overflow diagnostics on the original path when any corner
+          // would exceed its Float32 placement storage.
+          let finite = true;
+          for (const y of [y0, y1]) for (const x of [x0, x1]) {
+            const cell = Float32Array.from(multiplyHeprMatrices(toScene, [1, 0, 0, 1, x * xs, y * ys]));
+            if (!cell.every(Number.isFinite) ||
+                !Float32Array.from(multiplyHeprMatrices(cell as unknown as PdfMatrix, cropped)).every(Number.isFinite)) finite = false;
+          }
+          if (finite) {
+            validateRasterRepeat(candidate);
+            const grid = rasterRepeatBounds(candidate), enclosing = Float32Array.of(grid.maxX - grid.minX, 0, 0,
+              grid.maxY - grid.minY, grid.minX, grid.minY);
+            if (enclosing.every(Number.isFinite)) { repeat = candidate; repeatMatrix = enclosing; }
+          }
+        }
+        if (repeat) {
+          // Charge the same logical cells and coordinates even though the
+          // canonical scene now stores one reusable grid, not one object per cell.
+          budget(amount * 6, amount);
+          scene.rasterLayers.push({ ...pixels, matrix: repeatMatrix!, repeat, paintOrder: first, pageIndex: 0,
+            interpolate: images.interpolate[image] !== 0 });
+          appendRun("raster", first, 1, paintedClip, condition);
+          return;
+        }
+        for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+          signal.throwIfAborted();
+          transforms.set(multiplyHeprMatrices(toScene, [1, 0, 0, 1, x * xs, y * ys]), cellOffset);
+          if (!cellMatrix.every(Number.isFinite)) { skippedPatternCells++; continue; }
+          const matrix = Float32Array.from(multiplyHeprMatrices(cellMatrix as unknown as PdfMatrix, cropped));
+          if (!matrix.every(Number.isFinite)) return fail("pattern image coordinates exceed Float32 storage.");
+          budget(6);
+          scene.rasterLayers.push({ ...pixels, matrix, paintOrder: scene.rasterLayers.length, pageIndex: 0,
+            interpolate: images.interpolate[image] !== 0 });
+          if (performance.now() - lastYield > 8) { await new Promise<void>(resolve => setTimeout(resolve, 0)); lastYield = performance.now(); }
+        }
+        if (scene.rasterLayers.length > first) appendRun("raster", first, scene.rasterLayers.length - first, paintedClip, condition);
+        return;
+      }
       // The top-level execution validated `page`, and the cell page stays valid
       // with it. The cell matrix is the one new value, so each tile checks it after
       // Float32 storage instead of revalidating the whole page.
@@ -1102,9 +1232,15 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     beginProgram(execution) {
       if (execution.program.kind !== "type3") return;
       const condition = combine(execution.state, inheritedCondition);
-      for (let glyph = 0; glyph < page.stores.glyphs.glyphIds.length; glyph++) {
-        if (page.stores.glyphs.transformIndices[glyph] === execution.invocationCommand.transformIndex) glyphConditions[glyph] = condition ?? -1;
+      if (!glyphsByTransform) {
+        glyphsByTransform = new Map();
+        for (let glyph = 0; glyph < page.stores.glyphs.glyphIds.length; glyph++) {
+          if ((glyph & 65535) === 0) signal.throwIfAborted();
+          const transformIndex = page.stores.glyphs.transformIndices[glyph], matches = glyphsByTransform.get(transformIndex);
+          if (matches) matches.push(glyph); else glyphsByTransform.set(transformIndex, [glyph]);
+        }
       }
+      for (const glyph of glyphsByTransform.get(execution.invocationCommand.transformIndex) ?? []) glyphConditions[glyph] = condition ?? -1;
     },
     beginCompositeGroup(execution) {
       flushStencil();
@@ -1209,7 +1345,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     options.textPositions, signal);
   scene.sourceTextCount = source.stores.glyphs.glyphIds.length;
   scene.pathCount = scene.fillPathCount + scene.segmentCount;
-  scene.imagePaintOpCount = scene.rasterLayers.length;
+  scene.imagePaintOpCount = scene.rasterLayers.reduce((sum, layer) => sum + (layer.repeat ? rasterRepeatCount(layer.repeat) : 1), 0);
   const image = scene.rasterLayers[0];
   if (image) {
     scene.rasterLayerWidth = image.width; scene.rasterLayerHeight = image.height; scene.rasterLayerMatrix = image.matrix;

@@ -25,6 +25,7 @@ import {
 } from "./rangeTransport";
 import {
   PDF_WORKER_PROTOCOL_VERSION,
+  PDF_WORKER_RESPONSE_TRANSFER_MIN_BYTES,
   collectPdfTransferables,
   deserializePdfError,
   serializePdfError,
@@ -243,7 +244,7 @@ export function attachPdfWorkerRuntime(
           scene,
           diagnostics: activeSession.getDiagnostics()
         };
-        endpoint.postMessage(response, collectPdfTransferables(scene));
+        endpoint.postMessage(response, collectPdfTransferables(scene, PDF_WORKER_RESPONSE_TRANSFER_MIN_BYTES));
         return;
       }
       const page = await activeSession.compilePage(request.sourcePageIndex, compileOptions);
@@ -256,7 +257,7 @@ export function attachPdfWorkerRuntime(
         page,
         diagnostics: activeSession.getDiagnostics()
       };
-      endpoint.postMessage(response, collectPdfTransferables(page));
+      endpoint.postMessage(response, collectPdfTransferables(page, PDF_WORKER_RESPONSE_TRANSFER_MIN_BYTES));
     } catch (error) {
       postFailure(request.requestId, error);
     } finally {

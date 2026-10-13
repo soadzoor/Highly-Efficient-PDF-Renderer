@@ -41,7 +41,11 @@ import type {
 // Version 13 preserves vector overviews and substitutes OCR before scan decoding.
 // Version 14 requires workers to honor the embedded-font painting policy.
 // Version 15 preserves scan appearance for independent page thumbnails.
-export const PDF_WORKER_PROTOCOL_VERSION = 15 as const;
+export const PDF_WORKER_PROTOCOL_VERSION = 16 as const;
+
+// Thousands of tiny matrices cost far more to transfer individually than to
+// clone. This selects the cheaper transport; it does not limit response data.
+export const PDF_WORKER_RESPONSE_TRANSFER_MIN_BYTES = 4_096;
 
 /** Clone-safe subset of RequestInit used by the worker's GET-only URL reader. */
 export interface PdfWorkerRequestInit {
@@ -382,8 +386,8 @@ export function deserializePdfError(error: SerializedPdfError): PdfError {
   });
 }
 
-/** Collect each transferable ArrayBuffer once without traversing Blob payloads. */
-export function collectPdfTransferables(value: unknown): Transferable[] {
+/** Collect distinct buffers, cloning small ones when a minimum is supplied. */
+export function collectPdfTransferables(value: unknown, minimumByteLength = 0): Transferable[] {
   const transferables: Transferable[] = [];
   const buffers = new Set<ArrayBuffer>();
   const visited = new Set<object>();
@@ -391,14 +395,14 @@ export function collectPdfTransferables(value: unknown): Transferable[] {
     if (candidate === null || typeof candidate !== "object") return;
     if (ArrayBuffer.isView(candidate)) {
       const buffer = candidate.buffer;
-      if (buffer instanceof ArrayBuffer && !buffers.has(buffer)) {
+      if (buffer instanceof ArrayBuffer && buffer.byteLength >= minimumByteLength && !buffers.has(buffer)) {
         buffers.add(buffer);
         transferables.push(buffer);
       }
       return;
     }
     if (candidate instanceof ArrayBuffer) {
-      if (!buffers.has(candidate)) {
+      if (candidate.byteLength >= minimumByteLength && !buffers.has(candidate)) {
         buffers.add(candidate);
         transferables.push(candidate);
       }

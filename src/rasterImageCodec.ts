@@ -75,12 +75,70 @@ export async function encodeRasterRgbaCandidates(
   height: number,
   rgba: Uint8Array<ArrayBufferLike>
 ): Promise<RasterImageCandidates> {
-  const webp = await encodeRasterRgbaAsImage(width, height, rgba, "webp");
-  const png = await encodeRasterRgbaAsImage(width, height, rgba, "png");
+  const { webp, png } = await encodeRasterRgbaImages(width, height, rgba, ["webp", "png"],
+    (encoding, encoded) => encoding !== "png" || !encoded.webp ||
+      pngMayBeatWebp(width, height, rgba, encoded.webp.byteLength));
   return {
     webp: webp && rasterImageDimensionsMatch("webp", webp, width, height) ? webp : null,
     png: png && rasterImageDimensionsMatch("png", png, width, height) ? png : null
   };
+}
+
+/** Images below this size always try both encoders. */
+const PNG_PROBE_MIN_TEXELS = 1 << 16;
+/**
+ * Megapixel images at least 1024 rows tall sample 32 bands of 16 rows; their
+ * prediction stays within -5%/+30% of the real PNG, so a 1.2x margin is safe.
+ */
+const PNG_PROBE_LARGE_TEXELS = 1 << 20;
+const PNG_PROBE_LARGE_MARGIN = 1.2;
+/**
+ * Smaller images sample about an eighth of their rows in 4-32 bands. Blank
+ * margins and short bands make that prediction several times less accurate,
+ * so only a far larger predicted PNG skips the whole-image encode.
+ */
+const PNG_PROBE_SMALL_MARGIN = 2.5;
+const PNG_PROBE_MAX_BANDS = 32;
+const PNG_PROBE_MIN_BANDS = 4;
+const PNG_PROBE_ROW_SHARE = 8;
+
+/** Evenly spaced row bands to sample, or null when the image is too short. */
+function pngProbeLayout(width: number, height: number): { bands: number; rows: number; margin: number } | null {
+  if (width * height < PNG_PROBE_MIN_TEXELS) return null;
+  if (width * height >= PNG_PROBE_LARGE_TEXELS && height >= PNG_PROBE_MAX_BANDS * 16 * 2) {
+    return { bands: PNG_PROBE_MAX_BANDS, rows: 16, margin: PNG_PROBE_LARGE_MARGIN };
+  }
+  for (const rows of [16, 8]) {
+    const bands = Math.min(PNG_PROBE_MAX_BANDS, Math.floor(height / (rows * PNG_PROBE_ROW_SHARE)));
+    if (bands >= PNG_PROBE_MIN_BANDS) return { bands, rows, margin: PNG_PROBE_SMALL_MARGIN };
+  }
+  return null;
+}
+
+/**
+ * Lossless PNG of a photograph or scan is slower than WebP and several times
+ * larger, so it rarely wins the size comparison. Evenly spaced row bands
+ * predict its size from a fraction of the image. A predicted loss beyond the
+ * margin skips the whole-image encode; near or winning predictions still
+ * compare both encodings exactly.
+ */
+async function pngMayBeatWebp(
+  width: number,
+  height: number,
+  rgba: Uint8Array<ArrayBufferLike>,
+  webpBytes: number
+): Promise<boolean> {
+  const layout = pngProbeLayout(width, height);
+  if (!layout) return true;
+  const { bands, rows, margin } = layout;
+  const sampleRows = bands * rows, rowBytes = width * 4;
+  const sample = new Uint8Array(rowBytes * sampleRows);
+  for (let band = 0; band < bands; band += 1) {
+    const top = Math.floor((height - rows) * band / (bands - 1));
+    sample.set(rgba.subarray(top * rowBytes, (top + rows) * rowBytes), band * rows * rowBytes);
+  }
+  const { png } = await encodeRasterRgbaImages(width, sampleRows, sample, ["png"]);
+  return !png || png.byteLength * (height / sampleRows) < webpBytes * margin;
 }
 
 /** The smaller candidate, or null when neither beats raw RGBA storage. */
@@ -106,7 +164,7 @@ export async function encodeRasterRgbaAsPng(
   height: number,
   rgba: Uint8Array<ArrayBufferLike>
 ): Promise<Uint8Array | null> {
-  const png = await encodeRasterRgbaAsImage(width, height, rgba, "png");
+  const { png } = await encodeRasterRgbaImages(width, height, rgba, ["png"]);
   return png && rasterImageDimensionsMatch("png", png, width, height) &&
     png.byteLength < width * height * 4 ? png : null;
 }
@@ -372,12 +430,21 @@ function rasterImageMimeType(
   return encoding === "png" ? "image/png" : "image/jpeg";
 }
 
-async function encodeRasterRgbaAsImage(
+/** Optional per-encoder gate that sees the encodings produced so far. */
+type RasterEncodingGate = (
+  encoding: RasterImageEncoding,
+  encoded: Readonly<RasterImageCandidates>
+) => boolean | Promise<boolean>;
+
+/** Upload pixels once; the encoders consume the same canvas serially. */
+async function encodeRasterRgbaImages(
   width: number,
   height: number,
   rgba: Uint8Array<ArrayBufferLike>,
-  encoding: RasterImageEncoding
-): Promise<Uint8Array | null> {
+  encodings: readonly RasterImageEncoding[],
+  shouldEncode?: RasterEncodingGate
+): Promise<RasterImageCandidates> {
+  const result: RasterImageCandidates = { webp: null, png: null };
   const expectedBytes = width * height * 4;
   if (
     !Number.isSafeInteger(expectedBytes) ||
@@ -385,11 +452,11 @@ async function encodeRasterRgbaAsImage(
     height <= 0 ||
     rgba.byteLength < expectedBytes
   ) {
-    return null;
+    return result;
   }
 
   if (typeof document === "undefined") {
-    return encodeRasterRgbaAsNodeImage(width, height, rgba, encoding);
+    return encodeRasterRgbaAsNodeImages(width, height, rgba, encodings, shouldEncode);
   }
 
   const canvas = document.createElement("canvas");
@@ -398,27 +465,35 @@ async function encodeRasterRgbaAsImage(
   try {
     const context = canvas.getContext("2d", { alpha: true });
     if (!context) {
-      return null;
+      return result;
     }
 
-    const clamped = new Uint8ClampedArray(expectedBytes);
-    clamped.set(rgba.subarray(0, expectedBytes));
-    context.putImageData(new ImageData(clamped, width, height), 0, 0);
-    const blob = await new Promise<Blob | null>((resolve) => {
-      canvas.toBlob(
-        resolve,
-        rasterImageMimeType(encoding),
-        encoding === "webp" ? RASTER_WEBP_QUALITY : undefined
-      );
-    });
-    if (!blob || blob.type !== rasterImageMimeType(encoding)) {
-      return null;
+    context.putImageData(new ImageData(clampedRasterPixels(rgba, expectedBytes), width, height), 0, 0);
+    for (const encoding of encodings) {
+      if (shouldEncode && !(await shouldEncode(encoding, result))) continue;
+      const blob = await new Promise<Blob | null>((resolve) => {
+        canvas.toBlob(
+          resolve,
+          rasterImageMimeType(encoding),
+          encoding === "webp" ? RASTER_WEBP_QUALITY : undefined
+        );
+      });
+      if (blob?.type === rasterImageMimeType(encoding)) {
+        result[encoding] = new Uint8Array(await blob.arrayBuffer());
+      }
     }
-    return new Uint8Array(await blob.arrayBuffer());
+    return result;
   } finally {
     canvas.width = 0;
     canvas.height = 0;
   }
+}
+
+/** putImageData copies synchronously; an ordinary buffer needs no staging copy. */
+function clampedRasterPixels(rgba: Uint8Array<ArrayBufferLike>, length: number): Uint8ClampedArray<ArrayBuffer> {
+  return rgba.buffer instanceof ArrayBuffer
+    ? new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, length)
+    : new Uint8ClampedArray(rgba.subarray(0, length));
 }
 
 function rasterImageDimensionsMatch(
@@ -467,12 +542,14 @@ function readUint32BigEndian(bytes: Uint8Array<ArrayBufferLike>, offset: number)
   ) >>> 0;
 }
 
-async function encodeRasterRgbaAsNodeImage(
+async function encodeRasterRgbaAsNodeImages(
   width: number,
   height: number,
   rgba: Uint8Array<ArrayBufferLike>,
-  encoding: RasterImageEncoding
-): Promise<Uint8Array | null> {
+  encodings: readonly RasterImageEncoding[],
+  shouldEncode?: RasterEncodingGate
+): Promise<RasterImageCandidates> {
+  const result: RasterImageCandidates = { webp: null, png: null };
   const codec = await getNodeRasterImageCodec();
   if (!codec) {
     if (nodeRasterImageCodecError && !warnedAboutNodeRasterFallback) {
@@ -483,7 +560,7 @@ async function encodeRasterRgbaAsNodeImage(
         'Install it with "npm install @napi-rs/canvas" and regenerate the HEP files.'
       );
     }
-    return null;
+    return result;
   }
 
   const expectedBytes = width * height * 4;
@@ -491,20 +568,26 @@ async function encodeRasterRgbaAsNodeImage(
   try {
     const context = canvas.getContext("2d");
     if (!context) {
-      return null;
+      return result;
     }
 
-    const clamped = new Uint8ClampedArray(expectedBytes);
-    clamped.set(rgba.subarray(0, expectedBytes));
-    context.putImageData(new codec.ImageData(clamped, width, height), 0, 0);
-    const encoded = new Uint8Array(
-      encoding === "webp"
-        ? await canvas.encode(encoding, NODE_RASTER_WEBP_QUALITY)
-        : await canvas.encode(encoding)
-    );
-    return hasRasterImageSignature(encoding, encoded) ? encoded : null;
+    context.putImageData(new codec.ImageData(clampedRasterPixels(rgba, expectedBytes), width, height), 0, 0);
+    for (const encoding of encodings) {
+      if (shouldEncode && !(await shouldEncode(encoding, result))) continue;
+      try {
+        const encoded = new Uint8Array(
+          encoding === "webp"
+            ? await canvas.encode(encoding, NODE_RASTER_WEBP_QUALITY)
+            : await canvas.encode(encoding)
+        );
+        if (hasRasterImageSignature(encoding, encoded)) result[encoding] = encoded;
+      } catch {
+        // A backend can lack one encoder while supporting the other.
+      }
+    }
+    return result;
   } catch {
-    return null;
+    return result;
   } finally {
     canvas.width = 0;
     canvas.height = 0;

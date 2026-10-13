@@ -6,6 +6,7 @@ import { findSceneContentItem, type SceneContentItem } from "./structureData";
 import { sampleSceneGradientChannel } from "./gradientSampling";
 import { getGradientMeshTriangle, gradientMeshTriangleCount, type GradientMeshTriangle } from "./gradientMesh";
 import { isScenePaintRunVisible, scenePaintOrderedRuns, scenePaintRunConditions, scenePaintRunAlpha, releaseScenePaintQuery, type ScenePaintSample } from "./scenePaintQuery";
+import { rasterRepeatBounds, rasterRepeatPointRange, rasterRepeatPoints } from "./rasterRepeat";
 
 export type PrimitiveKind = "stroke" | "fill" | "text" | "raster" | "gradient-fill" | "gradient-stroke";
 /** An index in the canonical loaded scene, never an index in a rendering LOD. */
@@ -344,6 +345,8 @@ function primitiveBounds(scene: VectorScene, ref: PrimitiveRef): Bounds {
   if (ref.kind === "raster") {
     const retained = retainedRasterBounds(scene, ref.index);
     if (retained) return { ...retained };
+    const repeat = scene.rasterLayers[ref.index].repeat;
+    if (repeat) return rasterRepeatBounds(repeat);
     for (const point of rasterQuad(scene, ref.index)) include(bounds, point);
   } else if (ref.kind === "text") {
     const glyph = Math.round(scene.textInstanceB[i + 2]) * 4;
@@ -502,15 +505,76 @@ function gradientAlpha(scene: VectorScene, index: number, point: PrimitivePoint)
   return sampleSceneGradientChannel(scene, index, point.x, point.y, 3);
 }
 
-function rasterAlpha(scene: VectorScene, index: number, point: PrimitivePoint, replacement?: RasterLayer): number {
-  const layer = replacement ?? scene.rasterLayers[index], uv = inverse(point, layer.matrix);
+function rasterPointAlpha(layer: RasterLayer, point: PrimitivePoint): number {
+  const uv = inverse(point, layer.matrix);
   if (!uv || uv.x < 0 || uv.y < 0 || uv.x > 1 || uv.y > 1 || !layer.width || !layer.height) return 0;
-  const x = uv.x * layer.width - 0.5, y = uv.y * layer.height - 0.5, ix = Math.floor(x), iy = Math.floor(y);
+  const x = uv.x * layer.width - .5, y = uv.y * layer.height - .5, ix = Math.floor(x), iy = Math.floor(y),
+    fx = x - ix, fy = y - iy;
   const alpha = (px: number, py: number): number => layer.data[(Math.max(0, Math.min(layer.height - 1, py)) * layer.width +
     Math.max(0, Math.min(layer.width - 1, px))) * 4 + 3] / 255;
-  const fx = x - ix, fy = y - iy;
   return (layer.opacity ?? 1) * ((alpha(ix, iy) * (1 - fx) + alpha(ix + 1, iy) * fx) * (1 - fy) +
     (alpha(ix, iy + 1) * (1 - fx) + alpha(ix + 1, iy + 1) * fx) * fy);
+}
+
+type UniformRasterColor = readonly [number, number, number, number];
+const uniformRasterColors = new WeakMap<Uint8Array<ArrayBufferLike>, Map<number, UniformRasterColor | null>>();
+
+async function uniformRasterColor(layer: RasterLayer, work: Work): Promise<UniformRasterColor | null> {
+  const data = layer.data, pixels = layer.width * layer.height;
+  let lengths = uniformRasterColors.get(data);
+  if (lengths?.has(pixels)) return lengths.get(pixels)!;
+  const color: UniformRasterColor = [data[0] / 255, data[1] / 255, data[2] / 255, data[3] / 255];
+  let result: UniformRasterColor | null = color;
+  for (let offset = 4; offset < pixels * 4; offset += 4) {
+    if (work.shouldYield()) await work.yield();
+    if (data[offset] !== data[0] || data[offset + 1] !== data[1] || data[offset + 2] !== data[2] || data[offset + 3] !== data[3]) {
+      result = null; break;
+    }
+  }
+  if (!lengths) uniformRasterColors.set(data, lengths = new Map());
+  lengths.set(pixels, result); return result;
+}
+
+function sampleRasterUV(layer: RasterLayer, uv: PrimitivePoint): ScenePaintSample {
+  const x = uv.x * layer.width - 0.5, y = uv.y * layer.height - 0.5, ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const sample = (channel: number): number => {
+    const at = (px: number, py: number): number => {
+      const offset = (Math.max(0, Math.min(layer.height - 1, py)) * layer.width + Math.max(0, Math.min(layer.width - 1, px))) * 4;
+      return layer.data[offset + channel] / 255 * (channel === 3 ? 1 : layer.data[offset + 3] / 255);
+    };
+    return (at(ix, iy) * (1 - fx) + at(ix + 1, iy) * fx) * (1 - fy) + (at(ix, iy + 1) * (1 - fx) + at(ix + 1, iy + 1) * fx) * fy;
+  };
+  const coverage = sample(3), opacity = layer.opacity ?? 1;
+  return { color: [sample(0) * opacity, sample(1) * opacity, sample(2) * opacity, coverage * opacity], shape: coverage };
+}
+
+/** Match source-over between every old cell, even when Float32 placement rounding makes them overlap. */
+async function sampleRasterPoint(layer: RasterLayer, point: PrimitivePoint, work: Work): Promise<ScenePaintSample> {
+  const empty: ScenePaintSample = { color: [0, 0, 0, 0], shape: 0 };
+  if (!layer.width || !layer.height) return empty;
+  if (work.shouldYield()) await work.yield();
+  if (!layer.repeat) {
+    const uv = inverse(point, layer.matrix);
+    return uv && uv.x >= 0 && uv.x <= 1 && uv.y >= 0 && uv.y <= 1 ? sampleRasterUV(layer, uv) : empty;
+  }
+  const range = rasterRepeatPointRange(layer.repeat, point.x, point.y);
+  if (!range) return empty;
+  const count = (range.xLast - range.xFirst + 1) * (range.yLast - range.yFirst + 1);
+  const uniform = count > 1 ? await uniformRasterColor(layer, work) : null;
+  if (uniform) {
+    const coverage = uniform[3], alpha = -Math.expm1(count * Math.log1p(-coverage * (layer.opacity ?? 1)));
+    return { color: [uniform[0] * alpha, uniform[1] * alpha, uniform[2] * alpha, alpha],
+      shape: -Math.expm1(count * Math.log1p(-coverage)) };
+  }
+  const color: [number, number, number, number] = [0, 0, 0, 0];
+  let shape = 0;
+  for (const uv of rasterRepeatPoints(layer.repeat, point.x, point.y, range)) {
+    if (work.shouldYield()) await work.yield();
+    const sample = sampleRasterUV(layer, uv), remaining = 1 - sample.color[3];
+    for (let channel = 0; channel < 4; channel++) color[channel] = sample.color[channel] + color[channel] * remaining;
+    shape = sample.shape + shape * (1 - sample.shape);
+  }
+  return { color, shape };
 }
 
 interface Nearest { point: PrimitivePoint; distance: number }
@@ -1011,19 +1075,7 @@ export class ScenePrimitivePicker {
     const hit = await this.hit(ref, { ...options, point, clientPoint }, 0, work, true);
     if (!hit) return empty;
     if (ref.kind === "raster") {
-      const layer = options.rasterLayers?.get(ref.index) ?? this.scene.rasterLayers[ref.index], uv = inverse(point, layer.matrix);
-      if (!uv) return empty;
-      const x = uv.x * layer.width - 0.5, y = uv.y * layer.height - 0.5, ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
-      const sample = (channel: number): number => {
-        const at = (px: number, py: number): number => {
-          const offset = (Math.max(0, Math.min(layer.height - 1, py)) * layer.width + Math.max(0, Math.min(layer.width - 1, px))) * 4;
-          return layer.data[offset + channel] / 255 * (channel === 3 ? 1 : layer.data[offset + 3] / 255);
-        };
-        return (at(ix, iy) * (1 - fx) + at(ix + 1, iy) * fx) * (1 - fy) + (at(ix, iy + 1) * (1 - fx) + at(ix + 1, iy + 1) * fx) * fy;
-      };
-      const coverage = sample(3), alpha = coverage * (layer.opacity ?? 1);
-      const opacity = layer.opacity ?? 1;
-      return { color: [sample(0) * opacity, sample(1) * opacity, sample(2) * opacity, alpha], shape: coverage };
+      return sampleRasterPoint(options.rasterLayers?.get(ref.index) ?? this.scene.rasterLayers[ref.index], point, work);
     }
     const info = getScenePrimitive(this.scene, ref), style = info.getSegmentStyle(hit.segmentIndex ?? 0);
     let rgb: readonly [number, number, number] = style.color ?? [0, 0, 0], alpha = style.opacity;
@@ -1044,7 +1096,9 @@ export class ScenePrimitivePicker {
     if (ref.kind === "raster") {
       const layer = options.rasterLayers?.get(ref.index) ?? scene.rasterLayers[ref.index];
       const sampledLayer = shapeOnly ? { ...layer, opacity: 1 } : layer;
-      if (rasterAlpha(scene, ref.index, options.point, sampledLayer) > ALPHA_EPSILON)
+      const alpha = sampledLayer.repeat ? (await sampleRasterPoint(sampledLayer, options.point, work)).color[3]
+        : rasterPointAlpha(sampledLayer, options.point);
+      if (alpha > ALPHA_EPSILON)
         return { primitive: { ...ref }, ...getPrimitiveConditionFields(this.scene, ref), point: { ...options.point }, closestPoint: { ...options.point }, distancePx: 0 };
       const uv = inverse(options.point, layer.matrix);
       // A transparent pixel inside the layer must not become a rectangle hit.
@@ -1055,8 +1109,10 @@ export class ScenePrimitivePicker {
         const candidate = await nearestProjected({ start: quad[j], end: quad[(j + 1) % 4] }, options, work);
         if (candidate && (!nearest || candidate.distance < nearest.distance)) nearest = candidate;
       }
-      if (!nearest || nearest.distance > tolerance || rasterAlpha(scene, ref.index, nearest.point, sampledLayer) <= ALPHA_EPSILON ||
-          !withinClips(scene, nearest.point, clip.clipIndex, clip.rect)) return null;
+      if (!nearest || nearest.distance > tolerance || !withinClips(scene, nearest.point, clip.clipIndex, clip.rect)) return null;
+      const nearestAlpha = sampledLayer.repeat ? (await sampleRasterPoint(sampledLayer, nearest.point, work)).color[3]
+        : rasterPointAlpha(sampledLayer, nearest.point);
+      if (nearestAlpha <= ALPHA_EPSILON) return null;
       return { primitive: { ...ref }, ...getPrimitiveConditionFields(this.scene, ref), point: { ...options.point }, closestPoint: nearest.point, distancePx: nearest.distance };
     }
     const store = segmentStore(scene, ref), stroke = ref.kind === "stroke" || ref.kind === "gradient-stroke";

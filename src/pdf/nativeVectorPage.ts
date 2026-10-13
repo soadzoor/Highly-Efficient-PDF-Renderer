@@ -1806,6 +1806,10 @@ function buildRasterLayers(
       vectorClipped[sidecar.sourceEvents[event + 1]] = 1;
     }
   }
+  const vectorClipCrops = planVectorClipImageCrops(registry, sidecar, vectorClipped);
+  const croppedImages = new Map<ImageTexelRect, Uint8Array>();
+  const uniformCropColors = new Map<ImageTexelRect, Uint8Array | null>();
+  const uniformImageColors = new Map<number, Uint8Array | null>();
   const layers: RasterLayer[] = [];
   let compositedImages: Map<number, Uint8Array> | null = null;
   for (const invocation of order) {
@@ -1870,7 +1874,33 @@ function buildRasterLayers(
     let layerHeight = image.height;
     let layerData = imageData;
     let layerMatrix = flipImageMatrix(transform);
-    if (!vectorClipped[invocation] && (sidecar.imageFlags[invocation] & DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_CLIPPED) !== 0 &&
+    const crop = vectorClipCrops.get(invocation);
+    if (crop) {
+      let cropped = croppedImages.get(crop);
+      if (!cropped) croppedImages.set(crop, cropped = cropRgbaImage(imageData, image.width, crop, signal));
+      let color = uniformCropColors.get(crop);
+      if (color === undefined) uniformCropColors.set(crop, color = uniformRgbaColor(cropped, signal));
+      layerWidth = color ? 1 : crop.width;
+      layerHeight = color ? 1 : crop.height;
+      layerData = color ?? cropped;
+      layerMatrix = cropImageMatrix(layerMatrix, image.width, image.height, crop);
+    } else if (vectorClipped[invocation]) {
+      let color = uniformImageColors.get(imageIndex);
+      if (color === undefined) {
+        uniformImageColors.set(imageIndex, color = monochrome
+          ? monochrome.symbols ? null : uniformMonochromeColor(monochrome, image.width, image.height, signal)
+          : uniformRgbaColor(imageData, signal));
+      }
+      // Under a vector clip, a single-color image is a solid quad: one texel
+      // over the same placement replaces the decoded plane. Unclipped images
+      // keep their texel pitch, which raster tile-seam detection measures.
+      if (color) {
+        layerWidth = 1;
+        layerHeight = 1;
+        layerData = color;
+        monochrome = undefined;
+      }
+    } else if ((sidecar.imageFlags[invocation] & DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_CLIPPED) !== 0 &&
         !boundsContainBoundsExactly(
           clipBounds,
           transformedBounds({ minX: 0, minY: 0, maxX: 1, maxY: 1 }, transform)
@@ -1905,6 +1935,191 @@ function buildRasterLayers(
     layers.push(monochrome ? createMonochromeRasterLayer(base, monochrome) : { ...base, data: layerData });
   }
   return layers;
+}
+
+interface ImageTexelRect {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+/**
+ * The renderer applies a vector clip exactly, so an image beneath one needs
+ * only the source texels its conservative clip bounds can reach. Exporters
+ * often flatten labels as a full-page image under a small glyph clip; keeping
+ * every such image whole multiplied decode, encode and texture memory by the
+ * page area. Crops are whole source texels on an aligned grid with padding,
+ * so filtering, mip footprints and clip antialiasing sample the same texels.
+ * They never hold more texels than sharing the whole image: an image that is
+ * also painted uncropped keeps sharing it, and crops whose areas together
+ * exceed the image collapse to one shared union.
+ */
+function planVectorClipImageCrops(
+  registry: VectorSceneImageRegistry,
+  sidecar: DensePdfVectorSceneData,
+  vectorClipped: Uint8Array
+): Map<number, ImageTexelRect> {
+  const crops = new Map<number, ImageTexelRect>();
+  // `null` marks an image that some invocation paints whole.
+  const invocationsByImage = new Map<number, number[] | null>();
+  for (let invocation = 0; invocation < sidecar.imageIndices.length; invocation += 1) {
+    const imageIndex = sidecar.imageIndices[invocation];
+    if (invocationsByImage.get(imageIndex) === null) continue;
+    if (vectorClipped[invocation]) {
+      const invocations = invocationsByImage.get(imageIndex);
+      if (invocations) invocations.push(invocation);
+      else invocationsByImage.set(imageIndex, [invocation]);
+      continue;
+    }
+    const transform = sidecar.imageTransforms.subarray(invocation * 6, invocation * 6 + 6);
+    const clip = imageClipBoundsAt(sidecar, invocation);
+    // A partial rectangular clip produces its own capture in buildRasterLayers.
+    const ownCapture = (sidecar.imageFlags[invocation] & DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_CLIPPED) !== 0 &&
+      transform.every(Number.isFinite) && validBounds(clip) &&
+      !boundsContainBoundsExactly(clip, transformedBounds({ minX: 0, minY: 0, maxX: 1, maxY: 1 }, transform));
+    if (!ownCapture) invocationsByImage.set(imageIndex, null);
+  }
+  for (const [imageIndex, invocations] of invocationsByImage) {
+    if (!invocations || imageIndex >= registry.size) continue;
+    const image = registry.describe(imageIndex);
+    // Packed monochrome layers stay compact without cropping.
+    if (image.format === HEPR_IMAGE_FORMAT.Gray1 && image.softMaskImageIndex < 0) continue;
+    const { width, height } = image;
+    if (!Number.isSafeInteger(width) || width <= 0 || !Number.isSafeInteger(height) || height <= 0) continue;
+    const rects: ImageTexelRect[] = [];
+    for (const invocation of invocations) {
+      const rect = vectorClipImageTexelRect(
+        sidecar.imageTransforms.subarray(invocation * 6, invocation * 6 + 6),
+        imageClipBoundsAt(sidecar, invocation),
+        width,
+        height
+      );
+      if (!rect) break;
+      rects.push(rect);
+    }
+    if (rects.length !== invocations.length) continue;
+    let area = 0, x0 = width, y0 = height, x1 = 0, y1 = 0;
+    for (const rect of rects) {
+      area += rect.width * rect.height;
+      x0 = Math.min(x0, rect.x); y0 = Math.min(y0, rect.y);
+      x1 = Math.max(x1, rect.x + rect.width); y1 = Math.max(y1, rect.y + rect.height);
+    }
+    if (area <= width * height) {
+      invocations.forEach((invocation, index) => crops.set(invocation, rects[index]));
+      continue;
+    }
+    if (x1 - x0 === width && y1 - y0 === height) continue;
+    const union: ImageTexelRect = { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+    for (const invocation of invocations) crops.set(invocation, union);
+  }
+  return crops;
+}
+
+/** Source texels kept beyond the clip bounds, and the grid crops snap to. */
+const VECTOR_CLIP_IMAGE_CROP_TEXELS = 16;
+
+/** Row-major texel rectangle reached by `clip`, or null when cropping saves nothing. */
+function vectorClipImageTexelRect(
+  transform: Float32Array,
+  clip: Readonly<Bounds>,
+  width: number,
+  height: number
+): ImageTexelRect | null {
+  if (!transform.every(Number.isFinite) || !validBounds(clip)) return null;
+  const layer = flipImageMatrix(transform);
+  const determinant = layer[0] * layer[3] - layer[1] * layer[2];
+  if (!Number.isFinite(determinant) || determinant === 0) return null;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const pageX of [clip.minX, clip.maxX]) {
+    for (const pageY of [clip.minY, clip.maxY]) {
+      const dx = pageX - layer[4], dy = pageY - layer[5];
+      const x = (layer[3] * dx - layer[2] * dy) / determinant * width;
+      const y = (layer[0] * dy - layer[1] * dx) / determinant * height;
+      minX = Math.min(minX, x); minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+    }
+  }
+  if (![minX, minY, maxX, maxY].every(Number.isFinite)) return null;
+  const grid = VECTOR_CLIP_IMAGE_CROP_TEXELS;
+  const x0 = Math.max(0, Math.floor((Math.floor(minX) - grid) / grid) * grid);
+  const y0 = Math.max(0, Math.floor((Math.floor(minY) - grid) / grid) * grid);
+  const x1 = Math.min(width, Math.ceil((Math.ceil(maxX) + grid) / grid) * grid);
+  const y1 = Math.min(height, Math.ceil((Math.ceil(maxY) + grid) / grid) * grid);
+  // A clip missing the image keeps the established whole-image layer.
+  if (x1 <= x0 || y1 <= y0 || (x0 === 0 && y0 === 0 && x1 === width && y1 === height)) return null;
+  return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+}
+
+function imageClipBoundsAt(sidecar: DensePdfVectorSceneData, invocation: number): Bounds {
+  const offset = invocation * 4;
+  return {
+    minX: sidecar.imageClipBounds[offset],
+    minY: sidecar.imageClipBounds[offset + 1],
+    maxX: sidecar.imageClipBounds[offset + 2],
+    maxY: sidecar.imageClipBounds[offset + 3]
+  };
+}
+
+function cropRgbaImage(source: Uint8Array, sourceWidth: number, rect: ImageTexelRect, signal?: AbortSignal): Uint8Array {
+  const rowBytes = rect.width * 4;
+  const data = new Uint8Array(rowBytes * rect.height);
+  for (let row = 0; row < rect.height; row += 1) {
+    if ((row & 0xff) === 0) throwIfAborted(signal);
+    const from = ((rect.y + row) * sourceWidth + rect.x) * 4;
+    data.set(source.subarray(from, from + rowBytes), row * rowBytes);
+  }
+  return data;
+}
+
+/** Place a texel sub-rectangle exactly where it lay inside the whole layer. */
+function cropImageMatrix(layer: Float32Array, width: number, height: number, rect: ImageTexelRect): Float32Array {
+  const scaleX = rect.width / width, scaleY = rect.height / height;
+  const offsetX = rect.x / width, offsetY = rect.y / height;
+  // `+ 0` keeps signed zeros out of the stored matrix.
+  return new Float32Array([
+    layer[0] * scaleX + 0,
+    layer[1] * scaleX + 0,
+    layer[2] * scaleY + 0,
+    layer[3] * scaleY + 0,
+    layer[0] * offsetX + layer[2] * offsetY + layer[4],
+    layer[1] * offsetX + layer[3] * offsetY + layer[5]
+  ]);
+}
+
+/** The single straight-RGBA8 color of every pixel, or null at the first difference. */
+function uniformRgbaColor(rgba: Uint8Array, signal?: AbortSignal): Uint8Array | null {
+  // A lone texel is already as small as a solid quad gets.
+  if (rgba.length <= 4 || rgba.length % 4 !== 0) return null;
+  const red = rgba[0], green = rgba[1], blue = rgba[2], alpha = rgba[3];
+  for (let offset = 4; offset < rgba.length; offset += 4) {
+    if ((offset & 0xfffff) === 0) throwIfAborted(signal);
+    if (rgba[offset] !== red || rgba[offset + 1] !== green ||
+        rgba[offset + 2] !== blue || rgba[offset + 3] !== alpha) return null;
+  }
+  return Uint8Array.of(red, green, blue, alpha);
+}
+
+/** Packed rows whose visible bits all select one palette entry; row padding is ignored. */
+function uniformMonochromeColor(
+  monochrome: { readonly data: Uint8Array; readonly colors: Uint8Array },
+  width: number,
+  height: number,
+  signal?: AbortSignal
+): Uint8Array | null {
+  const { data, colors } = monochrome;
+  const rowBytes = Math.ceil(width / 8);
+  if (width <= 0 || height <= 0 || width * height === 1 || data.length < rowBytes * height || colors.length < 8) return null;
+  const fill = data[0] & 0x80 ? 0xff : 0;
+  const tailMask = width & 7 ? (0xff << (8 - (width & 7))) & 0xff : 0xff;
+  for (let row = 0, offset = 0; row < height; row += 1, offset += rowBytes) {
+    if ((row & 0xfff) === 0) throwIfAborted(signal);
+    for (let byte = offset; byte < offset + rowBytes - 1; byte += 1) {
+      if (data[byte] !== fill) return null;
+    }
+    if ((data[offset + rowBytes - 1] & tailMask) !== (fill & tailMask)) return null;
+  }
+  return colors.slice(fill ? 4 : 0, fill ? 8 : 4);
 }
 
 function clipVectorNearestImage(

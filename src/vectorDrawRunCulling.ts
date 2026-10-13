@@ -2,6 +2,7 @@ import type { TextLodBuildData } from "./textGreekLod";
 import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { retainedRasterBounds } from "./retainedRasterBounds";
 import { strokeSourceRecords, type StrokeRecordSource } from "./strokeRecords";
+import { rasterRepeatBounds } from "./rasterRepeat";
 import { vectorFillCoverageMetadata } from "./vectorFillCoverage";
 import { GUARDED_RUN_COUNT, VISIBILITY_GUARD_PIXELS } from "./visibilityGuard";
 
@@ -84,6 +85,12 @@ export class VectorDrawRunCuller {
           const retained = retainedRasterBounds(scene, index);
           if (retained) {
             include(retained.minX, retained.minY); include(retained.maxX, retained.maxY);
+            continue;
+          }
+          const repeat = scene.rasterLayers[index].repeat;
+          if (repeat) {
+            const bounds = rasterRepeatBounds(repeat);
+            include(bounds.minX, bounds.minY); include(bounds.maxX, bounds.maxY);
             continue;
           }
           const m = scene.rasterLayers[index].matrix;

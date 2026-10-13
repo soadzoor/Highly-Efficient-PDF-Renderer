@@ -343,8 +343,9 @@ try {
   const interleavedTable = await readTable(interleavedArchive);
   assert.deepEqual(interleavedTable.layers.map(layer => layer.storage), ["mono", "atlas", "mono", "atlas", "atlas", "rgba", "rgba"]);
   assert.deepEqual(interleavedTable.layers[1].cell, interleavedTable.layers[3].cell);
+  assert.equal(interleavedTable.layers[6].source, 5, "a repeated standalone image references its first copy");
   assert.deepEqual(Object.keys(interleavedArchive.files).filter(name => name.startsWith("raster/")).sort(),
-    ["raster/layer-0.mono", "raster/layer-2.mono", "raster/atlas-0.rgba", "raster/layer-5.rgba", "raster/layer-6.rgba"].sort());
+    ["raster/layer-0.mono", "raster/layer-2.mono", "raster/atlas-0.rgba", "raster/layer-5.rgba"].sort());
   const loadedInterleaved = await loadSceneFromHep(interleavedBytes);
   for (const [index, source] of interleaved.entries()) {
     const actual = loadedInterleaved.rasterLayers[index];
@@ -374,11 +375,15 @@ try {
 
   const standaloneTable = sections.encodeRasterLayerTable({ atlases: [], layers: [storedTable.layers[0]] });
   assert.equal(standaloneTable[2], 8 | 4, "mono uses a new storage flag and preserves the old opacity flag");
-  for (const flag of [8 | 1, 8 | 2, 8 | 3, 8 | 16, 8 | 32, 64, 128]) {
+  for (const flag of [8 | 1, 8 | 2, 8 | 3, 8 | 16, 8 | 32, 128]) {
     const invalid = standaloneTable.slice();
     invalid[2] = flag;
     assert.throws(() => sections.decodeRasterLayerTable(invalid, limits), /flag|storage|monochrome/i);
   }
+  // Bit 6 marks a v15 shared section, which the first layer cannot reference.
+  const unsharedFirst = standaloneTable.slice();
+  unsharedFirst[2] = 8 | 64;
+  assert.throws(() => sections.decodeRasterLayerTable(unsharedFirst, limits), /shared section/);
   for (const delta of [-1, 1]) {
     const corrupt = await editArchive(storedBytes, async archive => {
       const payload = await archive.file("raster/layer-0.mono").async("uint8array");

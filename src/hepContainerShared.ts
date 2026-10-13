@@ -8,16 +8,32 @@ export const MAX_UINT32 = 0xffffffff;
 export const GROUP_BYTES = 64 * 1024;
 export const encoder = new TextEncoder();
 export const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-const crcTable = new Uint32Array(256);
-for (let i = 0; i < crcTable.length; i += 1) {
+// Slicing-by-8 tables: table k advances a byte's CRC contribution by k bytes.
+const crcTables = new Uint32Array(256 * 8);
+for (let i = 0; i < 256; i += 1) {
   let value = i;
   for (let bit = 0; bit < 8; bit += 1) value = (value >>> 1) ^ ((value & 1) ? 0xedb88320 : 0);
-  crcTable[i] = value >>> 0;
+  crcTables[i] = value >>> 0;
+}
+for (let i = 0; i < 256; i += 1) {
+  for (let table = 1; table < 8; table += 1) {
+    const previous = crcTables[(table - 1) * 256 + i];
+    crcTables[table * 256 + i] = (previous >>> 8) ^ crcTables[previous & 255];
+  }
 }
 
+/** Standard CRC-32 (IEEE, reflected), eight bytes per step. */
 export function crc32(bytes: Uint8Array): number {
   let value = 0xffffffff;
-  for (let i = 0; i < bytes.length; i += 1) value = crcTable[(value ^ bytes[i]) & 255] ^ (value >>> 8);
+  let i = 0;
+  for (const end = bytes.length - 7; i < end; i += 8) {
+    const low = value ^ (bytes[i] | (bytes[i + 1] << 8) | (bytes[i + 2] << 16) | (bytes[i + 3] << 24));
+    value = crcTables[7 * 256 + (low & 255)] ^ crcTables[6 * 256 + ((low >>> 8) & 255)] ^
+      crcTables[5 * 256 + ((low >>> 16) & 255)] ^ crcTables[4 * 256 + (low >>> 24)] ^
+      crcTables[3 * 256 + bytes[i + 4]] ^ crcTables[2 * 256 + bytes[i + 5]] ^
+      crcTables[256 + bytes[i + 6]] ^ crcTables[bytes[i + 7]];
+  }
+  for (; i < bytes.length; i += 1) value = crcTables[(value ^ bytes[i]) & 255] ^ (value >>> 8);
   return (value ^ 0xffffffff) >>> 0;
 }
 

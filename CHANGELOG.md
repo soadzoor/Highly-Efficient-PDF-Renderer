@@ -48,6 +48,91 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   compiler reported its early return as warning X4000 ("potentially
   uninitialized variable") in Three.js WebGL. Coverage and texture reads are
   unchanged.
+- Speed up PDF worker responses containing many pattern placements by cloning
+  small buffers instead of transferring each tiny matrix or clip separately.
+  Large image and geometry buffers still transfer without copying; scene values,
+  shared resource identities and cancellation behavior are preserved.
+- Avoid repeated spot-color, palette and ICC conversions for identical image
+  samples, preserving the existing color arithmetic and transparency. Convert
+  8-bit three- and four-component calibrated or ICC images without a color-key
+  mask through a per-image color memo sized to the image and specialized pixel
+  loops, and convert retained ICC lattices straight from component bytes with
+  per-byte cell and weight tables, giving identical colors. Keep
+  unpacked 1-, 2- and 4-bit samples in byte storage instead of widening to 16 bits.
+  Store proven uniform opaque black or white images as exact packed bits while
+  preserving their dimensions, masks and original color metadata.
+- Reuse one canvas upload when choosing between WebP and PNG during HEP export,
+  and avoid redundant copies of internally owned encoded images. Preserve public
+  archive read isolation and the existing encoded image quality. Skip the
+  whole-image PNG when a PNG of evenly spaced row bands predicts it clearly
+  larger than the WebP: at least 1.2 times for images of one megapixel and
+  1024 rows or more, and 2.5 times for images from 65,536 pixels, whose smaller
+  samples predict less precisely. Closer or winning predictions still compare
+  both encodings exactly. Photographs and scans previously spent more time on a
+  PNG that was several times larger. Hash and compare raster layers by whole
+  pixels when finding repeated images.
+- Convert PDFs to HEP without keeping every decoded page image in memory. Each
+  page's larger images are encoded as soon as the page is parsed, while the
+  worker decodes the next page, and their pixels are released; small images
+  still pack into document-wide atlases, and the HEP is byte-identical to a
+  whole-scene export. A 13-page set of 50-megapixel scans now converts in 22 s
+  instead of 27 s with a 2.0 GB peak instead of 6.5 GB. On macOS the
+  PDF-to-HEP command runs conversion workers with `MallocLargeCache=0`, so freed
+  encoder buffers are returned instead of retained; a value already set in the
+  environment takes precedence.
+- Store a repeated larger raster image, such as a plan or logo painted on many
+  pages, once and reference it from its other placements, instead of writing
+  identical bytes for each copy; identical packed monochrome layers share their
+  section too. Readers decode a shared section once for all its placements.
+  Exports with shared sections use HEP scene format v15 and require an updated
+  reader; other exports keep their previous format.
+- Store raster layers with exactly two colors as exact packed 1-bit sections
+  instead of WebP or PNG, as monochrome layers already were. Readers restore
+  the renderers' 1-bit textures, which lossy WebP would lose, and such HEP
+  files can be several times smaller. Images small enough for a raster atlas
+  keep their lossless atlas. Exports containing such layers advertise scene
+  format v10 or v12 and require a reader that supports packed raster sections.
+- Speed up HEP export of dense vector drawings: build vector LOD point-recipe
+  tables with numeric coordinate keys instead of a string per source point, and
+  decide whether recipes save space by compressing only the sections they replace
+  when those are large. Decoded LOD data is unchanged, tested exports stayed
+  byte-identical, and peak memory drops for drawings with millions of segments.
+  Rank plain deflate and the three integer codecs of large vector LOD sections
+  on evenly spaced slices, compressing only the best candidates whole instead
+  of all four; the chosen encodings matched the exhaustive choice on every
+  tested section. Compute container checksums eight bytes at a time, which
+  also speeds up HEP loading.
+- Share repeated HEP atlas cells and native WebGL image textures across independent
+  placements, retaining sampler settings and safe replacement/disposal. Batch
+  nearest-neighbor images and reuse identical raster tile plans to avoid excessive
+  GPU allocations and planning memory when opening densely patterned drawings.
+- Keep proven uniform stencil tiling patterns as reusable grids instead of
+  allocating a scene object, execution group and rectangular clips per cell.
+  Native and Three WebGL/WebGPU renderers draw packed instances with the original
+  Float32 placements, gaps, colors, clipping, opacity and paint order. Preserve
+  page composition, layer visibility, structure attribution, picking and caller
+  limits; complex, overlapping or sheared source cells keep general execution.
+  Index Type3 glyph transforms once and release temporary compiler clips sooner.
+  Compact grids use HEP scene v14 and require an updated reader; existing HEP
+  scene formats remain readable and ordinary exports keep their previous format.
+- Open and convert PDFs that paint many page-sized images under small vector
+  clips, such as flattened labels, without decoding, encoding and uploading
+  every whole image. Vector-clipped images keep only the source texels their
+  clip bounds can reach, on an aligned grid with padding that preserves sampling,
+  mip filtering and clip antialiasing; single-color images under a vector clip
+  draw as one solid texel. Images also painted unclipped keep sharing their whole
+  texture, and overlapping crops never store more texels than the source image.
+  Reconstruct PNG-predicted streams with one loop per predictor algorithm, about
+  three times faster with identical output.
+- Report lost WebGL contexts and unavailable GPU limits directly instead of
+  misidentifying them as invalid HEP vector clip capacity.
+- Prevent subpixel gaps in opaque tiled PDF images from flashing as white
+  lines during native WebGL zooming. Integrate the original gap coverage across
+  shared tile boundaries, preserving source pixels, nearest sampling, paint
+  order and visible gaps at high zoom while reusing existing image textures.
+  Apply the same treatment when image batching falls back to individual draws.
+  Preserve original sampling when minified pixels reach farther tiles, and skip
+  opacity scans for unrelated images.
 
 ## [0.1.62] - 2026-10-12
 

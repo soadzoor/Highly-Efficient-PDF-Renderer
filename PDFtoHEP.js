@@ -937,6 +937,17 @@ export async function createPdfToHepDiagnosticLog(options, pending) {
   return log;
 }
 
+/**
+ * macOS malloc keeps freed large blocks for reuse. The native image encoders
+ * allocate a slightly different set of large buffers for every page, so each
+ * conversion worker retained several gigabytes it never reused (5.6 GB peak
+ * footprint for a 13-page set of 50 MP scans, 1.8 GB without the cache, at
+ * the same speed). A value already set in the environment takes precedence.
+ */
+export function pdfToHepWorkerAllocatorEnvironment(platform = process.platform) {
+  return platform === "darwin" ? { MallocLargeCache: "0" } : {};
+}
+
 export function startPdfToHepWorker(
   item,
   force,
@@ -962,6 +973,7 @@ export function startPdfToHepWorker(
       stdio: ["inherit", diagnosticLog?.fd ?? "inherit", diagnosticLog?.fd ?? "inherit", "ipc"],
       shell: false,
       env: {
+        ...pdfToHepWorkerAllocatorEnvironment(),
         ...process.env,
         ...(item.password ? { [PDF_PASSWORD_ENV]: item.password } : {}),
         [PDF_TO_HEP_WORKER_ENV]: "1",
