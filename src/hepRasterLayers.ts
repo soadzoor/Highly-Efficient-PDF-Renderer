@@ -1,6 +1,7 @@
 /**
- * Scene v9–v14 raster layers: one binary record per canonical image layer, with
- * the pixels of small lossless layers packed into shared atlas images.
+ * Scene v9–v15 raster layers: one binary record per canonical image layer, with
+ * the pixels of small lossless layers packed into shared atlas images. Since
+ * v15 a repeated larger image can reuse an earlier layer's section.
  *
  * PDFs can paint thousands of tiny images; a map sliced into one-pixel
  * scanlines is common. Scene v8 stored every image as its own PNG section plus
@@ -31,6 +32,8 @@ const FLAG_OPACITY = 4;
 const FLAG_MONOCHROME = 8;
 const FLAG_JBIG2 = 16;
 const FLAG_BINARY = 32;
+/** Scene v15: the layer reuses the section an earlier layer stores. */
+const FLAG_SHARED = 64;
 const MAX_INT32 = 0x7fffffff;
 
 export type RasterLayerStorage = typeof LAYER_STORAGE[number];
@@ -58,6 +61,11 @@ export interface RasterLayerRecord {
   storage: RasterLayerStorage;
   /** Present exactly when `storage` is "atlas". */
   cell?: RasterAtlasCell;
+  /**
+   * Scene v15: index of the earlier layer whose section holds these identical
+   * pixels. That layer has the same storage and size and owns its section.
+   */
+  source?: number;
 }
 
 export interface RasterLayerTable {
@@ -83,6 +91,13 @@ function requireInteger(value: number, min: number, max: number, label: string):
 /** Standalone layers are named by their layer index. */
 export function rasterLayerFile(index: number, storage: Exclude<RasterLayerStorage, "atlas">): string {
   return `raster/layer-${index}.${storage}`;
+}
+
+/** The section holding a non-atlas layer's pixels, following a v15 shared reference. */
+export function rasterLayerSectionFile(table: RasterLayerTable, index: number): string {
+  const layer = table.layers[index];
+  if (layer.storage === "atlas") return rasterAtlasFile(layer.cell!.atlas, table.atlases[layer.cell!.atlas].encoding);
+  return rasterLayerFile(layer.source ?? index, layer.storage);
 }
 
 export function rasterAtlasFile(index: number, encoding: RasterAtlasEncoding): string {
@@ -245,13 +260,16 @@ export function encodeRasterLayerTable({ atlases, layers }: RasterLayerTable): U
     }
     const storageFlag = layer.storage === "mono" ? FLAG_MONOCHROME :
       layer.storage === "jbig2" ? FLAG_JBIG2 : layer.storage === "binary" ? FLAG_BINARY : storage;
-    writer.writeByte(storageFlag | (hasOpacity ? FLAG_OPACITY : 0));
+    const shared = layer.source !== undefined;
+    if (shared) requireSharedSource(layers, index, layer.source!, layer);
+    writer.writeByte(storageFlag | (hasOpacity ? FLAG_OPACITY : 0) | (shared ? FLAG_SHARED : 0));
     writer.writeVarUint32(requireInteger(layer.width, 1, MAX_INT32, "layer width"));
     writer.writeVarUint32(requireInteger(layer.height, 1, MAX_INT32, "layer height"));
     writer.writeZigzagVarint(requireInteger(layer.paintOrder, 0, MAX_INT32, "paint order") - previousPaintOrder);
     writer.writeZigzagVarint(requireInteger(layer.pageIndex, 0, MAX_INT32, "page index") - previousPageIndex);
     previousPaintOrder = layer.paintOrder;
     previousPageIndex = layer.pageIndex;
+    if (shared) writer.writeVarUint32(index - layer.source!);
     if ((layer.storage === "atlas") !== (layer.cell !== undefined)) fail(`layer ${index} has a mismatched atlas cell`);
     if (layer.cell) {
       const { atlas: atlasIndex, x, y } = layer.cell;
@@ -276,6 +294,20 @@ export function encodeRasterLayerTable({ atlases, layers }: RasterLayerTable): U
   return writer.toUint8Array();
 }
 
+/** A shared section belongs to an earlier, unshared layer of the same storage and size. */
+function requireSharedSource(
+  layers: readonly RasterLayerRecord[],
+  index: number,
+  source: number,
+  layer: RasterLayerRecord
+): void {
+  const owner = layers[requireInteger(source, 0, index - 1, "shared section layer")];
+  if (layer.storage === "atlas" || owner.source !== undefined || owner.storage !== layer.storage ||
+      owner.width !== layer.width || owner.height !== layer.height) {
+    fail(`layer ${index} shares an incompatible section`);
+  }
+}
+
 export function decodeRasterLayerTable(bytes: Uint8Array, limits: RasterLayerTableLimits): RasterLayerTable {
   const cursor = new VarintCursor(bytes);
   const atlasCount = requireInteger(cursor.readVarUint32(), 0, limits.maxAtlases, "atlas count");
@@ -296,7 +328,9 @@ export function decodeRasterLayerTable(bytes: Uint8Array, limits: RasterLayerTab
   let previousCell = { atlas: -1, right: 0, y: 0 };
   for (let index = 0; index < layerCount; index += 1) {
     const flags = cursor.readByte("raster layer flags");
-    if (flags & ~(FLAG_STORAGE_MASK | FLAG_OPACITY | FLAG_MONOCHROME | FLAG_JBIG2 | FLAG_BINARY)) fail(`layer ${index} has reserved flag bits`);
+    if (flags & ~(FLAG_STORAGE_MASK | FLAG_OPACITY | FLAG_MONOCHROME | FLAG_JBIG2 | FLAG_BINARY | FLAG_SHARED)) {
+      fail(`layer ${index} has reserved flag bits`);
+    }
     const extendedStorage = flags & (FLAG_MONOCHROME | FLAG_JBIG2 | FLAG_BINARY);
     if (extendedStorage && ((flags & FLAG_STORAGE_MASK) || (extendedStorage & (extendedStorage - 1)))) {
       fail(`layer ${index} has conflicting storage flags`);
@@ -308,6 +342,10 @@ export function decodeRasterLayerTable(bytes: Uint8Array, limits: RasterLayerTab
     paintOrder = requireInteger(paintOrder + cursor.readZigzagVarint(), 0, MAX_INT32, "paint order");
     pageIndex = requireInteger(pageIndex + cursor.readZigzagVarint(), 0, MAX_INT32, "page index");
     const layer: RasterLayerRecord = { width, height, matrix: new Float32Array(6), paintOrder, pageIndex, storage };
+    if (flags & FLAG_SHARED) {
+      layer.source = index - requireInteger(cursor.readVarUint32(), 1, index, "shared section distance");
+      requireSharedSource(layers, index, layer.source, layer);
+    }
     if (storage === "atlas") {
       const atlas = requireInteger(cursor.readVarUint32(), 0, atlasCount - 1, "atlas index");
       const sameAtlas = atlas === previousCell.atlas;

@@ -1,3 +1,4 @@
+import { preparedRasterSection } from "./preparedRasterSections";
 import { PAGE_PRIMITIVE_KINDS, PAGE_PRIMITIVE_RANGE_STRIDE, scenePrimitiveCounts, validatePagePrimitiveRanges } from "./scenePageViews";
 import { appendVectorDrawRun, defaultVectorDrawRuns, validateVectorDrawRuns } from "./vectorDrawOrder";
 import { placeSceneAnnotation, type AnnotationAppearanceMode, type SceneAnnotation, type ScenePdfPage } from "./annotationData";
@@ -357,13 +358,15 @@ export async function extractPdfPageScenes(
   /** @internal Used by HEP export to cancel active PDF parser work. */
   signal?: AbortSignal,
   /** @internal Transfer only disposable buffers owned by the high-level loader. */
-  ownership: "copy" | "transfer" = "copy"
+  ownership: "copy" | "transfer" = "copy",
+  /** @internal HEP export: encode each parsed page's larger images before keeping it. */
+  preparePage?: (scene: VectorScene, signal?: AbortSignal) => Promise<void>
 ): Promise<VectorScene[]> {
   signal?.throwIfAborted();
   validateIccEngine(options.iccEngine);
   assertPdfSourceBytes(pdfData);
   const progress = createLoadProgressReporter(options.onProgress);
-  return extractPdfPageScenesWithNativeTier(pdfData, options, progress, 0, signal, ownership);
+  return extractPdfPageScenesWithNativeTier(pdfData, options, progress, 0, signal, ownership, preparePage);
 }
 
 function withRemappedProgress(
@@ -391,7 +394,8 @@ async function extractPdfPageScenesWithNativeTier(
   progress: LoadProgressReporter,
   start: number,
   signal?: AbortSignal,
-  ownership: "copy" | "transfer" = "copy"
+  ownership: "copy" | "transfer" = "copy",
+  preparePage?: (scene: VectorScene, signal?: AbortSignal) => Promise<void>
 ): Promise<VectorScene[]> {
   const pageScenes = await extractPdfPageScenesWithNative(
     pdfData,
@@ -403,7 +407,8 @@ async function extractPdfPageScenesWithNativeTier(
       "worker"
     ),
     signal,
-    ownership
+    ownership,
+    preparePage
   );
   progress.report(NATIVE_PDF_SUCCESS_PROGRESS_END, {
     stage: "compile",
@@ -421,7 +426,8 @@ async function extractPdfPageScenesWithNative(
   pdfData: ArrayBuffer,
   options: VectorExtractOptions,
   signal?: AbortSignal,
-  ownership: "copy" | "transfer" = "copy"
+  ownership: "copy" | "transfer" = "copy",
+  preparePage?: (scene: VectorScene, signal?: AbortSignal) => Promise<void>
 ): Promise<VectorScene[]> {
   signal?.throwIfAborted();
   options = { ...options, compressScans: resolvePdfViewingOptions(options).compressScans };
@@ -484,6 +490,9 @@ async function extractPdfPageScenesWithNative(
       scanCompressor = createPdfRasterCompressor(options.onDiagnostic);
     }
     const pageScenes: VectorScene[] = [];
+    // The worker compiles the next page while the previous one is prepared;
+    // at most one page waits for preparation, bounding retained pixels.
+    let preparing: Promise<void> | undefined;
 
     for (selectionIndex = 0; selectionIndex < selectedPageCount; selectionIndex += 1) {
       signal?.throwIfAborted();
@@ -520,6 +529,12 @@ async function extractPdfPageScenesWithNative(
       }
       await scanCompressor?.preparePage(scene, selectedPageCount, sourcePageIndex, signal);
       signal?.throwIfAborted();
+      if (preparePage) {
+        await preparing;
+        preparing = preparePage(scene, signal);
+        // Observed by the next await; avoids an unhandled rejection meanwhile.
+        preparing.catch(() => undefined);
+      }
       pageScenes.push(scene);
       progress.report(pageEnd, {
         stage: "pdf-page",
@@ -535,6 +550,7 @@ async function extractPdfPageScenesWithNative(
       });
     }
 
+    await preparing;
     signal?.throwIfAborted();
     progress.report(1, {
       stage: "compile",
@@ -1949,7 +1965,8 @@ function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
       const height = Math.max(0, Math.trunc(layer?.height ?? 0));
       if (width <= 0 || height <= 0 || (layer.monochrome
         ? !(layer.monochrome.data instanceof Uint8Array) || layer.monochrome.data.length !== Math.ceil(width / 8) * height || layer.monochrome.colors.length !== 8
-        : !(layer.data instanceof Uint8Array) || layer.data.length < width * height * 4)) {
+        : !(layer.data instanceof Uint8Array) ||
+          (layer.data.length < width * height * 4 && !preparedRasterSection(layer.data)))) {
         continue;
       }
 

@@ -1120,8 +1120,9 @@ optionally encodes repeated transparency wrappers and matching draw-run metadata
 losslessly, preserving their group boundaries and paint order. Exports use v13
 when repeated wrappers can share storage. Scene v14 stores compact regular
 raster repeat grids with exact cell placement and sequential page translations;
-it requires an updated reader. Other scenes retain v9–v13. The current
-loader accepts v9–v14, including older JBIG2 HEPs,
+it requires an updated reader. Scene v15 stores a repeated larger image once and
+references it from its other placements; it also requires an updated reader.
+Other scenes retain v9–v13. The current loader accepts v9–v15, including older JBIG2 HEPs,
 which use the fast packed encoding when re-exported.
 
 PDF-source builds measure the original PDF automatically. Scenes loaded through

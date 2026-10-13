@@ -35,6 +35,7 @@ import {
 import { encodeHepMonochromeRaster } from "./hepMonochromeRaster";
 import { encodeHepBinaryRaster } from "./hepBinaryRaster";
 import { detectMonochromeRaster } from "./monochromeRaster";
+import { preparedRasterSection, type PreparedRasterSection } from "./preparedRasterSections";
 import { encodeHepRasterRepeats, SCENE_RASTER_REPEATS_PATH } from "./hepRasterRepeats";
 import {
   IdenticalRasterFinder,
@@ -67,6 +68,7 @@ import {
   PARSED_DATA_BINARY_FORMAT_VERSION,
   PARSED_DATA_GROUP_RUN_FORMAT_VERSION,
   PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION,
+  PARSED_DATA_SHARED_RASTER_FORMAT_VERSION,
   TEXT_INDEX_JSON_PATH,
   TEXT_CHAR_MAP_PATH,
   TEXT_FALLBACK_PATH,
@@ -250,7 +252,8 @@ export async function buildHepBlobForLayout(
   reportBuildProgress(hepBuildStart, { stage: "hep-build" });
 
   const manifest = {
-    formatVersion: rasterRepeats ? PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION :
+    formatVersion: rasterLayersManifest?.shared ? PARSED_DATA_SHARED_RASTER_FORMAT_VERSION :
+      rasterRepeats ? PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION :
       paintGraphExport?.repeatedGroups ? PARSED_DATA_GROUP_RUN_FORMAT_VERSION :
       rasterLayersManifest?.binary ? PARSED_DATA_BINARY_FORMAT_VERSION :
       rasterLayersManifest?.mono || rasterLayers.some(layer => layer.monochrome)
@@ -429,7 +432,7 @@ async function writeHepRasterLayers(
     signal?: AbortSignal;
     onTexelsEncoded: (processed: number) => void;
   }
-): Promise<{ file: string; count: number; atlasCount: number; binary: boolean; mono: boolean } | undefined> {
+): Promise<{ file: string; count: number; atlasCount: number; binary: boolean; mono: boolean; shared: boolean } | undefined> {
   if (layers.length === 0) {
     return undefined;
   }
@@ -437,9 +440,14 @@ async function writeHepRasterLayers(
   const pixels: Uint8Array[] = [];
   const encoded: Array<{ storage: "png" | "webp"; bytes: Uint8Array } | null> = [];
   const identical = new IdenticalRasterFinder();
+  /** Packed monochrome layers compare their palette and bits. */
+  const identicalPacked = new IdenticalRasterFinder();
+  /** The layer that writes each section encoded while its page was parsed. */
+  const preparedOwners = new Map<PreparedRasterSection, number>();
   let binary = false;
   let mono = false;
-  /** Packed sections of two-color layers, reused by their identical copies. */
+  let shared = false;
+  /** Layers owning a packed section, which identical copies reference. */
   const packedSections: Array<{ storage: "binary" | "mono"; bytes: Uint8Array } | undefined> = [];
   /** The first earlier layer with identical pixels, or -1. */
   const originals: number[] = [];
@@ -475,35 +483,8 @@ async function writeHepRasterLayers(
       ...(layer.opacity === undefined ? {} : { opacity: layer.opacity }),
       storage: "rgba"
     };
-    let monochrome = layer.monochrome;
-    let rgba: Uint8Array | undefined;
-    let original = -1;
-    let section: { storage: "binary" | "mono"; bytes: Uint8Array } | undefined;
-    if (!monochrome) {
-      if (!(layer.data instanceof Uint8Array) || layer.data.byteLength < expectedBytes) {
-        throw new Error(`Raster layer ${i} has insufficient RGBA data.`);
-      }
-      rgba = layer.data.subarray(0, expectedBytes);
-      original = identical.findOrAdd(i, layer.width, layer.height, rgba);
-      section = original >= 0 ? packedSections[original] : undefined;
-      // Exactly two colors pack losslessly into far smaller sections, and the
-      // renderers keep 1-bit textures only for exact colors, which lossy WebP
-      // would lose. Tiny images keep sharing their lossless atlas instead.
-      if (!section && original < 0 && !isRasterAtlasCandidate(layer.width, layer.height)) {
-        monochrome = detectMonochromeRaster(rgba, layer.width, layer.height) ?? undefined;
-      }
-    }
-    if (monochrome && !section) {
-      const packedRuns = encodeHepBinaryRaster(monochrome, layer.width, layer.height, options.signal);
-      section = packedRuns ? { storage: "binary", bytes: packedRuns }
-        : { storage: "mono", bytes: encodeHepMonochromeRaster(monochrome, layer.width, layer.height, options.signal) };
-    }
-    if (section) {
-      archive.file(rasterLayerFile(i, section.storage), section.bytes);
-      record.storage = section.storage;
-      if (section.storage === "binary") binary = true;
-      else mono = true;
-      if (!layer.monochrome) packedSections[i] = section;
+    // A layer without its own section: packed, prepared, or a v15 reference.
+    const finishSectionLayer = async (): Promise<void> => {
       records.push(record);
       pixels.push(new Uint8Array(0));
       encoded.push(null);
@@ -513,19 +494,91 @@ async function writeHepRasterLayers(
         encodedTexels += layer.width * layer.height;
         options.onTexelsEncoded(encodedTexels);
       }
-      // Packed copies have no image-encoder await to let progress repaint or cancellation run.
+      // These have no image-encoder await to let progress repaint or cancellation run.
       if (performance.now() - lastYield >= 8) {
         await new Promise<void>(resolve => setTimeout(resolve, 0));
         throwIfBuildAborted(options.signal);
         lastYield = performance.now();
       }
+    };
+    // Packed layers expose RGBA only through an expanding getter; never touch it.
+    const prepared = layer.monochrome ? undefined : preparedRasterSection(layer.data);
+    if (prepared) {
+      // Encoded while its page was parsed; identical images share one section.
+      record.storage = prepared.storage;
+      const owner = preparedOwners.get(prepared);
+      if (owner !== undefined) {
+        record.source = owner;
+        shared = true;
+      } else {
+        preparedOwners.set(prepared, i);
+        if (prepared.storage === "png" || prepared.storage === "webp") {
+          writeOwnedHepImageSection(archive, rasterLayerFile(i, prepared.storage), prepared.bytes);
+        } else {
+          archive.file(rasterLayerFile(i, prepared.storage), prepared.bytes);
+          if (prepared.storage === "binary") binary = true;
+          else mono = true;
+        }
+      }
+      await finishSectionLayer();
+      continue;
+    }
+    let monochrome = layer.monochrome;
+    let rgba: Uint8Array | undefined;
+    let original = -1;
+    let packedSource = -1;
+    if (!monochrome) {
+      if (!(layer.data instanceof Uint8Array) || layer.data.byteLength < expectedBytes) {
+        throw new Error(`Raster layer ${i} has insufficient RGBA data.`);
+      }
+      rgba = layer.data.subarray(0, expectedBytes);
+      original = identical.findOrAdd(i, layer.width, layer.height, rgba);
+      if (original >= 0 && packedSections[original]) packedSource = original;
+      // Exactly two colors pack losslessly into far smaller sections, and the
+      // renderers keep 1-bit textures only for exact colors, which lossy WebP
+      // would lose. Tiny images keep sharing their lossless atlas instead.
+      if (original < 0 && !isRasterAtlasCandidate(layer.width, layer.height)) {
+        monochrome = detectMonochromeRaster(rgba, layer.width, layer.height) ?? undefined;
+      }
+    } else if (!monochrome.symbols) {
+      // A repeated packed image, such as a blank scanned page, shares its section.
+      const key = new Uint8Array(monochrome.colors.length + monochrome.data.length);
+      key.set(monochrome.colors);
+      key.set(monochrome.data, monochrome.colors.length);
+      packedSource = identicalPacked.findOrAdd(i, layer.width, layer.height, key);
+    }
+    if (packedSource >= 0) {
+      record.storage = records[packedSource].storage;
+      record.source = packedSource;
+      shared = true;
+      await finishSectionLayer();
+      continue;
+    }
+    if (monochrome) {
+      const packedRuns = encodeHepBinaryRaster(monochrome, layer.width, layer.height, options.signal);
+      const section = packedRuns ? { storage: "binary" as const, bytes: packedRuns }
+        : { storage: "mono" as const, bytes: encodeHepMonochromeRaster(monochrome, layer.width, layer.height, options.signal) };
+      archive.file(rasterLayerFile(i, section.storage), section.bytes);
+      record.storage = section.storage;
+      if (section.storage === "binary") binary = true;
+      else mono = true;
+      packedSections[i] = section;
+      await finishSectionLayer();
       continue;
     }
     if (!rgba) throw new Error(`Raster layer ${i} has insufficient RGBA data.`);
+    if (original >= 0 && !joinsAtlas[original]) {
+      // A repeated larger image references the section its first copy writes.
+      record.storage = records[original].storage;
+      record.source = original;
+      shared = true;
+      await finishSectionLayer();
+      continue;
+    }
     let best: { storage: "png" | "webp"; bytes: Uint8Array } | null = null;
     let lossyWins = false;
     if (original >= 0) {
-      // A repeated image reuses the first copy's encoding and atlas cell.
+      // A repeated small image reuses the first copy's atlas cell.
       best = encoded[original];
     } else if (options.encodeRasterImages) {
       const candidates = await encodeRasterRgbaCandidates(layer.width, layer.height, rgba);
@@ -592,7 +645,8 @@ async function writeHepRasterLayers(
   }
 
   records.forEach((record, index) => {
-    if (record.storage === "atlas" || record.storage === "mono" || record.storage === "binary") return;
+    if (record.storage === "atlas" || record.storage === "mono" || record.storage === "binary" ||
+        record.source !== undefined || preparedRasterSection(layers[index].data)) return;
     const image = encoded[index];
     if (image) {
       // WebP and PNG already carry entropy compression; deflating them again
@@ -603,7 +657,7 @@ async function writeHepRasterLayers(
     }
   });
   archive.file(SCENE_RASTER_LAYERS_PATH, encodeRasterLayerTable({ atlases, layers: records }));
-  return { file: SCENE_RASTER_LAYERS_PATH, count: records.length, atlasCount: atlases.length, binary, mono };
+  return { file: SCENE_RASTER_LAYERS_PATH, count: records.length, atlasCount: atlases.length, binary, mono, shared };
 }
 
 function buildTextIndexExport(scene: VectorScene): TextIndexExportResult | null {

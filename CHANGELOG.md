@@ -31,6 +31,21 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   both encodings exactly. Photographs and scans previously spent more time on a
   PNG that was several times larger. Hash and compare raster layers by whole
   pixels when finding repeated images.
+- Convert PDFs to HEP without keeping every decoded page image in memory. Each
+  page's larger images are encoded as soon as the page is parsed, while the
+  worker decodes the next page, and their pixels are released; small images
+  still pack into document-wide atlases, and the HEP is byte-identical to a
+  whole-scene export. A 13-page set of 50-megapixel scans now converts in 22 s
+  instead of 27 s with a 2.0 GB peak instead of 6.5 GB. On macOS the
+  PDF-to-HEP command runs conversion workers with `MallocLargeCache=0`, so freed
+  encoder buffers are returned instead of retained; a value already set in the
+  environment takes precedence.
+- Store a repeated larger raster image, such as a plan or logo painted on many
+  pages, once and reference it from its other placements, instead of writing
+  identical bytes for each copy; identical packed monochrome layers share their
+  section too. Readers decode a shared section once for all its placements.
+  Exports with shared sections use HEP scene format v15 and require an updated
+  reader; other exports keep their previous format.
 - Store raster layers with exactly two colors as exact packed 1-bit sections
   instead of WebP or PNG, as monochrome layers already were. Readers restore
   the renderers' 1-bit textures, which lossy WebP would lose, and such HEP

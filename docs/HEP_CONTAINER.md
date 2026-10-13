@@ -4,9 +4,9 @@ The `.hep` file is a binary container with MIME type `application/x-hep`. Contai
 versions **1–4** wrap **scene schema versions 9–14**, recorded in
 `manifest.json`. These version numbers evolve independently. The page-based v8
 document model is a different thing; it is not this container's scene schema.
-Readers support all four container versions and scene v9–v14; files using older
+Readers support all four container versions and scene v9–v15; files using older
 scene schemas must be regenerated from their original PDF. Writers use scene
-v14 for compact raster repeat grids, v13 when repeated paint-group metadata is compacted, v12 for transposed binary
+v15 when repeated raster images share one section, v14 for compact raster repeat grids, v13 when repeated paint-group metadata is compacted, v12 for transposed binary
 runs, v10 for plain packed monochrome rasters, otherwise v9. Legacy v11 JBIG2
 streams remain readable. Readers need support for
 the scene version used by the file. Container repacking preserves section bytes
@@ -283,7 +283,7 @@ decimal text.
 | `clipPaths` | `{file, count, edgeCount}` | `geometry/clip-paths.d512` |
 | `drawRuns` | `{file, count, encoding?}` | `geometry/draw-runs.varint` |
 | `paintGraph` | `{file, rootCount, encoding?}` | `geometry/paint-graph.varint` |
-| `rasterLayers` (v9–v14) | `{file, count, atlasCount, repeats?}` | `geometry/raster-layers.varint` |
+| `rasterLayers` (v9–v15) | `{file, count, atlasCount, repeats?}` | `geometry/raster-layers.varint` |
 | `rasterLayers.repeats` (v14) | `{file, count, translationCount}` | `geometry/raster-repeats.f64` |
 
 Every integer is an unsigned LEB128 varint unless described as zigzag, which is
@@ -378,9 +378,14 @@ byte (0 raw RGBA8, 1 PNG), `width` and `height`. Then `layerCount` and per layer
 a flags byte (bits 0-1 storage: 0 raw RGBA8, 1 PNG, 2 WebP, 3 atlas cell; bit 2
 opacity present; bit 3 selects packed monochrome in v10+, bit 4 selects original
 JBIG2 in v11+, bit 5 selects transposed binary runs in v12+; an extended storage
-flag requires bits 0-1 and all other storage flags zero; bits 6-7 zero),
+flag requires bits 0-1 and all other storage flags zero; bit 6 marks a shared
+section in v15+; bit 7 zero),
 `width`, `height`, and zigzag deltas of
-`paintOrder` and `pageIndex` against the previous layer. An atlas cell follows
+`paintOrder` and `pageIndex` against the previous layer. A shared layer then
+stores the varint distance back to the earlier layer whose section holds its
+identical pixels; that layer must have the same storage and size, must not be
+an atlas cell and must not itself be shared, and the shared layer has no
+section of its own. An atlas cell follows
 with its atlas index and zigzag `x` and `y`, relative to the previous cell's right
 edge and row when that cell is in the same atlas and to zero otherwise; the cell
 must lie inside its atlas. Layers with identical pixels may share one cell, so a
@@ -399,6 +404,12 @@ retains the individual cell geometry; painting that aggregate matrix as one
 stretched image would be incorrect. Readers therefore require v14 when repeat
 metadata is present. Files without raster repeats keep their existing scene
 version, and v9–v13 files remain readable.
+
+Scene v15 lets a repeated larger image, such as a plan or logo painted on many
+pages, reference the section of its first copy through the shared-section bit
+above, instead of storing identical bytes again. Readers decode such a section
+once and give every referencing layer the same pixels. Exports without shared
+sections keep their existing scene version.
 
 The repeat section starts with a uint32 record count. Each record stores a
 uint32 raster-layer index, a uint32 translation-pair count, then sixteen

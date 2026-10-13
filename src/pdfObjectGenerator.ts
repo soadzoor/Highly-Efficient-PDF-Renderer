@@ -208,10 +208,12 @@ export async function loadPdfSceneFromSource(
   /** @internal Used by HEP export to cancel source loading and parsing. */
   signal: AbortSignal | undefined = options.signal,
   /** @internal Only the Three viewer factory requests a partial viewing scene. */
-  demandLoading = false
+  demandLoading = false,
+  /** @internal HEP export: encode each parsed page's larger images before keeping it. */
+  preparePage?: (scene: VectorScene, signal?: AbortSignal) => Promise<void>
 ): Promise<LoadedPdfScene> {
   signal?.throwIfAborted();
-  const pending = loadPdfSceneFromSourceInternal(source, options, signal, demandLoading);
+  const pending = loadPdfSceneFromSourceInternal(source, options, signal, demandLoading, preparePage);
   try { return await waitForLoad(pending, signal); }
   catch (error) {
     // A metadata session can finish just after its caller cancels. Drain and close that unclaimed worker.
@@ -224,7 +226,8 @@ async function loadPdfSceneFromSourceInternal(
   source: PdfObjectSource,
   options: PdfObjectGeneratorOptions,
   signal?: AbortSignal,
-  demandLoading = false
+  demandLoading = false,
+  preparePage?: (scene: VectorScene, signal?: AbortSignal) => Promise<void>
 ): Promise<LoadedPdfScene> {
   signal?.throwIfAborted();
   const progress = createLoadProgressReporter(options.onProgress);
@@ -284,7 +287,8 @@ async function loadPdfSceneFromSourceInternal(
       createParseBuffer(sourceBytes),
       extractOptions,
       signal,
-      "transfer"
+      "transfer",
+      preparePage
     );
     signal?.throwIfAborted();
     const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, pageScenes.length);

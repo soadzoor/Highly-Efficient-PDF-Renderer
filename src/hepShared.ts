@@ -1,3 +1,4 @@
+import { preparedRasterSection } from "./preparedRasterSections";
 import { validatePagePrimitiveRanges } from "./scenePageViews";
 import { validateVectorDrawRuns } from "./vectorDrawOrder";
 import { validateSceneOptionalContentReferences } from "./optionalContent";
@@ -55,6 +56,8 @@ export const PARSED_DATA_BINARY_FORMAT_VERSION = 12;
 export const PARSED_DATA_GROUP_RUN_FORMAT_VERSION = 13;
 /** Regular raster repeat grids retain their original float64 placement metadata. */
 export const PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION = 14;
+/** Repeated larger images reuse one raster section through a layer reference. */
+export const PARSED_DATA_SHARED_RASTER_FORMAT_VERSION = 15;
 export const TEXT_INDEX_JSON_PATH = "text/text-index.json";
 export const TEXT_CHAR_MAP_PATH = "text/char-map.bin";
 export const TEXT_FALLBACK_PATH = "text/fallback-quads.d512";
@@ -427,7 +430,8 @@ export function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
       const height = Math.max(0, Math.trunc(layer?.height ?? 0));
       if (width <= 0 || height <= 0 || (layer.monochrome
         ? layer.monochrome.data.length !== Math.ceil(width / 8) * height || layer.monochrome.colors.length !== 8
-        : !(layer.data instanceof Uint8Array) || layer.data.length < width * height * 4)) {
+        : !(layer.data instanceof Uint8Array) ||
+          (layer.data.length < width * height * 4 && !preparedRasterSection(layer.data)))) {
         continue;
       }
 

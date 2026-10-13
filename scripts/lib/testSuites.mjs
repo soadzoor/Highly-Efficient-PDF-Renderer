@@ -26,6 +26,7 @@ export const fastTests = [
   "hep-integer-chunks",
   "hep-path-chunks",
   "hep-api",
+  "hep-streaming-export",
   "large-bit-addresses",
   "hep-lod",
   "hep-lod-point-recipes",

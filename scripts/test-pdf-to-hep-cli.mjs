@@ -18,6 +18,7 @@ import {
   hepOutputPathForPdf,
   loadSourceHepBuilder,
   parsePdfToHepArguments,
+  pdfToHepWorkerAllocatorEnvironment,
   pdfToHepWorkerArguments,
   resolvePdfToHepWorkerHeapMb,
   runPdfToHep,
@@ -310,6 +311,10 @@ assert.deepEqual(spawnInvocation.args, redirectedWorkerArguments);
 assert.equal(spawnInvocation.options.shell, false);
 assert.deepEqual(spawnInvocation.options.stdio, ["inherit", "inherit", "inherit", "ipc"]);
 assert.equal(spawnInvocation.options.env.HEPR_PDF_TO_HEP_INTERNAL_WORKER, "1");
+assert.deepEqual(pdfToHepWorkerAllocatorEnvironment("darwin"), { MallocLargeCache: "0" });
+assert.deepEqual(pdfToHepWorkerAllocatorEnvironment("linux"), {}, "other platforms keep their allocator defaults");
+assert.equal(spawnInvocation.options.env.MallocLargeCache, process.env.MallocLargeCache ?? (process.platform === "darwin" ? "0" : undefined),
+  "macOS workers release freed large encoder buffers unless the caller configured malloc");
 assert.equal(spawnInvocation.options.env.HEPR_PDF_TO_HEP_BATCH_INDEX, "2");
 assert.equal(spawnInvocation.options.env.HEPR_PDF_TO_HEP_BATCH_TOTAL, "5");
 assert.match(
