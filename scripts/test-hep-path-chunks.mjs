@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { deflateSync, inflateSync } from "node:zlib";
 import { HepArchive } from "./lib/hepContainer.mjs";
-const { pathChainMaxLength, encodePathChains, decodePathChains, chooseHepPathEncoding } =
-  await import("../src/hepContainerPaths.ts");
+const { pathChainMaxLength, decodePathChains } = await import("../src/hepContainerPaths.ts");
+const { encodePathChains, chooseHepPathEncoding } = await import("../src/hepContainerPathEncoding.ts");
 
 function uint(output, value) {
   while (value >= 128) { output.push(value % 128 + 128); value = Math.floor(value / 128); }

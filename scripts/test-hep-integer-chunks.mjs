@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { deflateSync, inflateSync } from "node:zlib";
 import { HepArchive } from "./lib/hepContainer.mjs";
-const { bytePlaneVarintMaxLength, chooseHepIntegerEncoding, decodeBytePlaneVarints,
-  encodeBytePlaneVarints, encodeHepIntegerChunk } = await import("../src/hepContainerIntegers.ts");
+const { bytePlaneVarintMaxLength, decodeBytePlaneVarints } = await import("../src/hepContainerIntegers.ts");
+const { chooseHepIntegerEncoding, encodeBytePlaneVarints, encodeHepIntegerChunk } =
+  await import("../src/hepContainerIntegerEncoding.ts");
 const { transformBytes } = await import("../src/hepContainerShared.ts");
 
 const align = length => Math.ceil(length / 4) * 4;

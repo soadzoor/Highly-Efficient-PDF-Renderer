@@ -21,8 +21,8 @@ export async function repackHepStorageBytes(input, { signal } = {}) {
   } });
   try {
     const { HepArchive, crc32 } = await import("../src/hepContainer.ts");
-    const { chooseHepIntegerEncoding } = await import("../src/hepContainerIntegers.ts");
-    const { chooseHepPathEncoding } = await import("../src/hepContainerPaths.ts");
+    const { chooseHepIntegerEncoding } = await import("../src/hepContainerIntegerEncoding.ts");
+    const { chooseHepPathEncoding } = await import("../src/hepContainerPathEncoding.ts");
     const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
     const archive = await HepArchive.loadAsync(bytes, { signal });
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);

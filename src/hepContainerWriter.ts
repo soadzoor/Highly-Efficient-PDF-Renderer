@@ -14,9 +14,9 @@ import {
   validateEntryLength,
   transformBytes
 } from "./hepContainerShared";
-import { encodePaletteBytes } from "./hepContainerPalette";
-import { encodeHepIntegerChunk } from "./hepContainerIntegers";
-import { chooseHepPathEncoding } from "./hepContainerPaths";
+import { encodePaletteBytes } from "./hepContainerPaletteEncoding";
+import { encodeHepIntegerChunk } from "./hepContainerIntegerEncoding";
+import { chooseHepPathEncoding } from "./hepContainerPathEncoding";
 import { ownedHepSectionBytes } from "./hepContainerOwnedSections";
 import type { HepArchiveEntry, HepArchiveWriteOptions, HepArchiveProgress } from "./hepContainer";
 import type { EntryRecord, ChunkRecord } from "./hepContainerShared";

@@ -41,6 +41,9 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   headless profile; frames that do select again cost more than before. Stroke
   detail can differ slightly from the previous selection (about 0.1% of total
   ink in a headless comparison).
+- Keep HEP export encoders (integer, palette and path chunk codecs) in
+  writer-only modules, so bundled viewers no longer ship them with the HEP
+  reader; the initial viewer bundle shrinks by about 1 kB gzip.
 
 ### Fixed
 

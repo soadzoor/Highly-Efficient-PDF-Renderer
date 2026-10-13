@@ -14,6 +14,7 @@ export const {
   crc32,
   hasHepSignature,
   hasLegacyZipSignature,
-  encodeFloat32Palette,
   decodeFloat32Palette
 } = await import("../../src/hepContainer.ts");
+// The encoder is writer-only and lives outside the reader's module graph.
+export const { encodeFloat32Palette } = await import("../../src/hepContainerPaletteEncoding.ts");

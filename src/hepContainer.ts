@@ -26,7 +26,7 @@ import type { HepArchiveLoadOptions, HepArchiveWriteOptions, HepArchiveProgress,
 import { waitForLoad } from "./loadCancellation";
 
 export { crc32, hasHepSignature, hasLegacyZipSignature } from "./hepContainerShared";
-export { encodeFloat32Palette, decodeFloat32Palette } from "./hepContainerPalette";
+export { decodeFloat32Palette } from "./hepContainerPalette";
 export type { HepArchiveLoadOptions, HepArchiveWriteOptions, HepArchiveProgress } from "./hepContainerShared";
 
 export class HepArchiveEntry {

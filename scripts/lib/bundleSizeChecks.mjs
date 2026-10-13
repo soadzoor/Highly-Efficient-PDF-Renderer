@@ -12,10 +12,12 @@ export async function checkBundlerSizes(fixture, consumerConfig) {
   for (const [symbol, maximumGzip] of [
     ["buildStrokeScene", 12_000],
     ["createSceneTextSearcher", 15_000],
-    // Shared page rendering, raster compression and compositor batching bring
-    // both object factories to about 282 kB gzip; retain a bounded margin.
-    ["createThreePdfObject", 300_000],
-    ["pdfObjectGenerator", 300_000],
+    // Shared page rendering, raster compression, compositor and mixed vector
+    // batching, raster repeat grids and tile seams bring both object factories
+    // to about 305 kB gzip; retain a bounded margin. HEP export encoders stay
+    // in writer-only modules so the reader's chunk never carries them.
+    ["createThreePdfObject", 310_000],
+    ["pdfObjectGenerator", 310_000],
     ["buildHep", 12_000]
   ]) {
     const entryPath = resolve(fixture, `size-${symbol}.js`);
