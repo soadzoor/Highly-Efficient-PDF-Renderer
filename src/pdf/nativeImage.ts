@@ -1559,14 +1559,22 @@ function convertSamplesToSrgb(
   };
 }
 
-const PACKED_COLOR_CACHE_BITS = 12;
+/**
+ * Direct-mapped memo size: 4K slots for small images, growing with the pixel
+ * count to 1M slots (12 MB) for photographs with millions of distinct colors.
+ * Larger tables stop fitting the CPU caches and convert more slowly again.
+ */
+function packedColorCacheBits(pixelCount: number): number {
+  return Math.max(12, Math.min(20, Math.ceil(Math.log2(Math.max(1, pixelCount))) - 4));
+}
 
 /**
  * Three- or four-component 8-bit pixels without a color-key Mask, converted
  * with the general loop's Decode interpolation, conversion call and rounding.
- * Page-sized calibrated or ICC planes repeat few colors: each pixel compares
- * one packed key, and a small direct-mapped memo converts every distinct color
- * once instead of per run. Returns the uniform black/white value or -1.
+ * Each pixel compares one packed key; a direct-mapped memo sized to the image
+ * converts repeated colors once instead of per run, and retained ICC lattices
+ * convert straight from the component bytes. Returns the uniform black/white
+ * value or -1.
  */
 function convertPackedSamples8ToSrgb(
   samples: ImageSamples,
@@ -1586,20 +1594,27 @@ function convertPackedSamples8ToSrgb(
       );
     }
   }
-  const memoKeys = new Float64Array(1 << PACKED_COLOR_CACHE_BITS).fill(-1);
-  const memoColors = new Int32Array(1 << PACKED_COLOR_CACHE_BITS);
+  const memoBits = packedColorCacheBits(output.length >> 2);
+  const memoKeys = new Float64Array(1 << memoBits).fill(-1);
+  const memoColors = new Int32Array(1 << memoBits);
   const components = new Array<number>(componentCount);
+  // ICC lattices convert straight from the component bytes; other spaces,
+  // and any color the direct path cannot convert, go through convertToSrgb.
+  const direct = colors.createImageByteConverter(colorSpaceIndex, componentCount, decoded);
   // Packed sRGB bytes for a color change; only these leave the pixel loops.
   const resolve = (pixels: ImageSamples, sample: number, key: number): number => {
-    const slot = Math.imul(key, 0x9e3779b1) >>> (32 - PACKED_COLOR_CACHE_BITS);
+    const slot = Math.imul(key, 0x9e3779b1) >>> (32 - memoBits);
     if (memoKeys[slot] === key) return memoColors[slot];
-    for (let component = 0; component < componentCount; component += 1) {
-      components[component] = decoded[component * 256 + pixels[sample + component]];
+    let packed = direct ? direct(pixels, sample) : -1;
+    if (packed < 0) {
+      for (let component = 0; component < componentCount; component += 1) {
+        components[component] = decoded[component * 256 + pixels[sample + component]];
+      }
+      const rgb = colors.convertToSrgb(colorSpaceIndex, components, signal);
+      // `& 0xff` is the Uint8Array store conversion the general loop relies on.
+      packed = (Math.round(rgb[0] * 255) & 0xff) | ((Math.round(rgb[1] * 255) & 0xff) << 8) |
+        ((Math.round(rgb[2] * 255) & 0xff) << 16);
     }
-    const rgb = colors.convertToSrgb(colorSpaceIndex, components, signal);
-    // `& 0xff` is the Uint8Array store conversion the general loop relies on.
-    const packed = (Math.round(rgb[0] * 255) & 0xff) | ((Math.round(rgb[1] * 255) & 0xff) << 8) |
-      ((Math.round(rgb[2] * 255) & 0xff) << 16);
     memoKeys[slot] = key;
     memoColors[slot] = packed;
     return packed;

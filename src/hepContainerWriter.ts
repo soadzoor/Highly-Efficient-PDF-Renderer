@@ -15,7 +15,7 @@ import {
   transformBytes
 } from "./hepContainerShared";
 import { encodePaletteBytes } from "./hepContainerPalette";
-import { chooseHepIntegerEncoding } from "./hepContainerIntegers";
+import { encodeHepIntegerChunk } from "./hepContainerIntegers";
 import { chooseHepPathEncoding } from "./hepContainerPaths";
 import { ownedHepSectionBytes } from "./hepContainerOwnedSections";
 import type { HepArchiveEntry, HepArchiveWriteOptions, HepArchiveProgress } from "./hepContainer";
@@ -89,7 +89,10 @@ export async function generateHepArchive(
     options.signal?.throwIfAborted();
     let stored = decoded;
     let codec = 0;
-    if (!chunk.store) {
+    if (!chunk.store && chunk.entries.length === 1 && /^lod-vector\/[^/]+\.bin$/.test(chunk.entries[0].record.name)) {
+      // Plain deflate and the varint integer codecs, ranked on a sample first.
+      ({ stored, codec } = await encodeHepIntegerChunk(decoded, options.signal));
+    } else if (!chunk.store) {
       const compressed = await transformBytes(decoded, true, Number.MAX_SAFE_INTEGER, options.signal);
       if (compressed.length < decoded.length) { stored = compressed; codec = 1; }
       // This changes only the physical chunk codec: section names, decoded
@@ -101,10 +104,6 @@ export async function generateHepArchive(
           const packed = await transformBytes(palette, true, Number.MAX_SAFE_INTEGER, options.signal);
           if (align4(packed.length) < align4(stored.length)) { stored = packed; codec = 2; }
         }
-      }
-      if (chunk.entries.length === 1 && /^lod-vector\/[^/]+\.bin$/.test(chunk.entries[0].record.name)) {
-        const packed = await chooseHepIntegerEncoding(decoded, stored.length, options.signal);
-        if (packed) { stored = packed; codec = 3; }
       }
       if (chunk.entries.length === 1 && chunk.entries[0].record.name === "geometry/clip-paths.d512") {
         const packed = await chooseHepPathEncoding(decoded, stored.length, options.signal);

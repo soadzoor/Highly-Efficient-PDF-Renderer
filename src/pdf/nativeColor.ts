@@ -22,6 +22,7 @@ import {
   resolveNativeIccTransformThroughCaller,
   sampleNativeIccTransform,
   sampleNativeIccTransformComponents,
+  createNativeIccByteSampler,
   validateIccEngine,
   normalizeIccComponents,
   normalizeNativeIccTransformResult,
@@ -254,6 +255,37 @@ export class NativePdfColorRegistry {
       return record.parameters;
     }
     return Array.from({ length: record.componentCount }, () => [0, 1]).flat();
+  }
+
+  /**
+   * Packed sRGB bytes (r | g << 8 | b << 16) for three- or four-component
+   * 8-bit image colors whose Decode values are tabulated in `decoded`, or null
+   * unless the space is a retained ICC lattice. Each color equals convertToSrgb
+   * followed by Uint8 rounding; a color it cannot convert returns -1 so the
+   * caller reports it through convertToSrgb.
+   */
+  createImageByteConverter(
+    index: number,
+    componentCount: 3 | 4,
+    decoded: Float64Array
+  ): ((pixels: ArrayLike<number>, offset: number) => number) | null {
+    const record = this.getRecord(index);
+    if (record.kind !== "ICCBased" || !record.iccTransform || this.maxColorDepth <= 0 ||
+        record.componentCount !== componentCount) return null;
+    const sampler = createNativeIccByteSampler(record.iccTransform, componentCount, decoded,
+      record.parameters, record.iccTransformMode ?? 2);
+    if (!sampler) return null;
+    const rgb = new Float64Array(3);
+    let reported = false;
+    return (pixels, offset) => {
+      if (!sampler(pixels, offset, rgb)) return -1;
+      if (!reported) {
+        reported = true;
+        this.reportIccFallback(index, record);
+      }
+      return (Math.round(clamp01(rgb[0]) * 255) & 0xff) | ((Math.round(clamp01(rgb[1]) * 255) & 0xff) << 8) |
+        ((Math.round(clamp01(rgb[2]) * 255) & 0xff) << 16);
+    };
   }
 
   /** Convert one color to canonical nonlinear sRGB in the closed interval [0, 1]. */

@@ -172,14 +172,21 @@ try {
   assert.equal(embedded.format, HEPR_IMAGE_FORMAT.Rgba8, "embedded opacity retains an RGBA channel");
   assert(embedded.data.every((value, i) => value === (i % 4 === 3 ? 128 : 0)));
 
-  const convert = colors.convertToSrgb;
-  for (const components of [1, 3]) {
+  const convert = colors.convertToSrgb, byteConverter = colors.createImageByteConverter;
+  for (const components of [1, 3, 4]) {
     const cancelled = new AbortController();
+    // Abort during the first color conversion, through either entry point;
+    // every later pixel is a cache hit that must still observe cancellation.
     colors.convertToSrgb = (...args) => { const rgb = scalar(...args); cancelled.abort(); return rgb; };
+    colors.createImageByteConverter = (...args) => {
+      const direct = byteConverter.apply(colors, args);
+      return direct && ((pixels, offset) => { const packed = direct(pixels, offset); cancelled.abort(); return packed; });
+    };
     await assert.rejects(images.add(image(8193, 1, 8, icc(components), new Uint8Array(8193 * components)), undefined, cancelled.signal),
-      error => error.code === "aborted", "palette and repeated-vector cache hits must not bypass cancellation");
+      error => error.code === "aborted", "palette, repeated-vector and memo cache hits must not bypass cancellation");
   }
   colors.convertToSrgb = convert;
+  colors.createImageByteConverter = byteConverter;
   const page = createEmptyHeprPageData({ sourcePageIndex: 0, mediaBox: [0, 0, 80, 40], cropBox: [0, 0, 80, 40],
     bleedBox: null, trimBox: null, artBox: null, rotation: 0, userUnit: 1, width: 80, height: 40 });
   page.stores.images = images.buildStore(); page.stores.colors = colors.buildStore(); page.stores.functions = colors.functions.buildStore();

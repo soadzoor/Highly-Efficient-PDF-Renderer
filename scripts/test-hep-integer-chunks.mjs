@@ -3,7 +3,8 @@ import { randomBytes } from "node:crypto";
 import { deflateSync, inflateSync } from "node:zlib";
 import { HepArchive } from "./lib/hepContainer.mjs";
 const { bytePlaneVarintMaxLength, chooseHepIntegerEncoding, decodeBytePlaneVarints,
-  encodeBytePlaneVarints } = await import("../src/hepContainerIntegers.ts");
+  encodeBytePlaneVarints, encodeHepIntegerChunk } = await import("../src/hepContainerIntegers.ts");
+const { transformBytes } = await import("../src/hepContainerShared.ts");
 
 const align = length => Math.ceil(length / 4) * 4;
 function planeBytes(words) {
@@ -127,6 +128,35 @@ const other = await new HepArchive().file("geometry/data.bin", planeBytes(residu
 assert.equal(new DataView(other.buffer).getUint16(4, true), 1, "unmeasured section types keep existing codecs");
 const cancelled = new AbortController(); cancelled.abort();
 await assert.rejects(chooseHepIntegerEncoding(planeBytes(residuals), 100000, cancelled.signal), { name: "AbortError" });
+
+// The writer ranks candidates on evenly spaced slices of large chunks; its
+// choice must match compressing plain deflate and every varint mode whole.
+async function exhaustiveChunk(source) {
+  const compressed = await transformBytes(source, true, Number.MAX_SAFE_INTEGER);
+  const plain = compressed.length < source.length ? { stored: compressed, codec: 1 } : { stored: source, codec: 0 };
+  const packed = await chooseHepIntegerEncoding(source, plain.stored.length);
+  return packed ? { stored: packed, codec: 3 } : plain;
+}
+const sampledFixtures = [];
+for (const count of [65536, 300_000]) {
+  let seed = count;
+  const next = () => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return seed >>> 0; };
+  sampledFixtures.push(Uint32Array.from({ length: count }, () => (next() & 127) - 64));
+  sampledFixtures.push(Uint32Array.from({ length: count }, (_, index) => index * 3 + (next() & 3)));
+  sampledFixtures.push(Uint32Array.from({ length: count }, (_, index) => index < count / 2 ? (next() & 15) : index * 7));
+  sampledFixtures.push(Uint32Array.from({ length: count }, next));
+}
+for (const words of sampledFixtures) {
+  const source = planeBytes(words);
+  const expected = await exhaustiveChunk(source), actual = await encodeHepIntegerChunk(source);
+  assert.equal(actual.codec, expected.codec, `${words.length}-word chunk keeps the exhaustive codec`);
+  assert.deepEqual(actual.stored, expected.stored, `${words.length}-word chunk keeps the exhaustive payload`);
+}
+const largeSource = planeBytes(sampledFixtures[5]);
+const largeFile = await new HepArchive().file("lod-vector/3.bin", largeSource).generateAsync({ type: "uint8array" });
+assert.deepEqual(await (await HepArchive.loadAsync(largeFile)).file("lod-vector/3.bin").async("uint8array"), largeSource,
+  "a sampled integer chunk round-trips through the container");
+await assert.rejects(encodeHepIntegerChunk(largeSource, cancelled.signal), { name: "AbortError" });
 
 // v3 keeps earlier codecs readable. The existing container suite covers v1/v2 fixtures.
 for (const compression of ["STORE", "DEFLATE"]) {

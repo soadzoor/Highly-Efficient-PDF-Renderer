@@ -15,8 +15,9 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 - Avoid repeated spot-color, palette and ICC conversions for identical image
   samples, preserving the existing color arithmetic and transparency. Convert
   8-bit three- and four-component calibrated or ICC images without a color-key
-  mask through a small per-image color memo and specialized pixel loops, and
-  sample retained ICC lattices without per-color traversal or allocations. Keep
+  mask through a per-image color memo sized to the image and specialized pixel
+  loops, and convert retained ICC lattices straight from component bytes with
+  per-byte cell and weight tables, giving identical colors. Keep
   unpacked 1-, 2- and 4-bit samples in byte storage instead of widening to 16 bits.
   Store proven uniform opaque black or white images as exact packed bits while
   preserving their dimensions, masks and original color metadata.
@@ -41,6 +42,11 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   decide whether recipes save space by compressing only the sections they replace
   when those are large. Decoded LOD data is unchanged, tested exports stayed
   byte-identical, and peak memory drops for drawings with millions of segments.
+  Rank plain deflate and the three integer codecs of large vector LOD sections
+  on evenly spaced slices, compressing only the best candidates whole instead
+  of all four; the chosen encodings matched the exhaustive choice on every
+  tested section. Compute container checksums eight bytes at a time, which
+  also speeds up HEP loading.
 - Share repeated HEP atlas cells and native WebGL image textures across independent
   placements, retaining sampler settings and safe replacement/disposal. Batch
   nearest-neighbor images and reuse identical raster tile plans to avoid excessive
