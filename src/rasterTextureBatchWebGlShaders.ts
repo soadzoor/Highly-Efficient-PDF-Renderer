@@ -1,10 +1,11 @@
 import { RASTER_CLIP_GLSL } from "./rasterClipShaders";
 import { RASTER_CLIP_UV_BOUNDS_GLSL } from "./rasterClipBounds";
+import { RASTER_TILE_SEAM_GLSL, RASTER_TILE_SEAM_VERTEX_GLSL } from "./rasterTileSeamShaders";
 
 // Leave two fragment samplers for geometric clips and a folded soft mask.
 export const RASTER_BATCH_TEXTURES = 14;
 export const RASTER_BATCH_INSTANCES = 512;
-export const RASTER_BATCH_INSTANCE_FLOATS = 16;
+export const RASTER_BATCH_INSTANCE_FLOATS = 24;
 
 // Clip roots travel with the image, so different clips do not split a draw.
 const INSTANCE_CLIP_GLSL = RASTER_CLIP_GLSL.replace("uniform float uVectorClipIndex;", "")
@@ -17,6 +18,8 @@ layout(location = 0) in vec4 aRasterMatrixABCD;
 layout(location = 1) in vec4 aRasterEFOpacityClip;
 layout(location = 2) in vec3 aTextureSlotUvMargin;
 layout(location = 3) in vec4 aRasterUvBounds;
+layout(location = 4) in vec4 aRasterSeamBounds;
+layout(location = 5) in vec4 aRasterSeamGaps;
 uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
 uniform float uZoom;
@@ -27,13 +30,18 @@ out vec2 vWorld;
 flat out float vOpacity;
 flat out float vRasterClip;
 flat out float vTextureSlot;
+flat out vec4 vRasterSeamOriginalBounds;
+flat out vec4 vRasterSeamGaps;
 
 ${RASTER_CLIP_UV_BOUNDS_GLSL}
+${RASTER_TILE_SEAM_VERTEX_GLSL}
 
 void main() {
   vec2 uv = vec2(float(gl_VertexID & 1), float(1 - (gl_VertexID >> 1)));
   vOpacity = aRasterEFOpacityClip.z;
   vRasterClip = aRasterEFOpacityClip.w; vTextureSlot = aTextureSlotUvMargin.x;
+  vRasterSeamGaps = aRasterSeamGaps;
+  vRasterSeamOriginalBounds = heprRasterOriginalBounds(aRasterMatrixABCD, aRasterEFOpacityClip.xy);
   if (uUseLocalToClip < 0.5) {
     vec4 bounds = heprRasterClipUvBounds(aRasterUvBounds, aTextureSlotUvMargin.yz,
       max(1.0 / max(uZoom, 1e-6), 1e-4));
@@ -48,6 +56,10 @@ void main() {
     aRasterMatrixABCD.x * uv.x + aRasterMatrixABCD.z * uv.y + aRasterEFOpacityClip.x,
     aRasterMatrixABCD.y * uv.x + aRasterMatrixABCD.w * uv.y + aRasterEFOpacityClip.y
   );
+  if (any(greaterThan(aRasterSeamGaps, vec4(0.0)))) {
+    vec4 packed = heprRasterTileSeamPack(uv, aRasterMatrixABCD, aRasterEFOpacityClip.xy, aRasterSeamBounds);
+    world = packed.xy; uv = packed.zw;
+  }
   if (uUseLocalToClip >= 0.5) gl_Position = uLocalToClip * vec4(world, 0.0, 1.0);
   else {
     vec2 screen = (world - uCameraCenter) * uZoom + 0.5 * uViewport;
@@ -81,9 +93,12 @@ in vec2 vWorld;
 flat in float vOpacity;
 flat in float vRasterClip;
 flat in float vTextureSlot;
+flat in vec4 vRasterSeamOriginalBounds;
+flat in vec4 vRasterSeamGaps;
 out vec4 outColor;
 
 ${INSTANCE_CLIP_GLSL}
+${RASTER_TILE_SEAM_GLSL}
 
 // A balanced choice keeps every slot within four comparisons. Explicit
 // sampler names and derivatives preserve mip filtering across instances.
@@ -123,8 +138,12 @@ void main() {
   // Sampler indices must be constant in GLSL ES. Explicit derivatives retain
   // the original hardware mip filtering across nonuniform texture branches.
   vec2 dx = dFdx(vUv), dy = dFdy(vUv);
+  vec2 seamFootprint = abs(dFdx(vWorld)) + abs(dFdy(vWorld));
   vec4 color = heprRasterBatchSample(vTextureSlot, vUv, dx, dy);
   color *= mix(vOpacity, 1.0, uPdfShapeOnly);
+  if (any(greaterThan(vRasterSeamGaps, vec4(0.0)))) {
+    color *= heprRasterTileSeamCoverage(vWorld, seamFootprint, vRasterSeamOriginalBounds, vRasterSeamGaps);
+  }
   if (color.a <= 0.001) discard;
   outColor = color * heprVectorClipAA(vWorld, clipAAWidth);
 }

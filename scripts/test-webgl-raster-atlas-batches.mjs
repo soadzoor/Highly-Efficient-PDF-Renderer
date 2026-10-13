@@ -163,7 +163,7 @@ try {
   bounded.renderer.drawSourceOrderedContent(1000, 1000, 505, 505, 0.5);
   assert.notEqual(bounded.renderer.rasterTextureClipBounds.get(boundedLayer).get(0), cachedBounds,
     "a clip upload invalidates the inverse-bounds cache");
-  assert.deepEqual(bounded.renderer.rasterTextureBatchCache[0].instances, bounded.renderer.rasterTextureBatchInstances.slice(0, 32),
+  assert.deepEqual(bounded.renderer.rasterTextureBatchCache[0].instances, bounded.renderer.rasterTextureBatchInstances.slice(0, 2 * RASTER_BATCH_INSTANCE_FLOATS),
     "changed clip bounds replace cached GPU geometry");
 
   const ordered = makeScene(6); ordered.rasterLayers = ordered.rasterLayers.map((_, i) => largeImage(i));
@@ -202,6 +202,41 @@ try {
   assert(nearestBatch.mock.calls.some(call => call[0] === "texParameteri" && call[2] === "TEXTURE_MIN_FILTER" && call[3] === "NEAREST"));
   assert(nearestBatch.mock.calls.some(call => call[0] === "texParameteri" && call[2] === "TEXTURE_MAG_FILTER" && call[3] === "NEAREST"));
   assert.deepEqual(nearestScene, nearestCanonical);
+
+  const seamScene = makeScene(2);
+  seamScene.paintGraph.roots[0].alpha = 1;
+  seamScene.rasterLayers.forEach((layer, index) => {
+    layer.opacity = 1; layer.interpolate = false; layer.matrix[4] = index * 20.025;
+    for (let i = 3; i < layer.data.length; i += 4) layer.data[i] = 255;
+  });
+  const seamCanonical = structuredClone(seamScene), seams = fixture(Renderer, seamScene, VectorOrderedBatches);
+  assert.equal(seams.renderer.rasterTileSeams.size, 2);
+  seams.renderer.drawSourceOrderedContent(100, 80, 0, 0, 1);
+  const seamPaint = seams.mock.paints.find(p => p.label === "rasterTextureBatch");
+  for (let i = 0; i < 2; i++) {
+    const descriptor = seams.renderer.rasterTileSeams.get(i), offset = i * RASTER_BATCH_INSTANCE_FLOATS;
+    assert.deepEqual(seamPaint.instances.subarray(offset + 16, offset + 20), descriptor.bounds);
+    assert.deepEqual(seamPaint.instances.subarray(offset + 20, offset + 24), descriptor.gaps);
+  }
+  assert.equal(seamPaint.instances[18], seamPaint.instances[RASTER_BATCH_INSTANCE_FLOATS + 16],
+    "adjacent images submit the identical Float32 boundary without changing their UV matrices");
+  seams.mock.clear(); seams.renderer.drawSourceOrderedContent(100, 80, 1, 0, 2);
+  assert.equal(seams.mock.calls.filter(c => c[0] === "bufferData").length, 0, "zoom and pan reuse seam descriptors and instances");
+  seams.renderer.rasterTextureBatchUnavailable = true;
+  seams.mock.clear(); seams.renderer.drawSourceOrderedContent(100, 80, 1, 0, 2);
+  const seamFallback = seams.mock.paints.filter(p => p.label === "raster");
+  assert.equal(seamFallback.length, 2);
+  seamFallback.forEach((paint, index) => {
+    assert.deepEqual(paint.uniforms.get("uRasterSeamBounds"), seams.renderer.rasterTileSeams.get(index).bounds);
+    assert.deepEqual(paint.uniforms.get("uRasterSeamGaps"), seams.renderer.rasterTileSeams.get(index).gaps);
+  });
+  const transparentReplacement = { ...seamScene.rasterLayers[1], opacity: 0.5 };
+  seams.renderer.prepareRasterLayerUpdates(new Map([[1, transparentReplacement]])).commit();
+  assert.equal(seams.renderer.rasterTileSeams.size, 0, "replacing a tile invalidates both sides of its opaque seam");
+  seams.mock.clear(); seams.renderer.drawSourceOrderedContent(100, 80, 1, 0, 2);
+  assert(seams.mock.paints.filter(p => p.label === "raster").every(p =>
+    p.uniforms.get("uRasterSeamGaps").every(value => value === 0)), "ordinary draws reset stale seam uniforms");
+  assert.deepEqual(seamScene, seamCanonical, "seam coverage leaves source matrices and pixels unchanged");
 
   const paired = makeScene(7); paired.rasterLayers = paired.rasterLayers.map((_, i) => largeImage(i));
   paired.drawRuns[3].blendMode = "Multiply"; delete paired.paintGraph;
@@ -276,9 +311,10 @@ try {
   cacheBudget.renderer.destroyRasterTextureBatchCache(); cacheBudget.mock.clear();
   cacheBudget.renderer.rasterTextureBatchInstances = new Float32Array(512 * RASTER_BATCH_INSTANCE_FLOATS);
   for (let i = 0; i < 130; i++) cacheBudget.renderer.bindRasterTextureBatchGeometry(512);
-  assert.equal(cacheBudget.renderer.rasterTextureBatchCacheBytes, 4 * 1024 * 1024);
-  assert.equal(cacheBudget.renderer.rasterTextureBatchCache.length, 128);
-  assert.equal(cacheBudget.mock.calls.filter(c => c[0] === "bufferData" && c[3] === "DYNAMIC_DRAW").length, 2,
+  const cachedBatchCount = Math.floor(4 * 1024 * 1024 / (512 * RASTER_BATCH_INSTANCE_FLOATS * 4));
+  assert.equal(cacheBudget.renderer.rasterTextureBatchCacheBytes, cachedBatchCount * 512 * RASTER_BATCH_INSTANCE_FLOATS * 4);
+  assert.equal(cacheBudget.renderer.rasterTextureBatchCache.length, cachedBatchCount);
+  assert.equal(cacheBudget.mock.calls.filter(c => c[0] === "bufferData" && c[3] === "DYNAMIC_DRAW").length, 130 - cachedBatchCount,
     "the byte budget retains streaming draws for excess batches");
   cacheBudget.renderer.destroyRasterTextureBatchCache(); cacheBudget.mock.clear();
   for (let i = 0; i < 514; i++) cacheBudget.renderer.bindRasterTextureBatchGeometry(2);
@@ -387,7 +423,7 @@ try {
   assert.equal(failure.mock.paints.filter(p => p.label === "rasterTextureBatch").length, 43,
     "failed atlases can still batch the original textures");
   for (const item of [split, partial, folds, shapes, blends, failure, reuse, interleaved, multiplyBoundary, tiled,
-    maskedBatch, shapeBatch, unavailable, repeated, bounded, cacheFailure, cacheBudget, visibilityCache]) {
+    maskedBatch, shapeBatch, unavailable, repeated, bounded, cacheFailure, cacheBudget, visibilityCache, seams]) {
     item.renderer.dispose(); assert.equal(item.mock.alive.size, 0, "batch resources are released at disposal");
   }
   renderer.dispose();

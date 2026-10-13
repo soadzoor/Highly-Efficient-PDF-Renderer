@@ -35,6 +35,11 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   scene formats remain readable and ordinary exports keep their previous format.
 - Report lost WebGL contexts and unavailable GPU limits directly instead of
   misidentifying them as invalid HEP vector clip capacity.
+- Prevent subpixel gaps in opaque tiled PDF images from flashing as white
+  lines during native WebGL zooming. Integrate the original gap coverage across
+  shared tile boundaries, preserving source pixels, nearest sampling, paint
+  order and visible gaps at high zoom while reusing existing image textures.
+  Apply the same treatment when image batching falls back to individual draws.
 
 ## [0.1.61] - 2026-10-12
 

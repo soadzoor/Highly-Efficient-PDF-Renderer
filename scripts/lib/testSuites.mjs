@@ -84,6 +84,7 @@ export const fastTests = [
   "webgl-monochrome-raster",
   "webgpu-monochrome-raster",
   "raster-clip-seams",
+  "raster-tile-seams",
   "raster-strip-batches",
   "raster-atlas-batches",
   "raster-tiles",

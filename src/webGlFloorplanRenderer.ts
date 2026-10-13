@@ -21,6 +21,8 @@ import { prepareRasterPixels, finishRasterUpdateSteps, finishRasterUpdateStepsAs
 import { RasterResourceCache } from "./rasterResourceCache";
 import { buildRasterRepeatInstances, rasterRepeatCount, type RasterRepeat } from "./rasterRepeat";
 import { rasterRepeatVertexGlsl } from "./rasterRepeatShaders";
+import { buildRasterTileSeams, type RasterTileSeamDescriptor } from "./rasterTileSeams";
+import { rasterTileSeamVertexGlsl, rasterTileSeamFragmentGlsl } from "./rasterTileSeamShaders";
 import { buildPackedCoverageMipAtlas, type PackedMonochromeCoverageAtlas } from "./packedMonochromeCoverage";
 import { automaticRasterMemoryBudget, estimateRasterTilePlanBytes, planSceneRasterMemory,
   estimateRasterSourcePlanBytes, estimateRasterTextureBytes, rememberMonochromePlanBytes, reportRasterMemoryBudget } from "./rasterMemoryBudget";
@@ -354,6 +356,7 @@ function hasPreparedRasterPixels(source: RasterLayerSource, plan: RasterTilePlan
 }
 
 const WHOLE_RASTER_RECT = Float32Array.of(0, 0, 1, 1);
+const ZERO_RASTER_SEAM = Float32Array.of(0, 0, 0, 0);
 
 interface RasterStripBatchGpu {
   count: number;
@@ -648,6 +651,9 @@ export class WebGlFloorplanRenderer {
   private readonly uRasterMatrixEF: WebGLUniformLocation;
   private readonly uRasterQuad: WebGLUniformLocation;
   private readonly uRasterUv: WebGLUniformLocation;
+  private readonly uRasterSeamBounds: WebGLUniformLocation;
+  private readonly uRasterSeamGaps: WebGLUniformLocation;
+  private rasterTileSeams = new Map<number, RasterTileSeamDescriptor>();
 
   private readonly uRasterViewport: WebGLUniformLocation;
 
@@ -1028,8 +1034,8 @@ export class WebGlFloorplanRenderer {
     );
     this.textProgram = this.createProgram(TEXT_VERTEX_SHADER_SOURCE, multiplyFragmentGlsl(TEXT_FRAGMENT_SHADER_SOURCE, true));
     this.vectorCompositeProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE);
-    this.rasterProgram = this.createProgram(RASTER_VERTEX_SHADER_SOURCE,
-      foldable(monochromeRasterFragmentGlsl(RASTER_FRAGMENT_SHADER_SOURCE), true));
+    this.rasterProgram = this.createProgram(rasterTileSeamVertexGlsl(RASTER_VERTEX_SHADER_SOURCE),
+      foldable(monochromeRasterFragmentGlsl(rasterTileSeamFragmentGlsl(RASTER_FRAGMENT_SHADER_SOURCE)), true));
     this.pageBackgroundProgram = this.createProgram(
       pagePlaceholderVertexGlsl(RASTER_VERTEX_SHADER_SOURCE).replace("#version 300 es", "#version 300 es\n#define INSTANCED_PAGE_BACKGROUNDS"),
       foldable(pagePlaceholderFragmentGlsl(RASTER_FRAGMENT_SHADER_SOURCE), true));
@@ -1215,6 +1221,8 @@ export class WebGlFloorplanRenderer {
     this.uRasterMatrixEF = this.mustGetUniformLocation(this.rasterProgram, "uRasterMatrixEF");
     this.uRasterQuad = this.mustGetUniformLocation(this.rasterProgram, "uRasterQuad");
     this.uRasterUv = this.mustGetUniformLocation(this.rasterProgram, "uRasterUv");
+    this.uRasterSeamBounds = this.mustGetUniformLocation(this.rasterProgram, "uRasterSeamBounds");
+    this.uRasterSeamGaps = this.mustGetUniformLocation(this.rasterProgram, "uRasterSeamGaps");
     this.uRasterViewport = this.mustGetUniformLocation(this.rasterProgram, "uViewport");
     this.uRasterCameraCenter = this.mustGetUniformLocation(this.rasterProgram, "uCameraCenter");
     this.uRasterZoom = this.mustGetUniformLocation(this.rasterProgram, "uZoom");
@@ -1788,6 +1796,7 @@ export class WebGlFloorplanRenderer {
         this.destroyRasterStripBatches();
         this.destroyRasterAtlasBatches();
         for (const [index, layer] of updates) this.rasterLayerUpdates.set(index, layer);
+        this.updateRasterTileSeams(source);
         this.rasterResolutionSources = null;
         this.rasterResolutionPlanner?.invalidate();
         this.trimRasterResourceCache();
@@ -3169,6 +3178,9 @@ export class WebGlFloorplanRenderer {
     gl.uniform1f(this.uRasterOpacity, layer.opacity);
     gl.uniform4f(this.uRasterMatrixABCD, layer.matrix[0], layer.matrix[1], layer.matrix[2], layer.matrix[3]);
     gl.uniform2f(this.uRasterMatrixEF, layer.matrix[4], layer.matrix[5]);
+    const seam = !layer.quad && !layer.uv && !layer.extraTiles?.length ? this.rasterTileSeams?.get(layerIndex) : undefined;
+    gl.uniform4fv(this.uRasterSeamBounds, seam?.bounds ?? ZERO_RASTER_SEAM);
+    gl.uniform4fv(this.uRasterSeamGaps, seam?.gaps ?? ZERO_RASTER_SEAM);
     // Tiles of one image never overlap, so each draws with the image's state.
     this.drawRasterTile(layer);
     for (const tile of layer.extraTiles ?? []) this.drawRasterTile(tile);
@@ -3342,7 +3354,7 @@ export class WebGlFloorplanRenderer {
   private initializeRasterTextureBatchVao(buffer: WebGLBuffer, vao: WebGLVertexArrayObject): void {
     const gl = this.gl;
     gl.bindVertexArray(vao); gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    for (let attribute = 0; attribute < 4; attribute++) {
+    for (let attribute = 0; attribute < 6; attribute++) {
       gl.enableVertexAttribArray(attribute);
       gl.vertexAttribPointer(attribute, attribute === 2 ? 3 : 4, gl.FLOAT, false,
         RASTER_BATCH_INSTANCE_FLOATS * 4, attribute * 16);
@@ -3897,6 +3909,9 @@ export class WebGlFloorplanRenderer {
         clips.set(this.vectorClipIndex, bounds);
       }
       data.set(bounds, offset + 9);
+      const seam = this.rasterTileSeams?.get(index);
+      data.set(seam?.bounds ?? ZERO_RASTER_SEAM, offset + 16);
+      data.set(seam?.gaps ?? ZERO_RASTER_SEAM, offset + 20);
       rasterIndices.push(index);
       return true;
     };
@@ -4829,6 +4844,7 @@ export class WebGlFloorplanRenderer {
       else this.deleteRasterLayerTextures(layer);
     }
     this.rasterLayers = [];
+    this.rasterTileSeams?.clear();
     if (!preserveCache) this.rasterResourceCache?.clear();
     else this.trimRasterResourceCache();
     this.rasterCompression?.releaseWorkspace();
@@ -4856,7 +4872,7 @@ export class WebGlFloorplanRenderer {
   private uploadRasterAtlasBatches(scene: VectorScene, maxTextureSize: number, availableBytes = Infinity): void {
     const gl = this.gl;
     try {
-      const excluded = new Set<number>();
+      const excluded = new Set<number>(this.rasterTileSeams?.keys());
       // Keep the established strip atlas path for flat single-row images.
       // Partial/failed strips can still share the original texture batch path.
       if (!scene.paintGraph) scene.rasterLayers.forEach((source, index) => { if (source.height === 1) excluded.add(index); });
@@ -4920,6 +4936,7 @@ export class WebGlFloorplanRenderer {
     const gl = this.gl;
     try {
       const batches = buildRasterStripBatches(scene, maxTextureSize, "linear").filter(batch => {
+        for (let i = batch.first; i < batch.first + batch.count; i++) if (this.rasterTileSeams?.has(i)) return false;
         const bytes = batch.data.byteLength + batch.instances.byteLength;
         if (bytes > availableBytes) return false;
         availableBytes -= bytes;
@@ -4992,6 +5009,7 @@ export class WebGlFloorplanRenderer {
         for (const [index, source] of rasterSources.entries()) {
           this.rasterLayers.push(this.createRasterLayerGpu(source, index, memoryPlan.plans[index], memoryPlan.compressionFormats[index]));
         }
+        this.updateRasterTileSeams(scene);
         // Atlases contain original RGBA pixels and cannot bypass a compressed
         // or reduced plan. Canonical textures remain authoritative for updates.
         if (this.rasterLayerUpdates.size === 0 && memoryPlan.resolutionScale === 1 &&
@@ -5008,6 +5026,15 @@ export class WebGlFloorplanRenderer {
         if (!this.retryRasterCompression(memoryPlan.compressionFormats, error)) throw error;
       }
     }
+  }
+
+  private updateRasterTileSeams(scene: VectorScene): void {
+    const source = this.rasterLayerUpdates.size ? { ...scene,
+      rasterLayers: scene.rasterLayers.map((layer, index) => this.rasterLayerUpdates.get(index) ?? layer) } : scene;
+    this.rasterTileSeams = buildRasterTileSeams(source, index => {
+      const layer = this.rasterLayers[index];
+      return !!layer && !layer.repeat && !layer.quad && !layer.uv && !layer.extraTiles?.length;
+    });
   }
 
   private classifyRasterLayerSource(source: RasterLayerSource, canCompress = false): RasterLayerSource {
@@ -5073,6 +5100,7 @@ export class WebGlFloorplanRenderer {
       this.destroyRasterStripBatches(); this.destroyRasterAtlasBatches();
       this.getRasterResourceCache().park(this.rasterLayers[index], this.rasterLayers[index].estimatedBytes ?? 0);
       this.rasterLayers[index] = replacement;
+      this.updateRasterTileSeams(scene);
       this.trimRasterResourceCache();
       this.destroyVectorMinifyResources();
     }).catch(error => {
