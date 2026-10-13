@@ -9,7 +9,7 @@ import {
   sceneStrokeRecords, splitStrokeTextures, type SplitStrokeTextures, type StrokeRecords, type StrokeTextureData
 } from "./strokeRecords";
 import { acquireThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
-import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
+import { ThreeVectorDrawRuns, type StoredVectorLodSelection } from "./threeVectorDrawRuns";
 import type { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
 import * as THREE from "three";
 
@@ -345,6 +345,18 @@ export class ThreeMaterialStrokeLayer {
       this.segmentIndexAttribute.needsUpdate = true;
     }
     this.orderedRuns?.finishUpdate();
+  }
+
+  /**
+   * Ordered Vector LOD: select stored records straight from the visible lists
+   * of their levels, without an intermediate ID list. Returns the selected
+   * count, or null when this layer has no ordered batches.
+   */
+  updateFrameWithStoredSelection(viewState: ViewState, viewport: ViewportPixels,
+    selection: StoredVectorLodSelection): number | null {
+    if (!this.orderedRuns) return null;
+    this.updateFrameUniforms(viewState, viewport);
+    return this.orderedRuns.updateStoredSelection(selection);
   }
 
   /** Reuse external selection IDs while refreshing camera and shared paint order. */

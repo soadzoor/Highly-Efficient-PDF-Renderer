@@ -30,6 +30,19 @@ export function threeVectorDrawRunsRevision(parent: THREE.Object3D): number | un
   return drawRunsByParent.get(parent)?.revision;
 }
 
+/** The batches whose meshes are `parent`'s children, if any. */
+export function threeVectorDrawRunsOf(parent: THREE.Object3D): ThreeVectorDrawRuns | undefined {
+  return drawRunsByParent.get(parent);
+}
+
+/** The visible records of the levels of a stored Vector LOD. */
+export interface StoredVectorLodSelection {
+  readonly levels: readonly { readonly visibleSegmentIds: Uint32Array; readonly visibleSegmentCount: number }[];
+  /** Storage IDs of each level's records; null levels use `bases[level] + id`. */
+  readonly records: readonly (Uint32Array | null)[];
+  readonly bases: readonly number[];
+}
+
 /**
  * Batch meshes have identity local transforms, so their world matrix is the
  * parent's. Three recomputes every descendant's matrices each frame; with
@@ -144,6 +157,11 @@ export class ThreeVectorDrawRuns {
   private rangesByKey: DrawRunRange[] = [];
   private textSelection: OrderedTextLodSelection | null = null;
   private textSelectionRevision = -1;
+  /** See deferInstanceWrites. */
+  private instanceWritesDeferred = false;
+  /** Whether batch IDs lag the selection because their writes were deferred. */
+  private instanceIdsStale = false;
+  private readonly entryByMesh = new Map<THREE.Object3D, DrawRunEntry>();
 
   static create(scene: VectorScene, kind: VectorDrawRun["kind"],
     parent: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>, attribute: string,
@@ -232,31 +250,112 @@ export class ThreeVectorDrawRuns {
       }
       return;
     }
-    if (!replanned && source.version === this.sourceVersion && count === this.sourceCount) return;
-    this.sourceVersion = source.version;
-    this.sourceCount = count;
+    const sourceChanged = source.version !== this.sourceVersion || count !== this.sourceCount;
+    if (!replanned && !sourceChanged) return;
     // Spatial culling can repack the same IDs in a different order. The ordered
     // batches only depend on membership, so reuse their buffers and redundancy
     // decision when no primitive actually entered or left the candidate set.
-    if (!this.updateSelectedKeys(source.array as Float32Array, count) && this.entriesCurrent) return;
+    // A replan with the same source keeps the selection, which may have come
+    // from updateStoredSelection rather than the source attribute.
+    let changed = false;
+    if (sourceChanged) {
+      this.sourceVersion = source.version;
+      this.sourceCount = count;
+      const selected = source.array as Float32Array, ranks = this.lodIdToRank;
+      for (let index = 0; index < count; index++) this.markSelectedKey(ranks ? ranks[selected[index]] : selected[index]);
+      changed = this.takeSelectedKeys(count);
+    }
+    if (!changed && this.entriesCurrent) return;
     this.updateEntries();
   }
 
   /**
-   * Sort the selection into paint-order keys without scanning every paint:
-   * canonical IDs, or the static paint ranks of stored LOD records.
+   * Select stored LOD records straight from their levels' visible lists, as
+   * the native ordered batches do: one pass to paint-order ranks, which also
+   * deduplicate records that several levels share. Returns the selected count.
    */
-  private updateSelectedKeys(selected: Float32Array, count: number): boolean {
-    if (this.nextKeys.length < count) {
-      this.nextKeys = new Uint32Array(Math.min(this.selectionCapacity, Math.max(count, this.nextKeys.length * 2)));
+  updateStoredSelection(selection: StoredVectorLodSelection): number {
+    const ranks = this.lodIdToRank;
+    if (!ranks) throw new Error("Stored LOD selection requires stored-record origins.");
+    this.parent.geometry.instanceCount = 0;
+    if (this.plan.version !== this.planVersion) this.rebuildEntries();
+    let count = 0;
+    selection.levels.forEach((level, index) => {
+      const records = selection.records[index], base = selection.bases[index];
+      const ids = level.visibleSegmentIds;
+      count += level.visibleSegmentCount;
+      if (records) {
+        for (let item = 0; item < level.visibleSegmentCount; item++) this.markSelectedKey(ranks[records[ids[item]]]);
+      } else {
+        for (let item = 0; item < level.visibleSegmentCount; item++) this.markSelectedKey(ranks[base + ids[item]]);
+      }
+    });
+    if ((this.takeSelectedKeys(count) || !this.entriesCurrent) && !this.textSelection) this.updateEntries();
+    return this.selectedKeyCount;
+  }
+
+  /**
+   * While the mixed vector layer draws these batches, it reads their instances
+   * through writeMixedInstances and they are never drawn themselves. Updates
+   * then keep each batch's count and visibility but skip writing its IDs.
+   * Ending the deferral writes any that lag the selection, before any draw.
+   */
+  deferInstanceWrites(deferred: boolean): void {
+    // Text has its own selection and is never mixed.
+    deferred &&= !this.textSelection;
+    if (deferred === this.instanceWritesDeferred) return;
+    this.instanceWritesDeferred = deferred;
+    if (!deferred && this.instanceIdsStale) this.updateEntries();
+  }
+
+  get deferredInstanceWrites(): boolean {
+    return this.instanceWritesDeferred;
+  }
+
+  /**
+   * Write `mesh`'s selected instances as mixed records (ID, clip code, kind,
+   * page) from `offset`, exactly as its own buffers would list them. Returns
+   * the offset after them.
+   */
+  writeMixedInstances(mesh: THREE.Object3D, values: Float32Array, offset: number, kind: number,
+    pages: ArrayLike<number> | undefined): number {
+    const entry = this.entryByMesh.get(mesh);
+    if (!entry) return offset;
+    const keys = this.selectedKeys;
+    const redundancy = this.strokeRedundancyEnabled ? this.strokeRedundancy : null;
+    for (const range of entry.ranges) {
+      if (range.selectionEnd === range.selectionFirst || !this.rangeVisible(range)) continue;
+      const clipCode = (range.run.clipIndex ?? -1) + 1;
+      const stored = this.lodIdToRank !== null ? range.ids : undefined;
+      for (let item = range.selectionFirst; item < range.selectionEnd; item++) {
+        const id = stored ? stored[keys[item] - range.keyFirst] : keys[item];
+        if (redundancy && !redundancy.isRetained(id)) continue;
+        values[offset++] = id;
+        values[offset++] = clipCode;
+        values[offset++] = kind;
+        values[offset++] = pages?.[id] ?? 0;
+      }
     }
-    const next = this.nextKeys;
-    const bits = this.selectedKeyBits, groups = this.selectedKeyWords, ranks = this.lodIdToRank;
-    for (let index = 0; index < count; index++) {
-      const key = ranks ? ranks[selected[index]] : selected[index], word = key >>> 5;
-      bits[word] |= 1 << (key & 31);
-      groups[word >>> 5] |= 1 << (word & 31);
+    return offset;
+  }
+
+  /** Add one key (canonical ID or stored-record rank) to the next selection. */
+  private markSelectedKey(key: number): void {
+    const word = key >>> 5;
+    this.selectedKeyBits[word] |= 1 << (key & 31);
+    this.selectedKeyWords[word >>> 5] |= 1 << (word & 31);
+  }
+
+  /**
+   * Sort the marked keys into paint order without scanning every paint, and
+   * clear the marks. `marked` bounds their number. Returns whether the
+   * selection changed.
+   */
+  private takeSelectedKeys(marked: number): boolean {
+    if (this.nextKeys.length < marked) {
+      this.nextKeys = new Uint32Array(Math.min(this.selectionCapacity, Math.max(marked, this.nextKeys.length * 2)));
     }
+    const next = this.nextKeys, bits = this.selectedKeyBits, groups = this.selectedKeyWords;
     // The upper bitset skips invisible ranges; the lower one visits only the
     // selected keys in paint order, including ties between LOD representatives.
     let out = 0;
@@ -433,8 +532,10 @@ export class ThreeVectorDrawRuns {
     mesh.userData.heprStaticBatch = true;
     mesh.renderOrder = vectorDrawRunRenderOrder(order, this.scene.drawRuns!.length);
     this.parent.add(mesh);
-    this.entries.push({ mesh, ranges, ids, idValues: ids.array as Float32Array,
-      clipCodes, clipValues: (clipCodes?.array as Float32Array | undefined) ?? null });
+    const entry = { mesh, ranges, ids, idValues: ids.array as Float32Array,
+      clipCodes, clipValues: (clipCodes?.array as Float32Array | undefined) ?? null };
+    this.entries.push(entry);
+    this.entryByMesh.set(mesh, entry);
     this.visibilityApplied = false;
     this.entriesCurrent = false;
     this.revision = ++revisions;
@@ -468,15 +569,25 @@ export class ThreeVectorDrawRuns {
       }
       redundancy.update(candidates, count);
     }
-    let modified = false, rendered = 0, considered = 0;
+    // Deferred batches keep counts and visibility; writeMixedInstances lists their IDs.
+    const deferred = this.instanceWritesDeferred && !text;
+    let modified = deferred, rendered = 0, considered = 0;
     for (const entry of this.entries) {
       let visible = 0;
       let changed = false;
       let clipsChanged = false;
       for (const range of entry.ranges) {
-        if (this.visibility.requiresCompositing
-          ? range.run.optionalContent !== undefined && this.snapshot.conditions[range.run.optionalContent] === 0
-          : !this.visibility.isRunVisible(range.run)) continue;
+        if (!text && range.selectionEnd === range.selectionFirst) continue;
+        if (!this.rangeVisible(range)) continue;
+        if (deferred) {
+          // Redundant strokes are dropped per ID; count them as the writer will.
+          const redundancy = this.strokeRedundancyEnabled ? this.strokeRedundancy : null;
+          if (!redundancy) visible += range.selectionEnd - range.selectionFirst;
+          else for (let item = range.selectionFirst; item < range.selectionEnd; item++) {
+            if (redundancy.isRetained(keys[item])) visible++;
+          }
+          continue;
+        }
         const clipCode = (range.run.clipIndex ?? -1) + 1;
         const stored = this.lodIdToRank !== null ? range.ids : undefined;
         let first = range.selectionFirst;
@@ -501,6 +612,7 @@ export class ThreeVectorDrawRuns {
           visible++;
         }
       }
+      if (deferred) considered += visible;
       const shown = this.enabled && visible > 0;
       if (changed || clipsChanged || entry.mesh.geometry.instanceCount !== visible || entry.mesh.visible !== shown) modified = true;
       entry.mesh.geometry.instanceCount = visible;
@@ -509,12 +621,20 @@ export class ThreeVectorDrawRuns {
       if (changed) markInstanceUpdate(entry.ids, visible);
       if (clipsChanged && entry.clipCodes) markInstanceUpdate(entry.clipCodes, visible);
     }
+    this.instanceIdsStale = deferred;
     this.renderedCount = rendered;
     this.visibilityApplied = true;
     this.entriesCurrent = true;
     if (modified) this.revision = ++revisions;
     profile?.add("three.batchCandidateInstances", considered);
     profile?.endSection("three.batchUpdate");
+  }
+
+  /** Whether optional content shows a paint range's instances. */
+  private rangeVisible(range: DrawRunRange): boolean {
+    return this.visibility.requiresCompositing
+      ? range.run.optionalContent === undefined || this.snapshot.conditions[range.run.optionalContent] !== 0
+      : this.visibility.isRunVisible(range.run);
   }
 
   setEnabled(enabled: boolean): void {
@@ -575,6 +695,7 @@ export class ThreeVectorDrawRuns {
       geometry.dispose();
     }
     this.entries = [];
+    this.entryByMesh.clear();
     this.visibilityApplied = false;
     this.revision = ++revisions;
   }

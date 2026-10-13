@@ -55,11 +55,12 @@ try {
       "both canonical clip/paint ranges survive simplification");
     const material = layer.layers[0];
     let selectionUpdates = 0;
-    const updateSelection = material.updateFrameWithVisibleSegmentIds.bind(material);
-    material.updateFrameWithVisibleSegmentIds = (...args) => { selectionUpdates++; return updateSelection(...args); };
+    const updateSelection = material.updateFrameWithStoredSelection.bind(material);
+    material.updateFrameWithStoredSelection = (...args) => { selectionUpdates++; return updateSelection(...args); };
+    material.updateFrameWithVisibleSegmentIds = () => assert.fail("ordered LOD selects stored records without an ID copy");
     const sourceVersion = material.segmentIndexAttribute.version;
     const entryVersions = material.mesh.children.map(mesh => mesh.geometry.getAttribute("aSegmentIndex").version);
-    const combined = layer.combinedIds, visible = material.visibleSegmentIds;
+    const visible = material.visibleSegmentIds;
     const runtimeIds = layer.runtime.levels.map(level => level.visibleSegmentIds);
     const noIdAccess = values => new Proxy(values, {
       get(target, key) {
@@ -68,7 +69,6 @@ try {
       },
       set(_target, key) { assert.fail(`cached frames must not repack selected primitive IDs (${String(key)})`); }
     });
-    layer.combinedIds = noIdAccess(combined);
     material.visibleSegmentIds = noIdAccess(visible);
     layer.runtime.levels.forEach((level, index) => { level.visibleSegmentIds = noIdAccess(runtimeIds[index]); });
     try {
@@ -106,7 +106,6 @@ try {
       frame(10);
       assert.deepEqual(drawn(), coarse, "hide/show restores cached selection without copying IDs");
     } finally {
-      layer.combinedIds = combined;
       material.visibleSegmentIds = visible;
       layer.runtime.levels.forEach((level, index) => { level.visibleSegmentIds = runtimeIds[index]; });
     }

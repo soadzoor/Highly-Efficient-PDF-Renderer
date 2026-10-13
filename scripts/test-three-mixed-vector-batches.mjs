@@ -13,6 +13,7 @@ try {
   const { ThreeMaterialFillLayer } = await import("../src/threeMaterialFillLayer.ts");
   const { ThreeMaterialStrokeLayer } = await import("../src/threeMaterialStrokeLayer.ts");
   const { ThreeMixedVectorLayer } = await import("../src/threeMixedVectorLayer.ts");
+  const { threeVectorDrawRunsOf } = await import("../src/threeVectorDrawRuns.ts");
   const { ThreeVectorDrawPlan } = await import("../src/threeVectorDrawPlan.ts");
   const { ThreeVectorLodStrokeLayer } = await import("../src/vectorStrokeLod.ts");
   const { ScenePageViews } = await import("../src/scenePageViews.ts");
@@ -154,6 +155,16 @@ try {
   assert.deepEqual(reusedData.updateRanges, [{ start: 0, count: 4095 * 4 }], "only instances in use upload");
   assert.deepEqual(records(entry.mixed)[0], [0, 0, 1], "changed selected IDs invalidate mixed data");
   assert.equal(records(entry.mixed).filter(record => record[2] === 0).length, 2047);
+  // Hidden whole, the ordinary batches skipped writing their own IDs; the mixed
+  // records above came straight from their selection. Releasing them writes it.
+  const strokeRuns = threeVectorDrawRunsOf(entry.stroke.mesh);
+  assert.equal(strokeRuns.deferredInstanceWrites, true, "fully mixed batches defer their own instance writes");
+  entry.mixed.restore(); entry.mixed.releaseDeferredWrites();
+  assert.equal(strokeRuns.deferredInstanceWrites, false);
+  const strokeIds = entry.stroke.mesh.children.filter(mesh => mesh.visible).flatMap(mesh =>
+    Array.from(mesh.geometry.getAttribute("aSegmentIndex").array.subarray(0, mesh.geometry.instanceCount)));
+  assert.deepEqual(strokeIds.sort((a, b) => a - b), Array.from(withoutFirst),
+    "released batches write the deferred selection before they can draw");
   entry.refresh();
   const foreign = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial());
   entry.fill.mesh.add(foreign); entry.mixed.update(entry.roots, host, camera);

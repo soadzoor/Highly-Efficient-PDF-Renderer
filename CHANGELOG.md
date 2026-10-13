@@ -22,9 +22,14 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   unchanged selections without per-record lookup tables, and the mixed layer
   rewrites its instance buffer in place. Large drawings keep the native
   renderer's 64-pixel culling margin for fills, so small pans reuse the
-  selection. Panning the same drawing zoomed in took about half the CPU time
-  per frame in a headless profile, with identical pixels; frames that change
-  the stroke LOD selection still cost more.
+  selection. As in the native renderer, ordered Vector LOD selects stored
+  records straight from its levels, and layers drawn entirely through the mixed
+  batch no longer write their own instance IDs; the mixed batch reads the
+  selection directly, and the IDs are written again before those layers can
+  draw. Panning the same drawing zoomed in now takes about the same CPU time
+  per frame as the native renderer (from 13.9 to 5.7 ms and from 20.6 to 9.8 ms
+  in a headless profile, at two pan speeds), with identical pixels. Frames that
+  change the stroke LOD selection still cost more in both renderers.
 
 ### Fixed
 

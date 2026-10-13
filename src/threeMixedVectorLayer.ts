@@ -13,7 +13,7 @@ import type { ThreeShaderCompileHost } from "./threeShaderPreparation";
 import { compileThreeMixedVectorRoots } from "./threeMixedVectorPreparation";
 import { getThreeRenderPerformance } from "./threeRenderPerformance";
 import type { ThreeWebGpuMixedVectorMaterialState } from "./threeWebGpuMixedVectorMaterial";
-import { threeVectorDrawRunsRevision } from "./threeVectorDrawRuns";
+import { threeVectorDrawRunsOf, threeVectorDrawRunsRevision, type ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
 
 interface MixedLayerOptions {
   fill: ThreeMaterialFillLayer;
@@ -42,6 +42,9 @@ interface SourceDraw {
   clipVersion: number;
   order: number;
   groupOrder: number;
+  /** The ordinary batches this mesh belongs to, and their revision when collected. */
+  owner?: ThreeVectorDrawRuns;
+  ownerRevision: number;
 }
 interface MixedEntry { mesh: DrawMesh; data: THREE.InstancedInterleavedBuffer; sources: SourceDraw[]; count: number; }
 /** The batches under one ordinary layer mesh, valid while its revision holds. */
@@ -78,6 +81,8 @@ export class ThreeMixedVectorLayer {
   private hiddenMeshes: DrawMesh[] = [];
   /** Batch-only layer meshes from the last collection and how many batches each draws. */
   private batchParentDraws = new Map<THREE.Object3D, number>();
+  /** Ordinary batches drawn only through this layer, which skip writing their own IDs. */
+  private deferredOwners = new Set<ThreeVectorDrawRuns>();
   private ready = false;
   private failed = false;
   private disposed = false;
@@ -119,8 +124,35 @@ export class ThreeMixedVectorLayer {
   }
 
   update(roots: readonly THREE.Object3D[], host: MixedHost, camera: THREE.Camera): void {
+    // Any frame that does not hide a layer through this one draws its own batches.
+    if (!this.applyUpdate(roots, host, camera)) this.releaseDeferredWrites();
+  }
+
+  /**
+   * Batches of a layer hidden whole by this one are never drawn themselves,
+   * so they may skip writing their instance IDs (see deferInstanceWrites).
+   * Any other layer writes them again before it can be drawn.
+   */
+  releaseDeferredWrites(): void {
+    for (const owner of this.deferredOwners) owner.deferInstanceWrites(false);
+    this.deferredOwners.clear();
+  }
+
+  private updateDeferredWrites(): void {
+    const owners = new Set<ThreeVectorDrawRuns>();
+    for (const parent of this.suppressedParents) {
+      const owner = threeVectorDrawRunsOf(parent);
+      if (owner) owners.add(owner);
+    }
+    for (const owner of this.deferredOwners) if (!owners.has(owner)) owner.deferInstanceWrites(false);
+    for (const owner of owners) owner.deferInstanceWrites(true);
+    this.deferredOwners = owners;
+  }
+
+  /** Returns whether this layer now draws in place of its sources. */
+  private applyUpdate(roots: readonly THREE.Object3D[], host: MixedHost, camera: THREE.Camera): boolean {
     this.restore();
-    if (this.failed || this.disposed) return;
+    if (this.failed || this.disposed) return false;
     const draws = this.collect(roots);
     if (draws !== this.groupedDraws) {
       this.groupedDraws = draws;
@@ -128,7 +160,7 @@ export class ThreeMixedVectorLayer {
       this.renderedStrokes = draws.reduce((count, draw) => count + (draw.sourceKind === 0 ? draw.count : 0), 0);
     }
     const groups = this.groups;
-    if (!groups.length) return;
+    if (!groups.length) return false;
     // Ordinary layers share one effective Group order. If custom nested groups
     // introduce more scopes, keep those other scopes on their ordinary meshes.
     const groupOrder = groups[0][0].groupOrder;
@@ -136,7 +168,7 @@ export class ThreeMixedVectorLayer {
     try {
       // Compilation holds borrowed geometry until its promise settles. Moving
       // the camera meanwhile continues to draw the ordinary selected meshes.
-      if (this.preparing && !this.ready) return;
+      if (this.preparing && !this.ready) return false;
       if (!this.material) this.createMaterial();
       if (!sameDraws(this.snapshot, draws)) {
         this.snapshot = draws;
@@ -148,14 +180,19 @@ export class ThreeMixedVectorLayer {
       this.syncMaterialState();
       this.syncUniforms();
       if (!this.ready) this.prepare(host, camera);
-      if (!this.ready) return;
+      if (!this.ready) return false;
       this.suppress();
+      this.updateDeferredWrites();
       this.active = true;
       this.group.visible = this.fillRenderingEnabled || this.strokeRenderingEnabled;
       const profile = getThreeRenderPerformance();
       profile?.add("three.mixedVectorBatches", this.entries.length);
       profile?.add("three.mixedVectorInstances", this.entries.reduce((count, entry) => count + entry.count, 0));
-    } catch (error) { this.fallback(error); }
+      return true;
+    } catch (error) {
+      this.fallback(error);
+      return false;
+    }
   }
 
   /**
@@ -170,7 +207,8 @@ export class ThreeMixedVectorLayer {
     const strokeRoot = this.options.stroke.mesh, fillRoot = this.options.fill.mesh;
     const parentDraws = this.batchParentDraws;
     parentDraws.clear();
-    const record = (mesh: DrawMesh, sourceKind: 0 | 1 | -1, groupOrder: number): void => {
+    const record = (mesh: DrawMesh, sourceKind: 0 | 1 | -1, groupOrder: number,
+      owner?: ThreeVectorDrawRuns, ownerRevision = -1): void => {
       const run = mesh.userData.heprDrawRun;
       const count = mesh.geometry instanceof THREE.InstancedBufferGeometry ? mesh.geometry.instanceCount : 1;
       if (count <= 0 || !run) return;
@@ -178,7 +216,8 @@ export class ThreeMixedVectorLayer {
       const clips = mesh.geometry.getAttribute("aVectorClipIndex");
       const kind = ids && run.blendMode === undefined && !Array.isArray(mesh.material) ? sourceKind : -1;
       draws.push({ mesh, kind, sourceKind, ids, clips, count, clipCode: (run.clipIndex ?? -1) + 1,
-        version: attributeVersion(ids), clipVersion: attributeVersion(clips), order: mesh.renderOrder, groupOrder });
+        version: attributeVersion(ids), clipVersion: attributeVersion(clips), order: mesh.renderOrder, groupOrder,
+        owner, ownerRevision });
     };
     const visit = (object: THREE.Object3D, sourceKind: 0 | 1 | -1, groupOrder: number): void => {
       if (!object.visible || object === this.group) return;
@@ -198,14 +237,14 @@ export class ThreeMixedVectorLayer {
         parentDraws.set(object, cached.draws.length);
         return;
       }
-      const first = draws.length;
+      const first = draws.length, owner = threeVectorDrawRunsOf(object);
       let batchesOnly = true;
       for (const child of object.children) {
         // Batches have no children or ordering scopes of their own.
         if (child.children.length > 0 || !child.userData.heprDrawRun || !(child as THREE.Mesh).isMesh) {
           batchesOnly = false;
           visit(child, sourceKind, groupOrder);
-        } else if (child.visible) record(child as DrawMesh, sourceKind, groupOrder);
+        } else if (child.visible) record(child as DrawMesh, sourceKind, groupOrder, owner, revision);
       }
       if (batchesOnly) {
         this.collectedBatches.set(object, { revision, sourceKind, groupOrder, childCount: object.children.length,
@@ -324,6 +363,11 @@ export class ThreeMixedVectorLayer {
     let offset = 0;
     for (const source of sources) {
       const pages = (source.kind === 0 ? strokePages : fillPages) as Float32Array | undefined;
+      if (source.owner?.deferredInstanceWrites) {
+        // The owner lists the batch straight from its selection; its own IDs are not written.
+        offset = source.owner.writeMixedInstances(source.mesh, values, offset, source.kind, pages);
+        continue;
+      }
       const ids = plainValues(source.ids!), clips = source.clips ? plainValues(source.clips) : null;
       for (let item = 0; item < source.count; item++) {
         const id = ids ? ids[item] : source.ids!.getX(item);
@@ -400,6 +444,7 @@ export class ThreeMixedVectorLayer {
 
   private fallback(error: unknown): void {
     this.restore();
+    this.releaseDeferredWrites();
     this.failed = true;
     this.preparationAbort.abort();
     this.disposeEntries();
@@ -417,6 +462,7 @@ export class ThreeMixedVectorLayer {
 
   dispose(): void {
     this.restore();
+    this.releaseDeferredWrites();
     this.disposed = true;
     this.preparationAbort.abort();
     this.snapshot = [];
@@ -480,6 +526,7 @@ function sameDraws(previous: SourceDraw[], next: SourceDraw[]): boolean {
   return previous.length === next.length && previous.every((draw, index) => {
     const other = next[index];
     return draw.mesh === other.mesh && draw.ids === other.ids && draw.clips === other.clips &&
+      draw.owner === other.owner && draw.ownerRevision === other.ownerRevision &&
       draw.kind === other.kind && draw.count === other.count && draw.version === other.version &&
       draw.clipVersion === other.clipVersion && draw.clipCode === other.clipCode && draw.order === other.order &&
       draw.groupOrder === other.groupOrder;

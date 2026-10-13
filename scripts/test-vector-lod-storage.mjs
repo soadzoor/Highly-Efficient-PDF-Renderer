@@ -179,7 +179,8 @@ try {
     checkSplitMaterial(material, storage.textures);
     assert.equal(material.grid, null);
     assert.equal(material.segmentMarks.length, 0, "externally culled LOD does not duplicate unused spatial scratch");
-    assert.equal(layer.combinedIds.length, 0, "Three LOD reserves selection IDs on demand");
+    assert.equal(layer.storedSelection, true, "ordered Three LOD selects stored records without an intermediate ID list");
+    assert.equal("combinedIds" in layer, false);
     // One recolored stroke in each texture set: canonical row 0, and the first
     // canonical stroke of the partial row that lives in the tail.
     const headColors = head.styles.data.slice(), tailColors = tail.styles.data.slice();

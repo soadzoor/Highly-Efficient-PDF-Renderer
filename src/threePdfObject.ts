@@ -3955,10 +3955,17 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   }
 
   private updateMixedVectorLayer(renderer: ThreeHostRenderer, camera: THREE.Camera, active: boolean): void {
-    if (!active || !this.mixedVectorBatchingEnabled || !this.sceneData.drawRuns) return;
+    // Ordinary batches drawn this frame need their own instance IDs again.
+    if (!active || !this.mixedVectorBatchingEnabled || !this.sceneData.drawRuns) {
+      this.mixedVectorLayer?.releaseDeferredWrites();
+      return;
+    }
     const stroke = this.vectorLodStrokeLayer?.group.visible
       ? this.vectorLodStrokeLayer.getMixedVectorStrokeLayer() : this.strokeMaterialLayer;
-    if (!stroke || !stroke.mesh.visible || !this.fillMaterialLayer.mesh.visible) return;
+    if (!stroke || !stroke.mesh.visible || !this.fillMaterialLayer.mesh.visible) {
+      this.mixedVectorLayer?.releaseDeferredWrites();
+      return;
+    }
     if (!this.mixedVectorLayer) {
       this.mixedVectorLayer = new ThreeMixedVectorLayer({ fill: this.fillMaterialLayer, stroke,
         materialBackend: this.rendererType === "webgpu" ? "webgpu" : "webgl", webGpu: this.webGpu,

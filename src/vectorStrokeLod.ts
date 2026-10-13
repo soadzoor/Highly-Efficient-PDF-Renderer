@@ -56,10 +56,9 @@ export class ThreeVectorLodStrokeLayer {
   private requestedVisible = false;
   private selectionInitialized = false;
   private disposed = false;
-  private combinedIds: Uint32Array | null;
+  /** One ordered layer selects stored records from every level directly. */
+  private storedSelection: boolean;
   private layout: VectorStrokeLodStorageLayout | null = null;
-  /** One bit per stored stroke: levels that share a stroke submit it once. */
-  private selectedStorageBits: Uint32Array | null = null;
 
   constructor(
     scene: VectorScene,
@@ -71,24 +70,23 @@ export class ThreeVectorLodStrokeLayer {
     this.group.name = "hepr-vector-lod-strokes";
     this.group.visible = false;
     this.layers = [];
-    this.combinedIds = null;
+    this.storedSelection = false;
     this.runtime = preparedRuntime?.take(scene) ?? takePrebuiltVectorStrokeLodRuntime(scene) ?? new VectorStrokeLodRuntime(scene);
     try {
       if (scene.drawRuns) {
         const { layout, records, textures } = getSplitVectorStrokeLodStorage(scene, this.runtime.levels);
         const origins = vectorStrokeLodStorageOrigins(layout)!;
         this.layout = layout;
-        this.selectedStorageBits = new Uint32Array(Math.ceil(layout.count / 32));
         const drawPlan = options.drawPlan ?? getThreeVectorDrawPlan(scene);
         drawPlan.setStrokeSource(records, origins);
         const layer = new ThreeMaterialStrokeLayer(scene, { ...options, drawPlan, canonicalScene: scene,
           strokeOrigins: origins, strokeRecords: records, strokeTextures: textures });
         this.layers.push(layer);
-        this.combinedIds = new Uint32Array(0);
+        this.storedSelection = true;
         layer.setVisible(false); layer.setDrawEnabled(false);
         this.group.add(layer.mesh);
       } else {
-        this.combinedIds = null;
+        this.storedSelection = false;
         for (const level of this.runtime.levels) {
           const layer = new ThreeMaterialStrokeLayer(vectorStrokeLodLevelUploadScene(level), options);
           this.layers.push(layer);
@@ -193,7 +191,7 @@ export class ThreeVectorLodStrokeLayer {
     if (!this.group.visible) {
       return 0;
     }
-    return this.combinedIds ? this.layers[0].getRenderedSegmentCount() : this.runtime.getRenderedSegmentCount();
+    return this.storedSelection ? this.layers[0].getRenderedSegmentCount() : this.runtime.getRenderedSegmentCount();
   }
 
   getStats(): VectorStrokeLodStats {
@@ -224,29 +222,12 @@ export class ThreeVectorLodStrokeLayer {
 
   private updateLevelDraws(viewState: ViewState, viewport: ViewportPixels): void {
     const visible = this.requestedVisible && this.group.visible;
-    if (this.combinedIds) {
-      const selectedCount = visible
-        ? this.runtime.levels.reduce((sum, level) => sum + level.visibleSegmentCount, 0) : 0;
-      if (this.combinedIds.length < selectedCount) {
-        this.combinedIds = new Uint32Array(Math.max(selectedCount, this.combinedIds.length * 2, 256));
-      }
-      let count = 0;
-      const layout = this.layout!, selected = this.selectedStorageBits!;
-      this.runtime.levels.forEach((level, index) => {
-        if (!visible) return;
-        const records = layout.records[index], base = layout.bases[index];
-        for (let item = 0; item < level.visibleSegmentCount; item++) {
-          const local = level.visibleSegmentIds[item];
-          const id = records ? records[local] : base + local;
-          const word = id >>> 5, bit = 1 << (id & 31);
-          if ((selected[word] & bit) !== 0) continue;
-          selected[word] |= bit;
-          this.combinedIds![count++] = id;
-        }
-      });
-      for (let item = 0; item < count; item++) selected[this.combinedIds[item] >>> 5] = 0;
-      this.layers[0].updateFrameWithVisibleSegmentIds(viewState, viewport, this.combinedIds, count);
-      this.layers[0].setVisible(visible); this.layers[0].setDrawEnabled(count > 0);
+    if (this.storedSelection) {
+      // Ranks deduplicate records that several levels share.
+      const layout = this.layout!, layer = this.layers[0];
+      const count = layer.updateFrameWithStoredSelection(viewState, viewport,
+        { levels: visible ? this.runtime.levels : [], records: layout.records, bases: layout.bases }) ?? 0;
+      layer.setVisible(visible); layer.setDrawEnabled(count > 0);
       return;
     }
     for (let i = 0; i < this.layers.length; i += 1) {
@@ -266,7 +247,7 @@ export class ThreeVectorLodStrokeLayer {
       const layer = this.layers[i];
       const level = this.runtime.levels[i];
       layer.setVisible(visible);
-      layer.setDrawEnabled(visible && (this.combinedIds ? this.runtime.getRenderedSegmentCount() > 0 : level.visibleSegmentCount > 0));
+      layer.setDrawEnabled(visible && (this.storedSelection ? this.runtime.getRenderedSegmentCount() > 0 : level.visibleSegmentCount > 0));
     }
   }
 }
