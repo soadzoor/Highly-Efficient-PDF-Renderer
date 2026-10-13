@@ -13,7 +13,9 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   Large image and geometry buffers still transfer without copying; scene values,
   shared resource identities and cancellation behavior are preserved.
 - Avoid repeated spot-color, palette and ICC conversions for identical image
-  samples, preserving the existing color arithmetic and transparency. Keep
+  samples, preserving the existing color arithmetic and transparency. Convert
+  8-bit three- and four-component calibrated or ICC images without a color-key
+  mask through a small per-image color memo and specialized pixel loops. Keep
   unpacked 1-, 2- and 4-bit samples in byte storage instead of widening to 16 bits.
   Store proven uniform opaque black or white images as exact packed bits while
   preserving their dimensions, masks and original color metadata.
@@ -33,6 +35,15 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   Index Type3 glyph transforms once and release temporary compiler clips sooner.
   Compact grids use HEP scene v14 and require an updated reader; existing HEP
   scene formats remain readable and ordinary exports keep their previous format.
+- Open and convert PDFs that paint many page-sized images under small vector
+  clips, such as flattened labels, without decoding, encoding and uploading
+  every whole image. Vector-clipped images keep only the source texels their
+  clip bounds can reach, on an aligned grid with padding that preserves sampling,
+  mip filtering and clip antialiasing; single-color images under a vector clip
+  draw as one solid texel. Images also painted unclipped keep sharing their whole
+  texture, and overlapping crops never store more texels than the source image.
+  Reconstruct PNG-predicted streams with one loop per predictor algorithm, about
+  three times faster with identical output.
 - Report lost WebGL contexts and unavailable GPU limits directly instead of
   misidentifying them as invalid HEP vector clip capacity.
 - Prevent subpixel gaps in opaque tiled PDF images from flashing as white
@@ -40,6 +51,8 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   shared tile boundaries, preserving source pixels, nearest sampling, paint
   order and visible gaps at high zoom while reusing existing image textures.
   Apply the same treatment when image batching falls back to individual draws.
+  Preserve original sampling when minified pixels reach farther tiles, and skip
+  opacity scans for unrelated images.
 
 ## [0.1.61] - 2026-10-12
 

@@ -113,6 +113,23 @@ try {
     assert.deepEqual(source, snapshot);
   }
 
+  // More distinct colors than the conversion memo has slots: collisions and
+  // repeats must reproduce the per-pixel scalar conversion exactly.
+  for (const components of [3, 4]) {
+    const width = 4099, height = 3;
+    const values = Uint8Array.from({ length: width * height * components }, (_, i) =>
+      (Math.imul((Math.floor(i / components) * 7) % 5000 + 1, 2654435761) >>> (8 * (i % components))) & 255);
+    const decode = Array.from({ length: components }, (_, i) => i % 2 ? [-.2, 1.2] : [1, 0]).flat();
+    const result = images.describe(await images.add(image(width, height, 8, icc(components), values, { Decode: decode })));
+    const expected = new Uint8Array(width * height * 4);
+    for (let pixel = 0; pixel < width * height; pixel++) {
+      const raw = Array.from(values.subarray(pixel * components, (pixel + 1) * components));
+      const rgb = scalar(result.colorSpaceIndex, raw.map((v, c) => decode[c * 2] + v / 255 * (decode[c * 2 + 1] - decode[c * 2])));
+      expected.set([...rgb.map(v => Math.round(v * 255)), 255], pixel * 4);
+    }
+    assert.deepEqual(result.data, expected, `${components}-component ICC memo collisions keep scalar colors`);
+  }
+
   for (const space of [name("DeviceRGB"), icc(3)]) for (const value of [0, 255]) {
     const width = 257, height = 3, source = new Uint8Array(width * height * 3).fill(value);
     const result = images.describe(await images.add(image(width, height, 8, space, source)));

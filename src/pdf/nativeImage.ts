@@ -1502,6 +1502,13 @@ function convertSamplesToSrgb(
     if (uniform >= 0) return { data: packUniformBlackWhite(width, height, uniform, signal), format: HEPR_IMAGE_FORMAT.Gray1 };
     return { data: output, format: HEPR_IMAGE_FORMAT.Rgba8 };
   }
+  if (bitsPerComponent === 8 && colorKeyMask.length === 0 && (componentCount === 3 || componentCount === 4) &&
+      width * height >= 256) {
+    const uniform = convertPackedSamples8ToSrgb(samples, output, componentCount, decode, colorSpaceIndex, colors,
+      allowGrayOutput, signal);
+    if (uniform >= 0) return { data: packUniformBlackWhite(width, height, uniform, signal), format: HEPR_IMAGE_FORMAT.Gray1 };
+    return { data: output, format: HEPR_IMAGE_FORMAT.Rgba8 };
+  }
   const view = sixteenBit ? new DataView(output.buffer) : null;
   const components = new Array<number>(componentCount);
   const previous = new Array<number>(componentCount).fill(-1);
@@ -1550,6 +1557,90 @@ function convertSamplesToSrgb(
     data: uniform >= 0 ? packUniformBlackWhite(width, height, uniform, signal) : output,
     format: uniform >= 0 ? HEPR_IMAGE_FORMAT.Gray1 : sixteenBit ? HEPR_IMAGE_FORMAT.Rgba16 : HEPR_IMAGE_FORMAT.Rgba8
   };
+}
+
+const PACKED_COLOR_CACHE_BITS = 12;
+
+/**
+ * Three- or four-component 8-bit pixels without a color-key Mask, converted
+ * with the general loop's Decode interpolation, conversion call and rounding.
+ * Page-sized calibrated or ICC planes repeat few colors: each pixel compares
+ * one packed key, and a small direct-mapped memo converts every distinct color
+ * once instead of per run. Returns the uniform black/white value or -1.
+ */
+function convertPackedSamples8ToSrgb(
+  samples: ImageSamples,
+  output: Uint8Array,
+  componentCount: 3 | 4,
+  decode: readonly number[],
+  colorSpaceIndex: number,
+  colors: NativePdfColorRegistry,
+  detectUniform: boolean,
+  signal?: AbortSignal
+): number {
+  const decoded = new Float64Array(componentCount * 256);
+  for (let component = 0; component < componentCount; component += 1) {
+    for (let sample = 0; sample < 256; sample += 1) {
+      decoded[component * 256 + sample] = interpolate(
+        sample / 255, 0, 1, decode[component * 2], decode[component * 2 + 1]
+      );
+    }
+  }
+  const memoKeys = new Float64Array(1 << PACKED_COLOR_CACHE_BITS).fill(-1);
+  const memoColors = new Int32Array(1 << PACKED_COLOR_CACHE_BITS);
+  const components = new Array<number>(componentCount);
+  // Packed sRGB bytes for a color change; only these leave the pixel loops.
+  const resolve = (pixels: ImageSamples, sample: number, key: number): number => {
+    const slot = Math.imul(key, 0x9e3779b1) >>> (32 - PACKED_COLOR_CACHE_BITS);
+    if (memoKeys[slot] === key) return memoColors[slot];
+    for (let component = 0; component < componentCount; component += 1) {
+      components[component] = decoded[component * 256 + pixels[sample + component]];
+    }
+    const rgb = colors.convertToSrgb(colorSpaceIndex, components, signal);
+    // `& 0xff` is the Uint8Array store conversion the general loop relies on.
+    const packed = (Math.round(rgb[0] * 255) & 0xff) | ((Math.round(rgb[1] * 255) & 0xff) << 8) |
+      ((Math.round(rgb[2] * 255) & 0xff) << 16);
+    memoKeys[slot] = key;
+    memoColors[slot] = packed;
+    return packed;
+  };
+  const pixelCount = output.length >> 2;
+  let previous = -1, red = 0, green = 0, blue = 0;
+  let uniform = detectUniform ? -2 : -1;
+  // One loop per layout keeps the per-pixel path free of layout branches.
+  if (componentCount === 3) {
+    for (let pixel = 0, sample = 0, offset = 0; pixel < pixelCount; pixel += 1, sample += 3, offset += 4) {
+      if ((pixel & 0xfff) === 0) throwIfAborted(signal);
+      const key = (samples[sample] << 16) | (samples[sample + 1] << 8) | samples[sample + 2];
+      if (key !== previous) {
+        previous = key;
+        const packed = resolve(samples, sample, key);
+        red = packed & 0xff; green = (packed >> 8) & 0xff; blue = packed >> 16;
+        if (uniform !== -1) uniform = uniformBlackWhiteSample(uniform, red, green, blue, 255);
+      }
+      output[offset] = red;
+      output[offset + 1] = green;
+      output[offset + 2] = blue;
+      output[offset + 3] = 255;
+    }
+  } else {
+    for (let pixel = 0, sample = 0, offset = 0; pixel < pixelCount; pixel += 1, sample += 4, offset += 4) {
+      if ((pixel & 0xfff) === 0) throwIfAborted(signal);
+      const key = ((samples[sample] << 24) | (samples[sample + 1] << 16) |
+        (samples[sample + 2] << 8) | samples[sample + 3]) >>> 0;
+      if (key !== previous) {
+        previous = key;
+        const packed = resolve(samples, sample, key);
+        red = packed & 0xff; green = (packed >> 8) & 0xff; blue = packed >> 16;
+        if (uniform !== -1) uniform = uniformBlackWhiteSample(uniform, red, green, blue, 255);
+      }
+      output[offset] = red;
+      output[offset + 1] = green;
+      output[offset + 2] = blue;
+      output[offset + 3] = 255;
+    }
+  }
+  return uniform;
 }
 
 /**

@@ -5,7 +5,7 @@ import { RASTER_TILE_SEAM_GLSL, RASTER_TILE_SEAM_VERTEX_GLSL } from "./rasterTil
 // Leave two fragment samplers for geometric clips and a folded soft mask.
 export const RASTER_BATCH_TEXTURES = 14;
 export const RASTER_BATCH_INSTANCES = 512;
-export const RASTER_BATCH_INSTANCE_FLOATS = 24;
+export const RASTER_BATCH_INSTANCE_FLOATS = 28;
 
 // Clip roots travel with the image, so different clips do not split a draw.
 const INSTANCE_CLIP_GLSL = RASTER_CLIP_GLSL.replace("uniform float uVectorClipIndex;", "")
@@ -20,6 +20,7 @@ layout(location = 2) in vec3 aTextureSlotUvMargin;
 layout(location = 3) in vec4 aRasterUvBounds;
 layout(location = 4) in vec4 aRasterSeamBounds;
 layout(location = 5) in vec4 aRasterSeamGaps;
+layout(location = 6) in vec2 aRasterSeamMaxFootprint;
 uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
 uniform float uZoom;
@@ -32,6 +33,7 @@ flat out float vRasterClip;
 flat out float vTextureSlot;
 flat out vec4 vRasterSeamOriginalBounds;
 flat out vec4 vRasterSeamGaps;
+flat out vec2 vRasterSeamMaxFootprint;
 
 ${RASTER_CLIP_UV_BOUNDS_GLSL}
 ${RASTER_TILE_SEAM_VERTEX_GLSL}
@@ -41,6 +43,7 @@ void main() {
   vOpacity = aRasterEFOpacityClip.z;
   vRasterClip = aRasterEFOpacityClip.w; vTextureSlot = aTextureSlotUvMargin.x;
   vRasterSeamGaps = aRasterSeamGaps;
+  vRasterSeamMaxFootprint = aRasterSeamMaxFootprint;
   vRasterSeamOriginalBounds = heprRasterOriginalBounds(aRasterMatrixABCD, aRasterEFOpacityClip.xy);
   if (uUseLocalToClip < 0.5) {
     vec4 bounds = heprRasterClipUvBounds(aRasterUvBounds, aTextureSlotUvMargin.yz,
@@ -95,6 +98,7 @@ flat in float vRasterClip;
 flat in float vTextureSlot;
 flat in vec4 vRasterSeamOriginalBounds;
 flat in vec4 vRasterSeamGaps;
+flat in vec2 vRasterSeamMaxFootprint;
 out vec4 outColor;
 
 ${INSTANCE_CLIP_GLSL}
@@ -142,7 +146,7 @@ void main() {
   vec4 color = heprRasterBatchSample(vTextureSlot, vUv, dx, dy);
   color *= mix(vOpacity, 1.0, uPdfShapeOnly);
   if (any(greaterThan(vRasterSeamGaps, vec4(0.0)))) {
-    color *= heprRasterTileSeamCoverage(vWorld, seamFootprint, vRasterSeamOriginalBounds, vRasterSeamGaps);
+    color *= heprRasterTileSeamCoverage(vWorld, seamFootprint, vRasterSeamOriginalBounds, vRasterSeamGaps, vRasterSeamMaxFootprint);
   }
   if (color.a <= 0.001) discard;
   outColor = color * heprVectorClipAA(vWorld, clipAAWidth);

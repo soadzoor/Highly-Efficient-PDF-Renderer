@@ -905,18 +905,21 @@ function decodePngPredictor(
     if (filter > 4) throw new PdfError("invalid-object", "Invalid PNG predictor filter byte.");
     const rowOffset = row * rowBytes;
     const availableColumns = Math.min(rowBytes, input.length - inputOffset);
-    for (let column = 0; column < availableColumns; column += 1) {
-      if ((column & 0x3fff) === 0) throwIfAborted(signal);
-      const encoded = input[inputOffset++];
-      const left = column >= bytesPerPixel ? output[rowOffset + column - bytesPerPixel] : 0;
-      const up = row > 0 ? output[rowOffset - rowBytes + column] : 0;
-      const upLeft = row > 0 && column >= bytesPerPixel
-        ? output[rowOffset - rowBytes + column - bytesPerPixel]
-        : 0;
-      const prediction = filter === 0 ? 0 : filter === 1 ? left : filter === 2 ? up
-        : filter === 3 ? Math.floor((left + up) / 2) : paeth(left, up, upLeft);
-      output[rowOffset + column] = (encoded + prediction) & 0xff;
+    for (let start = 0; start < availableColumns; start += PNG_PREDICTOR_ABORT_COLUMNS) {
+      if (start > 0) throwIfAborted(signal);
+      decodePngPredictorColumns(
+        input,
+        inputOffset - rowOffset,
+        output,
+        rowOffset,
+        row > 0 ? rowOffset - rowBytes : -1,
+        filter,
+        bytesPerPixel,
+        start,
+        Math.min(availableColumns, start + PNG_PREDICTOR_ABORT_COLUMNS)
+      );
     }
+    inputOffset += availableColumns;
   }
   if (finalRowBytes > 1) {
     onDiagnostic?.(Object.freeze({
@@ -927,6 +930,80 @@ function decodePngPredictor(
     }));
   }
   return output;
+}
+
+const PNG_PREDICTOR_ABORT_COLUMNS = 0x4000;
+
+/**
+ * Reconstruct output bytes `start..end` of one PNG-predicted row. Each
+ * algorithm runs its own loop: these rows can span whole page-sized images,
+ * and per-byte dispatch dominated their decoding. `inputDelta` maps an output
+ * index to its encoded byte; `previous` is -1 for the implicit zero row.
+ */
+function decodePngPredictorColumns(
+  input: Uint8Array,
+  inputDelta: number,
+  output: Uint8Array,
+  rowOffset: number,
+  previous: number,
+  filter: number,
+  bytesPerPixel: number,
+  start: number,
+  end: number
+): void {
+  const first = rowOffset + start, last = rowOffset + end;
+  // Bytes before the first whole pixel have no left or upper-left neighbor.
+  const leftStart = Math.min(last, Math.max(first, rowOffset + bytesPerPixel));
+  const upDelta = previous - rowOffset;
+  if (filter === 0 || (filter === 2 && previous < 0)) {
+    output.set(input.subarray(first + inputDelta, last + inputDelta), first);
+  } else if (filter === 1) {
+    for (let index = first; index < leftStart; index += 1) output[index] = input[index + inputDelta];
+    for (let index = leftStart; index < last; index += 1) {
+      output[index] = (input[index + inputDelta] + output[index - bytesPerPixel]) & 0xff;
+    }
+  } else if (filter === 2) {
+    for (let index = first; index < last; index += 1) {
+      output[index] = (input[index + inputDelta] + output[index + upDelta]) & 0xff;
+    }
+  } else if (filter === 3) {
+    if (previous < 0) {
+      for (let index = first; index < leftStart; index += 1) output[index] = input[index + inputDelta];
+      for (let index = leftStart; index < last; index += 1) {
+        output[index] = (input[index + inputDelta] + (output[index - bytesPerPixel] >> 1)) & 0xff;
+      }
+    } else {
+      for (let index = first; index < leftStart; index += 1) {
+        output[index] = (input[index + inputDelta] + (output[index + upDelta] >> 1)) & 0xff;
+      }
+      for (let index = leftStart; index < last; index += 1) {
+        output[index] = (input[index + inputDelta] +
+          ((output[index - bytesPerPixel] + output[index + upDelta]) >> 1)) & 0xff;
+      }
+    }
+  } else if (previous < 0) {
+    // Paeth over the zero row predicts from the left byte alone.
+    for (let index = first; index < leftStart; index += 1) output[index] = input[index + inputDelta];
+    for (let index = leftStart; index < last; index += 1) {
+      output[index] = (input[index + inputDelta] + output[index - bytesPerPixel]) & 0xff;
+    }
+  } else {
+    // Without left neighbors, Paeth(0, up, 0) selects up.
+    for (let index = first; index < leftStart; index += 1) {
+      output[index] = (input[index + inputDelta] + output[index + upDelta]) & 0xff;
+    }
+    for (let index = leftStart; index < last; index += 1) {
+      const left = output[index - bytesPerPixel];
+      const up = output[index + upDelta];
+      const upLeft = output[index + upDelta - bytesPerPixel];
+      const leftDistance = Math.abs(up - upLeft);
+      const upDistance = Math.abs(left - upLeft);
+      const diagonalDistance = Math.abs(left + up - 2 * upLeft);
+      const prediction = leftDistance <= upDistance && leftDistance <= diagonalDistance ? left
+        : upDistance <= diagonalDistance ? up : upLeft;
+      output[index] = (input[index + inputDelta] + prediction) & 0xff;
+    }
+  }
 }
 
 function integerEntry(dictionary: PdfDictionary | null, key: string, fallback: number): number {
@@ -1148,15 +1225,6 @@ function writePackedSample(
     const sourceMask = 1 << (bits - bit - 1);
     bytes[byteOffset] = value & sourceMask ? bytes[byteOffset] | mask : bytes[byteOffset] & ~mask;
   }
-}
-
-function paeth(left: number, up: number, upLeft: number): number {
-  const estimate = left + up - upLeft;
-  const leftDistance = Math.abs(estimate - left);
-  const upDistance = Math.abs(estimate - up);
-  const diagonalDistance = Math.abs(estimate - upLeft);
-  return leftDistance <= upDistance && leftDistance <= diagonalDistance ? left
-    : upDistance <= diagonalDistance ? up : upLeft;
 }
 
 function isWhitespace(byte: number): boolean {

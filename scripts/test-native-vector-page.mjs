@@ -570,6 +570,11 @@ try {
     transfer: [repeatedScene.gradientMetaA.buffer]
   }));
 
+  await testVectorClippedImageCrops(buildNativeVectorPage, input, {
+    DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH,
+    DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE,
+    DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT
+  });
   await testCompiledAggregateBounds(buildNativeVectorPage, compileVectorFormContent);
   benchmarkPackedBoundsAdaptation(buildNativeVectorPage);
 
@@ -585,6 +590,139 @@ function setPixel(data, width, x, y, rgba) {
 function readPixel(layer, x, y) {
   const offset = (y * layer.width + x) * 4;
   return [...layer.data.subarray(offset, offset + 4)];
+}
+
+async function testVectorClippedImageCrops(buildNativeVectorPage, input, events) {
+  const { HEPR_IMAGE_FORMAT } = await import("../src/heprDocumentData.ts");
+  const width = 256, height = 128;
+  const pixels = new Uint8Array(width * height * 4);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) setPixel(pixels, width, x, y, [x, y, (x * 7 + y) & 255, 255]);
+  }
+  const clipPath = (minX, minY, maxX, maxY) => ({
+    parent: null,
+    fillRule: 0,
+    path: {
+      data: Float32Array.of(0, minX, minY, 1, maxX, minY, 1, maxX, maxY, 1, minX, maxY, 4),
+      transform: [1, 0, 0, 1, 0, 0],
+      bounds: { minX, minY, maxX, maxY }
+    }
+  });
+  const sceneFor = ({ images = [{ width, height, data: pixels }], paints }) => {
+    const base = input.compiled.vectorSceneData;
+    return buildNativeVectorPage({
+      ...input,
+      pageInfo: { sourcePageIndex: 0, width: 300, height: 200 },
+      pageBounds: { minX: 0, minY: 0, maxX: 300, maxY: 200 },
+      imageRegistry: {
+        size: images.length,
+        describe: (index) => ({
+          ...input.imageRegistry.describe(0),
+          format: HEPR_IMAGE_FORMAT.Rgba8,
+          interpolate: false,
+          ...images[index]
+        })
+      },
+      compiled: {
+        ...input.compiled,
+        vectorSceneData: {
+          ...base,
+          sourceEvents: Uint32Array.from([
+            ...paints.flatMap((_paint, index) => [events.DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE, index]),
+            events.DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT, 0,
+            events.DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH, 0,
+            events.DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH, 1
+          ]),
+          sourceClips: [...paints.map(paint => paint.clip ? clipPath(...paint.clip) : null), null, null, null],
+          imageIndices: Uint32Array.from(paints, paint => paint.image ?? 0),
+          imageTransforms: Float32Array.from(paints.flatMap(paint => paint.transform ?? [width, 0, 0, height, 0, 0])),
+          imageClipBounds: Float32Array.from(paints.flatMap(paint => paint.clip ?? [0, 0, 300, 200])),
+          imagePaintOrders: Uint32Array.from(paints, (_paint, index) => index + 1),
+          imageFlags: Uint8Array.from(paints, paint => paint.clip ? 1 : 0)
+        }
+      }
+    });
+  };
+  // Every crop texel must keep its source value and its page placement.
+  const assertSourceTexels = (layer, transform, label) => {
+    const whole = [transform[0], transform[1], -transform[2], -transform[3],
+      transform[2] + transform[4], transform[3] + transform[5]];
+    const m = layer.matrix;
+    for (const [x, y] of [[0, 0], [layer.width - 1, 0], [0, layer.height - 1], [layer.width >> 1, layer.height >> 1]]) {
+      const u = (x + 0.5) / layer.width, v = (y + 0.5) / layer.height;
+      const pageX = m[0] * u + m[2] * v + m[4], pageY = m[1] * u + m[3] * v + m[5];
+      const determinant = whole[0] * whole[3] - whole[1] * whole[2];
+      const dx = pageX - whole[4], dy = pageY - whole[5];
+      const sourceX = (whole[3] * dx - whole[2] * dy) / determinant * width - 0.5;
+      const sourceY = (whole[0] * dy - whole[1] * dx) / determinant * height - 0.5;
+      assert.ok(Math.abs(sourceX - Math.round(sourceX)) < 1e-3 && Math.abs(sourceY - Math.round(sourceY)) < 1e-3,
+        `${label}: texel ${x},${y} keeps the source sampling grid`);
+      assert.deepEqual(readPixel(layer, x, y), [...pixels.subarray(
+        (Math.round(sourceY) * width + Math.round(sourceX)) * 4,
+        (Math.round(sourceY) * width + Math.round(sourceX)) * 4 + 4
+      )], `${label}: texel ${x},${y} keeps its source value`);
+    }
+  };
+
+  const cropped = sceneFor({ paints: [{ clip: [100, 50, 110, 60] }] }).rasterLayers[0];
+  assert.equal(cropped.width, 48, "the crop keeps aligned padding around the clip bounds");
+  assert.equal(cropped.height, 48);
+  assert.deepEqual([...cropped.matrix], [48, 0, 0, -48, 80, 80], "cropped texels keep their page placement");
+  assertSourceTexels(cropped, [width, 0, 0, height, 0, 0], "axis-aligned");
+
+  const rotatedTransform = [0, 128, -256, 0, 280, 10];
+  const rotated = sceneFor({ paints: [{ transform: rotatedTransform, clip: [150, 60, 160, 64] }] }).rasterLayers[0];
+  assert.ok(rotated.width * rotated.height < width * height / 8, "a rotated placement also crops");
+  assertSourceTexels(rotated, rotatedTransform, "rotated");
+
+  const shared = sceneFor({ paints: [{}, { clip: [100, 50, 110, 60] }] }).rasterLayers;
+  assert.equal(shared[1].width, width, "an image also painted whole keeps sharing its decoded plane");
+  assert.strictEqual(shared[1].data, shared[0].data);
+
+  const overlapping = sceneFor({ paints: [{ clip: [0, 28, 150, 128] }, { clip: [100, 28, 200, 128] }] }).rasterLayers;
+  assert.equal(overlapping[0].width, 224, "crops larger than the image together collapse to their union");
+  assert.equal(overlapping[0].height, 128);
+  assert.strictEqual(overlapping[0].data, overlapping[1].data, "a union crop is shared");
+
+  const solid = new Uint8Array(64 * 32 * 4);
+  for (let offset = 0; offset < solid.length; offset += 4) solid.set([12, 34, 56, 200], offset);
+  const [solidLayer, unclippedSolid] = sceneFor({
+    images: [{ width: 64, height: 32, data: solid }],
+    paints: [{ clip: [-1, -1, 300, 200] }, {}]
+  }).rasterLayers;
+  assert.equal(solidLayer.width, 1, "a single-color image under a vector clip becomes one texel");
+  assert.equal(solidLayer.height, 1);
+  assert.deepEqual([...solidLayer.data], [12, 34, 56, 200]);
+  assert.deepEqual([...solidLayer.matrix], [256, 0, 0, -128, 0, 128], "the solid quad keeps the image placement");
+  assert.strictEqual(unclippedSolid.data, solid, "an unclipped image keeps its texel pitch for tile seams");
+  assert.equal(unclippedSolid.width, 64);
+
+  const blank = new Uint8Array(width * height * 4);
+  for (let offset = 0; offset < blank.length; offset += 4) blank[offset + 3] = 255;
+  setPixel(blank, width, 250, 2, [255, 255, 255, 255]);
+  const solidCrop = sceneFor({ images: [{ width, height, data: blank }], paints: [{ clip: [100, 50, 110, 60] }] })
+    .rasterLayers[0];
+  assert.deepEqual([solidCrop.width, solidCrop.height, ...solidCrop.data], [1, 1, 0, 0, 0, 255],
+    "a crop that only reaches one color becomes one texel");
+  assert.deepEqual([...solidCrop.matrix], [48, 0, 0, -48, 80, 80], "the solid crop keeps the crop placement");
+
+  const packedWidth = 13, packedRowBytes = 2;
+  const packed = new Uint8Array(packedRowBytes * 4);
+  for (let row = 0; row < 4; row += 1) packed[row * packedRowBytes + 1] = 0b0000_0101;
+  const packedLayer = sceneFor({
+    images: [{ width: packedWidth, height: 4, format: HEPR_IMAGE_FORMAT.Gray1, data: packed }],
+    paints: [{ clip: [100, 50, 110, 60] }]
+  }).rasterLayers[0];
+  assert.equal(packedLayer.monochrome, undefined, "a uniform packed image becomes one texel");
+  assert.deepEqual([packedLayer.width, packedLayer.height, ...packedLayer.data], [1, 1, 0, 0, 0, 255],
+    "packed row padding does not count as a second color");
+  packed[packedRowBytes] = 0x80;
+  const mixedPacked = sceneFor({
+    images: [{ width: packedWidth, height: 4, format: HEPR_IMAGE_FORMAT.Gray1, data: packed }],
+    paints: [{ clip: [100, 50, 110, 60] }]
+  }).rasterLayers[0];
+  assert.ok(mixedPacked.monochrome, "a two-color packed image stays packed");
+  assert.equal(mixedPacked.width, packedWidth);
 }
 
 async function testCompiledAggregateBounds(buildNativeVectorPage, compileVectorFormContent) {

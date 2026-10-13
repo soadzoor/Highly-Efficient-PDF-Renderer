@@ -798,6 +798,19 @@ async function testPngPredictor() {
     );
   }
 
+  // Rows wider than the cancellation slice keep left/up neighbors across slices.
+  let state = 7;
+  const wideRows = Array.from({ length: 10 }, () => Uint8Array.from({ length: 3 * 6_000 }, () => {
+    state = (Math.imul(state, 1_103_515_245) + 12_345) >>> 0;
+    return state >>> 24;
+  }));
+  assert.deepEqual(
+    await decodePdfFilterChain(bytesOf(deflateSync(encodePngRows(wideRows, [4, 1, 2, 3, 4, 0, 3, 1, 4, 2], 3))),
+      ["FlateDecode"], [predictorParams(15, 3, 8, 6_000)]),
+    concat(...wideRows),
+    "every PNG algorithm reconstructs rows longer than one cancellation slice"
+  );
+
   await assert.rejects(
     decodePredictor(Uint8Array.of(5, 0), 15, 1, 8, 1),
     hasPdfError("invalid-object", /filter byte/)

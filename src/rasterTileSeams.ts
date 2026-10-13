@@ -6,6 +6,8 @@ export interface RasterTileSeamDescriptor {
   bounds: Float32Array;
   /** Original gap's full width at each corresponding geometry edge. */
   gaps: Float32Array;
+  /** Shared per-axis footprint ceiling before farther gaps need legacy sampling. */
+  maxFootprint: Float32Array;
 }
 
 interface Tile {
@@ -17,7 +19,7 @@ interface Tile {
   count: number;
 }
 
-interface Neighbors { left: Tile; right: Tile; axis: 0 | 1; gap: number }
+interface Neighbors { left: Tile; right: Tile; axis: 0 | 1; gap: number; limit: number }
 
 /**
  * Identify small gaps between opaque image neighbors without changing source
@@ -155,6 +157,8 @@ function findNeighbors(tiles: readonly Tile[], axis: 0 | 1): Neighbors[] {
   }
   for (const ends of buckets.values()) for (const bucket of ends.values()) {
     bucket.sort((a, b) => a.bounds[axis] - b.bounds[axis] || a.bounds[axis + 2] - b.bounds[axis + 2] || a.index - b.index);
+    let limit = Infinity;
+    for (const tile of bucket) limit = Math.min(limit, tile.bounds[axis + 2] - tile.bounds[axis]);
     // A contained rectangle must not create a false gap through a wider
     // predecessor. An overlap on the opposite edge does not disqualify an
     // otherwise empty neighboring gap.
@@ -165,17 +169,17 @@ function findNeighbors(tiles: readonly Tile[], axis: 0 | 1): Neighbors[] {
       const exposed = left.bounds[axis + 2] === end;
       end = Math.max(end, right.bounds[axis + 2]);
       if (!exposed || !(gap > 0) || gap > Math.min(left.pitch[axis], right.pitch[axis])) continue;
-      pairs.push({ left, right, axis, gap });
+      pairs.push({ left, right, axis, gap, limit });
     }
   }
   return pairs;
 }
 
-function connectNeighbors({ left, right, axis, gap }: Neighbors, result: Map<number, RasterTileSeamDescriptor>): void {
+function connectNeighbors({ left, right, axis, gap, limit }: Neighbors, result: Map<number, RasterTileSeamDescriptor>): void {
   const descriptor = (tile: Tile): RasterTileSeamDescriptor => {
     let value = result.get(tile.index);
     if (!value) {
-      value = { bounds: Float32Array.from(tile.bounds), gaps: new Float32Array(4) };
+      value = { bounds: Float32Array.from(tile.bounds), gaps: new Float32Array(4), maxFootprint: new Float32Array(2) };
       result.set(tile.index, value);
     }
     return value;
@@ -184,4 +188,5 @@ function connectNeighbors({ left, right, axis, gap }: Neighbors, result: Map<num
   const a = descriptor(left), b = descriptor(right);
   a.bounds[axis + 2] = b.bounds[axis] = midpoint;
   a.gaps[axis + 2] = b.gaps[axis] = width;
+  a.maxFootprint[axis] = b.maxFootprint[axis] = limit;
 }

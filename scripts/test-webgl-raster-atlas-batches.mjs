@@ -217,6 +217,7 @@ try {
     const descriptor = seams.renderer.rasterTileSeams.get(i), offset = i * RASTER_BATCH_INSTANCE_FLOATS;
     assert.deepEqual(seamPaint.instances.subarray(offset + 16, offset + 20), descriptor.bounds);
     assert.deepEqual(seamPaint.instances.subarray(offset + 20, offset + 24), descriptor.gaps);
+    assert.deepEqual(seamPaint.instances.subarray(offset + 24, offset + 26), descriptor.maxFootprint);
   }
   assert.equal(seamPaint.instances[18], seamPaint.instances[RASTER_BATCH_INSTANCE_FLOATS + 16],
     "adjacent images submit the identical Float32 boundary without changing their UV matrices");
@@ -229,6 +230,7 @@ try {
   seamFallback.forEach((paint, index) => {
     assert.deepEqual(paint.uniforms.get("uRasterSeamBounds"), seams.renderer.rasterTileSeams.get(index).bounds);
     assert.deepEqual(paint.uniforms.get("uRasterSeamGaps"), seams.renderer.rasterTileSeams.get(index).gaps);
+    assert.deepEqual(paint.uniforms.get("uRasterSeamMaxFootprint"), [...seams.renderer.rasterTileSeams.get(index).maxFootprint]);
   });
   const transparentReplacement = { ...seamScene.rasterLayers[1], opacity: 0.5 };
   seams.renderer.prepareRasterLayerUpdates(new Map([[1, transparentReplacement]])).commit();

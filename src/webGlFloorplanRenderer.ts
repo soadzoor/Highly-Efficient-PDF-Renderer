@@ -653,6 +653,7 @@ export class WebGlFloorplanRenderer {
   private readonly uRasterUv: WebGLUniformLocation;
   private readonly uRasterSeamBounds: WebGLUniformLocation;
   private readonly uRasterSeamGaps: WebGLUniformLocation;
+  private readonly uRasterSeamMaxFootprint: WebGLUniformLocation;
   private rasterTileSeams = new Map<number, RasterTileSeamDescriptor>();
 
   private readonly uRasterViewport: WebGLUniformLocation;
@@ -1223,6 +1224,7 @@ export class WebGlFloorplanRenderer {
     this.uRasterUv = this.mustGetUniformLocation(this.rasterProgram, "uRasterUv");
     this.uRasterSeamBounds = this.mustGetUniformLocation(this.rasterProgram, "uRasterSeamBounds");
     this.uRasterSeamGaps = this.mustGetUniformLocation(this.rasterProgram, "uRasterSeamGaps");
+    this.uRasterSeamMaxFootprint = this.mustGetUniformLocation(this.rasterProgram, "uRasterSeamMaxFootprint");
     this.uRasterViewport = this.mustGetUniformLocation(this.rasterProgram, "uViewport");
     this.uRasterCameraCenter = this.mustGetUniformLocation(this.rasterProgram, "uCameraCenter");
     this.uRasterZoom = this.mustGetUniformLocation(this.rasterProgram, "uZoom");
@@ -3181,6 +3183,7 @@ export class WebGlFloorplanRenderer {
     const seam = !layer.quad && !layer.uv && !layer.extraTiles?.length ? this.rasterTileSeams?.get(layerIndex) : undefined;
     gl.uniform4fv(this.uRasterSeamBounds, seam?.bounds ?? ZERO_RASTER_SEAM);
     gl.uniform4fv(this.uRasterSeamGaps, seam?.gaps ?? ZERO_RASTER_SEAM);
+    gl.uniform2f(this.uRasterSeamMaxFootprint, seam?.maxFootprint[0] ?? 0, seam?.maxFootprint[1] ?? 0);
     // Tiles of one image never overlap, so each draws with the image's state.
     this.drawRasterTile(layer);
     for (const tile of layer.extraTiles ?? []) this.drawRasterTile(tile);
@@ -3354,9 +3357,9 @@ export class WebGlFloorplanRenderer {
   private initializeRasterTextureBatchVao(buffer: WebGLBuffer, vao: WebGLVertexArrayObject): void {
     const gl = this.gl;
     gl.bindVertexArray(vao); gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    for (let attribute = 0; attribute < 6; attribute++) {
+    for (let attribute = 0; attribute < 7; attribute++) {
       gl.enableVertexAttribArray(attribute);
-      gl.vertexAttribPointer(attribute, attribute === 2 ? 3 : 4, gl.FLOAT, false,
+      gl.vertexAttribPointer(attribute, attribute === 6 ? 2 : attribute === 2 ? 3 : 4, gl.FLOAT, false,
         RASTER_BATCH_INSTANCE_FLOATS * 4, attribute * 16);
       gl.vertexAttribDivisor(attribute, 1);
     }
@@ -3912,6 +3915,8 @@ export class WebGlFloorplanRenderer {
       const seam = this.rasterTileSeams?.get(index);
       data.set(seam?.bounds ?? ZERO_RASTER_SEAM, offset + 16);
       data.set(seam?.gaps ?? ZERO_RASTER_SEAM, offset + 20);
+      data[offset + 24] = seam?.maxFootprint[0] ?? 0;
+      data[offset + 25] = seam?.maxFootprint[1] ?? 0;
       rasterIndices.push(index);
       return true;
     };

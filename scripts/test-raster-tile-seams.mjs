@@ -34,8 +34,8 @@ try {
       Math.max(...points.map(p => p[0])), Math.max(...points.map(p => p[1])));
   };
   const vec4 = values => ({ x: values[0], y: values[1], z: values[2], w: values[3] });
-  const at = (point, footprint, bounds, gaps) => coverage({ x: point[0], y: point[1] },
-    { x: footprint[0], y: footprint[1] }, vec4(bounds), vec4(gaps));
+  const at = (point, footprint, bounds, gaps, maxFootprint = [Infinity, Infinity]) => coverage({ x: point[0], y: point[1] },
+    { x: footprint[0], y: footprint[1] }, vec4(bounds), vec4(gaps), { x: maxFootprint[0], y: maxFootprint[1] });
   const close = (actual, expected, message, tolerance = 1e-9) =>
     assert(Math.abs(actual - expected) <= tolerance, `${message}: ${actual} vs ${expected}`);
 
@@ -44,6 +44,8 @@ try {
   assert.deepEqual(descriptors.get(0).gaps, Float32Array.of(0, 0, .125, 0));
   assert.deepEqual(descriptors.get(1).gaps, Float32Array.of(.125, 0, 0, 0));
   assert.equal(descriptors.get(0).bounds[2], descriptors.get(1).bounds[0], "both opaque tiles meet at exactly one stored midpoint");
+  assert.equal(descriptors.get(0).maxFootprint[0], 16);
+  assert.equal(descriptors.get(1).maxFootprint[0], 16);
   assert.deepEqual(original, canonical, "neighbor preparation preserves canonical pixels, matrices and paint metadata");
   assert.equal(original.rasterLayers[0].data, original.rasterLayers[1].data, "immutable pixel aliases remain intact");
   for (const gap of [0, -.125, 1.25]) assert.equal(buildRasterTileSeams(basic(gap)).size, 0,
@@ -123,6 +125,27 @@ try {
   assert.equal(buildRasterTileSeams(distant).size, 0, "photographs without geometric seam candidates require no alpha scan");
   assert.equal(pixelReads, 0);
 
+  const tiny = sceneOf(Array.from({ length: 5 }, (_, index) => layer([1, 0, 0, -1, index * 2, 1], 1, 1))),
+    tinySeams = buildRasterTileSeams(tiny);
+  assert.equal(tinySeams.size, 5);
+  for (const [owner, x, expected] of [[0, .5, 1], [0, 1.25, 0], [1, 1.75, 0], [1, 2.5, 1]]) {
+    const seam = tinySeams.get(owner);
+    assert.equal(seam.maxFootprint[0], 1);
+    assert.equal(at([x, .5], [4, 4], gpuBounds(tiny.rasterLayers[owner].matrix), seam.gaps, seam.maxFootprint), expected,
+      "a deeply minified mosaic retains hard-center geometry when farther gaps are not represented");
+  }
+  const unequal = sceneOf([layer([8, 0, 0, -4, 0, 4], 8, 4), layer([1, 0, 0, -4, 8.125, 4], 1, 4)]),
+    unequalSeams = buildRasterTileSeams(unequal);
+  assert.equal(unequalSeams.get(0).maxFootprint[0], 1);
+  assert.equal(unequalSeams.get(1).maxFootprint[0], 1, "unequal neighbors share the smaller locality limit");
+  for (const [owner, x] of [[0, 8.025], [1, 8.1]]) {
+    const seam = unequalSeams.get(owner), bounds = gpuBounds(unequal.rasterLayers[owner].matrix);
+    assert.equal(at([x, 2], [2, 2], bounds, seam.gaps, seam.maxFootprint), 0,
+      "both halves of an unequal-width seam switch to legacy sampling together");
+    close(at([x, 2], [.5, .5], bounds, seam.gaps, seam.maxFootprint), .75,
+      "both halves retain area filtering within the shared locality limit");
+  }
+
   // Exact matrices from the reported source/HEP. The ordinary satellite tiles
   // have no clips and retain the same geometry before and after HEP storage.
   const tileWidth = 122.64009094238281, matrix = (x, top) => [tileWidth, 0, 0, -tileWidth, x, top],
@@ -175,19 +198,26 @@ try {
             owner = horizontal ? (position >= midpoint ? 0 : 1) : (position < midpoint ? 0 : 1),
             point = horizontal ? [(originalBounds[owner][0] + originalBounds[owner][2]) / 2, position]
               : [position, (originalBounds[owner][1] + originalBounds[owner][3]) / 2],
-            alpha = at(point, [footprint, footprint], originalBounds[owner], seams.get(owner).gaps);
+            limit = seams.get(owner).maxFootprint[horizontal ? 1 : 0],
+            alpha = at(point, [footprint, footprint], originalBounds[owner], seams.get(owner).gaps, seams.get(owner).maxFootprint);
+          const axis = horizontal ? 1 : 0, geometry = seams.get(owner).bounds;
+          if (footprint > limit && (position < geometry[axis] || position >= geometry[axis + 2])) continue;
           assert(alpha >= 0 && alpha <= 1, "filtered coverage remains bounded");
           filteredGapArea += (1 - alpha) * footprint;
-          oldHardGapArea += position > low && position < high ? footprint : 0;
-          if (gap * zoom < 1) assert(alpha >= 1 - gap * zoom - 1e-9, "a subpixel gap cannot flicker into a fully white pixel");
+          oldHardGapArea += position >= low && position < high ? footprint : 0;
+          if (footprint > limit) assert.equal(alpha, position >= originalBounds[owner][axis] && position < originalBounds[owner][axis + 2] ? 1 : 0,
+            "footprints reaching farther tiles retain the original hard-center gap coverage");
+          else if (gap * zoom < 1) assert(alpha >= 1 - gap * zoom - 1e-9, "a subpixel gap cannot flicker into a fully white pixel");
         }
-        close(filteredGapArea, gap, `gap area remains constant at zoom ${zoom}, phase ${phase}`, 1e-8);
-        if (gap * zoom < .5 && phase === 0) assert(oldHardGapArea > gap,
+        const limit = seams.get(0).maxFootprint[horizontal ? 1 : 0];
+        if (footprint <= limit) close(filteredGapArea, gap, `gap area remains constant at zoom ${zoom}, phase ${phase}`, 1e-8);
+        else close(filteredGapArea, oldHardGapArea, "unresolved distant gaps preserve legacy sampling", 1e-8);
+        if (footprint <= limit && gap * zoom < .5 && phase === 0) assert(oldHardGapArea > gap,
           "the same centred narrow gap previously exposed a full white pixel");
       }
     }
     const center = (low + high) / 2, point = horizontal ? [originalBounds[0][0] + 1, center] : [center, originalBounds[0][1] + 1];
-    assert.equal(at(point, [gap / 4, gap / 4], originalBounds[0], seams.get(0).gaps), 0,
+    assert.equal(at(point, [gap / 4, gap / 4], originalBounds[0], seams.get(0).gaps, seams.get(0).maxFootprint), 0,
       "resolved source gaps remain fully empty at high zoom");
   }
   for (const zoom of [.01, 1, 1000]) for (const point of [[0, 0], [16, 8], [16.125, 8], [8, 16]]) {

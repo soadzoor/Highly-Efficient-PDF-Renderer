@@ -154,7 +154,8 @@ function fixture(raster) {
         : "1 0 0 rg 1 2 3 4 re f") },
     { number: 5, body: raster === "stencil"
       ? tinyPdfStream("/Type /XObject /Subtype /Image /Width 2 /Height 2 /ImageMask true /BitsPerComponent 1", Uint8Array.of(0, 0))
+      // Two colors keep the clipped image a real texture rather than a solid quad.
       : tinyPdfStream("/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8",
-        Uint8Array.of(255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0)) }
+        Uint8Array.of(255, 0, 0, 0, 0, 255, 255, 0, 0, 255, 0, 0)) }
   ] });
 }

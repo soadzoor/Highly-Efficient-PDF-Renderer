@@ -10,7 +10,7 @@ float heprRasterGapCoverage(float point, float footprint, float lo, float hi) {
   return clamp((min(point + width * 0.5, hi) - max(point - width * 0.5, lo)) / width, 0.0, 1.0);
 }
 
-float heprRasterTileSeamCoverage(vec2 point, vec2 footprint, vec4 bounds, vec4 gaps) {
+float heprRasterTileSeamCoverage(vec2 point, vec2 footprint, vec4 bounds, vec4 gaps, vec2 maxFootprint) {
   float x = 1.0 - heprRasterGapCoverage(point.x, footprint.x, bounds.x - gaps.x, bounds.x)
     - heprRasterGapCoverage(point.x, footprint.x, bounds.z, bounds.z + gaps.z);
   float y = 1.0 - heprRasterGapCoverage(point.y, footprint.y, bounds.y - gaps.y, bounds.y)
@@ -18,10 +18,10 @@ float heprRasterTileSeamCoverage(vec2 point, vec2 footprint, vec4 bounds, vec4 g
   // A footprint wider than a tile can reach further, unrecorded neighbors.
   // Preserve the original geometry sampling in that axis rather than invent
   // coverage from only the two immediately adjacent empty intervals.
-  if (gaps.x + gaps.z > 0.0 && footprint.x > bounds.z - bounds.x) {
+  if (gaps.x + gaps.z > 0.0 && footprint.x > maxFootprint.x) {
     x = point.x >= bounds.x && point.x < bounds.z ? 1.0 : 0.0;
   }
-  if (gaps.y + gaps.w > 0.0 && footprint.y > bounds.w - bounds.y) {
+  if (gaps.y + gaps.w > 0.0 && footprint.y > maxFootprint.y) {
     y = point.y >= bounds.y && point.y < bounds.w ? 1.0 : 0.0;
   }
   return clamp(x, 0.0, 1.0) * clamp(y, 0.0, 1.0);
@@ -69,11 +69,12 @@ ${RASTER_TILE_SEAM_VERTEX_GLSL}`)
 export function rasterTileSeamFragmentGlsl(source: string): string {
   return source.replace("in vec2 vWorld;", `in vec2 vWorld;
 uniform vec4 uRasterSeamGaps;
+uniform vec2 uRasterSeamMaxFootprint;
 flat in vec4 vRasterSeamOriginalBounds;
 ${RASTER_TILE_SEAM_GLSL}`)
     .replace("  vec4 color = texture(uRasterTex, vUv) * uRasterOpacity;", `  vec2 seamFootprint = abs(dFdx(vWorld)) + abs(dFdy(vWorld));
   vec4 color = texture(uRasterTex, vUv) * uRasterOpacity;
   if (any(greaterThan(uRasterSeamGaps, vec4(0.0)))) {
-    color *= heprRasterTileSeamCoverage(vWorld, seamFootprint, vRasterSeamOriginalBounds, uRasterSeamGaps);
+    color *= heprRasterTileSeamCoverage(vWorld, seamFootprint, vRasterSeamOriginalBounds, uRasterSeamGaps, uRasterSeamMaxFootprint);
   }`);
 }
