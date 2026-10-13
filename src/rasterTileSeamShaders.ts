@@ -15,6 +15,15 @@ float heprRasterTileSeamCoverage(vec2 point, vec2 footprint, vec4 bounds, vec4 g
     - heprRasterGapCoverage(point.x, footprint.x, bounds.z, bounds.z + gaps.z);
   float y = 1.0 - heprRasterGapCoverage(point.y, footprint.y, bounds.y - gaps.y, bounds.y)
     - heprRasterGapCoverage(point.y, footprint.y, bounds.w, bounds.w + gaps.w);
+  // A footprint wider than a tile can reach further, unrecorded neighbors.
+  // Preserve the original geometry sampling in that axis rather than invent
+  // coverage from only the two immediately adjacent empty intervals.
+  if (gaps.x + gaps.z > 0.0 && footprint.x > bounds.z - bounds.x) {
+    x = point.x >= bounds.x && point.x < bounds.z ? 1.0 : 0.0;
+  }
+  if (gaps.y + gaps.w > 0.0 && footprint.y > bounds.w - bounds.y) {
+    y = point.y >= bounds.y && point.y < bounds.w ? 1.0 : 0.0;
+  }
   return clamp(x, 0.0, 1.0) * clamp(y, 0.0, 1.0);
 }
 `;
