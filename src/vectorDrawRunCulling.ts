@@ -3,11 +3,7 @@ import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { retainedRasterBounds } from "./retainedRasterBounds";
 import { strokeSourceRecords, type StrokeRecordSource } from "./strokeRecords";
 import { vectorFillCoverageMetadata } from "./vectorFillCoverage";
-
-/** Drawings with at least this many paints keep an offscreen culling margin. */
-export const GUARDED_RUN_COUNT = 1024;
-/** That margin in screen pixels: small camera moves then reuse the selected instances. */
-export const VISIBILITY_GUARD_PIXELS = 64;
+import { GUARDED_RUN_COUNT, VISIBILITY_GUARD_PIXELS } from "./visibilityGuard";
 
 /** Conservative paint bounds. Filtering retains the original order and instance ranges. */
 export class VectorDrawRunCuller {

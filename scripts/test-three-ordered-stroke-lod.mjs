@@ -32,8 +32,10 @@ try {
     scene.styles.set([0.5, 0, 0, 0], index * 4);
   }
   const original = structuredClone(scene);
-  for (const materialBackend of ["webgl", "webgpu"]) {
-    const plan = new ThreeVectorDrawPlan(scene);
+  // Camera-driven plans defer their first batches until the first frame, as
+  // the Three PDF object's do; a stored LOD selection must then stay authoritative.
+  for (const materialBackend of ["webgl", "webgpu"]) for (const deferInitialBatches of [false, true]) {
+    const plan = new ThreeVectorDrawPlan(scene, null, deferInitialBatches);
     const layer = new ThreeVectorLodStrokeLayer(scene, { materialBackend, webGpu, drawPlan: plan,
       strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0] });
     const controller = new OptionalContentController(scene);

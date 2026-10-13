@@ -12,6 +12,7 @@ import {
 } from "./vectorStrokeLodStorage";
 import type {Bounds, VectorScene} from "./pdfVectorExtractor";
 import type {ViewState} from "./webGlFloorplanRenderer";
+import { VISIBILITY_GUARD_PIXELS } from "./visibilityGuard";
 
 /**
  * Vector stroke level-of-detail behavior.
@@ -473,7 +474,6 @@ const LOD_OVERVIEW_SCREEN_ERROR_BUDGET_PX = 5;
 const LOD_PLANAR_ROUNDOFF_EPSILON = 1e-12;
 const LOD_PLANAR_BASIS_INDICES = [0, 1, 4, 5] as const;
 const LOD_RUNTIME_TILE_TARGET_SEGMENTS = 512;
-const LOD_VISIBILITY_GUARD_PIXELS = 64;
 const LOD_RUNTIME_MIN_TILE_COUNT = 256;
 const LOD_RUNTIME_MAX_TILE_COUNT = 4096;
 const LOD_RUNTIME_MIN_GRID_SIDE = 12;
@@ -722,11 +722,15 @@ export class VectorStrokeLodRuntime {
         this.fullViewMaxLevelIndex === maxLevelIndex) return false;
     const guard = cacheableView && this.levels[0].segmentCount >= VECTOR_STROKE_LOD_MIN_SEGMENTS &&
       [viewBounds.minX, viewBounds.minY, viewBounds.maxX, viewBounds.maxY].every(Number.isFinite)
-      ? LOD_VISIBILITY_GUARD_PIXELS * this.localUnitsPerPixel : 0;
+      ? VISIBILITY_GUARD_PIXELS * this.localUnitsPerPixel : 0;
     const cached = this.selectionGuard;
+    // The selection includes whole tiles that the guard reaches beyond the
+    // view. Panning reuses it while the view stays inside the guard, also
+    // across tile boundaries; per-tile budgets then remain those of the view
+    // that made the selection until the next one.
     if (guard > 0 && cached && tileRange && cached.baseline === screenErrorLevelIndex && cached.maxLevel === maxLevelIndex &&
-        cached.range.c0 === tileRange.c0 && cached.range.c1 === tileRange.c1 &&
-        cached.range.r0 === tileRange.r0 && cached.range.r1 === tileRange.r1 &&
+        tileRange.c0 >= cached.range.c0 && tileRange.c1 <= cached.range.c1 &&
+        tileRange.r0 >= cached.range.r0 && tileRange.r1 <= cached.range.r1 &&
         viewBounds.minX >= cached.bounds.minX && viewBounds.minY >= cached.bounds.minY &&
         viewBounds.maxX <= cached.bounds.maxX && viewBounds.maxY <= cached.bounds.maxY &&
         cached.bounds.maxX - cached.bounds.minX <= viewBounds.maxX - viewBounds.minX + guard * 4 &&
@@ -740,9 +744,8 @@ export class VectorStrokeLodRuntime {
       return true;
     }
 
-    // Expand primitive filtering, not the tile range: tile density budgets and
-    // LOD choice remain exactly those of the actual viewport. A cached result
-    // is reusable only while that tile range and baseline level also agree.
+    // Tile density budgets and LOD choice come from the actual viewport; tiles
+    // the guard adds beyond it select their levels with the same budget.
     const guardedBounds = guard > 0 ? { minX: viewBounds.minX - guard, minY: viewBounds.minY - guard,
       maxX: viewBounds.maxX + guard, maxY: viewBounds.maxY + guard } : null;
     const selectionBounds = guardedBounds && [guardedBounds.minX, guardedBounds.minY,
@@ -755,6 +758,11 @@ export class VectorStrokeLodRuntime {
     const projectedWeightSum = this.useLocalToClip && !this.constantClipW
       ? this.projectTiles(tileRange, viewport) : -1;
     const projected = projectedWeightSum >= 0;
+    // Tilted views have no guard; their tile weights cover the view's range only.
+    const selectionRange = !projected && selectionBounds !== viewBounds
+      ? tileRangeForBounds(selectionBounds.minX, selectionBounds.minY, selectionBounds.maxX, selectionBounds.maxY,
+        this.tileGrid) ?? tileRange
+      : tileRange;
     let visibleTileCount = 0;
     let occupiedTileCount = 0;
     for (let row = tileRange.r0; row <= tileRange.r1; row++) {
@@ -791,9 +799,12 @@ export class VectorStrokeLodRuntime {
         maxSelectedTileSegments = 0;
       }
       let selectedSegmentCount = 0;
-      selectTiles: for (let row = tileRange.r0; row <= tileRange.r1; row += 1) {
-        for (let column = tileRange.c0; column <= tileRange.c1; column += 1) {
+      selectTiles: for (let row = selectionRange.r0; row <= selectionRange.r1; row += 1) {
+        for (let column = selectionRange.c0; column <= selectionRange.c1; column += 1) {
           const tileIndex = row * this.tileGrid.columns + column;
+          // Guard tiles follow the view's budget but neither its statistics
+          // nor the probe that relaxes overview quality for the view.
+          const inView = row >= tileRange.r0 && row <= tileRange.r1 && column >= tileRange.c0 && column <= tileRange.c1;
           const baselineTileSegments = this.levels[0].tileCounts[tileIndex];
           let tileBaselineLevelIndex = screenErrorLevelIndex;
           let tileMaxLevelIndex = maxLevelIndex;
@@ -817,6 +828,10 @@ export class VectorStrokeLodRuntime {
           }
           const levelIndex = this.chooseTileLevel(tileIndex, tileTargetSegments, tileBaselineLevelIndex, tileMaxLevelIndex, pass > 0);
           const selectedTileSegments = this.levels[levelIndex].tileCounts[tileIndex];
+          if (!inView) {
+            appendTileSegments(this.levels[levelIndex], tileIndex, selectionBounds, cullingPlanes);
+            continue;
+          }
           if (baselineTileSegments > maxBaselineTileSegments) {
             maxBaselineTileSegments = baselineTileSegments;
             maxBaselineTileSelectedSegments = selectedTileSegments;
@@ -858,7 +873,7 @@ export class VectorStrokeLodRuntime {
       this.fullViewMaxLevelIndex = maxLevelIndex;
     }
     if (selectionBounds !== viewBounds) this.selectionGuard = {
-      bounds: selectionBounds, range: tileRange, baseline: screenErrorLevelIndex, maxLevel: maxLevelIndex
+      bounds: selectionBounds, range: selectionRange, baseline: screenErrorLevelIndex, maxLevel: maxLevelIndex
     };
     return true;
   }

@@ -5,10 +5,13 @@ const hooks = registerHooks({ resolve(s, c, n) {
 } });
 try {
   const [{ createEmptyVectorScene }, { VectorDrawRunCuller, vectorViewBounds },
-    { VectorStrokeLodRuntime, buildRuntimeTileBuckets }, { VectorOrderedBatches }] = await Promise.all([
+    { VectorStrokeLodRuntime, buildRuntimeTileBuckets }, { VectorOrderedBatches }, { VISIBILITY_GUARD_PIXELS: guardPx }] = await Promise.all([
     import("../src/emptyVectorScene.ts"), import("../src/vectorDrawRunCulling.ts"),
-    import("../src/vectorStrokeLodCore.ts"), import("../src/vectorOrderedBatches.ts")
+    import("../src/vectorStrokeLodCore.ts"), import("../src/vectorOrderedBatches.ts"), import("../src/visibilityGuard.ts")
   ]);
+  // Camera positions at one unit per pixel: beyond the guard margin, within the
+  // same 1500-unit tiles; entering the next tile inside the margin; and past it.
+  const crossX = 6000 + guardPx + 32, enterX = 6530, leaveX = 6500 + guardPx + 32;
   const count = 153_600, perRun = 96;
   const scene = Object.assign(createEmptyVectorScene(), {
     segmentCount: count, maxHalfWidth: .001, pageCount: 1,
@@ -66,7 +69,7 @@ try {
   checkRunSuperset(boundsAt(6000, 1.01), 1.01);
   assert.notEqual(culler.guardBounds, guard, "a larger AA bucket invalidates the guarded selection");
   const refreshed = culler.guardBounds;
-  checkRunSuperset(boundsAt(6200, 1.01), 1.01);
+  checkRunSuperset(boundsAt(6000 + 2 * guardPx, 1.01), 1.01);
   assert.notEqual(culler.guardBounds, refreshed, "leaving the guard selects entering paints");
   assert.equal(culler.select(null, 1), scene.drawRuns);
   assert.equal(culler.guardBounds, null, "unknown bounds clear the cached subset");
@@ -110,11 +113,22 @@ try {
   assert.deepEqual(runtime.levels.map(level => level.markToken), marks, "reuse does not rescan any tile primitives");
   assert.equal(step(6000, .99), false, "a safe zoom within the baseline level reuses selection");
   assert.deepEqual(runtime.getStats(), stats, "guard expansion does not change actual tile budgets");
-  assert(step(6080), "crossing the guard refreshes selection even in the same tiles");
-  assert(step(6500));
+  assert(step(crossX), "crossing the guard refreshes selection even in the same tiles");
+  assert(step(6000));
+  assert(step(6500), "a selection centred before the next tile");
   const oldGuard = runtime.selectionGuard;
-  assert(step(6530), "an entering tile invalidates selection even inside the previous guard");
-  assert(viewAt(6530).cameraCenterX < oldGuard.bounds.maxX - viewport.width / 2 - 16);
+  // The guard selects whole tiles beyond the view, so a tile the view enters
+  // inside it was already selected, with the budget of the view that chose it.
+  assert.equal(step(enterX), false, "an entering tile inside the guard reuses the selection that includes it");
+  assert(enterX + viewport.width / 2 + 16 > 7500, "the fixture view enters the next tile");
+  assert(viewAt(enterX).cameraCenterX < oldGuard.bounds.maxX - viewport.width / 2 - 16);
+  const selectedIds = new Set(runtime.levels.flatMap(level => Array.from(level.visibleSegmentIds.subarray(0, level.visibleSegmentCount))));
+  const entered = boundsAt(enterX);
+  for (let id = 0; id < count; id++) {
+    const x = scene.endpoints[id * 4];
+    if (x >= entered.minX && x <= entered.maxX) assert(selectedIds.has(id), "the reused selection covers the whole new view");
+  }
+  assert(step(leaveX), "leaving the guard selects again");
   assert(step(6000));
   assert(step(6000, .8));
   const broadLodGuard = runtime.selectionGuard;
@@ -153,7 +167,7 @@ try {
   assert.equal(projectedStep(6020, 1, noisy), false, "scene-bounded camera roundoff retains selection");
   const depthOnly = [...noisy]; depthOnly[2] = .02; depthOnly[6] = -.03; depthOnly[10] = -2; depthOnly[14] = 2;
   assert.equal(projectedStep(6020, 1, depthOnly), false, "depth-only clipping changes leave projected density unchanged");
-  assert(projectedStep(6080), "projected pan leaving the guard refreshes IDs");
+  assert(projectedStep(crossX), "projected pan leaving the guard refreshes IDs");
   assert(projectedStep(6000, 8));
   assert.equal(projectedStep(6020, 8), false, "projected full-page overview also reuses IDs");
   assert(projectedStep(6000), "returning to detail replaces the overview selection");
@@ -224,7 +238,8 @@ try {
   assert.equal(guardedRebuilds, 1);
   assert.equal(referenceSelections, 60);
   assert(referenceRebuilds > 50, "the baseline exercises real instance-membership churn");
-  assert(guardedIds >= referenceIds && guardedIds < referenceIds * 1.1, "guard overdraw stays bounded for a normal viewport");
+  assert(guardedIds >= referenceIds && guardedIds < referenceIds * (1 + (2 * guardPx + 64) / viewport.width),
+    "guard overdraw stays within the margin for a normal viewport");
   console.log(`Visibility guard passed: ${referenceSelections}→${guardedSelections} selections, ${referenceRebuilds}→${guardedRebuilds} batch rebuilds; ` +
     `${Math.round(referenceIds / 60)}→${Math.round(guardedIds / 60)} mean submitted strokes, no missing visible IDs.`);
 } finally { hooks.deregister(); }

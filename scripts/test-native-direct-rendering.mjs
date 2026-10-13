@@ -12,6 +12,7 @@ try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { VectorDrawRunCuller, vectorViewBounds } = await import("../src/vectorDrawRunCulling.ts");
   const { VectorStrokeLodRuntime, buildRuntimeTileBuckets } = await import("../src/vectorStrokeLodCore.ts");
+  const { VISIBILITY_GUARD_PIXELS: guard } = await import("../src/visibilityGuard.ts");
   const backends = [["WebGL", WebGlFloorplanRenderer], ["WebGPU", WebGpuFloorplanRenderer]];
   for (const [backend, Renderer] of backends) {
     // Meets the former paint-count threshold. Four columns let viewport
@@ -33,21 +34,27 @@ try {
       return culler.select(vectorViewBounds(width, height, x, y, zoom), 1 / zoom)
         .reduce((sum, run) => sum + run.count, 0);
     });
+    // Columns sit 300 px apart at -450, -150, 150 and 450 px from the start.
+    // Culling keeps a margin of `guard` pixels and selects again only once the
+    // view leaves it. Each target pan leaves the previous margin, and the new
+    // margin's left edge passes exactly the columns that should be dropped.
+    const dropOne = guard + 100, dropTwo = Math.max(guard + 450, dropOne + guard + 10);
+    const offscreen = Math.max(guard + 1000, dropTwo + guard + 10);
     renderer.beginPanInteraction();
     render();
     assert.equal(stats().renderedSegments, count, `${backend}: initial viewport includes all strokes`);
-    renderer.panByPixels(-200, 0); render();
+    renderer.panByPixels(-dropOne, 0); render();
     assert.equal(renderer.isPanInteracting, true);
     assert.equal(stats().renderedSegments, 3072, `${backend}: count changes before releasing the pointer`);
-    renderer.panByPixels(-300, 0); render();
+    renderer.panByPixels(dropOne - dropTwo, 0); render();
     assert.equal(stats().renderedSegments, 2048, `${backend}: continuing drag updates viewport selection`);
-    renderer.panByPixels(-600, 0); render();
+    renderer.panByPixels(dropTwo - offscreen, 0); render();
     assert.equal(stats().renderedSegments, 0, `${backend}: moving offscreen submits no strokes while dragging`);
-    renderer.panByPixels(1100, 0); render();
+    renderer.panByPixels(offscreen, 0); render();
     assert.equal(stats().renderedSegments, count, `${backend}: returning onscreen restores the scene`);
     renderer.endPanInteraction();
     renderer.animating = true;
-    renderer.panByPixels(-500, 0); render();
+    renderer.panByPixels(-(guard + 450), 0); render();
     assert.equal(stats().renderedSegments, 2048, `${backend}: translation animation also renders the current view`);
     renderer.animating = false; render();
     assert.equal(stats().renderedSegments, 2048, `${backend}: settled and moving selections match`);

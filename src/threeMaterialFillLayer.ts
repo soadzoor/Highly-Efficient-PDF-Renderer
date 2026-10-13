@@ -12,7 +12,7 @@ import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
 import { acquireThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
 import { enableThreeRawPaintFold, threePaintFoldFragmentGlsl } from "./threePaintFold";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
-import { GUARDED_RUN_COUNT, VISIBILITY_GUARD_PIXELS } from "./vectorDrawRunCulling";
+import { GUARDED_RUN_COUNT, VISIBILITY_GUARD_PIXELS } from "./visibilityGuard";
 import * as THREE from "three";
 
 import type { VectorScene } from "./pdfVectorExtractor";

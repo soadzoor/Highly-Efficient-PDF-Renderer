@@ -21,15 +21,26 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   selection with their paint ranges instead of scanning every paint, detect
   unchanged selections without per-record lookup tables, and the mixed layer
   rewrites its instance buffer in place. Large drawings keep the native
-  renderer's 64-pixel culling margin for fills, so small pans reuse the
-  selection. As in the native renderer, ordered Vector LOD selects stored
+  renderer's culling margin for fills, so small pans reuse the selection. As in
+  the native renderer, ordered Vector LOD selects stored
   records straight from its levels, and layers drawn entirely through the mixed
   batch no longer write their own instance IDs; the mixed batch reads the
   selection directly, and the IDs are written again before those layers can
   draw. Panning the same drawing zoomed in now takes about the same CPU time
   per frame as the native renderer (from 13.9 to 5.7 ms and from 20.6 to 9.8 ms
-  in a headless profile, at two pan speeds), with identical pixels. Frames that
-  change the stroke LOD selection still cost more in both renderers.
+  in a headless profile, at two pan speeds), with identical pixels.
+- Reuse stroke Vector LOD selections while panning across tile boundaries, in
+  the native renderers and Three.js. The selection now includes whole tiles
+  within the offscreen margin, and is kept while the view stays inside it; each
+  tile's detail budget is the one of the view that made the selection until the
+  next one. Native paint culling, Three.js fill culling and the LOD share a
+  256-pixel margin (previously 64 pixels), so they select again on the same
+  frames. Offscreen instances add vertex work only. On the 217k-fill drawing
+  panned zoomed in, LOD reselections fell from 50–86% to 0.4–10% of frames, and
+  Three.js CPU time per frame from 5.7/9.8 ms to 0.4/2.1 ms on average in a
+  headless profile; frames that do select again cost more than before. Stroke
+  detail can differ slightly from the previous selection (about 0.1% of total
+  ink in a headless comparison).
 
 ### Fixed
 

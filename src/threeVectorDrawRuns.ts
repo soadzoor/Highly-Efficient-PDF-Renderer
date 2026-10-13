@@ -277,6 +277,10 @@ export class ThreeVectorDrawRuns {
   updateStoredSelection(selection: StoredVectorLodSelection): number {
     const ranks = this.lodIdToRank;
     if (!ranks) throw new Error("Stored LOD selection requires stored-record origins.");
+    // This selection supersedes the source attribute's. Record that attribute
+    // as seen, or the next unchanged frame would read its stale IDs (all
+    // records, until something writes it) as a new selection.
+    this.sourceVersion = (this.parent.geometry.getAttribute(this.attribute) as THREE.InstancedBufferAttribute).version;
     this.parent.geometry.instanceCount = 0;
     if (this.plan.version !== this.planVersion) this.rebuildEntries();
     let count = 0;
