@@ -1,12 +1,12 @@
 # HEP container versions 1–4
 
 The `.hep` file is a binary container with MIME type `application/x-hep`. Container
-versions **1–4** wrap **scene schema versions 9–13**, recorded in
+versions **1–4** wrap **scene schema versions 9–14**, recorded in
 `manifest.json`. These version numbers evolve independently. The page-based v8
 document model is a different thing; it is not this container's scene schema.
-Readers support all four container versions and scene v9–v13; files using older
+Readers support all four container versions and scene v9–v14; files using older
 scene schemas must be regenerated from their original PDF. Writers use scene
-v13 when repeated paint-group metadata is compacted, v12 for transposed binary
+v14 for compact raster repeat grids, v13 when repeated paint-group metadata is compacted, v12 for transposed binary
 runs, v10 for plain packed monochrome rasters, otherwise v9. Legacy v11 JBIG2
 streams remain readable. Readers need support for
 the scene version used by the file. Container repacking preserves section bytes
@@ -283,7 +283,8 @@ decimal text.
 | `clipPaths` | `{file, count, edgeCount}` | `geometry/clip-paths.d512` |
 | `drawRuns` | `{file, count, encoding?}` | `geometry/draw-runs.varint` |
 | `paintGraph` | `{file, rootCount, encoding?}` | `geometry/paint-graph.varint` |
-| `rasterLayers` (v9–v13) | `{file, count, atlasCount}` | `geometry/raster-layers.varint` |
+| `rasterLayers` (v9–v14) | `{file, count, atlasCount, repeats?}` | `geometry/raster-layers.varint` |
+| `rasterLayers.repeats` (v14) | `{file, count, translationCount}` | `geometry/raster-repeats.f64` |
 
 Every integer is an unsigned LEB128 varint unless described as zigzag, which is
 the signed mapping. `geometry/clip-paths.d512` holds `pathCount`, then per path
@@ -357,8 +358,10 @@ common. Scene v8 gave each image its own PNG section and JSON record, and on a
 one-page map with 5,184 scanline images that overhead alone made the HEP 1.8 times
 the size of its PDF. Scene v9 keeps one binary record per canonical layer, so
 layer indices, transforms, paint order, pages and opacity are unchanged, and packs
-the pixels of small layers into shared atlas images. A reader crops every atlas
-cell back into that layer's own straight-alpha RGBA; atlases never reach the GPU.
+the pixels of small layers into shared atlas images. A reader crops each distinct
+atlas cell once into shared straight-alpha RGBA. Placements retain independent
+metadata; the native WebGL renderer shares identical image textures with
+independent lifetimes. The storage atlas itself does not reach the GPU.
 
 The optional `scene.rasterLayers.interpolation` string has one character per
 layer: `0` selects nearest source pixels, `1` selects smooth interpolation, and
@@ -366,8 +369,9 @@ layer: `0` selects nearest source pixels, `1` selects smooth interpolation, and
 the legacy policy. Readers validate its length and alphabet. This optional
 manifest metadata leaves the binary raster records unchanged; older readers
 ignore it and retain their previous sampling behavior. Nearest layers keep
-independent GPU sampling instead of entering smooth strip/atlas batches, and
-packed monochrome layers retain packed storage with direct texel sampling.
+nearest GPU sampling and can enter native WebGL texture batches without
+repacking into smooth strip/atlas batches. Packed monochrome layers retain
+packed storage with direct texel sampling.
 
 `geometry/raster-layers.varint` holds `atlasCount`, then per atlas an encoding
 byte (0 raw RGBA8, 1 PNG), `width` and `height`. Then `layerCount` and per layer
@@ -385,6 +389,38 @@ float64 in `[0,1]`. The section ends with all float32 matrices in
 component-major order (every `a`, then every `b`, ... every `f`), XOR-delta coded
 against the previous value and byte-shuffled like `text-instance-a`; its length
 must be exactly `24 * layerCount`.
+
+Scene v14 optionally adds `scene.rasterLayers.repeats`, describing
+`geometry/raster-repeats.f64` with the number of repeat paints and the total
+number of translation pairs. Each repeated layer remains one canonical raster
+paint, with its ordinary image payload, opacity, page, clip and drawing order.
+Its ordinary float32 `matrix` bounds the complete grid. The repeat metadata
+retains the individual cell geometry; painting that aggregate matrix as one
+stretched image would be incorrect. Readers therefore require v14 when repeat
+metadata is present. Files without raster repeats keep their existing scene
+version, and v9–v13 files remain readable.
+
+The repeat section starts with a uint32 record count. Each record stores a
+uint32 raster-layer index, a uint32 translation-pair count, then sixteen
+little-endian float64 values: six pattern-to-scene transform components, four
+cropped-cell bounds `[minX, minY, maxX, maxY]`, `xStep`, `yStep`, and the inclusive
+integer ranges `xFirst`, `xLast`, `yFirst`, `yLast`. The indicated number of
+float64 `[tx, ty]` pairs follows. Layer indices must be strictly increasing,
+unique and in range. The decoded section length is exactly
+`4 + 136 * count + 16 * translationCount`; readers check this against the
+archive entry before decoding. Cell coordinates remain safe integers without
+int32 narrowing. Bounds and transforms must be finite, cells axis aligned and
+nonoverlapping, steps nonzero, ranges nonempty, and the cell count safe.
+
+Cells retain the original lowering's float32 stores. The transform's linear
+components and each translated cell origin first round to float32; the cropped
+cell rectangle then produces its float32 placement matrix. Each stored
+translation pair applies to the matrix origin in sequence, with a float32
+store after each pair. Folding these translations into the original float64
+transform would change rounding. Cells are ordered with Y outermost and X
+innermost, both increasing through their inclusive integer ranges. Loading and
+re-exporting keep these exact values and do not expand the grid into layer,
+clip, draw-run or paint-graph objects for each cell.
 
 Section names derive from indices: a standalone layer is `raster/layer-N.rgba`,
 `.png` or `.webp` by its layer index, and an atlas is `raster/atlas-N.rgba` or

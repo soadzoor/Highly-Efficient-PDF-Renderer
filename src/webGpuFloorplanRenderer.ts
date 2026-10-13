@@ -1,3 +1,4 @@
+import { buildRasterRepeatInstances, type RasterRepeat } from "./rasterRepeat";
 import { buildCompactMonochromeAtlas, type CompactMonochromeAtlas } from "./compactMonochromeRaster";
 import { STROKE_COVERAGE_WGSL, STROKE_DENSITY_WGSL } from "./strokeCoverageShaders";
 import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
@@ -104,6 +105,9 @@ import { sceneStrokeRecords, strokeTextureRows, type StrokeRecordField, type Str
 type FrameListener = (stats: DrawStats) => void;
 
 interface WebGpuRasterTileResource {
+  repeatBuffer?: any;
+  repeatCount?: number;
+  extraRepeatBuffers?: { buffer: any; count: number }[];
   texture: any;
   coverageTexture?: any;
   uniformBuffer: any;
@@ -111,6 +115,7 @@ interface WebGpuRasterTileResource {
 }
 
 interface RasterLayerSource {
+  repeat?: RasterRepeat;
   opacity?: number;
   interpolate?: boolean;
   width: number;
@@ -906,9 +911,14 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
 `;
 
 const RASTER_SHADER_SOURCE = createRasterShaderSource(false);
+const RASTER_REPEAT_SHADER_SOURCE = createRasterShaderSource(false, true);
+const RASTER_REPEAT_VERTEX_LAYOUT = [{ arrayStride: 24, stepMode: "instance", attributes: [
+  { shaderLocation: 0, offset: 0, format: "float32x4" },
+  { shaderLocation: 1, offset: 16, format: "float32x2" }
+] }];
 
 /** Ordinary images and instanced page backgrounds share projection, clipping and color. */
-function createRasterShaderSource(pageBackgrounds: boolean): string {
+function createRasterShaderSource(pageBackgrounds: boolean, repeat = false): string {
   return /* wgsl */ `
 struct CameraUniforms {
   viewport : vec2f,
@@ -971,7 +981,8 @@ fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
 }
 
 @vertex
-fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) instanceIndex : u32) -> VsOut {
+fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) instanceIndex : u32${repeat
+  ? ", @location(0) repeatABCD: vec4f, @location(1) repeatEF: vec2f" : ""}) -> VsOut {
   let corner01 = cornerFromVertexIndex(vertexIndex) * 0.5 + 0.5;
   let localTopDown = vec2f(corner01.x, 1.0 - corner01.y);
 
@@ -979,12 +990,12 @@ ${pageBackgrounds ? `
   let rect = uPageRects[instanceIndex].rect;
   let world = rect.xy + rect.zw * localTopDown;
 ` : `
-  let a = uRaster.matrixA.x;
-  let b = uRaster.matrixA.y;
-  let c = uRaster.matrixA.z;
-  let d = uRaster.matrixA.w;
-  let e = uRaster.matrixB.x;
-  let f = uRaster.matrixB.y;
+  let a = ${repeat ? "repeatABCD.x" : "uRaster.matrixA.x"};
+  let b = ${repeat ? "repeatABCD.y" : "uRaster.matrixA.y"};
+  let c = ${repeat ? "repeatABCD.z" : "uRaster.matrixA.z"};
+  let d = ${repeat ? "repeatABCD.w" : "uRaster.matrixA.w"};
+  let e = ${repeat ? "repeatEF.x" : "uRaster.matrixB.x"};
+  let f = ${repeat ? "repeatEF.y" : "uRaster.matrixB.y"};
 
   // Corners select, never interpolate, so neighboring tiles share exact edges.
   let farCorner = localTopDown > vec2f(0.5);
@@ -1204,6 +1215,7 @@ export class WebGpuFloorplanRenderer {
   private readonly textPipeline: any;
 
   private readonly rasterPipeline: any;
+  private rasterRepeatPipeline: any = null;
   private pageBackgroundPipeline: any = null;
   private rasterStripPipeline: any = null;
 
@@ -3322,7 +3334,7 @@ export class WebGpuFloorplanRenderer {
         ]
       },
       primitive: {
-        topology: vertices ? "triangle-list" : "triangle-strip"
+        topology: vertices?.some(buffer => buffer.stepMode !== "instance") ? "triangle-list" : "triangle-strip"
       }
     });
     if (multiplyPass === undefined) this.multiplyPipelineFactories.set(pipeline, () => {
@@ -3914,15 +3926,29 @@ export class WebGpuFloorplanRenderer {
   }
 
   /** Tiles of one image never overlap, so each draws with the image's pipeline and clip. */
-  private drawRasterLayerResource(pass: any, resource: WebGpuRasterLayerResource): void {
-    pass.setBindGroup(0, resource.bindGroup);
-    pass.draw(4, 1, 0, 0);
-    this.frameDrawCalls += 1;
-    for (const tile of resource.extraTiles ?? []) {
+  private drawRasterLayerResource(pass: any, resource: WebGpuRasterLayerResource, multiplyPass?: 0 | 1): void {
+    const pipeline = resource.repeatBuffer ? this.getRasterRepeatPipeline() : this.rasterPipeline;
+    pass.setPipeline(multiplyPass === undefined ? pipeline : this.multiplyPipeline(pipeline, multiplyPass));
+    const extraRepeats = resource.extraRepeatBuffers;
+    const firstCount = (resource.repeatCount ?? 1) - (extraRepeats?.reduce((sum, chunk) => sum + chunk.count, 0) ?? 0);
+    const drawTile = (tile: WebGpuRasterTileResource): void => {
       pass.setBindGroup(0, tile.bindGroup);
-      pass.draw(4, 1, 0, 0);
+      if (resource.repeatBuffer) pass.setVertexBuffer(0, resource.repeatBuffer);
+      pass.draw(4, firstCount, 0, 0);
       this.frameDrawCalls += 1;
-    }
+      for (const chunk of extraRepeats ?? []) {
+        pass.setVertexBuffer(0, chunk.buffer);
+        pass.draw(4, chunk.count, 0, 0);
+        this.frameDrawCalls += 1;
+      }
+    };
+    drawTile(resource);
+    for (const tile of resource.extraTiles ?? []) drawTile(tile);
+  }
+
+  private getRasterRepeatPipeline(): any {
+    return this.rasterRepeatPipeline ??= this.createPipeline(RASTER_REPEAT_SHADER_SOURCE, "vsMain", "fsMain",
+      this.paintPipelineRecipes.get(this.rasterPipeline)!.layout, true, undefined, RASTER_REPEAT_VERTEX_LAYOUT);
   }
 
   private uploadVectorClips(scene: VectorScene): void {
@@ -4028,7 +4054,7 @@ export class WebGpuFloorplanRenderer {
             if (resource) {
               pass.setPipeline(multiplyPass === undefined ? this.rasterPipeline : this.multiplyPipeline(this.rasterPipeline, multiplyPass));
               this.bindVectorClip(pass);
-              this.drawRasterLayerResource(pass, resource);
+              this.drawRasterLayerResource(pass, resource, multiplyPass);
             }
           } else if (run.kind === "gradient-fill" && this.fillRenderingEnabled) {
             this.drawGradientFillIntoPass(pass, index);
@@ -4960,6 +4986,7 @@ export class WebGpuFloorplanRenderer {
           preferCompression: !monochrome && (layer.compressionHint === "scan" || !!layer.gpuCompression),
           opacity: layer.opacity,
           interpolate: layer.interpolate,
+          ...(layer.repeat ? { repeat: layer.repeat } : {}),
           matrix: layer.matrix instanceof Float32Array ? layer.matrix : new Float32Array(layer.matrix),
           paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
           pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
@@ -5051,6 +5078,7 @@ export class WebGpuFloorplanRenderer {
     const monochrome = layer.gpuCompression ? undefined : detectMonochromeRaster(layer.data, layer.width, layer.height);
     return { width: layer.width, height: layer.height, data: monochrome ? new Uint8Array(0) : layer.data,
       ...(monochrome ? { monochrome } : {}),
+      ...(layer.repeat ? { repeat: layer.repeat } : {}),
       compressionHint: layer.compressionHint, gpuCompression: layer.gpuCompression, gpuPreparation: layer.gpuPreparation,
       interpolate: layer.interpolate,
       compressionEligible: !monochrome && !!this.rasterCompression?.available && (!!layer.gpuCompression || assessRasterCompression(layer).eligible),
@@ -5175,7 +5203,7 @@ export class WebGpuFloorplanRenderer {
     const memoryPlan = planInput ? undefined : this.planRasterLayerMemory([this.prepareRasterSource(source)]);
     const plan = planInput ?? memoryPlan!.plans[0];
     const compressionFormat = compressionFormatInput === undefined ? memoryPlan?.compressionFormats[0] ?? null : compressionFormatInput;
-    const cached = this.getRasterResourceCache().take(source, plan, compressionFormat);
+    const cached = source.repeat ? null : this.getRasterResourceCache().take(source, plan, compressionFormat);
     if (cached) { this.recordPerformanceTransition("rasterUpload.cacheHit", 0); return cached; }
     const uploadStarted = performance.now();
     prepared ??= source.gpuPreparation;
@@ -5238,22 +5266,54 @@ export class WebGpuFloorplanRenderer {
       for (const tile of tiles) destroyRasterTileResource(tile);
       throw error;
     }
+    let repeatBuffer: any;
+    let repeatCount: number | undefined;
+    let extraRepeatBuffers: { buffer: any; count: number }[] | undefined;
+    if (source.repeat) {
+      const chunks: { buffer: any; count: number }[] = [];
+      try {
+        this.getRasterRepeatPipeline();
+        const instances = buildRasterRepeatInstances(source.repeat);
+        const reportedLimit = this.gpuDevice.limits?.maxBufferSize;
+        if (reportedLimit !== undefined && (!Number.isSafeInteger(reportedLimit) || reportedLimit < 24)) {
+          throw new RangeError("Raster repeat matrices cannot fit the device vertex-buffer capacity.");
+        }
+        // Respect actual hardware buffers and the draw API's unsigned instance count.
+        // Mocks without a reported device limit retain the ordinary single buffer.
+        const cellsPerBuffer = Math.min(Math.floor((reportedLimit ?? instances.byteLength) / 24), 0xffffffff);
+        const usage = (globalThis as any).GPUBufferUsage;
+        repeatCount = instances.length / 6;
+        for (let first = 0; first < repeatCount; first += cellsPerBuffer) {
+          const count = Math.min(cellsPerBuffer, repeatCount - first);
+          const buffer = this.gpuDevice.createBuffer({ size: count * 24, usage: (usage.VERTEX ?? 32) | usage.COPY_DST });
+          chunks.push({ buffer, count });
+          this.gpuDevice.queue.writeBuffer(buffer, 0, instances.subarray(first * 6, (first + count) * 6));
+        }
+        repeatBuffer = chunks[0].buffer;
+        if (chunks.length > 1) extraRepeatBuffers = chunks.slice(1);
+      } catch (error) {
+        for (const chunk of chunks) chunk.buffer.destroy();
+        for (const tile of tiles) destroyRasterTileResource(tile);
+        throw error;
+      }
+    }
     const paintOrder = source.paintOrder ?? 0, pageIndex = source.pageIndex ?? 0;
     const [first, ...extraTiles] = tiles;
     const resource: WebGpuRasterLayerResource = {
       ...first,
+      ...(repeatBuffer ? { repeatBuffer, repeatCount, ...(extraRepeatBuffers ? { extraRepeatBuffers } : {}) } : {}),
       rasterPlan: plan,
       estimatedBytes: estimateRasterSourcePlanBytes({ width: source.width, height: source.height,
-        monochrome, reducedMonochrome: coverage }, plan, compressionFormat) - compactSavings + plan.tiles.length * RASTER_UNIFORM_BUFFER_BYTES,
+        monochrome, reducedMonochrome: coverage }, plan, compressionFormat) - compactSavings + plan.tiles.length * RASTER_UNIFORM_BUFFER_BYTES + (repeatCount ?? 0) * 24,
       ...(compressionFormat ? { compressionFormat } : {}),
       ...(extraTiles.length > 0 ? { extraTiles } : {}),
       paintOrder: Number.isFinite(paintOrder) ? paintOrder : 0,
       pageIndex: Number.isFinite(pageIndex) ? Math.max(0, Math.trunc(pageIndex)) : 0
     };
     if (monochrome) rememberMonochromePlanBytes({ width: source.width, height: source.height, monochrome }, plan,
-      resource.estimatedBytes! - plan.tiles.length * RASTER_UNIFORM_BUFFER_BYTES);
+      resource.estimatedBytes! - plan.tiles.length * RASTER_UNIFORM_BUFFER_BYTES - (repeatCount ?? 0) * 24);
     this.recordPerformanceTransition("rasterUpload.submit", performance.now() - uploadStarted);
-    return this.getRasterResourceCache().remember(resource, source, plan, compressionFormat);
+    return source.repeat ? resource : this.getRasterResourceCache().remember(resource, source, plan, compressionFormat);
   }
 
   private createRasterTileResource(
@@ -5885,6 +5945,8 @@ export class WebGpuFloorplanRenderer {
 }
 
 function destroyRasterTileResource(tile: WebGpuRasterTileResource): void {
+  tile.repeatBuffer?.destroy();
+  for (const chunk of tile.extraRepeatBuffers ?? []) chunk.buffer.destroy();
   tile.texture?.destroy();
   if (tile.coverageTexture !== tile.texture) tile.coverageTexture?.destroy();
   tile.uniformBuffer?.destroy();

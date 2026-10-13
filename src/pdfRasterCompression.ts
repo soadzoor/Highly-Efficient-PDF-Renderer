@@ -45,7 +45,7 @@ export class PdfRasterCompressor {
     if (!(pageArea > 0)) return;
     const scans = scene.rasterLayers.filter(layer => {
       // Metadata comes first so packed scans never expand their lazy RGBA fallback.
-      if (layer.gpuCompression || layer.gpuPreparation || layer.matrix.length < 6) return false;
+      if (layer.repeat || layer.gpuCompression || layer.gpuPreparation || layer.matrix.length < 6) return false;
       const [a, b, c, d] = layer.matrix;
       if (Math.abs(a * d - b * c) < pageArea * .5) return false;
       if (layer.monochrome) return true;

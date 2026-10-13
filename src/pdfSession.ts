@@ -601,7 +601,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       // Such a page needs detail later; supported vector pages are complete at every zoom.
       if (scene.rasterLayers.length && !scene.segmentCount && !scene.textInstanceCount && !scene.fillPathCount &&
           !(scene.gradientFillPathCount ?? 0) && !(scene.gradientStrokeRunCount ?? 0) &&
-          scene.rasterLayers.some(layer => layer.width <= options.previewMaxDimension! && layer.height <= options.previewMaxDimension! &&
+          scene.rasterLayers.some(layer => !layer.repeat && layer.width <= options.previewMaxDimension! && layer.height <= options.previewMaxDimension! &&
             Math.abs(layer.matrix[0] * layer.matrix[3] - layer.matrix[1] * layer.matrix[2]) >=
               (scene.pageBounds.maxX - scene.pageBounds.minX) * (scene.pageBounds.maxY - scene.pageBounds.minY) * .75)) {
         scene.pdfOverviewKind = "raster";

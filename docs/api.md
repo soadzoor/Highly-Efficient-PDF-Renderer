@@ -829,6 +829,13 @@ Unicode character. Raster references identify whole layers, not shapes inside
 their pixels. Invisible OCR text in the original scan view has no pickable render
 instance; visible OCR overviews expose ordinary vector text primitives.
 
+Proven uniform stencil patterns use one raster layer per painted grid. Its
+optional `repeat: RasterRepeat` describes the reusable cell and its placements;
+`data`, `width` and `height` describe the cell's pixels. Picking respects gaps
+between cells and returns the grid's raster reference. Inspection and selection
+outlines use the enclosing grid quad. `rasterLayers.length` counts stored
+resources; `imagePaintOpCount` retains the logical image placement count.
+
 `getPrimitive(ref)` returns `kind`, `index`, `ref`, `bounds`, `pageIndex` (or
 `null` when ambiguous), original `color`/`opacity`, `segmentCount`, and
 `getSegment(index)` / `getSegmentStyle(index)`. Each segment has detached `start`/`end` points and an
@@ -1111,8 +1118,10 @@ unchanged, and does not add a permanent second document to the viewing cache.
 These exports use scene v10 (plain packed) or v12 (binary runs). Scene v13
 optionally encodes repeated transparency wrappers and matching draw-run metadata
 losslessly, preserving their group boundaries and paint order. Exports use v13
-when repeated wrappers can share storage; other scenes retain v9–v12. The current
-loader accepts v9–v13, including older JBIG2 HEPs,
+when repeated wrappers can share storage. Scene v14 stores compact regular
+raster repeat grids with exact cell placement and sequential page translations;
+it requires an updated reader. Other scenes retain v9–v13. The current
+loader accepts v9–v14, including older JBIG2 HEPs,
 which use the fast packed encoding when re-exported.
 
 PDF-source builds measure the original PDF automatically. Scenes loaded through

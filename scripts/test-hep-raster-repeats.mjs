@@ -14,8 +14,8 @@ try {
   const { HepArchive } = await import("../src/hepContainer.ts");
   const { buildHep } = await import("../src/hepBuilder.ts");
   const { loadSceneFromHep } = await import("../src/hepReader.ts");
-  const repeat = { transform: Float64Array.of(1.0000001192092896, .07, -.03, 1.23456789012345, 1000000.25, -1024 / 3),
-    bounds: Float64Array.of(-0, .00000000002, .9998646415770054, 1), xStep: 1, yStep: .75,
+  const repeat = { transform: Float64Array.of(1.0000001192092896, 0, -0, 1.23456789012345, 1000000.25, -1024 / 3),
+    bounds: Float64Array.of(-0, .00000000002, .9998646415770054, 1), xStep: 1, yStep: 1.25,
     xFirst: -3, xLast: 2, yFirst: 1, yLast: 4, translations: Float64Array.of(1.125, 1 / 3, -.625, -.125) };
   const otherRepeat = { ...repeat, transform: Float64Array.of(0, 1, -1, 0, 20, 30),
     translations: undefined, xFirst: 0, xLast: 1, yFirst: -2, yLast: 0 };
@@ -64,6 +64,12 @@ try {
   const hugeEncoded = encodeHepRasterRepeats([{ ...ordinary, repeat: huge }]);
   assert.equal(decodeHepRasterRepeats(hugeEncoded.bytes, 1, 1, 2).get(0).xFirst, huge.xFirst,
     "safe cell coordinates are not narrowed to int32");
+  const manyCells = { ...repeat, xFirst: 0, xLast: 999999, yFirst: 0, yLast: 999999 };
+  const manyEncoded = encodeHepRasterRepeats([{ ...ordinary, repeat: manyCells }]);
+  assert.equal(manyEncoded.bytes.length, hugeEncoded.bytes.length,
+    "serialized size depends on repeat paints and translations, not the number of cells");
+  assert.equal(rasterRepeatCount(decodeHepRasterRepeats(manyEncoded.bytes, 1, 1, 2).get(0)), 1_000_000_000_000,
+    "decoding validates large safe grids without expanding cells or introducing a resource ceiling");
 
   const corrupt = change => { const bytes = encoded.bytes.slice(); change(new DataView(bytes.buffer)); return bytes; };
   const secondRecord = 4 + 136 + 32;
@@ -117,6 +123,20 @@ try {
   const reexport = await HepArchive.loadAsync(await (await buildHep(loaded, options)).arrayBuffer());
   assert.deepEqual(await reexport.file(SCENE_RASTER_REPEATS_PATH).async("uint8array"), encoded.bytes,
     "loading and re-exporting do not fold post-float32 translations or quantize original transforms");
+  const grouped = { ...scene, rasterLayers: Array.from({ length: 128 }, (_, index) =>
+    index < layers.length ? layers[index] : { ...ordinary, paintOrder: index }), imagePaintOpCount: 128,
+    drawRuns: Array.from({ length: 128 }, (_, first) => ({ kind: "raster", first, count: 1 })),
+    paintGraph: { roots: Array.from({ length: 128 }, (_, runIndex) => ({ kind: "group", alpha: .5,
+      isolated: false, knockout: false, blendMode: "Darken", children: [{ kind: "draw", runIndex }] })) } };
+  const groupedBytes = await (await buildHep(grouped, options)).arrayBuffer();
+  const groupedArchive = await HepArchive.loadAsync(groupedBytes);
+  const groupedManifest = JSON.parse(await groupedArchive.file("manifest.json").async("string"));
+  assert.equal(groupedManifest.formatVersion, 14);
+  assert.equal(groupedManifest.scene.paintGraph.encoding, "group-runs-v1",
+    "repeat grids coexist with the earlier scene v13 paint-group encoding");
+  const groupedLoaded = await loadSceneFromHep(groupedBytes);
+  assert.deepEqual(groupedLoaded.paintGraph, grouped.paintGraph);
+  assert.deepEqual(groupedLoaded.rasterLayers[1].repeat, repeat);
 
   const rewritten = async edit => {
     const changed = await HepArchive.loadAsync(bytes), meta = JSON.parse(await changed.file("manifest.json").async("string"));

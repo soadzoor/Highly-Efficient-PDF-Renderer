@@ -1,4 +1,5 @@
 import type { RasterLayer, VectorScene } from "./pdfVectorExtractor";
+import { validateRasterRepeat } from "./rasterRepeat";
 
 export interface PreparedRasterLayerUpdates { commit(): void; dispose(): void }
 
@@ -15,5 +16,6 @@ export function validateRasterLayerUpdates(scene: VectorScene, updates: Readonly
         : layer.data.length !== layer.width * layer.height * 4) || layer.matrix.length !== 6 || !layer.matrix.every(Number.isFinite)) {
       throw new RangeError("Invalid raster replacement.");
     }
+    if (layer.repeat) validateRasterRepeat(layer.repeat);
   }
 }

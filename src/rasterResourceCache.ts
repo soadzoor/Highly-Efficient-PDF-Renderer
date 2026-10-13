@@ -3,6 +3,7 @@ import type { RasterTilePlan, RasterTileSource } from "./rasterTiles";
 /** Context-owned LRU. Cached textures count against the same budget as visible images. */
 export class RasterResourceCache<T extends object> {
   private readonly identities = new WeakMap<Uint8Array, number>();
+  private readonly repeatIdentities = new WeakMap<object, number>();
   private readonly keys = new WeakMap<T, string>();
   private readonly entries = new Map<string, { resource: T; bytes: number }>();
   private nextIdentity = 0;
@@ -15,9 +16,14 @@ export class RasterResourceCache<T extends object> {
     const pixels = source.monochrome?.data ?? source.data;
     let identity = this.identities.get(pixels);
     if (identity === undefined) this.identities.set(pixels, identity = ++this.nextIdentity);
+    let repeatIdentity = 0;
+    if (source.repeat) {
+      repeatIdentity = this.repeatIdentities.get(source.repeat) ?? ++this.nextIdentity;
+      this.repeatIdentities.set(source.repeat, repeatIdentity);
+    }
     return `${identity}:${source.width}:${source.height}:${plan.width}:${plan.height}:${plan.tiles.map(tile =>
       `${tile.x},${tile.y},${tile.width},${tile.height}`).join(";")}:${format ?? ""}:${source.interpolate === false ? "nearest" : "smooth"}:${source.opacity ?? 1}:${
-      source.matrix ? Array.from(source.matrix).join(",") : ""}:${source.pageIndex ?? 0}:${source.paintOrder ?? 0}:${source.monochrome ? Array.from(source.monochrome.colors).join(",") : ""}`;
+      source.matrix ? Array.from(source.matrix).join(",") : ""}:${source.pageIndex ?? 0}:${source.paintOrder ?? 0}:${source.monochrome ? Array.from(source.monochrome.colors).join(",") : ""}:${repeatIdentity}`;
   }
 
   remember(resource: T, source: RasterTileSource & { matrix?: ArrayLike<number>; opacity?: number; pageIndex?: number; paintOrder?: number },

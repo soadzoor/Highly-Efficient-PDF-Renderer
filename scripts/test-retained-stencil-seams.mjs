@@ -13,6 +13,11 @@ try {
   const { buildRasterAtlasBatches } = await import("../src/rasterAtlasBatches.ts");
   const { compositeBinaryStencilPlates } = await import("../src/retainedStencilRaster.ts");
   const { rasterRepeatMatrix } = await import("../src/rasterRepeat.ts");
+  const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
+  const { ScenePageViews } = await import("../src/scenePageViews.ts");
+  const { placeDemandRaster } = await import("../src/pdfDemandScene.ts");
+  const { buildRasterScenePreview } = await import("../src/pageRasterPreview.ts");
+  const { ScenePrimitivePicker, getScenePrimitive } = await import("../src/scenePrimitives.ts");
 
   const first = "q 20 0 0 10 10 10 cm .643137255 .682352941 .674509804 rg /A Do Q";
   const second = "q 20 0 0 10 10 10 cm .549019608 .588235294 .580392157 rg /B Do Q";
@@ -111,7 +116,8 @@ try {
   assert.equal((await lower(grayCoverage)).rasterLayers.length, 2, "fractional source coverage keeps its original compositing");
 
   async function patternScene({ generic = false, matrix = "1 0 0 1 0 0", mask = [0, 0],
-    clip = "0 0 3.75 3.5 re W n", content = "/PCS cs .2 .4 .6 /P scn 10 10 16 16 re f", lowerOptions = {} } = {}) {
+    clip = "0 0 3.75 3.5 re W n", xStep = 4, yStep = 4, interpolate = false,
+    content = "/PCS cs .2 .4 .6 /P scn 10 10 16 16 re f", lowerOptions = {} } = {}) {
     const cell = `${clip} 4 0 0 4 0 0 cm /B Do`;
     const bytes = writeTinyPdf({ objects: [
       { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
@@ -119,9 +125,9 @@ try {
       { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R /Resources << " +
         "/ColorSpace << /PCS [/Pattern /DeviceRGB] >> /Pattern << /P 5 0 R >> /ExtGState << /Half << /ca .5 >> >> >> >>" },
       { number: 4, body: tinyPdfStream("", content) },
-      { number: 5, body: tinyPdfStream(`/Type /Pattern /PatternType 1 /PaintType 2 /TilingType 1 /BBox [0 0 4 4] /XStep 4 /YStep 4 /Matrix [${matrix}] /Resources << /XObject << /B 6 0 R >> >>`,
+      { number: 5, body: tinyPdfStream(`/Type /Pattern /PatternType 1 /PaintType 2 /TilingType 1 /BBox [0 0 4 4] /XStep ${xStep} /YStep ${yStep} /Matrix [${matrix}] /Resources << /XObject << /B 6 0 R >> >>`,
         generic ? `/Artifact BMC ${cell} EMC` : cell) },
-      { number: 6, body: tinyPdfStream("/Type /XObject /Subtype /Image /Width 4 /Height 2 /ImageMask true /BitsPerComponent 1", Uint8Array.from(mask)) }
+      { number: 6, body: tinyPdfStream(`/Type /XObject /Subtype /Image /Width 4 /Height 2 /ImageMask true /BitsPerComponent 1 /Interpolate ${interpolate}`, Uint8Array.from(mask)) }
     ] });
     const session = await openPdf({ kind: "bytes", bytes });
     try {
@@ -173,22 +179,35 @@ try {
     }
     return result;
   }
-  for (const matrix of ["1 0 0 1 0 0", "-1 0 0 1 40 0", "0 1 -1 0 40 0", "2 0 0 3 .25 -.5"]) {
-    const optimized = await patternScene({ matrix }), generic = await patternScene({ matrix, generic: true });
+  for (const settings of [
+    { matrix: "1 0 0 1 0 0" }, { matrix: "-1 0 0 1 40 0" }, { matrix: "0 1 -1 0 40 0" },
+    { matrix: "2 0 0 3 .25 -.5" }, { matrix: "1 0 0 1 0 0", xStep: -4, yStep: -4 },
+    { matrix: "0 1 -1 0 40 0", xStep: -4, interpolate: true, clip: ".25 .5 3.5 3 re W n" }
+  ]) {
+    const { matrix } = settings, optimized = await patternScene(settings), generic = await patternScene({ ...settings, generic: true });
     const fastPaints = rasterPaints(optimized), originalPaints = rasterPaints(generic);
     assert.equal(fastPaints.length, originalPaints.length, "every original cell retains its logical raster instance");
     assert.equal(optimized.imagePaintOpCount, generic.imagePaintOpCount, "paint counts include every cell in the compact grid");
     assert.equal(optimized.rasterLayers.length, 1, "one reusable stencil grid replaces per-cell resource objects");
     assert(optimized.rasterLayers[0].repeat, "the source pattern remains explicit in canonical scene data");
+    assert.equal(optimized.rasterLayers[0].interpolate, settings.interpolate ?? false, "explicit source sampling remains unchanged");
     assert.equal(optimized.drawRuns.length, 1, "a proven simple cell batches its source-ordered placements");
     assert(generic.drawRuns.length > 1, "metadata in the cell keeps the conservative executor path");
     assert(optimized.clipPaths.length < generic.clipPaths.length, "cell clips are encoded in cropped placements");
     for (let index = 0; index < fastPaints.length; index++) assert.deepEqual(fastPaints[index].layer.data,
       originalPaints[index].layer.data, "cropping keeps identical RGBA samples and source order");
     assert(optimized.rasterLayers.every(layer => layer.data === optimized.rasterLayers[0].data), "all cells reuse owned tinted pixels");
-    for (let y = 9.125; y < 27; y += .25) for (let x = 9.125; x < 27; x += .25) assert.deepEqual(
-      sampleRasterPaints(optimized, fastPaints, x, y), sampleRasterPaints(generic, originalPaints, x, y),
+    const xs = fastPaints.flatMap(paint => [paint.layer.matrix[4], paint.layer.matrix[4] + paint.layer.matrix[0] + paint.layer.matrix[2]]),
+      ys = fastPaints.flatMap(paint => [paint.layer.matrix[5], paint.layer.matrix[5] + paint.layer.matrix[1] + paint.layer.matrix[3]]);
+    let visibleSamples = 0;
+    for (let y = Math.min(...ys) + .125; y < Math.max(...ys); y += .5) for (let x = Math.min(...xs) + .125; x < Math.max(...xs); x += .5) {
+      const sampled = sampleRasterPaints(optimized, fastPaints, x, y);
+      visibleSamples += sampled[3] > 0 ? 1 : 0;
+      assert.deepEqual(
+      sampled, sampleRasterPaints(generic, originalPaints, x, y),
       `cropped and clipped raster coverage agrees at ${matrix}: ${x},${y}`);
+    }
+    assert(visibleSamples > 0, "the comparison includes visible painted cells");
     // Sample both sides of each represented crop boundary, including Float32
     // placement rounding. Do not widen clips or erase subpixel source gaps.
     for (const paint of fastPaints.slice(0, 8)) {
@@ -208,6 +227,43 @@ try {
   for (let y = 9.125; y < 21; y += .5) for (let x = 9.125; x < 21; x += .5) assert.deepEqual(
     sampleRasterPaints(varied, variedPaints, x, y), sampleRasterPaints(variedOriginal, variedOriginalPaints, x, y),
     "bound colors, opacity groups and overlapping source paints stay equivalent");
+  const compact = await patternScene(), canonicalCompact = structuredClone(compact),
+    composed = composeVectorScenesInGrid([compact, compact], 2), nested = composeVectorScenesInGrid([composed, composed], 2);
+  for (const document of [composed, nested]) {
+    for (let pageIndex = 0; pageIndex < document.pageCount; pageIndex++) {
+      const layer = document.rasterLayers[pageIndex], repeat = layer.repeat;
+      assert(repeat, "composition preserves one grid resource per source pattern use");
+      assert.equal(repeat.translations.length, document === composed ? 2 : 4, "each composition keeps its Float32 placement store");
+      const view = new ScenePageViews(document).extract(pageIndex).scene;
+      assert.equal(view.rasterLayers[0].repeat, repeat, "page views keep immutable document-space repeat geometry");
+      assert.equal(view.imagePaintOpCount, compact.imagePaintOpCount, "page counts retain logical repeated paint operations");
+      assert.deepEqual(getScenePrimitive(view, { kind: "raster", index: 0 }).bounds,
+        getScenePrimitive(document, { kind: "raster", index: pageIndex }).bounds, "selection and page bounds use the exact grid extent");
+      for (let y = repeat.yFirst; y <= repeat.yLast; y++) for (let x = repeat.xFirst; x <= repeat.xLast; x++) {
+        const expected = rasterRepeatMatrix(compact.rasterLayers[0].repeat, x, y);
+        for (let index = 0; index < repeat.translations.length; index += 2) {
+          expected[4] += repeat.translations[index]; expected[5] += repeat.translations[index + 1];
+        }
+        assert.deepEqual(rasterRepeatMatrix(repeat, x, y), expected, "nested placement matches independent old per-cell Float32 stores");
+      }
+    }
+  }
+  assert.deepEqual(compact, canonicalCompact, "composition keeps cached compact pages reusable");
+  const preview = buildRasterScenePreview(compact, 2);
+  assert.equal(preview.rasterLayers[0].repeat, compact.rasterLayers[0].repeat, "preview reduction retains exact repeat geometry");
+  assert.equal(preview.rasterLayers[0].width, 2);
+  const placed = placeDemandRaster(compact.rasterLayers[0], composed, compact, 1);
+  assert.deepEqual(placed.repeat.translations, composed.rasterLayers[1].repeat.translations, "demand placement uses the same repeat translation as composition");
+  const picker = new ScenePrimitivePicker(compact), identity = point => ({ ...point }),
+    pick = (x, y) => picker.pick({ point: { x, y }, clientPoint: { x, y }, project: identity, unproject: identity, tolerancePx: 0 });
+  assert.deepEqual((await pick(13, 13))?.primitive, { kind: "raster", index: 0 }, "visible repeated cells are selectable");
+  assert.equal(await pick(11.875, 13), null, "horizontal cell gaps remain transparent to picking");
+  assert.equal(await pick(13, 11.75), null, "vertical cell gaps remain transparent to picking");
+  assert.equal(await pick(9, 13), null, "the source pattern paint clip still limits selection");
+  picker.dispose();
+  const overlappingCells = await patternScene({ xStep: 3, yStep: 3 });
+  assert(overlappingCells.rasterLayers.length > 1 && overlappingCells.rasterLayers.every(layer => !layer.repeat),
+    "overlapping stencil cells retain their individual source-over paint placements");
   for (const options of [
     { matrix: "1 .2 .1 1 0 0" }, { mask: [0xa0, 0x50] },
     { clip: "0 0 4 4 re 1 1 1 1 re W* n" },

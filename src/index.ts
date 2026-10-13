@@ -379,6 +379,7 @@ export {
 } from "./vectorStrokeLod";
 
 export type { Bounds, SceneTextItem, VectorScene } from "./pdfVectorExtractor";
+export type { RasterRepeat } from "./rasterRepeat";
 
 /**
  * Load the optional room detector on first use, then detect closed wall-bounded

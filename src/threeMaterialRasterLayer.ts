@@ -1,3 +1,4 @@
+import { buildRasterRepeatInstances, validateRasterRepeat, type RasterRepeat } from "./rasterRepeat";
 import { requireThreeWebGpuBackend, type ThreeWebGpuBackend } from "./threeMaterialBackend";
 import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTransforms";
 import { createThreeMultiplyMaterial } from "./threeVectorMultiply";
@@ -86,12 +87,19 @@ interface RasterImageState {
   tiles: RasterTileEntry[];
 }
 
+interface PreparedRasterGeometry {
+  geometry: THREE.BufferGeometry;
+  entry: RasterLayerEntry;
+  completion?: THREE.Material;
+}
+
 interface RasterTileEntry extends RasterLayerEntry {
   texture: THREE.Texture;
   completionMaterial?: THREE.Material;
 }
 
 interface RasterLayerSource {
+  repeat?: RasterRepeat;
   opacity?: number;
   interpolate?: boolean;
   width: number;
@@ -155,6 +163,7 @@ export class ThreeMaterialRasterLayer {
   private activeEntries: RasterLayerEntry[] = [];
   private readonly multiplyMaterials: THREE.Material[] = [];
   private readonly ownedTextures = new Set<THREE.Texture>();
+  private readonly ownedRepeatGeometries = new Set<THREE.InstancedBufferGeometry>();
   private maxRasterTextureDimension = 0;
   private maxTextureSize: number;
   private rasterTextureResidencyEnabled = false;
@@ -245,7 +254,7 @@ export class ThreeMaterialRasterLayer {
             textures[0],
             source.matrix,
             HEPR_THREE_LAYER_ORDER_RASTER + rasterOrderOffset,
-            this.geometry,
+            source.repeat ? this.createRepeatGeometry(source.repeat) : this.geometry,
             this.vectorClipIndices[rasterIndex] ?? -1,
             source.opacity ?? 1,
             rasterIndex,
@@ -292,6 +301,8 @@ export class ThreeMaterialRasterLayer {
       }
       this.activeEntries = this.entries.filter(entry => !entry.batched);
     } catch (error) {
+      for (const geometry of this.ownedRepeatGeometries) geometry.dispose();
+      this.ownedRepeatGeometries.clear();
       clips.release();
       throw error;
     }
@@ -463,8 +474,10 @@ export class ThreeMaterialRasterLayer {
           (layer.opacity ?? 1) < 0 || (layer.opacity ?? 1) > 1) {
         throw new Error("Invalid staged raster layer update.");
       }
+      if (layer.repeat) validateRasterRepeat(layer.repeat);
     }
-    const staged: { index: number; layer: RasterLayer; plan: RasterTilePlan; textures: THREE.Texture[] }[] = [];
+    const staged: { index: number; layer: RasterLayer; plan: RasterTilePlan; textures: THREE.Texture[];
+      geometry?: PreparedRasterGeometry }[] = [];
     let reservedBytes = 0;
     const releaseReservation = (): void => {
       this.pendingRasterBytes = Math.max(0, this.pendingRasterBytes - reservedBytes);
@@ -472,7 +485,10 @@ export class ThreeMaterialRasterLayer {
     };
     const disposeStaged = (): void => {
       releaseReservation();
-      for (const item of staged) for (const texture of item.textures) texture.dispose();
+      for (const item of staged) {
+        for (const texture of item.textures) texture.dispose();
+        if (item.geometry) this.disposePreparedRasterGeometry(item.geometry);
+      }
     };
     const replacements = [...updates].filter(([index, layer]) => this.appliedRasterLayers[index] !== layer);
     const sources = replacements.map(([, layer]) => classifyRasterSource(layer));
@@ -487,7 +503,14 @@ export class ThreeMaterialRasterLayer {
           cached: hasPreparedRasterPixels(sources[replacementIndex], plan) || hasPreparedRasterCompression(sources[replacementIndex], plan, format) ||
             this.resourceCache.has(sources[replacementIndex], plan, format) };
         if (this.disposed) throw new DOMException("Raster material layer disposed.", "AbortError");
-        staged.push({ index, layer, plan, textures: this.createImageTextures(layer, plan, index, format, pixels) });
+        const textures = this.createImageTextures(layer, plan, index, format, pixels);
+        try {
+          const geometry = this.prepareRasterGeometry(this.rasterEntries[index], layer, plan, textures);
+          staged.push({ index, layer, plan, textures, geometry });
+        } catch (error) {
+          for (const texture of textures) texture.dispose();
+          throw error;
+        }
       }
       const actualBytes = staged.reduce((bytes, item) => bytes + item.textures.reduce((sum,texture) =>
         sum + threeRasterTextureInfo(texture).estimatedBytes, 0), 0);
@@ -509,10 +532,10 @@ export class ThreeMaterialRasterLayer {
         finished = true;
         releaseReservation();
         if (staged.length > 0) this.destroyStripBatches();
-        for (const { index, layer, plan, textures } of staged) {
+        for (const { index, layer, plan, textures, geometry } of staged) {
           this.appliedRasterLayers[index] = layer;
           const entry = this.rasterEntries[index];
-          this.setRasterImage(entry, layer, plan, textures);
+          this.setRasterImage(entry, layer, plan, textures, geometry);
           entry.resident = this.rasterTextureResidencyEnabled;
           entry.mesh.visible = entry.resident &&
             this.isEntryVisible(entry);
@@ -699,6 +722,8 @@ export class ThreeMaterialRasterLayer {
     this.multiplyMaterials.length = 0;
 
     this.geometry.dispose();
+    for (const geometry of this.ownedRepeatGeometries) geometry.dispose();
+    this.ownedRepeatGeometries.clear();
     this.pageBackgroundGeometry?.dispose();
     for (const entry of this.stripEntries) entry.mesh.geometry.dispose();
     this.stripEntries.length = 0;
@@ -725,12 +750,39 @@ export class ThreeMaterialRasterLayer {
     entry: ResidentRasterLayerEntry,
     source: RasterLayerSource,
     plan: RasterTilePlan,
-    textures: THREE.Texture[]
+    textures: THREE.Texture[],
+    preparedGeometry?: PreparedRasterGeometry
   ): void {
     source = classifyRasterSource(source);
     const image = entry.image!;
+    preparedGeometry ??= image.source.repeat !== source.repeat ? this.prepareRasterGeometry(entry, source, plan, textures) : undefined;
     const previousTextures = image.textures;
     this.removeRasterTiles(entry, false);
+    if (preparedGeometry) {
+      const previousGeometry = entry.mesh.geometry;
+      entry.mesh.geometry = preparedGeometry.geometry;
+      for (const child of entry.mesh.children) if (child.userData.heprMultiplyCompletion) {
+        (child as THREE.Mesh).geometry = entry.mesh.geometry;
+      }
+      if (previousGeometry !== preparedGeometry.geometry &&
+          this.ownedRepeatGeometries.delete(previousGeometry as THREE.InstancedBufferGeometry)) previousGeometry.dispose();
+      if (!!image.source.repeat !== !!source.repeat) {
+        const replacement = preparedGeometry.entry;
+        for (const child of [...entry.mesh.children]) if (child.userData.heprMultiplyCompletion) {
+          const material = (child as THREE.Mesh).material as THREE.Material;
+          child.removeFromParent(); material.dispose();
+          this.multiplyMaterials.splice(this.multiplyMaterials.indexOf(material), 1);
+        }
+        entry.material.dispose();
+        entry.material = replacement.material; entry.mesh.material = replacement.material;
+        entry.webGpuState = replacement.webGpuState;
+        for (const child of [...replacement.mesh.children]) entry.mesh.add(child);
+        if (preparedGeometry.completion) this.multiplyMaterials.push(preparedGeometry.completion);
+      } else {
+        preparedGeometry.entry.material.dispose();
+        preparedGeometry.completion?.dispose();
+      }
+    }
     const previous = entry.texture;
     entry.texture = textures[0];
     for (const texture of textures) this.ownedTextures.add(texture);
@@ -814,7 +866,7 @@ export class ThreeMaterialRasterLayer {
     if (image.plan.tiles.length < 2) return;
     const completionOrder = entry.mesh.children.find(child => child.userData.heprMultiplyCompletion)?.renderOrder;
     for (let index = 1; index < image.plan.tiles.length; index++) {
-      const tile = this.createEntry(textures[index], image.source.matrix, entry.mesh.renderOrder, this.geometry,
+      const tile = this.createEntry(textures[index], image.source.matrix, entry.mesh.renderOrder, entry.mesh.geometry,
         this.vectorClipIndices[image.rasterIndex] ?? -1, image.source.opacity ?? 1, image.rasterIndex, image.plan.tiles[index]);
       const tileEntry: RasterTileEntry = {
         ...tile,
@@ -849,13 +901,13 @@ export class ThreeMaterialRasterLayer {
   }
 
   /** Paint Multiply as two ordered passes; the completion pass is a child mesh. */
-  private applyMultiply(entry: RasterLayerEntry, completionOrder?: number): THREE.Material {
+  private applyMultiply(entry: RasterLayerEntry, completionOrder?: number, track = true): THREE.Material {
     const original = entry.material;
     entry.mesh.material = entry.material = createThreeMultiplyMaterial(original, 0, true);
     const second = createThreeMultiplyMaterial(original, 1, true);
     original.dispose();
-    this.multiplyMaterials.push(second);
-    const completion = new THREE.Mesh(this.geometry, second);
+    if (track) this.multiplyMaterials.push(second);
+    const completion = new THREE.Mesh(entry.mesh.geometry, second);
     completion.frustumCulled = false;
     completion.userData.heprMultiplyCompletion = true;
     if (completionOrder !== undefined) completion.renderOrder = completionOrder;
@@ -956,6 +1008,37 @@ export class ThreeMaterialRasterLayer {
     this.activeEntries = this.entries.filter(entry => !entry.batched);
   }
 
+  /** Stage geometry/material changes before an update can change the active image. */
+  private prepareRasterGeometry(entry: ResidentRasterLayerEntry, source: RasterLayerSource,
+    plan: RasterTilePlan, textures: THREE.Texture[]): PreparedRasterGeometry | undefined {
+    if (!entry.image!.source.repeat && !source.repeat) return undefined;
+    const geometry = source.repeat ? this.createRepeatGeometry(source.repeat) : this.geometry;
+    let replacement: RasterLayerEntry | undefined;
+    let completion: THREE.Material | undefined;
+    try {
+      replacement = this.createEntry(textures[0], source.matrix, entry.mesh.renderOrder, geometry,
+        this.vectorClipIndices[entry.image!.rasterIndex] ?? -1, source.opacity ?? 1, entry.image!.rasterIndex, plan.tiles[0]);
+      if (entry.image!.multiply) completion = this.applyMultiply(replacement,
+        entry.mesh.children.find(child => child.userData.heprMultiplyCompletion)?.renderOrder, false);
+      return { geometry, entry: replacement, ...(completion ? { completion } : {}) };
+    } catch (error) {
+      replacement?.material.dispose(); completion?.dispose();
+      if (this.ownedRepeatGeometries.delete(geometry as THREE.InstancedBufferGeometry)) geometry.dispose();
+      throw error;
+    }
+  }
+
+  private disposePreparedRasterGeometry(prepared: PreparedRasterGeometry): void {
+    prepared.entry.material.dispose(); prepared.completion?.dispose();
+    if (this.ownedRepeatGeometries.delete(prepared.geometry as THREE.InstancedBufferGeometry)) prepared.geometry.dispose();
+  }
+
+  private createRepeatGeometry(repeat: RasterRepeat): THREE.InstancedBufferGeometry {
+    const geometry = createRasterRepeatGeometry(repeat);
+    this.ownedRepeatGeometries.add(geometry);
+    return geometry;
+  }
+
   private createEntry(
     texture: THREE.Texture,
     matrixSource: Float32Array,
@@ -970,12 +1053,14 @@ export class ThreeMaterialRasterLayer {
     tile = { quad: tile.quad, uv: tile.uv.map((value, index) => value * info.uvScale[index % 2]) };
     const matrix = normalizeRasterMatrix(matrixSource);
     const instancedPageBackground = geometry.hasAttribute("aPageRect");
+    const instancedRasterRepeat = geometry.hasAttribute("aRasterRepeatABCD");
     const pageBinding = this.pageTransforms ? instancedPageBackground ? { table: this.pageTransforms }
       : this.pageTransforms.page("raster", rasterIndex) : undefined;
 
     if (this.materialBackend === "webgpu") {
       const state = requireThreeWebGpuBackend(this.webGpu).createThreeWebGpuRasterMaterial({
         instancedPageBackground,
+        instancedRasterRepeat,
         pageBinding,
         colorCompositing: this.colorCompositing,
         opacity,
@@ -1004,7 +1089,8 @@ export class ThreeMaterialRasterLayer {
       glslVersion: THREE.GLSL3,
       defines: instancedPageBackground ? { INSTANCED_PAGE_BACKGROUNDS: 1 } : {},
       vertexShader: normalizeCoreShaderSource(instancedPageBackground
-        ? pagePlaceholderVertexGlsl(CORE_RASTER_VERTEX_SHADER_SOURCE) : CORE_RASTER_VERTEX_SHADER_SOURCE),
+        ? pagePlaceholderVertexGlsl(CORE_RASTER_VERTEX_SHADER_SOURCE)
+        : instancedRasterRepeat ? rasterRepeatVertexShader(CORE_RASTER_VERTEX_SHADER_SOURCE) : CORE_RASTER_VERTEX_SHADER_SOURCE),
       fragmentShader: normalizeCoreShaderSource(instancedPageBackground
         ? pagePlaceholderFragmentGlsl(monochromeRasterFragmentGlsl(CORE_RASTER_FRAGMENT_SHADER_SOURCE))
         : monochromeRasterFragmentGlsl(CORE_RASTER_FRAGMENT_SHADER_SOURCE)),
@@ -1101,6 +1187,24 @@ function createRasterGeometry(): THREE.BufferGeometry {
   ]);
   geometry.setAttribute("aCorner", new THREE.Float32BufferAttribute(corners, 2));
   geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1));
+  return geometry;
+}
+
+/** Ordinary raster sampling and clipping, with one matrix per repeated cell. */
+function rasterRepeatVertexShader(source: string): string {
+  return source.replace("uniform vec4 uRasterMatrixABCD;", "in vec4 aRasterRepeatABCD;")
+    .replace("uniform vec2 uRasterMatrixEF;", "in vec2 aRasterRepeatEF;")
+    .replace(/uRasterMatrixABCD\./g, "aRasterRepeatABCD.").replace(/uRasterMatrixEF\./g, "aRasterRepeatEF.");
+}
+
+function createRasterRepeatGeometry(repeat: RasterRepeat): THREE.InstancedBufferGeometry {
+  const geometry = new THREE.InstancedBufferGeometry();
+  geometry.setAttribute("aCorner", new THREE.Float32BufferAttribute([-1, -1, 1, -1, 1, 1, -1, 1], 2));
+  geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1));
+  const data = buildRasterRepeatInstances(repeat), instances = new THREE.InstancedInterleavedBuffer(data, 6);
+  geometry.setAttribute("aRasterRepeatABCD", new THREE.InterleavedBufferAttribute(instances, 4, 0));
+  geometry.setAttribute("aRasterRepeatEF", new THREE.InterleavedBufferAttribute(instances, 2, 4));
+  geometry.instanceCount = data.length / 6;
   return geometry;
 }
 

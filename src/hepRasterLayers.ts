@@ -1,5 +1,5 @@
 /**
- * Scene v9–v12 raster layers: one binary record per canonical image layer, with
+ * Scene v9–v14 raster layers: one binary record per canonical image layer, with
  * the pixels of small lossless layers packed into shared atlas images.
  *
  * PDFs can paint thousands of tiny images; a map sliced into one-pixel

@@ -41,7 +41,7 @@ import type {
 // Version 13 preserves vector overviews and substitutes OCR before scan decoding.
 // Version 14 requires workers to honor the embedded-font painting policy.
 // Version 15 preserves scan appearance for independent page thumbnails.
-export const PDF_WORKER_PROTOCOL_VERSION = 15 as const;
+export const PDF_WORKER_PROTOCOL_VERSION = 16 as const;
 
 // Thousands of tiny matrices cost far more to transfer individually than to
 // clone. This selects the cheaper transport; it does not limit response data.

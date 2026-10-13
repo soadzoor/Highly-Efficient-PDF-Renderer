@@ -38,7 +38,7 @@ export interface Bounds {
 }
 
 export interface RasterLayer {
-  /** Reusable uniform stencil cell; matrix encloses its grid rather than sampling it once. */
+  /** Reusable raster cell; matrix encloses its grid rather than sampling it once. */
   repeat?: RasterRepeat;
   /** Viewing-only GPU blocks; canonical pixels remain available for export and recovery. */
   gpuCompression?: PreparedRasterCompression;

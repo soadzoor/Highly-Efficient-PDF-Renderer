@@ -48,9 +48,12 @@ export function validateRasterRepeat(repeat: RasterRepeat): void {
 
 /** Match the original PDF lowering's two Float32 stores, then each page placement store. */
 export function rasterRepeatMatrix(repeat: RasterRepeat, x: number, y: number,
-  out = new Float32Array(6), offset = 0): Float32Array {
-  const [a0, b0, c0, d0, e0, f0] = repeat.transform, [minX, minY, maxX, maxY] = repeat.bounds;
-  const a = Math.fround(a0), b = Math.fround(b0), c = Math.fround(c0), d = Math.fround(d0);
+  out: Float32Array = new Float32Array(6), offset = 0): Float32Array {
+  const transform = repeat.transform, bounds = repeat.bounds;
+  const a0 = transform[0], b0 = transform[1], c0 = transform[2], d0 = transform[3], e0 = transform[4], f0 = transform[5];
+  const minX = bounds[0], minY = bounds[1], maxX = bounds[2], maxY = bounds[3];
+  const a = Math.fround(a0 * 1 + c0 * 0), b = Math.fround(b0 * 1 + d0 * 0);
+  const c = Math.fround(a0 * 0 + c0 * 1), d = Math.fround(b0 * 0 + d0 * 1);
   const e = Math.fround(a0 * (x * repeat.xStep) + c0 * (y * repeat.yStep) + e0);
   const f = Math.fround(b0 * (x * repeat.xStep) + d0 * (y * repeat.yStep) + f0);
   const width = maxX - minX, height = minY - maxY;
@@ -100,30 +103,71 @@ export function translateRasterRepeat(repeat: RasterRepeat, x: number, y: number
   return { ...repeat, translations };
 }
 
-/** Locate a cell in logarithmic time, preserving true gaps and Float32 page-placement rounding. */
-export function rasterRepeatPoint(repeat: RasterRepeat, x: number, y: number): { x: number; y: number } | null {
+export interface RasterRepeatPointRange {
+  readonly xFirst: number;
+  readonly xLast: number;
+  readonly yFirst: number;
+  readonly yLast: number;
+}
+
+/** Float32 rounding can overlap locally disjoint cells; locate every containing cell without expanding the grid. */
+export function rasterRepeatPointRange(repeat: RasterRepeat, x: number, y: number): RasterRepeatPointRange | null {
   if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
-  const matrix = new Float32Array(6), diagonal = repeat.transform[0] !== 0;
-  const find = (horizontal: boolean): number | null => {
+  const matrix = rasterRepeatMatrix(repeat, repeat.xFirst, repeat.yFirst), diagonal = repeat.transform[0] !== 0;
+  if (!(matrix[0] * matrix[3] - matrix[1] * matrix[2])) return null;
+  const find = (horizontal: boolean): readonly [number, number] | null => {
     const first = horizontal ? repeat.xFirst : repeat.yFirst, last = horizontal ? repeat.xLast : repeat.yLast;
     const axis = horizontal === diagonal ? 0 : 1, value = axis === 0 ? x : y;
     const increasing = (horizontal ? repeat.xStep * repeat.transform[diagonal ? 0 : 1]
       : repeat.yStep * repeat.transform[diagonal ? 3 : 2]) > 0;
-    const indexAt = (index: number) => increasing ? first + index : last - index;
-    let low = 0, high = last - first + 1;
-    while (low < high) {
-      const middle = low + Math.floor((high - low) / 2), index = indexAt(middle);
+    const indexAt = (index: number): number => increasing ? first + index : last - index;
+    const extent = (index: number, maximum: boolean): number => {
       rasterRepeatMatrix(repeat, horizontal ? index : repeat.xFirst, horizontal ? repeat.yFirst : index, matrix);
-      const minimum = matrix[4 + axis] + Math.min(0, matrix[axis], matrix[2 + axis], matrix[axis] + matrix[2 + axis]);
-      if (minimum <= value) low = middle + 1; else high = middle;
+      const a = matrix[axis], b = matrix[2 + axis];
+      return matrix[4 + axis] + (maximum ? Math.max(0, a, b, a + b) : Math.min(0, a, b, a + b));
+    };
+    const count = last - first + 1;
+    let low = 0, high = count;
+    while (low < high) {
+      const middle = low + Math.floor((high - low) / 2);
+      if (extent(indexAt(middle), false) <= value) low = middle + 1; else high = middle;
     }
-    return low ? indexAt(low - 1) : null;
+    const end = low;
+    low = 0; high = end;
+    while (low < high) {
+      const middle = low + Math.floor((high - low) / 2);
+      if (extent(indexAt(middle), true) < value) low = middle + 1; else high = middle;
+    }
+    if (low === end) return null;
+    const a = indexAt(low), b = indexAt(end - 1);
+    return [Math.min(a, b), Math.max(a, b)];
   };
-  const cellX = find(true), cellY = find(false);
-  if (cellX === null || cellY === null) return null;
+  const horizontal = find(true), vertical = find(false);
+  return horizontal && vertical ? { xFirst: horizontal[0], xLast: horizontal[1], yFirst: vertical[0], yLast: vertical[1] } : null;
+}
+
+function pointInRasterRepeatCell(repeat: RasterRepeat, x: number, y: number, cellX: number, cellY: number,
+  matrix: Float32Array): { x: number; y: number } | null {
   rasterRepeatMatrix(repeat, cellX, cellY, matrix);
   const [a, b, c, d, e, f] = matrix, determinant = a * d - b * c;
   if (!determinant) return null;
   const u = (d * (x - e) - c * (y - f)) / determinant, v = (-b * (x - e) + a * (y - f)) / determinant;
   return u >= 0 && u <= 1 && v >= 0 && v <= 1 ? { x: u, y: v } : null;
+}
+
+/** Return a matching cell UV, preserving true gaps and sequential Float32 page-placement rounding. */
+export function rasterRepeatPoint(repeat: RasterRepeat, x: number, y: number): { x: number; y: number } | null {
+  const range = rasterRepeatPointRange(repeat, x, y);
+  return range ? pointInRasterRepeatCell(repeat, x, y, range.xLast, range.yLast, new Float32Array(6)) : null;
+}
+
+/** Stream only matching cells in their original paint order, including Float32-induced overlaps. */
+export function* rasterRepeatPoints(repeat: RasterRepeat, x: number, y: number,
+  range = rasterRepeatPointRange(repeat, x, y)): Generator<{ x: number; y: number }> {
+  if (!range) return;
+  const matrix = new Float32Array(6);
+  for (let cellY = range.yFirst; cellY <= range.yLast; cellY++) for (let cellX = range.xFirst; cellX <= range.xLast; cellX++) {
+    const uv = pointInRasterRepeatCell(repeat, x, y, cellX, cellY, matrix);
+    if (uv) yield uv;
+  }
 }

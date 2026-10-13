@@ -27,6 +27,7 @@ try {
   const { vectorDrawRunRenderOrder } = await import("../src/threeVectorDrawRuns.ts");
   const { HeprThreePdfObject } = await import("../src/threePdfObject.ts");
   const { expandMonochromeRaster } = await import("../src/monochromeRaster.ts");
+  const { buildRasterRepeatInstances, rasterRepeatBounds } = await import("../src/rasterRepeat.ts");
 
   // Images within the limit, or on a host without one, stay one texture.
   for (const limit of [64, Infinity, NaN]) {
@@ -157,6 +158,171 @@ try {
     renderer.dispose();
     assert(device.textures.every(texture => texture.destroyed));
     assert(device.buffers.every(buffer => buffer.destroyed));
+  }
+
+  // Compact repeat layers share one image/entry and a contiguous exact matrix stream.
+  {
+    const repeat = { transform: Float64Array.of(0, 1.123, -2.5, 0, 12.345, 67.8),
+      bounds: Float64Array.of(0.2, 0.1, 2.2, 3.1), xStep: 3, yStep: -4,
+      xFirst: -1, xLast: 2, yFirst: -2, yLast: 0, translations: Float64Array.of(1 / 3, -2 / 3) };
+    const layerFor = repeat => {
+      const bounds = repeat ? rasterRepeatBounds(repeat) : { minX: 0, minY: 0, maxX: 8, maxY: 8 };
+      return { ...image(8, 8, 11), interpolate: false,
+        matrix: Float32Array.of(bounds.maxX - bounds.minX, 0, 0, bounds.maxY - bounds.minY, bounds.minX, bounds.minY),
+        ...(repeat ? { repeat } : {}) };
+    };
+    const source = layerFor(repeat), scene = sceneWith(source), matrices = buildRasterRepeatInstances(repeat);
+    scene.clipPaths = [{ parent: -1, fillRule: 0,
+      edges: Float32Array.of(0, 0, 100, 0, 100, 0, 100, 100, 100, 100, 0, 100, 0, 100, 0, 0) }];
+    scene.drawRuns[0].clipIndex = 0;
+    const device = makeDevice(64);
+    const renderer = new WebGpuFloorplanRenderer({}, device, { configure() {}, unconfigure() {} }, "rgba8unorm");
+    renderer.scene = scene; renderer.requestFrame = () => {};
+    renderer.vectorClipBindGroups = [{ clip: -2 }, { clip: -1 }, { clip: 0 }];
+    renderer.configureRasterLayers(scene);
+    const resource = renderer.rasterLayerResources[0], originalBuffer = resource.repeatBuffer;
+    assert.equal(renderer.rasterLayerResources.length, 1, "one canonical repeat creates one native image resource");
+    assert.equal(resource.repeatCount, 12);
+    assert.deepEqual(device.writes.find(write => write.buffer === originalBuffer).values, matrices);
+    assert.equal(originalBuffer.descriptor.size, matrices.byteLength);
+    assert.equal(renderer.rasterRepeatPipeline.descriptor.primitive.topology, "triangle-strip");
+    assert.deepEqual(renderer.rasterRepeatPipeline.descriptor.vertex.buffers, [{ arrayStride: 24, stepMode: "instance",
+      attributes: [{ shaderLocation: 0, offset: 0, format: "float32x4" }, { shaderLocation: 1, offset: 16, format: "float32x2" }] }]);
+    const ordinaryShader = renderer.rasterPipeline.descriptor.vertex.module.code;
+    const repeatShader = renderer.rasterRepeatPipeline.descriptor.vertex.module.code;
+    assert.match(repeatShader, /@location\(0\) repeatABCD: vec4f/);
+    assert.match(repeatShader, /let e = repeatEF\.x/);
+    assert.equal(repeatShader.slice(repeatShader.indexOf("@fragment")), ordinaryShader.slice(ordinaryShader.indexOf("@fragment")),
+      "repeat vertices preserve ordinary texture/monochrome/nearest/clip fragment processing");
+    let draws = submit(renderer);
+    assert.equal(draws.length, 1);
+    assert.deepEqual(draws[0].args, [4, 12, 0, 0]);
+    assert.equal(draws[0].vertexBuffers[0], originalBuffer);
+    assert.equal(draws[0].pipeline, renderer.rasterRepeatPipeline);
+    assert.equal(draws[0].groups[1], renderer.vectorClipBindGroups[2]);
+    scene.drawRuns[0].blendMode = "Multiply";
+    draws = submit(renderer);
+    assert.equal(draws.length, 2, "repeat Multiply preserves its two ordered paint passes");
+    assert(draws.every(draw => draw.args[1] === 12 && draw.vertexBuffers[0] === originalBuffer));
+    delete scene.drawRuns[0].blendMode;
+    const nextRepeat = { ...repeat, xLast: 3 };
+    const update = renderer.prepareRasterLayerUpdates(new Map([[0, layerFor(nextRepeat)]]));
+    update.commit(); update.dispose();
+    assert.equal(originalBuffer.destroyedCount, 1, "replacing compact repeat matrices releases their vertex buffer");
+    const replacementBuffer = renderer.rasterLayerResources[0].repeatBuffer;
+    assert.equal(submit(renderer)[0].args[1], 15);
+    const ordinaryUpdate = renderer.prepareRasterLayerUpdates(new Map([[0, layerFor(undefined)]]));
+    ordinaryUpdate.commit(); ordinaryUpdate.dispose();
+    assert.equal(replacementBuffer.destroyedCount, 1);
+    assert.equal(submit(renderer)[0].args[1], 1, "removing repeat metadata restores a single image draw");
+    renderer.dispose();
+    assert(device.buffers.every(buffer => buffer.destroyedCount === 1));
+
+    const limitedDevice = makeDevice(64);
+    limitedDevice.limits.maxBufferSize = 240;
+    const limitedRenderer = new WebGpuFloorplanRenderer({}, limitedDevice, { configure() {}, unconfigure() {} }, "rgba8unorm");
+    limitedRenderer.scene = scene; limitedRenderer.requestFrame = () => {};
+    limitedRenderer.vectorClipBindGroups = [{ clip: -2 }, { clip: -1 }, { clip: 0 }];
+    limitedRenderer.configureRasterLayers(scene);
+    const limitedResource = limitedRenderer.rasterLayerResources[0];
+    const chunks = [{ buffer: limitedResource.repeatBuffer, count: 10 }, ...limitedResource.extraRepeatBuffers];
+    assert.deepEqual(chunks.map(chunk => [chunk.buffer.descriptor.size, chunk.count]), [[240, 10], [48, 2]],
+      "repeat matrices respect the actual reported vertex-buffer capacity");
+    const limitedDraws = submit(limitedRenderer);
+    assert.deepEqual(limitedDraws.map(draw => draw.args), [[4, 10, 0, 0], [4, 2, 0, 0]]);
+    assert.deepEqual(limitedDraws.map(draw => draw.vertexBuffers[0]), chunks.map(chunk => chunk.buffer));
+    assert.deepEqual(Float32Array.from(chunks.flatMap(chunk =>
+      [...limitedDevice.writes.find(write => write.buffer === chunk.buffer).values])), matrices,
+    "chunked draws retain every matrix in source order");
+    limitedRenderer.dispose();
+    assert(limitedDevice.buffers.every(buffer => buffer.destroyedCount === 1),
+      "disposing a chunked repeat releases every owned buffer once");
+
+    const failedDevice = makeDevice(64);
+    const failedRenderer = new WebGpuFloorplanRenderer({}, failedDevice, { configure() {}, unconfigure() {} }, "rgba8unorm");
+    failedRenderer.scene = scene; failedRenderer.requestFrame = () => {};
+    const write = failedDevice.queue.writeBuffer;
+    failedDevice.queue.writeBuffer = (buffer, ...args) => {
+      if ((buffer.descriptor.usage & 32) !== 0) throw new Error("injected repeat upload failure");
+      return write(buffer, ...args);
+    };
+    assert.throws(() => failedRenderer.configureRasterLayers(scene), /injected repeat upload failure/);
+    failedRenderer.dispose();
+    assert(failedDevice.buffers.every(buffer => buffer.destroyedCount === 1),
+      "failed repeat upload releases the vertex/uniform buffers once");
+    assert(failedDevice.textures.every(texture => texture.destroyed));
+
+    for (const backend of ["webgl", "webgpu"]) {
+      const scene = sceneWith(source);
+      scene.clipPaths = [{ parent: -1, fillRule: 0,
+        edges: Float32Array.of(0, 0, 100, 0, 100, 0, 100, 100, 100, 100, 0, 100, 0, 100, 0, 0) }];
+      scene.drawRuns[0].clipIndex = 0;
+      scene.drawRuns[0].blendMode = "Multiply";
+      const layer = new ThreeMaterialRasterLayer(scene, { materialBackend: backend, webGpu,
+        colorCompositing: "display", pageBackground: [1, 1, 1, 1] });
+      const entry = layer.rasterEntries[0], geometry = entry.mesh.geometry;
+      assert.equal(layer.rasterEntries.length, 1, "one repeat creates one Three image entry");
+      assert.equal(geometry.instanceCount, 12);
+      assert.deepEqual(geometry.getAttribute("aRasterRepeatABCD").data.array, matrices);
+      assert.equal(geometry.getAttribute("aRasterRepeatABCD").data.stride, 6);
+      assert.equal(geometry.getAttribute("aRasterRepeatEF").offset, 4);
+      assert.equal(entry.mesh.children.find(child => child.userData.heprMultiplyCompletion).geometry, geometry,
+        "Multiply completion repeats the same exact cell geometry");
+      if (backend === "webgl") {
+        assert.match(entry.material.vertexShader, /in vec4 aRasterRepeatABCD/);
+        assert.doesNotMatch(entry.material.vertexShader, /uniform vec4 uRasterMatrixABCD/);
+      } else {
+        const shaders = await buildThreeShaders(entry.mesh);
+        assert.match(shaders.vertexShader, /aRasterRepeatABCD/);
+        assert.match(shaders.vertexShader, /aRasterRepeatEF/);
+        assert.match(shaders.fragmentShader, /heprThreeRasterSample/,
+          "the compiled repeat node material keeps ordinary raster sampling");
+        assert.match(shaders.fragmentShader, /heprVectorClip/);
+      }
+      assert.throws(() => layer.prepareRasterLayerUpdates(new Map([[0,
+        { ...source, repeat: { ...repeat, xLast: repeat.xFirst - 1 } }]])), /repeat/i);
+      assert.equal(entry.mesh.geometry, geometry, "invalid staged metadata leaves the active repeat unchanged");
+      let released = 0; geometry.addEventListener("dispose", () => released++);
+      const originalCreate = layer.createRepeatGeometry, previousTexture = entry.texture, previousMaterial = entry.material;
+      layer.createRepeatGeometry = () => { throw new RangeError("injected repeat geometry allocation failure"); };
+      assert.throws(() => layer.prepareRasterLayerUpdates(new Map([[0, layerFor(nextRepeat)]])), /injected repeat geometry/);
+      assert.equal(entry.texture, previousTexture);
+      assert.equal(entry.material, previousMaterial);
+      assert.equal(entry.mesh.geometry, geometry);
+      assert.equal(released, 0, "failed preparation preserves the active geometry and image");
+      let stagedGeometry;
+      layer.createRepeatGeometry = function(repeat) { return stagedGeometry = originalCreate.call(this, repeat); };
+      const cancelled = layer.prepareRasterLayerUpdates(new Map([[0, layerFor(nextRepeat)]]));
+      assert.notEqual(stagedGeometry, geometry, "repeat vertices are allocated before commit");
+      assert.equal(entry.mesh.geometry, geometry);
+      let cancelledReleased = 0; stagedGeometry.addEventListener("dispose", () => cancelledReleased++);
+      cancelled.dispose(); cancelled.dispose();
+      assert.equal(cancelledReleased, 1, "cancelling an update releases its staged geometry once");
+      assert.equal(entry.texture, previousTexture);
+      assert.equal(entry.mesh.geometry, geometry);
+      const changed = layer.prepareRasterLayerUpdates(new Map([[0, layerFor(nextRepeat)]]));
+      const adoptedGeometry = stagedGeometry;
+      let adoptedReleased = 0; adoptedGeometry.addEventListener("dispose", () => adoptedReleased++);
+      assert.equal(released, 0);
+      changed.commit(); changed.dispose();
+      layer.createRepeatGeometry = originalCreate;
+      assert.equal(entry.mesh.geometry, adoptedGeometry, "commit adopts the already prepared vertex payload");
+      assert.equal(adoptedReleased, 0, "disposing a committed transaction cannot release adopted geometry");
+      assert.equal(released, 1);
+      const changedGeometry = entry.mesh.geometry;
+      assert.equal(changedGeometry.instanceCount, 15);
+      assert.deepEqual(changedGeometry.getAttribute("aRasterRepeatABCD").data.array, buildRasterRepeatInstances(nextRepeat));
+      assert.equal(entry.mesh.children.find(child => child.userData.heprMultiplyCompletion).geometry, changedGeometry);
+      let changedReleased = 0; changedGeometry.addEventListener("dispose", () => changedReleased++);
+      const single = layer.prepareRasterLayerUpdates(new Map([[0, layerFor(undefined)]])); single.commit(); single.dispose();
+      assert.equal(changedReleased, 1);
+      assert.equal(entry.mesh.geometry.getAttribute("aRasterRepeatABCD"), undefined);
+      if (backend === "webgl") assert.match(entry.material.vertexShader, /uniform vec4 uRasterMatrixABCD/);
+      const again = layer.prepareRasterLayerUpdates(new Map([[0, layerFor(repeat)]])); again.commit(); again.dispose();
+      assert.equal(entry.mesh.geometry.instanceCount, 12, "adding a repeat rebuilds the appropriate material/geometry");
+      let finalReleased = 0; entry.mesh.geometry.addEventListener("dispose", () => finalReleased++);
+      layer.dispose(); assert.equal(finalReleased, 1);
+    }
   }
 
   // WebGPU devices expose the adapter's texture limit, not the 8192 default.
@@ -361,6 +527,24 @@ function sceneWith(layer) {
   return Object.assign(createEmptyVectorScene(), { rasterLayers: [layer], drawRuns: [{ kind: "raster", first: 0, count: 1 }] });
 }
 
+async function buildThreeShaders(mesh) {
+  const THREE = await import("three");
+  // The bundled builder shares the material's TSL assignment stack.
+  const { TSL, WGSLNodeBuilder } = await import("three/webgpu");
+  const renderer = {
+    contextNode: TSL.context({}), library: { fromMaterial: value => value },
+    getRenderTarget: () => null, getMRT: () => null,
+    backend: { compatibilityMode: false, utils: { getTextureSampleData: () => ({ primarySamples: 1 }) },
+      capabilities: { getUniformBufferLimit: () => 65536 } },
+    hasFeature: () => false, hasCompatibility: () => false,
+    coordinateSystem: THREE.WebGPUCoordinateSystem,
+    debug: { diagnostics: { keywords: false } }
+  };
+  const builder = new WGSLNodeBuilder(mesh, renderer);
+  builder.scene = new THREE.Scene(); builder.camera = new THREE.PerspectiveCamera();
+  return builder.build();
+}
+
 function premultiply(data) {
   const out = new Uint8Array(data.length);
   for (let i = 0; i < data.length; i += 4) {
@@ -431,7 +615,7 @@ function makeDevice(maxTextureDimension2D) {
     createBindGroup: descriptor => descriptor,
     createRenderPipeline: descriptor => ({ descriptor, getBindGroupLayout: index => descriptor.layout.bindGroupLayouts[index] }),
     createBuffer(descriptor) {
-      const buffer = { descriptor, destroyed: false, destroy() { this.destroyed = true; } };
+      const buffer = { descriptor, destroyed: false, destroyedCount: 0, destroy() { this.destroyed = true; this.destroyedCount++; } };
       buffers.push(buffer); return buffer;
     },
     createTexture(descriptor) {
@@ -443,12 +627,13 @@ function makeDevice(maxTextureDimension2D) {
 }
 
 function submit(renderer) {
-  const draws = [], groups = [];
+  const draws = [], groups = [], vertexBuffers = [];
   let pipeline;
   renderer.drawSourceOrderedContentIntoPass({
     setPipeline(value) { pipeline = value; },
     setBindGroup(index, value) { groups[index] = value; },
-    draw(...args) { draws.push({ pipeline, groups: groups.slice(), args }); }
+    setVertexBuffer(index, value) { vertexBuffers[index] = value; },
+    draw(...args) { draws.push({ pipeline, groups: groups.slice(), vertexBuffers: vertexBuffers.slice(), args }); }
   });
   return draws;
 }

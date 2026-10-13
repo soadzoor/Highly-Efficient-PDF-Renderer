@@ -70,7 +70,7 @@ export function buildRasterAtlasBatches(
 }
 
 function eligible(source: RasterLayer | undefined, size: number): source is RasterLayer {
-  return !!source && source.interpolate !== false && !source.monochrome && Number.isInteger(source.width) && Number.isInteger(source.height) &&
+  return !!source && !source.repeat && source.interpolate !== false && !source.monochrome && Number.isInteger(source.width) && Number.isInteger(source.height) &&
     source.width > 0 && source.height > 0 && source.width <= MAX_IMAGE_SIZE && source.height <= MAX_IMAGE_SIZE &&
     source.height <= size && mipChainWidth(source.width, source.height) <= size &&
     source.data instanceof Uint8Array && source.data.length >= source.width * source.height * 4 &&

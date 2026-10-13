@@ -1,4 +1,5 @@
 import type { MonochromeRaster } from "./monochromeRaster";
+import type { RasterRepeat } from "./rasterRepeat";
 import { finishRasterSteps, finishRasterStepsAsync } from "./rasterPreparationYield";
 
 /**
@@ -39,6 +40,7 @@ export interface RasterTilePlan {
 }
 
 export interface RasterTileSource {
+  readonly repeat?: RasterRepeat;
   readonly interpolate?: boolean;
   readonly width: number;
   readonly height: number;

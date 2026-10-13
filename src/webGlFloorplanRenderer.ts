@@ -19,6 +19,8 @@ import { buildRasterStripBatches } from "./rasterStripBatches";
 import { planRasterTiles, rasterTilePixels, reportRasterTileDownscale, sameRasterTilePlan, type RasterTilePlan } from "./rasterTiles";
 import { prepareRasterPixels, finishRasterUpdateSteps, finishRasterUpdateStepsAsync, type RasterPreparationJob, type PreparedRasterPixels } from "./rasterPreparation";
 import { RasterResourceCache } from "./rasterResourceCache";
+import { buildRasterRepeatInstances, rasterRepeatCount, type RasterRepeat } from "./rasterRepeat";
+import { rasterRepeatVertexGlsl } from "./rasterRepeatShaders";
 import { buildPackedCoverageMipAtlas, type PackedMonochromeCoverageAtlas } from "./packedMonochromeCoverage";
 import { automaticRasterMemoryBudget, estimateRasterTilePlanBytes, planSceneRasterMemory,
   estimateRasterSourcePlanBytes, estimateRasterTextureBytes, rememberMonochromePlanBytes, reportRasterMemoryBudget } from "./rasterMemoryBudget";
@@ -296,6 +298,7 @@ interface RasterTileGpu {
 }
 
 interface RasterLayerGpu extends RasterTileGpu {
+  repeat?: RasterRepeatGpu;
   rasterPlan: RasterTilePlan;
   /** Estimated logical texture bytes, including every tile and mip level. */
   estimatedBytes: number;
@@ -307,6 +310,13 @@ interface RasterLayerGpu extends RasterTileGpu {
   extraTiles?: RasterTileGpu[];
 }
 
+interface RasterRepeatGpu {
+  buffer: WebGLBuffer;
+  vao: WebGLVertexArrayObject;
+  count: number;
+  bytes: number;
+}
+
 interface SharedRasterTextures {
   tiles: RasterTileGpu[];
   estimatedBytes: number;
@@ -316,6 +326,7 @@ interface SharedRasterTextures {
 }
 
 interface RasterLayerSource {
+  repeat?: RasterRepeat;
   opacity?: number;
   interpolate?: boolean;
   width: number;
@@ -1266,6 +1277,7 @@ export class WebGlFloorplanRenderer {
       [this.gradientMeshProgram, "gradientMesh"], [this.gradientStrokeProgram, "gradientStroke"],
       [this.textProgram, "text"], [this.rasterProgram, "raster"], [this.rasterStripProgram?.program, "rasterStrip"],
       [this.rasterAtlasProgram?.program, "rasterAtlas"],
+      [this.rasterRepeatProgram?.program, "rasterRepeat"],
       [this.rasterTextureBatch?.program, "rasterTextureBatch"],
       [this.pageBackgroundProgram, "pageBackground"], [this.vectorCompositeProgram, "vectorComposite"], [this.highlightProgram, "highlight"]];
     return names.find(([candidate]) => candidate === program)?.[1] ?? null;
@@ -2243,6 +2255,8 @@ export class WebGlFloorplanRenderer {
     this.rasterStripProgram = null;
     if (this.rasterAtlasProgram) gl.deleteProgram(this.rasterAtlasProgram.program);
     this.rasterAtlasProgram = null;
+    if (this.rasterRepeatProgram) gl.deleteProgram(this.rasterRepeatProgram.program);
+    this.rasterRepeatProgram = null;
     if (this.rasterTextureBatch) {
       gl.deleteProgram(this.rasterTextureBatch.program);
       gl.deleteBuffer(this.rasterTextureBatch.buffer);
@@ -3139,6 +3153,13 @@ export class WebGlFloorplanRenderer {
     if (!layer) {
       return;
     }
+    if (layer.repeat) {
+      this.drawRasterRepeatLayer(layer, viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, zoomValue);
+      // Legacy flat passes prepare the ordinary program once for several
+      // layers; restore it after the repeat's instanced program.
+      if (statePrepared) this.prepareRasterProgram(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, zoomValue);
+      return;
+    }
     const gl = this.gl;
     if (!statePrepared) {
       this.prepareRasterProgram(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, zoomValue);
@@ -3156,23 +3177,70 @@ export class WebGlFloorplanRenderer {
     }
   }
 
-  private drawRasterTile(tile: RasterTileGpu): void {
+  private drawRasterTile(tile: RasterTileGpu, repeat?: RasterRepeatGpu, uniforms?: Record<string, WebGLUniformLocation>): void {
     const gl = this.gl;
     this.bindOrderedTexture(12, tile.texture);
     // Unit 13 is shared with text through the ordinary ordered binding cache.
     this.bindOrderedTexture(13, tile.monochrome?.mipTexture ?? tile.texture);
-    gl.uniform1f(this.uRasterMonochrome, tile.monochrome ? tile.interpolate === false ? tile.monochrome.coverage ? 5 : 4
+    gl.uniform1f(uniforms?.uRasterMonochrome ?? this.uRasterMonochrome, tile.monochrome ? tile.interpolate === false ? tile.monochrome.coverage ? 5 : 4
       : tile.monochrome.compact ? 3 : tile.monochrome.coverage ? 2 : 1 : 0);
-    gl.uniform1f(this.uRasterOpaque, tile.compressionFormat ? 1 : 0);
+    gl.uniform1f(uniforms?.uRasterOpaque ?? this.uRasterOpaque, tile.compressionFormat ? 1 : 0);
     if (tile.monochrome) {
-      gl.uniform2f(this.uRasterMonoSize, tile.monochrome.width, tile.monochrome.height);
-      gl.uniform4fv(this.uRasterMonoColor0, tile.monochrome.colors.subarray(0, 4));
-      gl.uniform4fv(this.uRasterMonoColor1, tile.monochrome.colors.subarray(4, 8));
+      gl.uniform2f(uniforms?.uRasterMonoSize ?? this.uRasterMonoSize, tile.monochrome.width, tile.monochrome.height);
+      gl.uniform4fv(uniforms?.uRasterMonoColor0 ?? this.uRasterMonoColor0, tile.monochrome.colors.subarray(0, 4));
+      gl.uniform4fv(uniforms?.uRasterMonoColor1 ?? this.uRasterMonoColor1, tile.monochrome.colors.subarray(4, 8));
     }
-    gl.uniform4fv(this.uRasterQuad, tile.quad ?? WHOLE_RASTER_RECT);
-    gl.uniform4fv(this.uRasterUv, tile.uv ?? WHOLE_RASTER_RECT);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    this.frameDrawCalls++;
+    gl.uniform4fv(uniforms?.uRasterQuad ?? this.uRasterQuad, tile.quad ?? WHOLE_RASTER_RECT);
+    gl.uniform4fv(uniforms?.uRasterUv ?? this.uRasterUv, tile.uv ?? WHOLE_RASTER_RECT);
+    if (repeat) {
+      // GLsizei is the API's signed 32-bit draw count, not a document limit.
+      for (let first = 0; first < repeat.count; first += 0x7fffffff) {
+        const count = Math.min(0x7fffffff, repeat.count - first);
+        if (first) {
+          gl.bindBuffer(gl.ARRAY_BUFFER, repeat.buffer);
+          gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 24, first * 24);
+          gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 24, first * 24 + 16);
+        }
+        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count); this.frameDrawCalls++;
+      }
+      if (repeat.count > 0x7fffffff) {
+        gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 24, 0);
+        gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 24, 16);
+      }
+    } else { gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); this.frameDrawCalls++; }
+  }
+
+  private rasterRepeatProgram: { program: WebGLProgram; uniforms: Record<string, WebGLUniformLocation> } | null = null;
+
+  private drawRasterRepeatLayer(layer: RasterLayerGpu, width: number, height: number, x: number, y: number, zoom: number): void {
+    const gl = this.gl;
+    if (!this.rasterRepeatProgram) {
+      let fragment = monochromeRasterFragmentGlsl(RASTER_FRAGMENT_SHADER_SOURCE);
+      if (this.paintFoldUnit >= 0) fragment = paintFoldFragmentGlsl(fragment, true);
+      const program = this.createProgram(rasterRepeatVertexGlsl(RASTER_VERTEX_SHADER_SOURCE), fragment);
+      try {
+        const uniforms = this.mustGetUniformMap(program, ["uViewport", "uCameraCenter", "uZoom", "uUseLocalToClip", "uLocalToClip",
+          "uRasterTex", "uRasterOpacity", "uRasterQuad", "uRasterUv", "uRasterMonochrome", "uRasterMonoMips", "uRasterMonoSize",
+          "uRasterMonoColor0", "uRasterMonoColor1", "uRasterOpaque"]);
+        if (this.paintFoldUnit >= 0) { gl.useProgram(program); gl.uniform1i(gl.getUniformLocation(program, "uPaintMask"), this.paintFoldUnit); }
+        this.rasterRepeatProgram = { program, uniforms };
+      } catch (error) { gl.deleteProgram(program); throw error; }
+    }
+    const { program, uniforms } = this.rasterRepeatProgram;
+    gl.useProgram(program); this.bindVectorClip(program); this.bindPaintFold(program);
+    gl.bindVertexArray(layer.repeat!.vao);
+    this.setGradientViewUniforms(uniforms, width, height, x, y, zoom);
+    gl.uniform1i(uniforms.uRasterTex, 12); gl.uniform1i(uniforms.uRasterMonoMips, 13);
+    gl.uniform1f(uniforms.uRasterOpacity, layer.opacity);
+    if (this.multiplyPass != null) this.setMultiplyBlend();
+    else gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    this.drawRasterTile(layer, layer.repeat, uniforms);
+    for (const tile of layer.extraTiles ?? []) this.drawRasterTile(tile, layer.repeat, uniforms);
+    if (this.performanceProfiler?.enabled) {
+      this.performanceProfiler.add("rasterRepeatDraws");
+      this.performanceProfiler.add("rasterRepeatCells", layer.repeat!.count);
+    }
+    if (this.multiplyPass == null) gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
 
   private drawRasterStripBatch(
@@ -3808,7 +3876,7 @@ export class WebGlFloorplanRenderer {
     };
     const queueRaster = (index: number): boolean => {
       const layer = this.rasterLayers?.[index];
-      if (!layer || layer.monochrome || layer.compressionFormat || layer.quad || layer.uv || layer.extraTiles?.length || this.rasterTextureBatchUnavailable) return false;
+      if (!layer || layer.repeat || layer.monochrome || layer.compressionFormat || layer.quad || layer.uv || layer.extraTiles?.length || this.rasterTextureBatchUnavailable) return false;
       let slot = rasterTextures.indexOf(layer.texture);
       if (rasterIndices.length === RASTER_BATCH_INSTANCES || slot < 0 && rasterTextures.length === RASTER_BATCH_TEXTURES) {
         flushRaster(); slot = -1;
@@ -4740,6 +4808,7 @@ export class WebGlFloorplanRenderer {
   private rasterPreparationIdentities = new WeakMap<object, number>();
   private nextRasterPreparationIdentity = 0;
   private sharedRasterTextureBytes = 0;
+  private rasterRepeatBufferBytes = 0;
   private rasterPreparationRunning = false;
 
   private getRasterResourceCache(): RasterResourceCache<RasterLayerGpu> {
@@ -5022,7 +5091,7 @@ export class WebGlFloorplanRenderer {
   private estimatedRasterResidentBytes(): number {
     // Leases include visible, parked and staged placements; count their texture
     // storage once. Per-placement estimates still conservatively plan staging.
-    let bytes = this.sharedRasterTextureBytes ?? 0;
+    let bytes = (this.sharedRasterTextureBytes ?? 0) + (this.rasterRepeatBufferBytes ?? 0);
     bytes += (this.rasterLayers ?? []).reduce((sum, layer) => sum +
       (this.rasterTextureLeases?.has(layer) ? 0 : layer.estimatedBytes ?? 0), 0);
     for (const batch of this.rasterStripBatches?.values() ?? []) bytes += batch.width * batch.height * 4 + batch.count * 32;
@@ -5147,10 +5216,41 @@ export class WebGlFloorplanRenderer {
     };
     shared.references++;
     (this.rasterTextureLeases ??= new WeakMap()).set(resource, shared);
+    try {
+      if (source.repeat) {
+        resource.repeat = this.createRasterRepeatGpu(source.repeat);
+        resource.estimatedBytes! += resource.repeat.bytes;
+      }
+    } catch (error) { this.deleteRasterLayerTextures(resource); throw error; }
     return this.getRasterResourceCache().remember(resource, source, plan, compressionFormat);
   }
 
+  private createRasterRepeatGpu(repeat: RasterRepeat): RasterRepeatGpu {
+    const data = buildRasterRepeatInstances(repeat), gl = this.gl;
+    const buffer = this.mustCreateBuffer();
+    let vao: WebGLVertexArrayObject | null = null;
+    try {
+      vao = this.createVertexArray(); gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuffer);
+      gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+      for (let attribute = 1; attribute <= 2; attribute++) {
+        gl.enableVertexAttribArray(attribute);
+        gl.vertexAttribPointer(attribute, attribute === 1 ? 4 : 2, gl.FLOAT, false, 24, attribute === 1 ? 0 : 16);
+        gl.vertexAttribDivisor(attribute, 1);
+      }
+      this.rasterRepeatBufferBytes = (this.rasterRepeatBufferBytes ?? 0) + data.byteLength;
+      return { buffer, vao, count: rasterRepeatCount(repeat), bytes: data.byteLength };
+    } catch (error) { gl.deleteBuffer(buffer); gl.deleteVertexArray(vao); throw error; }
+    finally { gl.bindVertexArray(null); gl.bindBuffer(gl.ARRAY_BUFFER, null); }
+  }
+
   private deleteRasterLayerTextures(layer: RasterLayerGpu): void {
+    if (this.releasedRasterTextureLeases?.has(layer)) return;
+    if (layer.repeat) {
+      this.gl.deleteBuffer(layer.repeat.buffer); this.gl.deleteVertexArray(layer.repeat.vao);
+      this.rasterRepeatBufferBytes -= layer.repeat.bytes;
+    }
     const shared = this.rasterTextureLeases?.get(layer);
     if (shared) {
       this.rasterTextureLeases!.delete(layer);
@@ -5162,7 +5262,6 @@ export class WebGlFloorplanRenderer {
       }
       return;
     }
-    if (this.releasedRasterTextureLeases?.has(layer)) return;
     this.deleteRasterTileTextures(layer);
     for (const tile of layer.extraTiles ?? []) this.deleteRasterTileTextures(tile);
   }

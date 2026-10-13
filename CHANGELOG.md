@@ -24,10 +24,15 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   placements, retaining sampler settings and safe replacement/disposal. Batch
   nearest-neighbor images and reuse identical raster tile plans to avoid excessive
   GPU allocations and planning memory when opening densely patterned drawings.
-- Lower proven uniform stencil pattern cells without per-cell execution groups
-  or redundant rectangular clips, preserving their exact gaps, colors, opacity
-  and paint order. Keep general execution for complex or sheared cells, index
-  Type3 glyph transforms once, and release temporary compiler clip objects sooner.
+- Keep proven uniform stencil tiling patterns as reusable grids instead of
+  allocating a scene object, execution group and rectangular clips per cell.
+  Native and Three WebGL/WebGPU renderers draw packed instances with the original
+  Float32 placements, gaps, colors, clipping, opacity and paint order. Preserve
+  page composition, layer visibility, structure attribution, picking and caller
+  limits; complex, overlapping or sheared source cells keep general execution.
+  Index Type3 glyph transforms once and release temporary compiler clips sooner.
+  Compact grids use HEP scene v14 and require an updated reader; existing HEP
+  scene formats remain readable and ordinary exports keep their previous format.
 - Report lost WebGL contexts and unavailable GPU limits directly instead of
   misidentifying them as invalid HEP vector clip capacity.
 
