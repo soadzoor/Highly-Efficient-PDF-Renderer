@@ -109,26 +109,39 @@ async function assertRasterWebpQualityParity(rasterImageCodec) {
     nodeEncoded.bytes.byteLength < quality92Webp.byteLength,
     "the parity quality must avoid @napi-rs/canvas's larger quality-92 default"
   );
+  const padded = new Uint8Array(rgba.length + 19).fill(99);
+  padded.set(rgba, 7);
+  const offsetPixels = padded.subarray(7, 7 + rgba.length);
+  const candidates = await rasterImageCodec.encodeRasterRgbaCandidates(width, height, offsetPixels);
+  assert.deepEqual(candidates.webp, new Uint8Array(quality80Webp));
+  assert.deepEqual(candidates.png, new Uint8Array(png));
+  assert.deepEqual(offsetPixels, rgba, "encoding must not mutate source pixels");
+  assert.equal(padded[6], 99);
+  assert.equal(padded.at(-1), 99);
 
   const previousDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
   const previousImageData = Object.getOwnPropertyDescriptor(globalThis, "ImageData");
   const browserCalls = [];
+  const browserCanvases = [];
+  const browserUploads = [];
   try {
     Object.defineProperty(globalThis, "document", {
       configurable: true,
       value: {
         createElement(tagName) {
           assert.equal(tagName, "canvas");
-          return {
+          const canvas = {
             width: 0,
             height: 0,
-            getContext: () => ({ putImageData() {} }),
+            getContext: () => ({ putImageData(image) { browserUploads.push(image); } }),
             toBlob(callback, mimeType, quality) {
               browserCalls.push({ mimeType, quality });
               const bytes = mimeType === "image/webp" ? quality80Webp : png;
               callback(new Blob([bytes], { type: mimeType }));
             }
           };
+          browserCanvases.push(canvas);
+          return canvas;
         }
       }
     });
@@ -146,13 +159,29 @@ async function assertRasterWebpQualityParity(rasterImageCodec) {
     const browserEncoded = await rasterImageCodec.encodeRasterRgbaAsBestImage(
       width,
       height,
-      rgba
+      offsetPixels
     );
     assert.equal(browserEncoded?.encoding, "webp");
     assert.deepEqual(browserCalls, [
       { mimeType: "image/webp", quality: 0.8 },
       { mimeType: "image/png", quality: undefined }
     ]);
+    assert.equal(browserCanvases.length, 1, "candidate encoders share one prepared canvas");
+    assert.equal(browserUploads.length, 1, "pixels are uploaded once for both encoders");
+    assert.equal(browserUploads[0].data.buffer, offsetPixels.buffer);
+    assert.equal(browserUploads[0].data.byteOffset, offsetPixels.byteOffset);
+    assert.equal(browserUploads[0].data.byteLength, rgba.byteLength);
+    assert.equal(browserCanvases[0].width, 0);
+    assert.equal(browserCanvases[0].height, 0);
+
+    if (typeof SharedArrayBuffer === "function") {
+      const shared = new Uint8Array(new SharedArrayBuffer(rgba.length));
+      shared.set(rgba);
+      await rasterImageCodec.encodeRasterRgbaCandidates(width, height, shared);
+      assert.ok(browserUploads[1].data.buffer instanceof ArrayBuffer,
+        "ImageData receives a private ordinary buffer for shared-memory pixels");
+      assert.deepEqual(new Uint8Array(browserUploads[1].data), rgba);
+    }
   } finally {
     if (previousDocument) {
       Object.defineProperty(globalThis, "document", previousDocument);
@@ -271,7 +300,14 @@ async function assertRasterAtlasRoundTrip(seedScene, zipBuilder, parsedData, ras
       assert.equal(loaded.paintOrder, source.paintOrder);
       assert.equal(loaded.pageIndex, 0);
       assert.equal(loaded.opacity, source.opacity);
+      if (index % 3 === 2) {
+        assert.equal(loaded.data, roundTrip.rasterLayers[index - 2].data,
+          "repeated atlas cells retain one canonical pixel resource");
+        assert.notEqual(loaded, roundTrip.rasterLayers[index - 2], "placements remain separate");
+        assert.notEqual(loaded.matrix, roundTrip.rasterLayers[index - 2].matrix, "placement transforms remain separate");
+      }
     }
+    assert.notEqual(roundTrip.rasterLayers[0].data, roundTrip.rasterLayers[1].data, "different atlas cells remain independent");
     assert.equal(roundTrip.rasterLayers[300].width, 200);
     assert.equal(roundTrip.rasterLayers[300].height, 150);
     assert.deepEqual(roundTrip.rasterLayers[301].data, roundTrip.rasterLayers[300].data);

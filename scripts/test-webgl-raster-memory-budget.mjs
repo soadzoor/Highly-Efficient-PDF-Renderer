@@ -69,7 +69,7 @@ try {
   assert(mock.peakBytes <= budget.peakBytes, "old/new texture staging stays within the heuristic peak allowance");
   staged.commit(); staged.dispose();
   assert.equal(renderer.rasterStagedBytes, 0, "committed textures leave the staging ledger");
-  assert(!mock.alive.has(old));
+  assert(mock.alive.has(old), "replacing one placement keeps the texture used by unchanged placements alive");
   assert.deepEqual(renderer.rasterLayers.slice(1), untouched, "unaffected textures keep their resolution and ownership");
   assert(renderer.estimatedRasterResidentBytes() <= budget.bytes);
   assert.equal(scene.rasterLayers[0].data, data, "retained replacements preserve canonical document pixels");

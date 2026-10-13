@@ -109,6 +109,111 @@ try {
   grayCoverage.stores.images.data[grayCoverage.stores.images.dataOffsets[0]] = 128;
   assert.equal((await lower(grayCoverage)).rasterLayers.length, 2, "fractional source coverage keeps its original compositing");
 
+  async function patternScene({ generic = false, matrix = "1 0 0 1 0 0", mask = [0, 0],
+    clip = "0 0 3.75 3.5 re W n", content = "/PCS cs .2 .4 .6 /P scn 10 10 16 16 re f", lowerOptions = {} } = {}) {
+    const cell = `${clip} 4 0 0 4 0 0 cm /B Do`;
+    const bytes = writeTinyPdf({ objects: [
+      { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+      { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+      { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R /Resources << " +
+        "/ColorSpace << /PCS [/Pattern /DeviceRGB] >> /Pattern << /P 5 0 R >> /ExtGState << /Half << /ca .5 >> >> >> >>" },
+      { number: 4, body: tinyPdfStream("", content) },
+      { number: 5, body: tinyPdfStream(`/Type /Pattern /PatternType 1 /PaintType 2 /TilingType 1 /BBox [0 0 4 4] /XStep 4 /YStep 4 /Matrix [${matrix}] /Resources << /XObject << /B 6 0 R >> >>`,
+        generic ? `/Artifact BMC ${cell} EMC` : cell) },
+      { number: 6, body: tinyPdfStream("/Type /XObject /Subtype /Image /Width 4 /Height 2 /ImageMask true /BitsPerComponent 1", Uint8Array.from(mask)) }
+    ] });
+    const session = await openPdf({ kind: "bytes", bytes });
+    try {
+      const page = await session.compilePage(0);
+      return await lower(page, { pageMarkedContentCount: page.stores.markedContent.mcids.length, ...lowerOptions });
+    } finally { await session.close(); }
+  }
+  function rasterPaints(scene) {
+    const paints = [];
+    const visit = (nodes, alpha) => {
+      for (const node of nodes) {
+        if (node.kind === "group") {
+          assert.equal(node.blendMode, "Normal"); assert(!node.softMask && !node.knockout);
+          visit(node.children, alpha * node.alpha);
+        } else {
+          const run = scene.drawRuns[node.runIndex]; assert.equal(run.kind, "raster");
+          for (let index = run.first; index < run.first + run.count; index++) paints.push({ layer: scene.rasterLayers[index],
+            clipIndex: run.clipIndex ?? -1, alpha });
+        }
+      }
+    };
+    visit(scene.paintGraph.roots, 1); return paints;
+  }
+  function sampleRasterPaints(scene, paints, x, y) {
+    const result = [0, 0, 0, 0];
+    for (const { layer, clipIndex, alpha } of paints) {
+      const [a, b, c, d, e, f] = layer.matrix, determinant = a * d - b * c;
+      const u = (d * (x - e) - c * (y - f)) / determinant, v = (-b * (x - e) + a * (y - f)) / determinant;
+      if (!(u >= 0 && u < 1 && v >= 0 && v < 1)) continue;
+      let clipped = false;
+      for (let index = clipIndex; index >= 0; index = scene.clipPaths[index].parent) {
+        const clip = scene.clipPaths[index]; let winding = 0;
+        for (let edge = 0; edge < clip.edges.length; edge += 4) {
+          const [x0, y0, x1, y1] = clip.edges.subarray(edge, edge + 4);
+          if ((y0 > y) !== (y1 > y) && x0 + (y - y0) / (y1 - y0) * (x1 - x0) > x) winding += y1 > y0 ? 1 : -1;
+        }
+        if (clip.fillRule ? winding % 2 === 0 : winding === 0) { clipped = true; break; }
+      }
+      if (clipped) continue;
+      const offset = (Math.min(layer.height - 1, Math.floor(v * layer.height)) * layer.width +
+        Math.min(layer.width - 1, Math.floor(u * layer.width))) * 4;
+      const sourceAlpha = layer.data[offset + 3] / 255 * alpha;
+      for (let channel = 0; channel < 3; channel++) result[channel] = layer.data[offset + channel] / 255 * sourceAlpha + result[channel] * (1 - sourceAlpha);
+      result[3] = sourceAlpha + result[3] * (1 - sourceAlpha);
+    }
+    return result;
+  }
+  for (const matrix of ["1 0 0 1 0 0", "-1 0 0 1 40 0", "0 1 -1 0 40 0", "2 0 0 3 .25 -.5"]) {
+    const optimized = await patternScene({ matrix }), generic = await patternScene({ matrix, generic: true });
+    const fastPaints = rasterPaints(optimized), originalPaints = rasterPaints(generic);
+    assert.equal(optimized.rasterLayers.length, generic.rasterLayers.length, "every original cell retains its raster instance");
+    assert.equal(optimized.drawRuns.length, 1, "a proven simple cell batches its source-ordered placements");
+    assert(generic.drawRuns.length > 1, "metadata in the cell keeps the conservative executor path");
+    assert(optimized.clipPaths.length < generic.clipPaths.length, "cell clips are encoded in cropped placements");
+    for (let index = 0; index < fastPaints.length; index++) assert.deepEqual(fastPaints[index].layer.data,
+      originalPaints[index].layer.data, "cropping keeps identical RGBA samples and source order");
+    assert(optimized.rasterLayers.every(layer => layer.data === optimized.rasterLayers[0].data), "all cells reuse owned tinted pixels");
+    for (let y = 9.125; y < 27; y += .25) for (let x = 9.125; x < 27; x += .25) assert.deepEqual(
+      sampleRasterPaints(optimized, fastPaints, x, y), sampleRasterPaints(generic, originalPaints, x, y),
+      `cropped and clipped raster coverage agrees at ${matrix}: ${x},${y}`);
+    // Sample both sides of each represented crop boundary, including Float32
+    // placement rounding. Do not widen clips or erase subpixel source gaps.
+    for (const paint of fastPaints.slice(0, 8)) {
+      const [a, b, c, d, e, f] = paint.layer.matrix;
+      for (const u of [-.0001, .0001, .9999, 1.0001]) {
+        const x = a * u + c * .5 + e, y = b * u + d * .5 + f;
+        assert.deepEqual(sampleRasterPaints(optimized, fastPaints, x, y), sampleRasterPaints(generic, originalPaints, x, y));
+      }
+    }
+  }
+  const variedContent = "/P << /MCID 0 >> BDC /PCS cs 1 0 0 /P scn 10 10 8 8 re f EMC " +
+    "/P << /MCID 1 >> BDC /Half gs /PCS cs 0 0 1 /P scn 12 12 8 8 re f EMC";
+  const varied = await patternScene({ content: variedContent }), variedOriginal = await patternScene({ content: variedContent, generic: true });
+  assert.equal(varied.drawRuns.length, 2, "color, opacity and structure boundaries remain separate");
+  assert.deepEqual(varied.markedContent.items.map(item => item.mcid), [0, 1]);
+  const variedPaints = rasterPaints(varied), variedOriginalPaints = rasterPaints(variedOriginal);
+  for (let y = 9.125; y < 21; y += .5) for (let x = 9.125; x < 21; x += .5) assert.deepEqual(
+    sampleRasterPaints(varied, variedPaints, x, y), sampleRasterPaints(variedOriginal, variedOriginalPaints, x, y),
+    "bound colors, opacity groups and overlapping source paints stay equivalent");
+  for (const options of [
+    { matrix: "1 .2 .1 1 0 0" }, { mask: [0xa0, 0x50] },
+    { clip: "0 0 4 4 re 1 1 1 1 re W* n" },
+    { clip: "0 0 m 4 4 l 0 4 l 4 0 l h W* n" }
+  ]) {
+    const scene = await patternScene(options);
+    assert(scene.drawRuns.length > 1, "sheared placements, nonuniform masks, holes and crossing clips use the exact executor");
+  }
+  for (const lowerOptions of [{ maxPatternCells: 1 }, { maxCoordinates: 1 }, { maxPrimitives: 0 }]) {
+    await assert.rejects(patternScene({ lowerOptions }), error => error.code === "resource-limit",
+      "the cached cell template preserves caller cell and geometry limits");
+  }
+  await assert.rejects(patternScene({ lowerOptions: { signal: AbortSignal.abort() } }), { name: "AbortError" });
+
   const largeComposite = compositeBinaryStencilPlates([], 4_000_001, 1, 1, new AbortController().signal);
   assert.equal(largeComposite.data.length, 4_000_001 * 4, "stencil allocations beyond the former allowance are attempted");
   assert.throws(() => compositeBinaryStencilPlates([], Number.MAX_SAFE_INTEGER, 2, 1,

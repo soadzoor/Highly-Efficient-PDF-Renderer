@@ -1326,6 +1326,8 @@ async function readRasterLayersFromParsedData(
     if (layer.cell) lastCellIndex.set(layer.cell.atlas, index);
   });
   const atlasPixels = new Map<number, Uint8Array>();
+  // A repeated cell is one immutable image resource with independent placements.
+  const atlasCells = new Map<string, Uint8Array>();
   // Decode shared legacy JBIG2 globals once across layers.
   const jbig2Globals = new Map<number, Uint8Array>();
   const layers: RasterLayer[] = [];
@@ -1382,14 +1384,20 @@ async function readRasterLayersFromParsedData(
     if (record.storage === "atlas") {
       const cell = record.cell!;
       const atlas = table.atlases[cell.atlas];
-      let pixels = atlasPixels.get(cell.atlas);
-      if (!pixels) {
-        pixels = await readRasterImageSection(archive, rasterAtlasFile(cell.atlas, atlas.encoding), atlas.width, atlas.height);
-        signal?.throwIfAborted();
-        atlasPixels.set(cell.atlas, pixels);
+      const key = `${cell.atlas}:${cell.x}:${cell.y}:${record.width}:${record.height}`;
+      const cached = atlasCells.get(key);
+      if (cached) data = cached;
+      else {
+        let pixels = atlasPixels.get(cell.atlas);
+        if (!pixels) {
+          pixels = await readRasterImageSection(archive, rasterAtlasFile(cell.atlas, atlas.encoding), atlas.width, atlas.height);
+          signal?.throwIfAborted();
+          atlasPixels.set(cell.atlas, pixels);
+        }
+        data = new Uint8Array(record.width * record.height * 4);
+        copyRasterRect(pixels, atlas.width, cell.x, cell.y, data, record.width, 0, 0, record.width, record.height);
+        atlasCells.set(key, data);
       }
-      data = new Uint8Array(record.width * record.height * 4);
-      copyRasterRect(pixels, atlas.width, cell.x, cell.y, data, record.width, 0, 0, record.width, record.height);
       if (lastCellIndex.get(cell.atlas) === i) atlasPixels.delete(cell.atlas);
     } else {
       data = await readRasterImageSection(archive, rasterLayerFile(i, record.storage), record.width, record.height);

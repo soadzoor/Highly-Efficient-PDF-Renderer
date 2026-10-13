@@ -20,6 +20,7 @@ import {
 } from "./hepSceneSections";
 import { writeHepGradientMesh } from "./hepGradientMesh";
 import { HepArchive } from "./hepContainer";
+import { writeOwnedHepImageSection } from "./hepContainerOwnedSections";
 import { warnIfHepSizeExceedsPdf, validateSourcePdfByteLength } from "./hepSizePolicy";
 import {
   GRADIENT_LUT_WIDTH,
@@ -557,7 +558,7 @@ async function writeHepRasterLayers(
       const png = options.encodeRasterImages ? await encodeRasterRgbaAsPng(width, height, atlasPixels[index]) : null;
       throwIfBuildAborted(options.signal);
       if (png) {
-        archive.file(rasterAtlasFile(index, "png"), png, { compression: "STORE" });
+        writeOwnedHepImageSection(archive, rasterAtlasFile(index, "png"), png);
       } else {
         archive.file(rasterAtlasFile(index, "rgba"), atlasPixels[index]);
       }
@@ -571,7 +572,7 @@ async function writeHepRasterLayers(
     if (image) {
       // WebP and PNG already carry entropy compression; deflating them again
       // wastes export time and normally cannot recover meaningful bytes.
-      archive.file(rasterLayerFile(index, image.storage), image.bytes, { compression: "STORE" });
+      writeOwnedHepImageSection(archive, rasterLayerFile(index, image.storage), image.bytes);
     } else {
       archive.file(rasterLayerFile(index, "rgba"), pixels[index]);
     }

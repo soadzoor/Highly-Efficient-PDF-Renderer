@@ -6,6 +6,31 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Fixed
+
+- Speed up PDF worker responses containing many pattern placements by cloning
+  small buffers instead of transferring each tiny matrix or clip separately.
+  Large image and geometry buffers still transfer without copying; scene values,
+  shared resource identities and cancellation behavior are preserved.
+- Avoid repeated spot-color, palette and ICC conversions for identical image
+  samples, preserving the existing color arithmetic and transparency. Keep
+  unpacked 1-, 2- and 4-bit samples in byte storage instead of widening to 16 bits.
+  Store proven uniform opaque black or white images as exact packed bits while
+  preserving their dimensions, masks and original color metadata.
+- Reuse one canvas upload when choosing between WebP and PNG during HEP export,
+  and avoid redundant copies of internally owned encoded images. Preserve public
+  archive read isolation and the existing encoded image quality.
+- Share repeated HEP atlas cells and native WebGL image textures across independent
+  placements, retaining sampler settings and safe replacement/disposal. Batch
+  nearest-neighbor images and reuse identical raster tile plans to avoid excessive
+  GPU allocations and planning memory when opening densely patterned drawings.
+- Lower proven uniform stencil pattern cells without per-cell execution groups
+  or redundant rectangular clips, preserving their exact gaps, colors, opacity
+  and paint order. Keep general execution for complex or sheared cells, index
+  Type3 glyph transforms once, and release temporary compiler clip objects sooner.
+- Report lost WebGL contexts and unavailable GPU limits directly instead of
+  misidentifying them as invalid HEP vector clip capacity.
+
 ## [0.1.61] - 2026-10-12
 
 ### Fixed

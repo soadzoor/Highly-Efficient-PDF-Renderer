@@ -17,6 +17,7 @@ import {
 import { encodePaletteBytes } from "./hepContainerPalette";
 import { chooseHepIntegerEncoding } from "./hepContainerIntegers";
 import { chooseHepPathEncoding } from "./hepContainerPaths";
+import { ownedHepSectionBytes } from "./hepContainerOwnedSections";
 import type { HepArchiveEntry, HepArchiveWriteOptions, HepArchiveProgress } from "./hepContainer";
 import type { EntryRecord, ChunkRecord } from "./hepContainerShared";
 
@@ -73,7 +74,8 @@ export async function generateHepArchive(
     options.signal?.throwIfAborted();
     let decoded: Uint8Array;
     if (chunk.entries.length === 1) {
-      decoded = await chunk.entries[0].source.async("uint8array");
+      const source = chunk.entries[0].source;
+      decoded = (chunk.store ? ownedHepSectionBytes(source) : undefined) ?? await source.async("uint8array");
     } else {
       decoded = new Uint8Array(chunk.length);
       for (const { record, source } of chunk.entries) {
@@ -147,7 +149,7 @@ export async function generateHepArchive(
   view.setUint32(20, crc32(headerIndex.subarray(HEADER_BYTES)), true);
   const parts: Uint8Array<ArrayBuffer>[] = [headerIndex];
   for (const payload of payloads) {
-    // All writer payloads are newly allocated ArrayBuffer-backed arrays.
+    // Payloads are owned ArrayBuffer-backed arrays, including transferred images.
     parts.push(payload as Uint8Array<ArrayBuffer>);
     const padding = align4(payload.length) - payload.length;
     if (padding) parts.push(new Uint8Array(padding));

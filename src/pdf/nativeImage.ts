@@ -1039,7 +1039,9 @@ export function unpackImageSamples(
   }
   // Widening 8-bit samples to 16 bits would only double the image's memory.
   if (bitsPerComponent === 8) return bytes;
-  const output = allocateSamples(sampleCount);
+  const output = bitsPerComponent === 16
+    ? allocateSamples(sampleCount)
+    : allocateBytes(sampleCount, "unpacked image samples");
   if (bitsPerComponent === 16) {
     for (let sample = 0; sample < sampleCount; sample += 1) {
       if ((sample & 0xfff) === 0) throwIfAborted(signal);
@@ -1401,6 +1403,26 @@ function convertPackedGray1(
   return output;
 }
 
+function uniformBlackWhiteSample(previous: number, red: number, green: number, blue: number, alpha: number): number {
+  return alpha === 255 && red === green && green === blue && (red === 0 || red === 255) &&
+    (previous === -2 || previous === red) ? red : -1;
+}
+
+function packUniformBlackWhite(width: number, height: number, value: number, signal?: AbortSignal): Uint8Array {
+  throwIfAborted(signal);
+  const rowBytes = Math.ceil(width / 8);
+  const data = allocateBytes(rowBytes * height, "uniform packed grayscale image");
+  if (value === 255) {
+    data.fill(255);
+    if (width & 7) for (let row = 0; row < height; row += 1) {
+      if ((row & 0xfff) === 0) throwIfAborted(signal);
+      data[(row + 1) * rowBytes - 1] &= 255 << (8 - (width & 7));
+    }
+  }
+  throwIfAborted(signal);
+  return data;
+}
+
 function convertSamplesToSrgb(
   samples: ImageSamples,
   width: number,
@@ -1449,47 +1471,84 @@ function convertSamplesToSrgb(
   // Amortize the 256-entry Decode tables; tiny images use the scalar path.
   if (bitsPerComponent === 8 && width * height >= 256 &&
       (color.kind === "DeviceGray" || color.kind === "DeviceRGB" || color.kind === "DeviceCMYK")) {
-    convertDeviceSamplesToSrgb8(samples, output, componentCount, decode, colorKeyMask, signal);
+    const uniform = convertDeviceSamplesToSrgb8(samples, output, componentCount, decode, colorKeyMask, signal, allowGrayOutput);
+    if (uniform >= 0) return { data: packUniformBlackWhite(width, height, uniform, signal), format: HEPR_IMAGE_FORMAT.Gray1 };
+    return { data: output, format: HEPR_IMAGE_FORMAT.Rgba8 };
+  }
+  if (bitsPerComponent <= 8 && componentCount === 1 && width * height >= 256) {
+    // A one-component image has at most 256 colors, even with a calibrated
+    // space, Indexed palette, or spot-color tint function. Resolve only values
+    // actually present: a malformed function can fail on an unused input.
+    const palette = new Uint8Array((maximum + 1) * 4);
+    const present = new Uint8Array(maximum + 1);
+    let uniform = allowGrayOutput ? -2 : -1;
+    for (let pixel = 0; pixel < width * height; pixel += 1) {
+      if ((pixel & 0xfff) === 0) throwIfAborted(signal);
+      const raw = samples[pixel], entry = raw * 4, offset = pixel * 4;
+      if (!present[raw]) {
+        const rgb = colors.convertToSrgb(colorSpaceIndex,
+          [interpolate(raw / maximum, 0, 1, decode[0], decode[1])], signal);
+        palette[entry] = Math.round(rgb[0] * 255);
+        palette[entry + 1] = Math.round(rgb[1] * 255);
+        palette[entry + 2] = Math.round(rgb[2] * 255);
+        palette[entry + 3] = colorKeyMask.length && raw >= colorKeyMask[0] && raw <= colorKeyMask[1] ? 0 : 255;
+        present[raw] = 1;
+      }
+      output[offset] = palette[entry]; output[offset + 1] = palette[entry + 1];
+      output[offset + 2] = palette[entry + 2]; output[offset + 3] = palette[entry + 3];
+      if (uniform !== -1) uniform = uniformBlackWhiteSample(uniform,
+        palette[entry], palette[entry + 1], palette[entry + 2], palette[entry + 3]);
+    }
+    if (uniform >= 0) return { data: packUniformBlackWhite(width, height, uniform, signal), format: HEPR_IMAGE_FORMAT.Gray1 };
     return { data: output, format: HEPR_IMAGE_FORMAT.Rgba8 };
   }
   const view = sixteenBit ? new DataView(output.buffer) : null;
   const components = new Array<number>(componentCount);
+  const previous = new Array<number>(componentCount).fill(-1);
+  let rgb: readonly [number, number, number] | undefined;
+  let uniform = allowGrayOutput && !sixteenBit && width * height >= 256 ? -2 : -1;
   const pixelCount = width * height;
   for (let pixel = 0; pixel < pixelCount; pixel += 1) {
     if ((pixel & 0xfff) === 0) throwIfAborted(signal);
     const sampleOffset = pixel * componentCount;
     let transparent = colorKeyMask.length > 0;
+    let sameColor = rgb !== undefined;
     for (let component = 0; component < componentCount; component += 1) {
       const raw = samples[sampleOffset + component];
-      components[component] = interpolate(
-        raw / maximum,
-        0,
-        1,
-        decode[component * 2],
-        decode[component * 2 + 1]
-      );
+      if (raw !== previous[component]) {
+        sameColor = false;
+        previous[component] = raw;
+        components[component] = interpolate(
+          raw / maximum, 0, 1, decode[component * 2], decode[component * 2 + 1]
+        );
+      }
       if (transparent && (raw < colorKeyMask[component * 2] || raw > colorKeyMask[component * 2 + 1])) {
         transparent = false;
       }
     }
-    const rgb = colors.convertToSrgb(colorSpaceIndex, components);
+    // Repeated background pixels are common in large ICC image planes. One
+    // previous color avoids graph traversal and temporary arrays for each
+    // pixel, with constant memory and the same scalar conversion arithmetic.
+    if (!sameColor) rgb = colors.convertToSrgb(colorSpaceIndex, components, signal);
     if (sixteenBit) {
       const offset = pixel * 8;
-      view!.setUint16(offset, Math.round(rgb[0] * 65535), false);
-      view!.setUint16(offset + 2, Math.round(rgb[1] * 65535), false);
-      view!.setUint16(offset + 4, Math.round(rgb[2] * 65535), false);
+      view!.setUint16(offset, Math.round(rgb![0] * 65535), false);
+      view!.setUint16(offset + 2, Math.round(rgb![1] * 65535), false);
+      view!.setUint16(offset + 4, Math.round(rgb![2] * 65535), false);
       view!.setUint16(offset + 6, transparent ? 0 : 65535, false);
     } else {
       const offset = pixel * 4;
-      output[offset] = Math.round(rgb[0] * 255);
-      output[offset + 1] = Math.round(rgb[1] * 255);
-      output[offset + 2] = Math.round(rgb[2] * 255);
+      output[offset] = Math.round(rgb![0] * 255);
+      output[offset + 1] = Math.round(rgb![1] * 255);
+      output[offset + 2] = Math.round(rgb![2] * 255);
       output[offset + 3] = transparent ? 0 : 255;
+      if (uniform !== -1) uniform = uniformBlackWhiteSample(uniform,
+        output[offset], output[offset + 1], output[offset + 2], output[offset + 3]);
     }
   }
   return {
-    data: output,
-    format: sixteenBit ? HEPR_IMAGE_FORMAT.Rgba16 : HEPR_IMAGE_FORMAT.Rgba8
+    data: uniform >= 0 ? packUniformBlackWhite(width, height, uniform, signal) : output,
+    format: uniform >= 0 ? HEPR_IMAGE_FORMAT.Gray1 : sixteenBit ? HEPR_IMAGE_FORMAT.Rgba16 : HEPR_IMAGE_FORMAT.Rgba8
   };
 }
 
@@ -1538,8 +1597,9 @@ function convertDeviceSamplesToSrgb8(
   componentCount: number,
   decode: readonly number[],
   colorKeyMask: readonly number[],
-  signal?: AbortSignal
-): void {
+  signal?: AbortSignal,
+  detectUniform = false
+): number {
   // Preserve the general converter's Decode interpolation and rounding exactly.
   // A byte has only 256 possible values, so Decode is evaluated once per value.
   const decoded = new Float64Array(componentCount * 256);
@@ -1551,6 +1611,7 @@ function convertDeviceSamplesToSrgb8(
     }
   }
   const rgb: [number, number, number] = [0, 0, 0];
+  let uniform = detectUniform ? -2 : -1;
   for (let pixel = 0, sampleOffset = 0; pixel < output.length / 4;
     pixel += 1, sampleOffset += componentCount) {
     if ((pixel & 0xfff) === 0) throwIfAborted(signal);
@@ -1582,7 +1643,10 @@ function convertDeviceSamplesToSrgb8(
       }
     }
     output[offset + 3] = transparent ? 0 : 255;
+    if (uniform !== -1) uniform = uniformBlackWhiteSample(uniform,
+      output[offset], output[offset + 1], output[offset + 2], output[offset + 3]);
   }
+  return uniform;
 }
 
 async function resolveFilters(
@@ -2244,8 +2308,9 @@ function validateImageWorkingSet(
   const pixels = width * height;
   const rowBytes = Math.ceil(width * componentCount * bitsPerComponent / 8);
   const packedBytes = rowBytes * height;
-  // 8-bit samples are used in place; other precisions widen to 16 bits.
-  const sampleBytes = bitsPerComponent === 8 ? 0 : pixels * componentCount * 2;
+  // 8-bit samples are used in place; packed samples expand only as far as
+  // their precision requires, keeping 1/2/4-bit planes in byte storage.
+  const sampleBytes = bitsPerComponent === 8 ? 0 : pixels * componentCount * (bitsPerComponent === 16 ? 2 : 1);
   const outputBytes = pixels * 4 * (bitsPerComponent === 16 ? 2 : 1);
   const limit = maxDecodedStreamBytes;
   if (

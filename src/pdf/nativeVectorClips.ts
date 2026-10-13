@@ -202,7 +202,9 @@ export class NativeVectorClipBuilder {
   readonly paths: VectorClipPath[] = [];
   approximatedCurves = false;
   precisionLimitedCurves = false;
-  private readonly ids = new Map<DensePdfTextClip, number>();
+  // Only the packed paths outlive compilation. Pattern-cell execution scopes
+  // may be released as soon as their numeric clip IDs have been recorded.
+  private readonly ids = new WeakMap<DensePdfTextClip, number>();
   private readonly shapes = new Map<string, number>();
   add(clip: DensePdfTextClip | null | undefined, signal?: AbortSignal): number | undefined {
     if (!clip) return undefined;

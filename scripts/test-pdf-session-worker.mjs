@@ -19,6 +19,7 @@ try {
     { attachPdfWorkerRuntime },
     {
       PDF_WORKER_PROTOCOL_VERSION,
+      PDF_WORKER_RESPONSE_TRANSFER_MIN_BYTES,
       collectPdfTransferables,
       deserializePdfError,
       serializePdfError
@@ -50,6 +51,7 @@ try {
   });
 
   assertRecursiveVectorTransferCollection(collectPdfTransferables);
+  assertSmallResponseBufferCloning(collectPdfTransferables, PDF_WORKER_RESPONSE_TRANSFER_MIN_BYTES);
 
   const [hostEndpoint, workerEndpoint] = linkedCloneEndpoints();
   let vectorTransferChecked = false;
@@ -68,12 +70,12 @@ try {
       message.type !== "hepr-pdf-result" || !message.ok ||
       message.operation !== "compile-vector-page"
     ) return;
-    const expected = collectPdfTransferables(message.scene);
+    const expected = collectPdfTransferables(message.scene, PDF_WORKER_RESPONSE_TRANSFER_MIN_BYTES);
     const actual = new Set(transfer);
     assert.equal(actual.size, expected.length,
       "the vector-page response must not repeat scene buffers");
     assert.ok(expected.every((buffer) => actual.has(buffer)),
-      "the vector-page response must transfer every recursive scene buffer");
+      "the vector-page response transfers large buffers and clones small resources");
     vectorTransferChecked = true;
   };
   const runtime = attachPdfWorkerRuntime(workerEndpoint);
@@ -876,4 +878,22 @@ function assertRecursiveVectorTransferCollection(collectPdfTransferables) {
   for (const buffer of [shared, image.buffer, matrix.buffer, fallbackQuads.buffer]) {
     assert.ok(transfers.includes(buffer), "a nested vector-scene buffer was not transferable");
   }
+}
+
+function assertSmallResponseBufferCloning(collectPdfTransferables, minimumByteLength) {
+  const matrix = Float32Array.of(1, 0, 0, 1, 12.25, -6.5);
+  const pixels = new Uint8Array(minimumByteLength).fill(123);
+  const scene = { matrix, sameMatrix: matrix, pixels,
+    sharedSlice: pixels.subarray(3, 8), metadata: { bounds: Float64Array.of(-1, 0, 10, 20) } };
+  const transfers = collectPdfTransferables(scene, minimumByteLength);
+  assert.deepEqual(transfers, [pixels.buffer], "only the large backing buffer is transferred, exactly once");
+  const clone = structuredClone(scene, { transfer: transfers });
+  assert.equal(pixels.byteLength, 0, "large resources retain zero-copy transfer ownership");
+  assert.equal(matrix.byteLength, 24, "tiny matrices are cloned instead of entering the transfer list");
+  assert.deepEqual(clone.matrix, matrix);
+  assert.notEqual(clone.matrix.buffer, matrix.buffer);
+  assert.equal(clone.matrix, clone.sameMatrix, "cloning preserves repeated resource identities");
+  assert.equal(clone.sharedSlice.buffer, clone.pixels.buffer, "transfer preserves aliased views");
+  assert.deepEqual(Array.from(clone.sharedSlice), [123, 123, 123, 123, 123]);
+  assert.deepEqual(clone.metadata.bounds, scene.metadata.bounds);
 }

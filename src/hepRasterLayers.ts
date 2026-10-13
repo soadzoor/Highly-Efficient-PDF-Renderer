@@ -8,7 +8,7 @@
  * HEP larger than its PDF. v9 still keeps every layer as its own record (its
  * index, transform, paint order, page and opacity), so picking, draw order and
  * optional content see exactly the same layers. Only where the pixels live
- * changes: a reader crops each atlas cell back into the layer's own RGBA.
+ * changes: a reader crops each distinct atlas cell once into shared RGBA.
  *
  * Every integer is an unsigned LEB128 varint unless it is called zigzag.
  */

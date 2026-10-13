@@ -39,6 +39,31 @@ try {
     "WebGL packing adapts optional indices before device allocation");
   assert.equal(webgl.vectorClipStoreTexels, fitted.length / 4);
 
+  for (const [reportedSize, lost] of [[null, true], [0, true], [8192, true],
+    [null, false], [0, false], [NaN, false], [Infinity, false], [24.5, false]]) {
+    let resourceChanges = 0;
+    const unavailableGl = new Proxy({
+      getParameter: () => reportedSize,
+      isContextLost: () => lost,
+      deleteTexture() { resourceChanges++; },
+      createTexture() { resourceChanges++; return {}; },
+      texImage2D() { resourceChanges++; }
+    }, { get(target, key) { return target[key] ?? (() => {}); } });
+    const previousClipTexture = {}, previousBoundsTexture = {}, previousBoundsCache = new WeakMap();
+    const unavailable = Object.assign(Object.create(WebGlFloorplanRenderer.prototype), {
+      gl: unavailableGl, vectorClipTexture: previousClipTexture,
+      vectorClipBoundsTexture: previousBoundsTexture, rasterTextureClipBounds: previousBoundsCache
+    });
+    assert.throws(() => unavailable.uploadVectorClips(scene), error => error.message === (lost
+      ? "WebGL context was lost before uploading vector clipping."
+      : "WebGL did not report a valid maximum texture size for vector clipping."),
+    "unavailable GPU capacity reports the context problem instead of invalid document geometry");
+    assert.equal(resourceChanges, 0, "failed context checks cannot delete or allocate clip textures");
+    assert.equal(unavailable.vectorClipTexture, previousClipTexture);
+    assert.equal(unavailable.vectorClipBoundsTexture, previousBoundsTexture);
+    assert.equal(unavailable.rasterTextureClipBounds, previousBoundsCache);
+  }
+
   const gpuUploads = [];
   const gpu = {
     limits: { maxTextureDimension2D: maxSize },

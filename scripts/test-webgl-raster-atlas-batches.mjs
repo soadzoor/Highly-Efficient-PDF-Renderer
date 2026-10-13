@@ -184,6 +184,25 @@ try {
     "a packed monochrome image keeps its own sampler and flushes surrounding RGBA batches");
   assert.equal(packed.mock.paints.find(p => p.label === "raster").uniforms.get("uRasterMonochrome"), 3);
 
+  const nearestScene = makeScene(8);
+  nearestScene.rasterLayers.forEach(layer => { layer.interpolate = false; });
+  nearestScene.clipPaths = [rectangle(0), rectangle(1)];
+  nearestScene.drawRuns.forEach((run, i) => { run.clipIndex = i % 2; });
+  const nearestCanonical = structuredClone(nearestScene), nearestBatch = fixture(Renderer, nearestScene, VectorOrderedBatches);
+  nearestBatch.renderer.drawSourceOrderedContent(100, 80, 0, 0, 1);
+  const nearestPaints = nearestBatch.mock.paints.filter(p => p.label.startsWith("raster"));
+  assert.deepEqual(nearestPaints.map(p => [p.label, p.count]), [["rasterTextureBatch", 8]],
+    "nearest images retain their texture samplers while batching across clip roots");
+  for (let i = 0; i < 8; i++) {
+    const instance = nearestPaints[0].instances.subarray(i * RASTER_BATCH_INSTANCE_FLOATS, (i + 1) * RASTER_BATCH_INSTANCE_FLOATS);
+    assert.equal(instance[7], i % 2);
+    assert.equal(nearestPaints[0].textures[instance[8]], nearestBatch.renderer.rasterLayers[i].texture);
+    assert.equal(nearestBatch.renderer.rasterLayers[i].interpolate, false);
+  }
+  assert(nearestBatch.mock.calls.some(call => call[0] === "texParameteri" && call[2] === "TEXTURE_MIN_FILTER" && call[3] === "NEAREST"));
+  assert(nearestBatch.mock.calls.some(call => call[0] === "texParameteri" && call[2] === "TEXTURE_MAG_FILTER" && call[3] === "NEAREST"));
+  assert.deepEqual(nearestScene, nearestCanonical);
+
   const paired = makeScene(7); paired.rasterLayers = paired.rasterLayers.map((_, i) => largeImage(i));
   paired.drawRuns[3].blendMode = "Multiply"; delete paired.paintGraph;
   const multiplyBoundary = fixture(Renderer, paired, VectorOrderedBatches);
