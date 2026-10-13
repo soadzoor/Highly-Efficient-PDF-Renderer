@@ -1,0 +1,1 @@
+var e=new WeakMap;function t(t,n,r){let i=r.buffer instanceof ArrayBuffer?new Uint8Array(r.buffer,r.byteOffset,r.byteLength):new Uint8Array(r);t.file(n,i,{compression:`STORE`}),e.set(t.file(n),i)}function n(t){return e.get(t)}export{t as n,n as t};

@@ -1,0 +1,1 @@
+let e;function t(){return e??=n()?import(`./nodePdfSource-5MULZ5G1.js`).then(({createNodeBundledStandardFontResolver:e})=>e()):import(`./standardFontResolver-BWSHeY-d.js`).then(({createBundledStandardFontResolver:e})=>e()),e}function n(){return typeof globalThis.process?.versions?.node==`string`}export{t as nativeVectorMissingFontResolver};
