@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-11T12:29:26.118Z",
+  "generatedAt": "2026-10-13T16:48:03.019Z",
   "examples": [
     {
       "id": "20260415_broschuere_leo_b2c_rz_online_reduz",
@@ -190,7 +190,7 @@
       },
       "hep": {
         "path": "examples/heps/thesis-parsed-data.hep",
-        "sizeBytes": 1551832
+        "sizeBytes": 1547696
       }
     },
     {
@@ -214,7 +214,7 @@
       },
       "hep": {
         "path": "examples/heps/TIKA-2848-2-parsed-data.hep",
-        "sizeBytes": 7881200
+        "sizeBytes": 7880236
       }
     },
     {
