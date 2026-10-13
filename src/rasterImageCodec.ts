@@ -85,17 +85,41 @@ export async function encodeRasterRgbaCandidates(
 }
 
 /** Images below this size always try both encoders. */
-const PNG_PROBE_MIN_TEXELS = 1 << 20;
-const PNG_PROBE_BANDS = 32;
-const PNG_PROBE_BAND_ROWS = 16;
-/** Whole-image PNG is skipped only when predicted at least this many times WebP's size. */
-const PNG_PROBE_MARGIN = 1.2;
+const PNG_PROBE_MIN_TEXELS = 1 << 16;
+/**
+ * Megapixel images at least 1024 rows tall sample 32 bands of 16 rows; their
+ * prediction stays within -5%/+30% of the real PNG, so a 1.2x margin is safe.
+ */
+const PNG_PROBE_LARGE_TEXELS = 1 << 20;
+const PNG_PROBE_LARGE_MARGIN = 1.2;
+/**
+ * Smaller images sample about an eighth of their rows in 4-32 bands. Blank
+ * margins and short bands make that prediction several times less accurate,
+ * so only a far larger predicted PNG skips the whole-image encode.
+ */
+const PNG_PROBE_SMALL_MARGIN = 2.5;
+const PNG_PROBE_MAX_BANDS = 32;
+const PNG_PROBE_MIN_BANDS = 4;
+const PNG_PROBE_ROW_SHARE = 8;
+
+/** Evenly spaced row bands to sample, or null when the image is too short. */
+function pngProbeLayout(width: number, height: number): { bands: number; rows: number; margin: number } | null {
+  if (width * height < PNG_PROBE_MIN_TEXELS) return null;
+  if (width * height >= PNG_PROBE_LARGE_TEXELS && height >= PNG_PROBE_MAX_BANDS * 16 * 2) {
+    return { bands: PNG_PROBE_MAX_BANDS, rows: 16, margin: PNG_PROBE_LARGE_MARGIN };
+  }
+  for (const rows of [16, 8]) {
+    const bands = Math.min(PNG_PROBE_MAX_BANDS, Math.floor(height / (rows * PNG_PROBE_ROW_SHARE)));
+    if (bands >= PNG_PROBE_MIN_BANDS) return { bands, rows, margin: PNG_PROBE_SMALL_MARGIN };
+  }
+  return null;
+}
 
 /**
- * Lossless PNG of a large photograph or scan is slower than WebP and many
- * times larger, so it never wins the size comparison. Evenly spaced row bands
- * predict its size from a few percent of the image. A predicted loss beyond
- * the margin skips the whole-image encode; near or winning predictions still
+ * Lossless PNG of a photograph or scan is slower than WebP and several times
+ * larger, so it rarely wins the size comparison. Evenly spaced row bands
+ * predict its size from a fraction of the image. A predicted loss beyond the
+ * margin skips the whole-image encode; near or winning predictions still
  * compare both encodings exactly.
  */
 async function pngMayBeatWebp(
@@ -104,16 +128,17 @@ async function pngMayBeatWebp(
   rgba: Uint8Array<ArrayBufferLike>,
   webpBytes: number
 ): Promise<boolean> {
-  const sampleRows = PNG_PROBE_BANDS * PNG_PROBE_BAND_ROWS;
-  if (width * height < PNG_PROBE_MIN_TEXELS || height < sampleRows * 2) return true;
-  const rowBytes = width * 4;
+  const layout = pngProbeLayout(width, height);
+  if (!layout) return true;
+  const { bands, rows, margin } = layout;
+  const sampleRows = bands * rows, rowBytes = width * 4;
   const sample = new Uint8Array(rowBytes * sampleRows);
-  for (let band = 0; band < PNG_PROBE_BANDS; band += 1) {
-    const top = Math.floor((height - PNG_PROBE_BAND_ROWS) * band / (PNG_PROBE_BANDS - 1));
-    sample.set(rgba.subarray(top * rowBytes, (top + PNG_PROBE_BAND_ROWS) * rowBytes), band * PNG_PROBE_BAND_ROWS * rowBytes);
+  for (let band = 0; band < bands; band += 1) {
+    const top = Math.floor((height - rows) * band / (bands - 1));
+    sample.set(rgba.subarray(top * rowBytes, (top + rows) * rowBytes), band * rows * rowBytes);
   }
   const { png } = await encodeRasterRgbaImages(width, sampleRows, sample, ["png"]);
-  return !png || png.byteLength * (height / sampleRows) < webpBytes * PNG_PROBE_MARGIN;
+  return !png || png.byteLength * (height / sampleRows) < webpBytes * margin;
 }
 
 /** The smaller candidate, or null when neither beats raw RGBA storage. */

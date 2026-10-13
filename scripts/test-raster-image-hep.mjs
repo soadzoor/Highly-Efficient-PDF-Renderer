@@ -62,9 +62,12 @@ function createRasterScene(seedScene, width, height, data) {
   };
 }
 
-/** Large images encode whole-image PNG only when a row-band probe says it could win. */
+/** Large and mid-size images encode whole-image PNG only when a row-band probe says it could win. */
 async function assertLargeImagePngProbe(rasterImageCodec) {
-  const width = 1024, height = 1100;
+  for (const [width, height] of [[1024, 1100], [512, 384]]) await assertPngProbe(rasterImageCodec, width, height);
+}
+
+async function assertPngProbe(rasterImageCodec, width, height) {
   const photo = new Uint8Array(width * height * 4);
   let state = 1;
   for (let y = 0; y < height; y += 1) {
@@ -76,7 +79,7 @@ async function assertLargeImagePngProbe(rasterImageCodec) {
   }
   const photoCandidates = await rasterImageCodec.encodeRasterRgbaCandidates(width, height, photo);
   assert.ok(photoCandidates.webp);
-  assert.equal(photoCandidates.png, null, "a noisy photograph skips a whole-image PNG that cannot beat WebP");
+  assert.equal(photoCandidates.png, null, `a ${width}x${height} noisy photograph skips a whole-image PNG that cannot beat WebP`);
 
   // Sharp one-pixel detail is where lossless PNG beats lossy WebP outright.
   const drawing = new Uint8Array(width * height * 4).fill(255);
@@ -84,8 +87,49 @@ async function assertLargeImagePngProbe(rasterImageCodec) {
     for (let x = 0; x < width; x += 1) if (((x ^ y) & 1) === 0) drawing.fill(0, (y * width + x) * 4, (y * width + x) * 4 + 3);
   }
   const drawingCandidates = await rasterImageCodec.encodeRasterRgbaCandidates(width, height, drawing);
-  assert.ok(drawingCandidates.png, "sharp drawings still encode PNG for the exact size comparison");
+  assert.ok(drawingCandidates.png, `${width}x${height} sharp drawings still encode PNG for the exact size comparison`);
   assert.equal(rasterImageCodec.pickBestRasterImage(width, height, drawingCandidates)?.encoding, "png");
+}
+
+/**
+ * Exactly two colors are stored packed and exact, so readers restore the
+ * renderers' 1-bit textures. Atlas-sized images keep sharing their atlas.
+ */
+async function assertTwoColorPackedStorage(zipBuilder, parsedData, rasterSections, readRasterTable, seedScene) {
+  const twoColor = (width, height, ink) => {
+    const rgba = new Uint8Array(width * height * 4);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) if ((x * 7 + y * 3) % 11 < 4) rgba.set(ink, (y * width + x) * 4);
+    }
+    return rgba;
+  };
+  const large = twoColor(200, 120, [10, 120, 200, 255]);
+  const small = twoColor(90, 90, [250, 10, 10, 255]), smallOther = twoColor(90, 90, [10, 250, 10, 255]);
+  const base = createRasterScene(seedScene, 200, 120, large).rasterLayers[0];
+  const scene = { ...createRasterScene(seedScene, 200, 120, large), rasterLayers: [
+    base,
+    { ...base, data: large.slice(), paintOrder: 5 },
+    { ...base, width: 90, height: 90, data: small, matrix: new Float32Array([90, 0, 0, 90, 0, 0]), paintOrder: 6 },
+    { ...base, width: 90, height: 90, data: smallOther, matrix: new Float32Array([90, 0, 0, 90, 100, 0]), paintOrder: 7 }
+  ] };
+  const bytes = await (await zipBuilder.buildHep(scene, { compression: "store" })).arrayBuffer();
+  const archive = await HepArchive.loadAsync(bytes);
+  const table = await readRasterTable(archive);
+  const storages = table.layers.map(layer => layer.storage);
+  assert.ok(["binary", "mono"].includes(storages[0]), "a two-color image is stored packed instead of WebP or PNG");
+  assert.equal(storages[1], storages[0]);
+  assert.deepEqual(
+    await archive.file(rasterSections.rasterLayerFile(1, storages[1])).async("uint8array"),
+    await archive.file(rasterSections.rasterLayerFile(0, storages[0])).async("uint8array"),
+    "an identical copy reuses the packed payload"
+  );
+  assert.deepEqual(storages.slice(2), ["atlas", "atlas"], "atlas-sized two-color images keep their lossless atlas");
+  const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
+  assert.ok(manifest.formatVersion >= (storages[0] === "binary" ? 12 : 10), "packed storage advertises a reader that supports it");
+  const restored = await parsedData.loadSceneFromHep(bytes);
+  scene.rasterLayers.forEach((layer, index) => assert.deepEqual(restored.rasterLayers[index].data, layer.data,
+    `two-color layer ${index} restores exact pixels`));
+  assert.ok(restored.rasterLayers[0].monochrome, "readers restore packed 1-bit storage for renderers");
 }
 
 async function assertRasterWebpQualityParity(rasterImageCodec) {
@@ -367,6 +411,7 @@ try {
 
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const seedScene = createEmptyVectorScene();
+  await assertTwoColorPackedStorage(zipBuilder, parsedData, rasterSections, readRasterTable, seedScene);
 
   const samplingPixels = Uint8Array.of(255, 0, 0, 255, 0, 0, 255, 255);
   const samplingScene = createRasterScene(seedScene, 2, 1, samplingPixels);

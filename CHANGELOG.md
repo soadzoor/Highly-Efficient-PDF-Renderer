@@ -23,11 +23,19 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 - Reuse one canvas upload when choosing between WebP and PNG during HEP export,
   and avoid redundant copies of internally owned encoded images. Preserve public
   archive read isolation and the existing encoded image quality. Skip the
-  whole-image PNG for images of at least one megapixel when a PNG of evenly
-  spaced row bands predicts it at least 1.2 times the WebP size; closer or winning
-  predictions still compare both encodings exactly. Large photographs and scans
-  previously spent more time on a PNG that was many times larger. Hash and
-  compare raster layers by whole pixels when finding repeated images.
+  whole-image PNG when a PNG of evenly spaced row bands predicts it clearly
+  larger than the WebP: at least 1.2 times for images of one megapixel and
+  1024 rows or more, and 2.5 times for images from 65,536 pixels, whose smaller
+  samples predict less precisely. Closer or winning predictions still compare
+  both encodings exactly. Photographs and scans previously spent more time on a
+  PNG that was several times larger. Hash and compare raster layers by whole
+  pixels when finding repeated images.
+- Store raster layers with exactly two colors as exact packed 1-bit sections
+  instead of WebP or PNG, as monochrome layers already were. Readers restore
+  the renderers' 1-bit textures, which lossy WebP would lose, and such HEP
+  files can be several times smaller. Images small enough for a raster atlas
+  keep their lossless atlas. Exports containing such layers advertise scene
+  format v10 or v12 and require a reader that supports packed raster sections.
 - Speed up HEP export of dense vector drawings: build vector LOD point-recipe
   tables with numeric coordinate keys instead of a string per source point, and
   decide whether recipes save space by compressing only the sections they replace
