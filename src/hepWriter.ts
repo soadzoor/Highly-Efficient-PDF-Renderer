@@ -258,7 +258,8 @@ export async function buildHepBlobForLayout(
       rasterLayersManifest?.binary ? PARSED_DATA_BINARY_FORMAT_VERSION :
       rasterLayersManifest?.mono || rasterLayers.some(layer => layer.monochrome)
       ? PARSED_DATA_MONOCHROME_FORMAT_VERSION : PARSED_DATA_FORMAT_VERSION,
-    sourceFile: label,
+    // The source file name is not stored: identical PDFs produce identical
+    // HEPs, so a converter can reuse one HEP for every copy of a PDF.
     sourcePdfByteLength,
     generatedAt: new Date().toISOString(),
     strokeGeometry: strokeGeometryExport?.manifest,

@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import path from "node:path";
 
-export async function repackHepLodBytes(bytes, { signal, vectorLodPrecision = "compact", sourcePdfByteLength } = {}) {
+export async function repackHepLodBytes(bytes, { signal, vectorLodPrecision = "compact", sourcePdfByteLength, label = "HEP" } = {}) {
   const hooks = registerHooks({ resolve(s, c, n) {
     return n(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? s + ".ts" : s, c);
   } });
@@ -48,7 +48,7 @@ export async function repackHepLodBytes(bytes, { signal, vectorLodPrecision = "c
     manifest.sourcePdfByteLength = sourcePdfByteLength;
     archive.file("manifest.json", JSON.stringify(manifest));
     const output = await archive.generateAsync({ type: "uint8array", compression: "DEFLATE", signal });
-    warnIfHepSizeExceedsPdf(output.length, sourcePdfByteLength, manifest.sourceFile ?? "HEP");
+    warnIfHepSizeExceedsPdf(output.length, sourcePdfByteLength, label);
     const verified = await HepArchive.loadAsync(output, { signal });
     for (const [name, original] of before) {
       signal?.throwIfAborted();
@@ -105,7 +105,9 @@ async function main(args) {
   if (worker) {
     if (!metadata.isFile() || !input.endsWith(".hep")) throw new Error("Worker requires a HEP file.");
     const original = await readFile(input);
-    const output = await repackHepLodBytes(original, { signal: AbortSignal.timeout(timeoutMs), vectorLodPrecision, sourcePdfByteLength });
+    const output = await repackHepLodBytes(original, {
+      signal: AbortSignal.timeout(timeoutMs), vectorLodPrecision, sourcePdfByteLength, label: path.basename(input)
+    });
     const smaller = output.length < original.length;
     let temporary;
     try {

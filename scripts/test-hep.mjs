@@ -545,7 +545,7 @@ async function run() {
     });
     const base64Zip = await readZip(base64ZipBlob);
     const base64Manifest = JSON.parse(await base64Zip.file("manifest.json").async("string"));
-    assert.equal(base64Manifest.sourceFile, "document.pdf");
+    assert.equal(base64Manifest.sourceFile, undefined, "identical PDFs produce identical HEPs regardless of their names");
 
     const sceneZipBlob = await buildHep(parsedPdf.scene, {
       sourceLabel: "already-parsed.pdf",
@@ -554,7 +554,7 @@ async function run() {
     });
     const sceneZip = await readZip(sceneZipBlob);
     const sceneManifest = JSON.parse(await sceneZip.file("manifest.json").async("string"));
-    assert.equal(sceneManifest.sourceFile, "already-parsed.pdf");
+    assert.equal(sceneManifest.sourceFile, undefined, "sourceLabel does not reach the manifest");
     const sceneRoundTrip = await loadSceneFromHep(await sceneZipBlob.arrayBuffer());
     assertSceneCountsEqual(sceneRoundTrip, parsedPdf.scene, "parsed scene round trip");
     assertNativeGradientResourcesEqual(sceneRoundTrip, parsedPdf.scene, "parsed scene round trip");

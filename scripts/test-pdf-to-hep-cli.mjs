@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { link, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
@@ -17,6 +17,7 @@ import {
   hepDiffersOnlyInGeneratedAt,
   hepOutputPathForPdf,
   loadSourceHepBuilder,
+  markDuplicatePdfs,
   parsePdfToHepArguments,
   pdfToHepWorkerAllocatorEnvironment,
   pdfToHepWorkerArguments,
@@ -237,11 +238,11 @@ assert.equal(sourceBuilderCloseCount, 1);
 async function encodeTestHep(generatedAt, {
   sceneByte = 7,
   extraSection = false,
-  sourceFile = "plan.pdf",
+  sourcePdfByteLength = 1234,
   compression = "DEFLATE"
 } = {}) {
   const archive = new HepArchive();
-  archive.file("manifest.json", JSON.stringify({ formatVersion: 9, sourceFile, generatedAt, scene: { pages: [1, 2] } }));
+  archive.file("manifest.json", JSON.stringify({ formatVersion: 9, sourcePdfByteLength, generatedAt, scene: { pages: [1, 2] } }));
   archive.file("scene/positions.bin", new Uint8Array(20_000).fill(sceneByte));
   archive.file("text/small.json", "{\"glyphs\":[]}");
   archive.file("empty.bin", new Uint8Array(0));
@@ -259,7 +260,7 @@ assert.equal(
 for (const [label, existing, candidate] of [
   ["same-length section content", existingTestHep, await encodeTestHep("2026-09-30T11:19:41.033Z", { sceneByte: 8 })],
   ["an added section", existingTestHep, await encodeTestHep("2026-09-30T11:19:41.033Z", { extraSection: true })],
-  ["other manifest fields", existingTestHep, await encodeTestHep("2026-09-30T11:19:41.033Z", { sourceFile: "plan2.pdf" })],
+  ["other manifest fields", existingTestHep, await encodeTestHep("2026-09-30T11:19:41.033Z", { sourcePdfByteLength: 1235 })],
   // An older writer's encoding of the same sections must still be replaced.
   ["container encoding", await encodeTestHep("2026-09-29T15:45:20.289Z", { compression: "STORE" }),
     await encodeTestHep("2026-09-30T11:19:41.033Z")]
@@ -887,6 +888,106 @@ process.exitCode = await runPdfToHep(process.argv.slice(2), {
     [],
     "atomic writes must not leave temporary files behind"
   );
+
+  // Identical PDFs: a batch converts the first and copies its HEP to the rest.
+  const duplicateDirectory = path.join(temporaryRoot, "duplicates");
+  await mkdir(duplicateDirectory);
+  const duplicateSources = [
+    ["a.pdf", "%PDF-same"], ["b.pdf", "%PDF-diff"], ["c.pdf", "%PDF-same"],
+    ["d.pdf", "%PDF-unique-size"], ["e.pdf", "%PDF-same"]
+  ];
+  await Promise.all(duplicateSources.map(([name, content]) => writeFile(path.join(duplicateDirectory, name), content)));
+  const duplicateOutput = (name) => hepOutputPathForPdf(path.join(duplicateDirectory, name));
+  const duplicateItems = () => duplicateSources.map(([name], index) => ({
+    pdfPath: path.join(duplicateDirectory, name),
+    outputPath: duplicateOutput(name),
+    fileNumber: index + 1,
+    fileCount: duplicateSources.length
+  }));
+  const hashedPdfs = [];
+  assert.equal(await markDuplicatePdfs(duplicateItems(), async (pdfPath) => {
+    hashedPdfs.push(path.basename(pdfPath));
+    return readFile(pdfPath, "utf8");
+  }), 2);
+  assert.deepEqual(hashedPdfs, ["a.pdf", "b.pdf", "c.pdf", "e.pdf"], "PDFs with a unique size are never hashed");
+
+  const runDuplicateBatch = async (options, failingPdfs = []) => {
+    const items = duplicateItems();
+    assert.equal(await markDuplicatePdfs(items), 2, "SHA-256 finds both copies of a.pdf");
+    const converted = [];
+    const logs = [];
+    const diagnostics = [];
+    const originalConsole = { log: console.log, error: console.error };
+    let result;
+    try {
+      console.log = (message) => logs.push(String(message));
+      console.error = () => {};
+      result = await runPdfToHepWorkerBatch(items, { workers: 2, ...options }, 0, {
+        heapMb: 512,
+        signalTarget: new EventEmitter(),
+        now: () => 0,
+        createDiagnosticLog: async () => ({
+          path: "/synthetic/duplicates.log", fd: 99,
+          write: (message) => diagnostics.push(String(message)),
+          async close() {}
+        }),
+        cleanupWorkerTemps: async () => {},
+        startWorker(item, force, heapMb) {
+          const name = path.basename(item.pdfPath);
+          converted.push(name);
+          const child = new FakeChild();
+          const worker = startPdfToHepWorker(item, force, heapMb, () => child);
+          const code = failingPdfs.includes(name) ? 1 : 0;
+          (code === 0 ? writeFile(item.outputPath, `HEP converted from ${name}`) : Promise.resolve()).then(() => {
+            child.emit("message", { type: "pdf-to-hep-sizes", sourceBytes: 9, outputBytes: 24 });
+            child.emit("close", code, null);
+          });
+          return worker;
+        }
+      });
+    } finally {
+      Object.assign(console, originalConsole);
+    }
+    const summary = Object.fromEntries(logs.at(-1).split("\n").filter((line) => line.startsWith("|"))
+      .map((line) => line.split("|").slice(1, -1).map((cell) => cell.trim())));
+    return { result, converted, logs, diagnostics, summary };
+  };
+
+  const duplicateRun = await runDuplicateBatch({ force: false });
+  assert.equal(duplicateRun.result, 0);
+  assert.deepEqual(duplicateRun.converted.sort(), ["a.pdf", "b.pdf", "d.pdf"]);
+  for (const name of ["c.pdf", "e.pdf"]) {
+    assert.equal(await readFile(duplicateOutput(name), "utf8"), "HEP converted from a.pdf");
+  }
+  for (const line of [
+    "Converting 3 PDF(s) with up to 2 worker(s); 2 duplicate PDF(s) will copy the HEP of an identical PDF.",
+    "[3/5] Copied the HEP for c.pdf; same content as a.pdf",
+    "[5/5] Copied the HEP for e.pdf; same content as a.pdf",
+    "Finished: 3 generated, 2 copied for duplicates, 0 skipped, 0 failed."
+  ]) assert(duplicateRun.logs.includes(line), `batch output includes: ${line}`);
+  assert.match(duplicateRun.logs.join("\n"), /\| 3\/5 \| c\.pdf\s+\| duplicate \| 0h 00m 00s \| 9 B \| 24 B \|/);
+  assert.equal(duplicateRun.summary["PDFs attempted"], "3", "copies are not conversion attempts");
+  assert.equal(duplicateRun.summary.Successful, "3");
+  assert.equal(duplicateRun.summary["Duplicate PDFs (HEP copied)"], "2");
+  assert.equal(duplicateRun.summary["Conversion time saved by duplicates (est.)"], "0h 00m 00s");
+  assert.match(duplicateRun.diagnostics.join("\n"),
+    new RegExp(`${path.join(duplicateDirectory, "e.pdf").replace(/[\\.]/g, "\\$&")}: same content as .*a\\.pdf`));
+
+  // --keep-unchanged leaves a byte-identical duplicate HEP untouched.
+  const keptInode = (await stat(duplicateOutput("c.pdf"))).ino;
+  const keptRun = await runDuplicateBatch({ force: true, keepUnchanged: true });
+  assert(keptRun.logs.includes("[3/5] Kept the HEP for c.pdf; same content as a.pdf"));
+  assert.equal((await stat(duplicateOutput("c.pdf"))).ino, keptInode);
+
+  // Without a HEP to copy, the next duplicate converts and serves the rest.
+  const failedRun = await runDuplicateBatch({ force: true }, ["a.pdf"]);
+  assert.equal(failedRun.result, 1);
+  assert.deepEqual(failedRun.converted.sort(), ["a.pdf", "b.pdf", "c.pdf", "d.pdf"]);
+  assert(failedRun.logs.includes("[5/5] Copied the HEP for e.pdf; same content as c.pdf"));
+  assert.equal(await readFile(duplicateOutput("e.pdf"), "utf8"), "HEP converted from c.pdf");
+  assert.equal(failedRun.summary["Duplicate PDFs (HEP copied)"], "1");
+  assert.deepEqual((await readdir(duplicateDirectory)).filter((name) => name.startsWith(".hepr-")), [],
+    "duplicate copies must not leave temporary files behind");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

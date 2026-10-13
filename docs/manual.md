@@ -1398,6 +1398,17 @@ and original PDF and saved HEP size totals for successful conversions. Existing
 output skips are excluded from timing and size comparisons. Summed conversion
 durations overlap in parallel and can exceed wall time.
 
+PDFs with identical content are converted once per batch. Pending PDFs that share
+their exact byte size are compared by SHA-256 before dispatch; each later copy
+receives a copy of the first one's HEP (cloned on copy-on-write filesystems such
+as APFS) and appears as `duplicate` in the table. The metrics table counts these
+separately from attempted conversions, with an estimate of the conversion time they
+saved, and the diagnostics log names the PDF each duplicate matched. If that PDF
+produces no HEP, its duplicates are converted normally. Only HEPs written by the
+current batch are copied; with `--force --keep-unchanged`, a duplicate's existing
+HEP is kept when it already has the same bytes. HEP files do not record their
+source file name, so a copy is identical to a conversion of the duplicate.
+
 Detailed worker output, warnings, errors, and full file paths are saved to
 `pdf-to-hep-<timestamp>-<unique>.log` in the current working directory. The terminal
 prints its location. Use `--log-file=<path>` to choose a different file; an

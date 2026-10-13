@@ -133,7 +133,6 @@ export interface ParsedDataManifest {
   sourcePdfByteLength?: unknown;
   lod?: unknown;
   formatVersion?: unknown;
-  sourceFile?: unknown;
   scene?: ParsedDataSceneEntry;
   textures?: ParsedDataTextureEntry[];
   textIndex?: unknown;

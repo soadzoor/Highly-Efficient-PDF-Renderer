@@ -183,6 +183,8 @@ and median attempted conversion times, batch wall time, and successful size
 totals. Existing-file skips are excluded from timing and size comparisons;
 `--force --keep-unchanged` conversions count as successful even when the existing
 HEP is kept. Summed conversion times can exceed wall time when workers overlap.
+PDFs with identical content (same size and SHA-256) are converted once per batch;
+the other copies receive a copy of that HEP and are reported as duplicates.
 Conversion requires `@napi-rs/canvas`, which npm installs as an optional dependency
 by default. If its installation fails or optional dependencies were omitted,
 install both packages with `npm install @soadzoor/hepr @napi-rs/canvas` and run

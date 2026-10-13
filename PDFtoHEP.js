@@ -2,7 +2,10 @@
 
 import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
+import { createReadStream } from "node:fs";
 import {
+  constants,
+  copyFile,
   link,
   lstat,
   mkdir,
@@ -14,7 +17,7 @@ import {
   stat,
   unlink
 } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { availableParallelism } from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -95,6 +98,9 @@ A final summary table shows conversion counts, size totals, average and median
 attempt times, summed conversion time and elapsed batch wall time.
 Detailed warnings, failures and raster-fallback pages/reasons are saved in the
 diagnostics log; ordinary embedded PDF images are not counted as fallback.
+
+PDFs with identical content (same size and SHA-256) are converted once per
+batch; the others receive a copy of that HEP and are counted as duplicates.
 
 Existing HEP files are skipped unless --force is supplied. Each child has its
 own heap limit (default: 12288 MiB, not preallocated); HEPR_PDF_TO_HEP_HEAP_MB
@@ -559,15 +565,50 @@ async function existingHepDiffersOnlyInGeneratedAt(outputPath, hepBlob, HepArchi
   }
 }
 
-export async function writeHepBlobAtomically(outputPath, blob, overwrite, signal) {
+function temporaryHepPath(outputPath) {
   const workerToken = process.env[PDF_TO_HEP_WORKER_TOKEN_ENV];
   const workerTokenPrefix = workerToken && UUID_PATTERN.test(workerToken)
     ? `${workerToken}-`
     : "";
-  const temporaryPath = path.join(
+  return path.join(
     path.dirname(outputPath),
     `.hepr-${process.pid}-${workerTokenPrefix}${randomUUID()}.tmp`
   );
+}
+
+async function commitTemporaryHep(temporaryPath, outputPath, overwrite) {
+  if (overwrite) {
+    await rename(temporaryPath, outputPath);
+    return;
+  }
+  try {
+    await link(temporaryPath, outputPath);
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      throw new ExistingOutputError(outputPath);
+    }
+    throw error;
+  }
+  try {
+    await unlink(temporaryPath);
+  } catch (error) {
+    console.warn(
+      `Wrote ${outputPath}, but could not remove temporary link ${temporaryPath}: ` +
+      formatError(error)
+    );
+  }
+}
+
+async function removeTemporaryHep(temporaryPath) {
+  await unlink(temporaryPath).catch((error) => {
+    if (error?.code !== "ENOENT") {
+      console.warn(`Could not remove temporary file ${temporaryPath}: ${formatError(error)}`);
+    }
+  });
+}
+
+export async function writeHepBlobAtomically(outputPath, blob, overwrite, signal) {
+  const temporaryPath = temporaryHepPath(outputPath);
   let temporaryExists = false;
 
   try {
@@ -579,36 +620,113 @@ export async function writeHepBlobAtomically(outputPath, blob, overwrite, signal
       await temporaryFile.close();
     }
     signal?.throwIfAborted();
-    if (overwrite) {
-      await rename(temporaryPath, outputPath);
-    } else {
-      try {
-        await link(temporaryPath, outputPath);
-      } catch (error) {
-        if (error?.code === "EEXIST") {
-          throw new ExistingOutputError(outputPath);
-        }
-        throw error;
-      }
-      try {
-        await unlink(temporaryPath);
-      } catch (error) {
-        console.warn(
-          `Wrote ${outputPath}, but could not remove temporary link ${temporaryPath}: ` +
-          formatError(error)
-        );
-      }
-    }
+    await commitTemporaryHep(temporaryPath, outputPath, overwrite);
     temporaryExists = false;
   } finally {
     if (temporaryExists) {
-      await unlink(temporaryPath).catch((error) => {
-        if (error?.code !== "ENOENT") {
-          console.warn(`Could not remove temporary file ${temporaryPath}: ${formatError(error)}`);
-        }
-      });
+      await removeTemporaryHep(temporaryPath);
     }
   }
+}
+
+/**
+ * Publishes a copy of a finished HEP with the same guarantees as
+ * writeHepBlobAtomically(). Copy-on-write filesystems (APFS, Btrfs, ReFS)
+ * clone the file instead of duplicating its blocks.
+ */
+export async function copyHepFileAtomically(sourcePath, outputPath, overwrite) {
+  const temporaryPath = temporaryHepPath(outputPath);
+  let temporaryExists = true;
+
+  try {
+    await copyFile(sourcePath, temporaryPath, constants.COPYFILE_EXCL | constants.COPYFILE_FICLONE);
+    await commitTemporaryHep(temporaryPath, outputPath, overwrite);
+    temporaryExists = false;
+  } catch (error) {
+    // An exclusive copy that found its temporary name taken created nothing.
+    // Any other failure may leave a partial temporary file on some platforms.
+    if (error?.code === "EEXIST") temporaryExists = false;
+    throw error;
+  } finally {
+    if (temporaryExists) {
+      await removeTemporaryHep(temporaryPath);
+    }
+  }
+}
+
+async function filesHaveSameBytes(leftPath, rightPath) {
+  try {
+    const [left, right] = await Promise.all([stat(leftPath), stat(rightPath)]);
+    if (left.size !== right.size) return false;
+    return Buffer.compare(await readFile(leftPath), await readFile(rightPath)) === 0;
+  } catch {
+    // A missing or unreadable existing HEP is simply replaced.
+    return false;
+  }
+}
+
+/**
+ * Gives a duplicate PDF the HEP of its identical PDF. Returns false when
+ * --keep-unchanged keeps an existing HEP that already has the same bytes.
+ */
+async function copyDuplicateHep(sourcePath, outputPath, { force, keepUnchanged }) {
+  if (keepUnchanged && await filesHaveSameBytes(sourcePath, outputPath)) return false;
+  await copyHepFileAtomically(sourcePath, outputPath, force);
+  return true;
+}
+
+async function sha256File(filePath) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(filePath)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+/**
+ * Marks each pending PDF whose bytes match an earlier pending PDF, so the
+ * batch converts only the first and copies its HEP to the others. Only PDFs
+ * that share their exact size with another one are hashed; a batch without
+ * duplicates reads file metadata only. SHA-256 rather than MD5 or SHA-1:
+ * crafted colliding PDF pairs are public for both, and SHA-256 is
+ * hardware-accelerated on current CPUs (several times faster than MD5 on
+ * Apple silicon). Returns the number of duplicates.
+ */
+export async function markDuplicatePdfs(pending, hashFile = sha256File) {
+  const itemsBySize = new Map();
+  for (const item of pending) {
+    let size;
+    try {
+      size = (await stat(item.pdfPath)).size;
+    } catch {
+      // The PDF's own worker reports why it cannot be read.
+      continue;
+    }
+    const sameSize = itemsBySize.get(size);
+    if (sameSize) sameSize.push(item);
+    else itemsBySize.set(size, [item]);
+  }
+
+  let duplicateCount = 0;
+  for (const sameSize of itemsBySize.values()) {
+    if (sameSize.length < 2) continue;
+    const firstByDigest = new Map();
+    for (const item of sameSize) {
+      let digest;
+      try {
+        digest = await hashFile(item.pdfPath);
+      } catch {
+        continue;
+      }
+      const first = firstByDigest.get(digest);
+      if (!first) {
+        firstByDigest.set(digest, item);
+        continue;
+      }
+      item.duplicateOf = first;
+      (first.duplicates ??= []).push(item);
+      duplicateCount += 1;
+    }
+  }
+  return duplicateCount;
 }
 
 export function createProgressLogger(sourceLabel, fileNumber, fileCount, {
@@ -708,7 +826,7 @@ export function formatPdfToHepTimingSummary(timings, { color = false } = {}) {
     return "Conversion time summary: no PDF conversions were attempted.";
   }
   const rows = timings.map((timing) => {
-    const outputBytes = timing.status === "generated" ? timing.outputBytes : undefined;
+    const outputBytes = hasPdfToHepOutput(timing.status) ? timing.outputBytes : undefined;
     return [
       `${timing.fileNumber}/${timing.fileCount}`,
       path.basename(timing.pdfPath).replace(/[\u0000-\u001f\u007f]/g, " "),
@@ -754,6 +872,10 @@ export function formatPdfToHepSummary(
   notAttemptedCount = 0,
   { wallTimeMs, color = false } = {}
 ) {
+  // Copies for duplicate PDFs are not conversion attempts; they are counted
+  // separately and kept out of the timing statistics.
+  const duplicates = timings.filter((timing) => timing.status === "duplicate");
+  const attempted = timings.filter((timing) => timing.status !== "duplicate");
   const successful = timings.filter((timing) => timing.status === "generated");
   const failed = timings.filter((timing) => timing.status === "failed");
   const interrupted = timings.filter((timing) => timing.status === "interrupted");
@@ -768,10 +890,11 @@ export function formatPdfToHepSummary(
     total + timing.warnings.reduce((count, warning) => count + warning.count, 0), 0
   );
   const rows = [
-    ["PDFs attempted", timings.length],
+    ["PDFs attempted", attempted.length],
     ["Successful", successful.length],
     ["Failed", failed.length],
-    ["Skipped", skippedCount]
+    ["Skipped", skippedCount],
+    ["Duplicate PDFs (HEP copied)", duplicates.length]
   ];
   if (interrupted.length > 0) rows.push(["Interrupted", interrupted.length]);
   if (notAttemptedCount > 0) rows.push(["Not attempted", notAttemptedCount]);
@@ -787,7 +910,7 @@ export function formatPdfToHepSummary(
     ["Warnings", `${warningCount} across ${withWarnings.length} PDF(s)`],
     ["Successful PDFs using raster fallback", successful.filter((timing) => timing.rasterFallbacks?.length > 0).length]
   );
-  const durations = timings.map((timing) => Number(timing.durationMs))
+  const durations = attempted.map((timing) => Number(timing.durationMs))
     .map((duration) => Number.isFinite(duration) && duration > 0 ? duration : 0)
     .sort((left, right) => left - right);
   const totalDurationMs = durations.reduce((total, duration) => total + duration, 0);
@@ -803,6 +926,11 @@ export function formatPdfToHepSummary(
     ["Fastest attempted PDF time", durationValue(durations[0])],
     ["Slowest attempted PDF time", durationValue(durations.at(-1))]
   );
+  if (duplicates.length > 0) {
+    // Each copy saves about as long as its identical PDF took to convert.
+    const savedMs = duplicates.reduce((total, timing) => total + (Number(timing.savedDurationMs) || 0), 0);
+    rows.push(["Conversion time saved by duplicates (est.)", formatPdfToHepDuration(savedMs)]);
+  }
   if (wallTimeMs !== undefined) rows.push(["Batch wall time (elapsed)", formatPdfToHepDuration(wallTimeMs)]);
   return "Conversion summary:\n" + formatPdfToHepTable(["Metric", "Value"], rows);
 }
@@ -810,6 +938,7 @@ export function formatPdfToHepSummary(
 export function formatPdfToHepDiagnosticsSummary(timings) {
   const failed = timings.filter((timing) => timing.status === "failed");
   const withWarnings = timings.filter((timing) => timing.warnings?.length > 0);
+  const duplicates = timings.filter((timing) => timing.status === "duplicate");
   const details = [];
   if (failed.length > 0) {
     details.push("Failed PDFs:");
@@ -826,7 +955,17 @@ export function formatPdfToHepDiagnosticsSummary(timings) {
       }
     }
   }
+  if (duplicates.length > 0) {
+    details.push("Duplicate PDFs (HEP copied from an identical PDF):");
+    for (const timing of duplicates) {
+      details.push(`  ${timing.pdfPath}: same content as ${timing.duplicateOf}`);
+    }
+  }
   return [...details, formatPdfToHepRasterFallbackSummary(timings)].join("\n");
+}
+
+function hasPdfToHepOutput(status) {
+  return status === "generated" || status === "duplicate";
 }
 
 function normalizeRasterFallbackDiagnostic(diagnostic) {
@@ -855,7 +994,7 @@ function appendPdfToHepTiming(timings, item, status, durationMs, report) {
     durationMs: Math.max(0, Number(durationMs) || 0),
     ...report,
     // A candidate that was never written must not count as generated output.
-    ...(status === "generated" ? {} : { outputBytes: undefined })
+    ...(hasPdfToHepOutput(status) ? {} : { outputBytes: undefined })
   };
   timings.push(timing);
   return timing;
@@ -1094,12 +1233,15 @@ async function runPdfToHepWorkerBatchWithLog(pending, options, skippedCount, dep
   const cleanupWorkerTemps = dependencies.cleanupWorkerTemps ?? cleanupPdfToHepWorkerTemps;
   const signalTarget = dependencies.signalTarget ?? process;
   const now = dependencies.now ?? (() => performance.now());
-  const workerCount = resolvePdfToHepWorkerCount(pending.length, options, dependencies);
+  // Duplicates marked by markDuplicatePdfs() wait for their identical PDF.
+  const queue = pending.filter((item) => !item.duplicateOf);
+  const workerCount = resolvePdfToHepWorkerCount(queue.length, options, dependencies);
   const batchStartedAt = now();
   const activeChildren = new Set();
   let nextIndex = 0;
   let interruptedExitCode = 0;
   let generatedCount = 0;
+  let duplicateCount = 0;
   const failures = [];
   const timings = [];
   const color = Boolean(process.stdout.isTTY) && process.env.NO_COLOR === undefined &&
@@ -1136,11 +1278,55 @@ async function runPdfToHepWorkerBatchWithLog(pending, options, skippedCount, dep
   signalTarget.on("SIGINT", onSigInt);
   signalTarget.on("SIGTERM", onSigTerm);
 
+  // Without a HEP to copy, duplicates convert as usual: the first one is
+  // queued and the rest wait for it.
+  const requeueDuplicates = (item) => {
+    const [next, ...rest] = item.duplicates ?? [];
+    if (!next) return;
+    next.duplicates = rest;
+    queue.push(next);
+  };
+  const copyDuplicateHeps = async (item, timing) => {
+    for (const duplicate of item.duplicates ?? []) {
+      // Duplicates left when the batch stops count as not attempted.
+      if (interruptedExitCode) return;
+      const startedAt = now();
+      const label = `[${duplicate.fileNumber}/${duplicate.fileCount}]`;
+      const name = path.basename(duplicate.pdfPath);
+      const sizes = { sourceBytes: timing.sourceBytes, outputBytes: timing.outputBytes };
+      try {
+        const copied = await copyDuplicateHep(item.outputPath, duplicate.outputPath, options);
+        appendPdfToHepTiming(timings, duplicate, "duplicate", now() - startedAt, {
+          ...sizes,
+          duplicateOf: item.pdfPath,
+          savedDurationMs: timing.durationMs
+        });
+        duplicateCount += 1;
+        console.log(
+          `${label} ${copied ? "Copied" : "Kept"} the HEP for ${name}; ` +
+          `same content as ${path.basename(item.pdfPath)}`
+        );
+      } catch (error) {
+        if (error instanceof ExistingOutputError) {
+          const skipped = appendPdfToHepTiming(timings, duplicate, "skipped", now() - startedAt, sizes);
+          skippedCount += 1;
+          console.log(`${label} Skipped ${name} after ${formatPdfToHepDuration(skipped.durationMs)}`);
+          continue;
+        }
+        const message = `Could not copy ${item.outputPath}: ${formatError(error)}`;
+        appendPdfToHepTiming(timings, duplicate, "failed", now() - startedAt, { ...sizes, errorMessage: message });
+        failures.push({ pdfPath: duplicate.pdfPath, message });
+        diagnosticLog?.write(`${duplicate.pdfPath}: ${message}`);
+        console.error(`${label} Failed ${name}. ${failureDetail(message)}`);
+      }
+    }
+  };
+
   // Each consumer claims the next PDF synchronously, before awaiting its child.
   // Fast PDFs refill their own slots without waiting for slower conversions.
   const runNext = async () => {
-    while (!interruptedExitCode && nextIndex < pending.length) {
-      const item = pending[nextIndex++];
+    while (!interruptedExitCode && nextIndex < queue.length) {
+      const item = queue[nextIndex++];
       const startedAt = now();
       let worker;
       try {
@@ -1164,6 +1350,7 @@ async function runPdfToHepWorkerBatchWithLog(pending, options, skippedCount, dep
           `${path.basename(item.pdfPath)} after ${formatPdfToHepDuration(timing.durationMs)}. ` +
           failureDetail(formatError(error))
         );
+        requeueDuplicates(item);
         continue;
       }
 
@@ -1209,6 +1396,7 @@ async function runPdfToHepWorkerBatchWithLog(pending, options, skippedCount, dep
           `${path.basename(item.pdfPath)} after ${formatPdfToHepDuration(timing.durationMs)}. ` +
           failureDetail(formatError(error))
         );
+        requeueDuplicates(item);
         continue;
       } finally {
         activeChildren.delete(worker.child);
@@ -1233,6 +1421,7 @@ async function runPdfToHepWorkerBatchWithLog(pending, options, skippedCount, dep
           `[${item.fileNumber}/${item.fileCount}] Converted ${path.basename(item.pdfPath)} in ` +
           formatPdfToHepDuration(timing.durationMs)
         );
+        await copyDuplicateHeps(item, timing);
         continue;
       }
       if (outcome.code === PDF_TO_HEP_WORKER_SKIPPED_EXIT_CODE) {
@@ -1242,6 +1431,8 @@ async function runPdfToHepWorkerBatchWithLog(pending, options, skippedCount, dep
           `[${item.fileNumber}/${item.fileCount}] Skipped ${path.basename(item.pdfPath)} after ` +
           formatPdfToHepDuration(timing.durationMs)
         );
+        // The existing HEP was not produced by this batch, so it is not copied.
+        requeueDuplicates(item);
         continue;
       }
       const detail = outcome.signal
@@ -1258,11 +1449,16 @@ async function runPdfToHepWorkerBatchWithLog(pending, options, skippedCount, dep
         `${path.basename(item.pdfPath)} after ${formatPdfToHepDuration(timing.durationMs)} ` +
         `(${detail}). Continuing with the next PDF. ` + failureDetail("")
       );
+      requeueDuplicates(item);
     }
   };
 
   if (diagnosticLog) console.log(`Diagnostics log: ${diagnosticLog.path}`);
-  console.log(`Converting ${pending.length} PDF(s) with up to ${workerCount} worker(s).`);
+  const waitingDuplicates = pending.length - queue.length;
+  console.log(
+    `Converting ${queue.length} PDF(s) with up to ${workerCount} worker(s)` +
+    (waitingDuplicates > 0 ? `; ${waitingDuplicates} duplicate PDF(s) will copy the HEP of an identical PDF.` : ".")
+  );
   try {
     // Keep signal forwarding installed until all active children have finished.
     const results = await Promise.allSettled(Array.from({ length: workerCount }, () => runNext()));
@@ -1285,7 +1481,11 @@ async function runPdfToHepWorkerBatchWithLog(pending, options, skippedCount, dep
     console.log(diagnostics);
   }
   if (!interruptedExitCode) {
-    console.log(`Finished: ${generatedCount} generated, ${skippedCount} skipped, ${failures.length} failed.`);
+    console.log(
+      `Finished: ${generatedCount} generated, ` +
+      (duplicateCount > 0 ? `${duplicateCount} copied for duplicates, ` : "") +
+      `${skippedCount} skipped, ${failures.length} failed.`
+    );
   }
   console.log(formatPdfToHepTimingSummary(timings, { color }));
   if (diagnosticLog) console.log(`Diagnostics log: ${diagnosticLog.path}`);
@@ -1356,6 +1556,9 @@ export async function runPdfToHep(args = process.argv.slice(2), dependencies = {
     await mkdir(options.outputDirectory, { recursive: true });
   }
   if (!workerProcess) {
+    // Only PDFs converted in this batch are copied; an existing HEP may come
+    // from an older converter or different options.
+    if (pending.length > 1) await markDuplicatePdfs(pending);
     return runPdfToHepWorkerBatch(pending, options, skippedCount, dependencies);
   }
   if (pending.length !== 1) {

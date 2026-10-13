@@ -6,7 +6,24 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Added
+
+- Convert identical PDFs once per `pdf-to-hep` batch. Pending PDFs that share
+  their exact size are compared by SHA-256; each later copy receives a copy of
+  the first one's HEP (cloned on copy-on-write filesystems) instead of a new
+  conversion. If that PDF produces no HEP, its duplicates are converted as
+  before. The terminal table marks these files `duplicate`, the summary counts
+  them separately from attempted conversions with an estimate of the time saved,
+  and the diagnostics log names the PDF each one matched. Only HEPs written by
+  the current batch are copied.
+
 ### Changed
+
+- Stop storing the source PDF's file name in new HEP manifests (`sourceFile`),
+  so identical PDFs produce identical HEPs whatever their names. No reader used
+  the field; existing HEPs keep it and still load unchanged. `buildHep()`'s
+  `sourceLabel` still names the document in size warnings. Because the manifest
+  changes, the next `--force --keep-unchanged` run rewrites existing HEPs once.
 
 - Cut Three.js per-frame CPU work for documents with thousands of ordered paint
   batches once mixed vector batching replaces them. The mixed layer reuses its
