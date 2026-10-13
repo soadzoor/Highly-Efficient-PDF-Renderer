@@ -13,6 +13,7 @@ import type { ThreeShaderCompileHost } from "./threeShaderPreparation";
 import { compileThreeMixedVectorRoots } from "./threeMixedVectorPreparation";
 import { getThreeRenderPerformance } from "./threeRenderPerformance";
 import type { ThreeWebGpuMixedVectorMaterialState } from "./threeWebGpuMixedVectorMaterial";
+import { threeVectorDrawRunsRevision } from "./threeVectorDrawRuns";
 
 interface MixedLayerOptions {
   fill: ThreeMaterialFillLayer;
@@ -43,6 +44,16 @@ interface SourceDraw {
   groupOrder: number;
 }
 interface MixedEntry { mesh: DrawMesh; sources: SourceDraw[]; count: number; }
+/** The batches under one ordinary layer mesh, valid while its revision holds. */
+interface CollectedBatches {
+  revision: number;
+  sourceKind: 0 | 1 | -1;
+  groupOrder: number;
+  childCount: number;
+  draws: SourceDraw[];
+}
+/** A layer mesh whose drawn children are all mixed, hidden as one object. */
+interface HiddenParent { parent: THREE.Object3D; meshes: DrawMesh[]; }
 
 /**
  * Borrow the ordinary layers' selected meshes and texture stores. Their culling,
@@ -56,6 +67,15 @@ export class ThreeMixedVectorLayer {
   private entries: MixedEntry[] = [];
   private snapshot: SourceDraw[] = [];
   private suppressed: DrawMesh[] = [];
+  private suppressedParents: THREE.Object3D[] = [];
+  private readonly collectedBatches = new WeakMap<THREE.Object3D, CollectedBatches>();
+  /** The last collection in traversal order, and the same draws sorted. */
+  private collectedDraws: SourceDraw[] = [];
+  private sortedDraws: SourceDraw[] = [];
+  private groupedDraws: SourceDraw[] | null = null;
+  private groups: SourceDraw[][] = [];
+  private hiddenParents: HiddenParent[] = [];
+  private hiddenMeshes: DrawMesh[] = [];
   private ready = false;
   private failed = false;
   private disposed = false;
@@ -77,6 +97,8 @@ export class ThreeMixedVectorLayer {
   restore(): void {
     for (const mesh of this.suppressed) mesh.visible = true;
     this.suppressed.length = 0;
+    for (const parent of this.suppressedParents) parent.visible = true;
+    this.suppressedParents.length = 0;
     this.group.visible = false;
     this.active = false;
   }
@@ -98,16 +120,12 @@ export class ThreeMixedVectorLayer {
     this.restore();
     if (this.failed || this.disposed) return;
     const draws = this.collect(roots);
-    const groups: SourceDraw[][] = [];
-    for (let first = 0; first < draws.length;) {
-      let end = first, strokes = 0, fills = 0;
-      while (end < draws.length && draws[end].kind >= 0 && draws[end].groupOrder === draws[first].groupOrder) {
-        if (draws[end].kind === 0) strokes += draws[end].count; else fills += draws[end].count;
-        end++;
-      }
-      if (strokes && fills) groups.push(draws.slice(first, end));
-      first = Math.max(end, first + 1);
+    if (draws !== this.groupedDraws) {
+      this.groupedDraws = draws;
+      this.groups = mixableGroups(draws);
+      this.renderedStrokes = draws.reduce((count, draw) => count + (draw.sourceKind === 0 ? draw.count : 0), 0);
     }
+    const groups = this.groups;
     if (!groups.length) return;
     // Ordinary layers share one effective Group order. If custom nested groups
     // introduce more scopes, keep those other scopes on their ordinary meshes.
@@ -122,16 +140,13 @@ export class ThreeMixedVectorLayer {
         this.disposeEntries();
         this.snapshot = draws;
         for (const sources of groups) if (sources[0].groupOrder === groupOrder) this.createEntry(sources);
+        this.planSuppression();
       }
       this.syncMaterialState();
       this.syncUniforms();
       if (!this.ready) this.prepare(host, camera);
       if (!this.ready) return;
-      this.renderedStrokes = draws.reduce((count, draw) => count + (draw.sourceKind === 0 ? draw.count : 0), 0);
-      for (const entry of this.entries) for (const source of entry.sources) {
-        source.mesh.visible = false;
-        this.suppressed.push(source.mesh);
-      }
+      this.suppress();
       this.active = true;
       this.group.visible = this.fillRenderingEnabled || this.strokeRenderingEnabled;
       const profile = getThreeRenderPerformance();
@@ -140,6 +155,13 @@ export class ThreeMixedVectorLayer {
     } catch (error) { this.fallback(error); }
   }
 
+  /**
+   * The selected source draws in paint order. Ordinary layers can hold
+   * thousands of batch meshes. Their owner (ThreeVectorDrawRuns) changes a
+   * revision with any change to their membership, visibility or instances, so
+   * their records are reused while it holds. An unchanged collection returns
+   * the previous array, letting callers skip their own work.
+   */
   private collect(roots: readonly THREE.Object3D[]): SourceDraw[] {
     const draws: SourceDraw[] = [];
     const strokeRoot = this.options.stroke.mesh, fillRoot = this.options.fill.mesh;
@@ -159,11 +181,67 @@ export class ThreeMixedVectorLayer {
             version: attributeVersion(ids), clipVersion: attributeVersion(clips), order: mesh.renderOrder, groupOrder });
         }
       }
-      for (const child of object.children) visit(child, sourceKind, groupOrder);
+      const revision = threeVectorDrawRunsRevision(object);
+      if (revision === undefined) {
+        for (const child of object.children) visit(child, sourceKind, groupOrder);
+        return;
+      }
+      const cached = this.collectedBatches.get(object);
+      if (cached && cached.revision === revision && cached.sourceKind === sourceKind && cached.groupOrder === groupOrder &&
+          cached.childCount === object.children.length) {
+        for (const draw of cached.draws) draws.push(draw);
+        return;
+      }
+      const first = draws.length;
+      let batchesOnly = true;
+      for (const child of object.children) {
+        if (child.children.length > 0 || !child.userData.heprDrawRun) batchesOnly = false;
+        visit(child, sourceKind, groupOrder);
+      }
+      if (batchesOnly) {
+        this.collectedBatches.set(object, { revision, sourceKind, groupOrder, childCount: object.children.length,
+          draws: draws.slice(first) });
+      } else this.collectedBatches.delete(object);
     };
     for (const root of roots) visit(root, -1, ancestorGroupOrder(root));
-    draws.sort((a, b) => a.groupOrder - b.groupOrder || a.order - b.order);
-    return draws;
+    if (sameDrawObjects(this.collectedDraws, draws)) return this.sortedDraws;
+    this.collectedDraws = draws;
+    this.sortedDraws = draws.slice().sort((a, b) => a.groupOrder - b.groupOrder || a.order - b.order);
+    return this.sortedDraws;
+  }
+
+  /**
+   * Hide a layer mesh instead of each batch when every child it would draw is
+   * mixed: Three then skips the whole subtree. The layer mesh itself must not
+   * draw, which suppress() checks every frame.
+   */
+  private planSuppression(): void {
+    const byParent = new Map<THREE.Object3D, DrawMesh[]>();
+    this.hiddenMeshes = [];
+    for (const entry of this.entries) for (const source of entry.sources) {
+      const parent = source.mesh.parent;
+      if (!parent) { this.hiddenMeshes.push(source.mesh); continue; }
+      const meshes = byParent.get(parent);
+      if (meshes) meshes.push(source.mesh); else byParent.set(parent, [source.mesh]);
+    }
+    this.hiddenParents = [];
+    for (const [parent, meshes] of byParent) {
+      // Batch visibility and counts change only with a new collection, which
+      // replans this. Any other child keeps the parent visible.
+      const batchesOnly = parent.children.every(child => child.userData.heprDrawRun && child.children.length === 0);
+      const drawing = parent.children.reduce((count, child) => count + (drawsSomething(child) ? 1 : 0), 0);
+      if (batchesOnly && drawing === meshes.length) this.hiddenParents.push({ parent, meshes });
+      else this.hiddenMeshes.push(...meshes);
+    }
+  }
+
+  private suppress(): void {
+    for (const { parent, meshes } of this.hiddenParents) {
+      if (drawsItself(parent)) {
+        for (const mesh of meshes) { mesh.visible = false; this.suppressed.push(mesh); }
+      } else { parent.visible = false; this.suppressedParents.push(parent); }
+    }
+    for (const mesh of this.hiddenMeshes) { mesh.visible = false; this.suppressed.push(mesh); }
   }
 
   private createMaterial(): void {
@@ -328,7 +406,39 @@ function attributeVersion(attribute?: InstanceAttribute): number {
   return attribute instanceof THREE.InterleavedBufferAttribute ? attribute.data.version : attribute?.version ?? -1;
 }
 
+/** Split paint-ordered draws at barriers; only spans holding both kinds gain from one shader. */
+function mixableGroups(draws: readonly SourceDraw[]): SourceDraw[][] {
+  const groups: SourceDraw[][] = [];
+  for (let first = 0; first < draws.length;) {
+    let end = first, strokes = 0, fills = 0;
+    while (end < draws.length && draws[end].kind >= 0 && draws[end].groupOrder === draws[first].groupOrder) {
+      if (draws[end].kind === 0) strokes += draws[end].count; else fills += draws[end].count;
+      end++;
+    }
+    if (strokes && fills) groups.push(draws.slice(first, end));
+    first = Math.max(end, first + 1);
+  }
+  return groups;
+}
+
+function sameDrawObjects(previous: readonly SourceDraw[], next: readonly SourceDraw[]): boolean {
+  if (previous.length !== next.length) return false;
+  for (let index = 0; index < next.length; index++) if (previous[index] !== next[index]) return false;
+  return true;
+}
+
+function drawsSomething(object: THREE.Object3D): boolean {
+  return object.visible && drawsItself(object);
+}
+
+function drawsItself(object: THREE.Object3D): boolean {
+  if (!(object as THREE.Mesh).isMesh) return false;
+  const geometry = (object as THREE.Mesh).geometry;
+  return !(geometry instanceof THREE.InstancedBufferGeometry) || geometry.instanceCount > 0;
+}
+
 function sameDraws(previous: SourceDraw[], next: SourceDraw[]): boolean {
+  if (previous === next) return true;
   return previous.length === next.length && previous.every((draw, index) => {
     const other = next[index];
     return draw.mesh === other.mesh && draw.ids === other.ids && draw.clips === other.clips &&

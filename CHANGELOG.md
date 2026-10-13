@@ -6,6 +6,24 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Changed
+
+- Cut Three.js per-frame CPU work for documents with thousands of ordered paint
+  batches once mixed vector batching replaces them. The mixed layer reuses its
+  collected batches while their source layer is unchanged, and hides a fully
+  mixed layer as one object instead of each batch. Batches follow their layer's
+  world matrix without per-batch matrix updates, and unchanged stroke-LOD
+  frames no longer revisit every batch. On a 217k-fill drawing panned at
+  fit-all, CPU time per frame in `renderer.render` fell from 6.2 ms to 0.3 ms
+  in a headless Chrome profile, with identical pixels.
+
+### Fixed
+
+- Give the fill shader's indexed winding helper a single exit. ANGLE's D3D
+  compiler reported its early return as warning X4000 ("potentially
+  uninitialized variable") in Three.js WebGL. Coverage and texture reads are
+  unchanged.
+
 ## [0.1.62] - 2026-10-12
 
 ### Changed

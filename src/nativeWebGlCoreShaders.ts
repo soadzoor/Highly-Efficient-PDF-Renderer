@@ -536,46 +536,49 @@ float heprFillIndexedWinding(int pathIndex, int segmentStart, int segmentCount,
       vFillCells = texelFetch(uFillSegmentTexA,
         coordFromIndex(uFillCellHeaders - 1 + pathIndex, uFillSegmentTexSize), 0);
     }
-    if (vFillCells.y > 0.0) {
-      return heprCellWinding(vFillCells, origin, box, footprint);
-    }
-    if (uFillBandBase >= 0) {
+    if (vFillCells.y <= 0.0 && uFillBandBase >= 0) {
       vFillBands = texelFetch(uFillSegmentTexA,
         coordFromIndex(uFillBandBase + pathIndex, uFillSegmentTexSize), 0);
     }
   }
+  // One exit: D3D's FXC (under ANGLE) cannot prove that an early return here
+  // covers every path and warns X4000 about the result.
   float winding = 0.0;
-  int bandCount = int(vFillBands.y);
-  int firstBand = 0;
-  int lastBand = 0;
-  if (bandCount > 0) {
-    float bandHeight = vFillBands.w;
-    firstBand = clamp(int(floor((box.y - vFillBands.z) / bandHeight)), 0, bandCount - 1);
-    lastBand = clamp(int(floor((box.y + footprint.y - vFillBands.z) / bandHeight)), 0, bandCount - 1);
-  }
-
-  for (int band = firstBand; band <= lastBand; band += 1) {
-    int count = segmentCount;
-    int entry = 0;
+  if (vFillCells.y > 0.0) {
+    winding = heprCellWinding(vFillCells, origin, box, footprint);
+  } else {
+    int bandCount = int(vFillBands.y);
+    int firstBand = 0;
+    int lastBand = 0;
     if (bandCount > 0) {
-      vec4 range = texelFetch(uFillSegmentTexA,
-        coordFromIndex(int(vFillBands.x) + band, uFillSegmentTexSize), 0);
-      entry = int(range.x);
-      count = int(range.y);
+      float bandHeight = vFillBands.w;
+      firstBand = clamp(int(floor((box.y - vFillBands.z) / bandHeight)), 0, bandCount - 1);
+      lastBand = clamp(int(floor((box.y + footprint.y - vFillBands.z) / bandHeight)), 0, bandCount - 1);
     }
-    vec2 rows = heprBandRows(vFillBands, band, bandCount, box);
-    for (int i = 0; i < count; i += 1) {
-      int segment = segmentStart + i;
+
+    for (int band = firstBand; band <= lastBand; band += 1) {
+      int count = segmentCount;
+      int entry = 0;
       if (bandCount > 0) {
-        int packedIndex = entry + i;
-        vec4 packed = texelFetch(uFillSegmentTexA,
-          coordFromIndex(uFillBandEntries + (packedIndex >> 2), uFillSegmentTexSize), 0);
-        segment = int(packed[packedIndex & 3]);
+        vec4 range = texelFetch(uFillSegmentTexA,
+          coordFromIndex(int(vFillBands.x) + band, uFillSegmentTexSize), 0);
+        entry = int(range.x);
+        count = int(range.y);
       }
-      vec4 primitiveA = texelFetch(uFillSegmentTexA, coordFromIndex(segment, uFillSegmentTexSize), 0);
-      vec4 primitiveB = texelFetch(uFillSegmentTexB, coordFromIndex(segment, uFillSegmentTexSize), 0);
-      winding += heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
-        primitiveB.z >= FILL_PRIMITIVE_QUADRATIC, box, rows.x, rows.y);
+      vec2 rows = heprBandRows(vFillBands, band, bandCount, box);
+      for (int i = 0; i < count; i += 1) {
+        int segment = segmentStart + i;
+        if (bandCount > 0) {
+          int packedIndex = entry + i;
+          vec4 packed = texelFetch(uFillSegmentTexA,
+            coordFromIndex(uFillBandEntries + (packedIndex >> 2), uFillSegmentTexSize), 0);
+          segment = int(packed[packedIndex & 3]);
+        }
+        vec4 primitiveA = texelFetch(uFillSegmentTexA, coordFromIndex(segment, uFillSegmentTexSize), 0);
+        vec4 primitiveB = texelFetch(uFillSegmentTexB, coordFromIndex(segment, uFillSegmentTexSize), 0);
+        winding += heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
+          primitiveB.z >= FILL_PRIMITIVE_QUADRATIC, box, rows.x, rows.y);
+      }
     }
   }
   return winding;

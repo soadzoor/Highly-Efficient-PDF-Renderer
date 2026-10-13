@@ -69,7 +69,8 @@ try {
     return Array.from({ length: geometry.instanceCount }, (_, i) =>
       ["aVectorIndex", "aVectorClipIndex", "aVectorKind"].map(name => geometry.getAttribute(name).getX(i)));
   });
-  const activeSources = entry => [entry.stroke.mesh, entry.fill.mesh].flatMap(root => root.children)
+  // Three draws a batch only when it and its layer mesh are visible.
+  const activeSources = entry => [entry.stroke.mesh, entry.fill.mesh].flatMap(root => root.visible ? root.children : [])
     .filter(mesh => mesh.visible && mesh.geometry.instanceCount > 0);
 
   // Actual selected source layers: 4096 interleaved paints become one mixed mesh.
@@ -80,6 +81,9 @@ try {
   assert.equal(entry.mixed.group.children.length, 1);
   assert.equal(entry.mixed.group.visible, true);
   assert.equal(activeSources(entry).length, 0);
+  assert.equal(entry.stroke.mesh.visible || entry.fill.mesh.visible, false,
+    "fully mixed layers hide as one object, so Three skips their thousands of batches");
+  assert(entry.stroke.mesh.children.every(child => child.visible), "batch visibility stays the layer's own selection");
   assert.equal(entry.mixed.getRenderedStrokeCount(), 2048);
   assert.deepEqual(records(entry.mixed), Array.from({ length: 2048 }, (_, i) => [[i, i % 2 + 1, 0], [i, 0, 1]]).flat(),
     "mixed instances retain exact selected IDs, per-paint clips and interleaved source order");
@@ -105,6 +109,16 @@ try {
   const probes = gl.links;
   for (let i = 0; i < 20; i++) { entry.refresh(); entry.mixed.update(entry.roots, host, camera); }
   assert.equal(entry.mixed.group.children[0].geometry, geometry, "stable selections reuse mixed geometry");
+  const collected = entry.mixed.collect(entry.roots);
+  assert.equal(entry.mixed.collect(entry.roots), collected, "unchanged layers reuse their collected batches");
+  entry.mixed.restore();
+  entry.stroke.mesh.updateMatrixWorld(true);
+  const moved = new THREE.Group(); moved.position.set(3, 4, 0); moved.add(entry.stroke.mesh); moved.updateMatrixWorld(true);
+  assert(entry.stroke.mesh.children.every(child => child.matrixWorld.elements[12] === 3 && child.matrixWorld.elements[13] === 4),
+    "batches follow a moved layer without per-batch matrix updates");
+  moved.remove(entry.stroke.mesh); entry.stroke.mesh.updateMatrixWorld(true);
+  assert(entry.stroke.mesh.children.every(child => child.matrixWorld.elements[12] === 0), "and return with it");
+  entry.refresh(); entry.mixed.update(entry.roots, host, camera);
   assert.equal(data.version, 0, "cached frames do not dirty the mixed upload");
   assert.equal(gl.links, probes, "shader preparation runs once");
   const sourceGroup = new THREE.Group(); sourceGroup.renderOrder = 17;
@@ -129,14 +143,23 @@ try {
 
   entry.mixed.restore();
   assert.equal(activeSources(entry).length, 4096, "disabling restores every suppressed source mesh");
-  const source = entry.stroke.mesh.children[0], ids = source.geometry.getAttribute("aSegmentIndex");
-  ids.setX(0, 7); ids.needsUpdate = true;
+  // The owning layer revises its batches with every selection change.
+  const withoutFirst = Uint32Array.from({ length: 2047 }, (_, i) => i + 1);
+  entry.stroke.updateFrameWithVisibleSegmentIds(view, viewport, withoutFirst, withoutFirst.length);
   let retired = 0;
   const retiredGeometry = entry.mixed.group.children[0].geometry;
   retiredGeometry.addEventListener("dispose", () => { retired++; assert.equal(retiredGeometry.getAttribute("aCorner"), undefined);
     assert.equal(retiredGeometry.index, null, "borrowed corner/index buffers detach before geometry disposal"); });
   entry.mixed.update(entry.roots, host, camera);
-  assert.equal(retired, 1); assert.equal(records(entry.mixed)[0][0], 7, "changed selected IDs invalidate mixed data");
+  assert.equal(retired, 1);
+  assert.deepEqual(records(entry.mixed)[0], [0, 0, 1], "changed selected IDs invalidate mixed data");
+  assert.equal(records(entry.mixed).filter(record => record[2] === 0).length, 2047);
+  entry.refresh();
+  const foreign = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial());
+  entry.fill.mesh.add(foreign); entry.mixed.update(entry.roots, host, camera);
+  assert.equal(entry.fill.mesh.visible, true, "a layer with other children stays visible");
+  assert.equal(activeSources(entry).length, 0, "its mixed batches are hidden individually");
+  entry.mixed.restore(); entry.fill.mesh.remove(foreign); foreign.geometry.dispose(); foreign.material.dispose();
   entry.refresh();
   const barrier = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial());
   barrier.userData.heprDrawRun = { kind: "text", first: 0, count: 1 };

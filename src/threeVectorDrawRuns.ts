@@ -17,6 +17,62 @@ export function vectorDrawRunRenderOrder(index: number, count: number): number {
     (HEPR_THREE_LAYER_ORDER_TEXT - HEPR_THREE_LAYER_ORDER_RASTER) * ((index + 1) / (count + 1));
 }
 
+const drawRunsByParent = new WeakMap<THREE.Object3D, ThreeVectorDrawRuns>();
+/** Shared, so a replacement layer on the same parent never repeats a revision. */
+let revisions = 0;
+
+/**
+ * Changes whenever the batches under `parent` change their membership,
+ * visibility or instance data; undefined for other objects. Lets consumers
+ * reuse what they derived from thousands of batch meshes on unchanged frames.
+ */
+export function threeVectorDrawRunsRevision(parent: THREE.Object3D): number | undefined {
+  return drawRunsByParent.get(parent)?.revision;
+}
+
+/**
+ * Batch meshes have identity local transforms, so their world matrix is the
+ * parent's. Three recomputes every descendant's matrices each frame; with
+ * thousands of batches that dominates CPU time. Copy the parent's world matrix
+ * only when it moves or batches are added, and update any other child as Three
+ * would.
+ */
+function installBatchMatrixPropagation(parent: THREE.Object3D): void {
+  if (drawRunsByParent.has(parent)) return;
+  const propagated = new THREE.Matrix4();
+  let valid = false, added = true;
+  let others = parent.children.reduce((count, child) => count + (isStaticBatch(child) ? 0 : 1), 0);
+  parent.addEventListener("childadded", ({ child }) => { added = true; if (!isStaticBatch(child)) others++; });
+  parent.addEventListener("childremoved", ({ child }) => { if (!isStaticBatch(child)) others--; });
+  parent.updateMatrixWorld = function (this: THREE.Object3D, force?: boolean): void {
+    if (this.matrixAutoUpdate) this.updateMatrix();
+    if (this.matrixWorldNeedsUpdate || force) {
+      if (this.matrixWorldAutoUpdate) {
+        if (this.parent === null) this.matrixWorld.copy(this.matrix);
+        else this.matrixWorld.multiplyMatrices(this.parent.matrixWorld, this.matrix);
+      }
+      this.matrixWorldNeedsUpdate = false;
+      force = true;
+    }
+    const moved = !valid || !propagated.equals(this.matrixWorld);
+    if (!moved && !added && others === 0) return;
+    if (moved) { propagated.copy(this.matrixWorld); valid = true; }
+    added = false;
+    for (const child of this.children) {
+      if (isStaticBatch(child)) {
+        if ((moved || child.matrixWorldNeedsUpdate) && child.matrixWorldAutoUpdate) {
+          child.matrixWorld.multiplyMatrices(this.matrixWorld, child.matrix);
+        }
+        child.matrixWorldNeedsUpdate = false;
+      } else child.updateMatrixWorld(force);
+    }
+  };
+}
+
+function isStaticBatch(object: THREE.Object3D): boolean {
+  return object.userData.heprStaticBatch === true && !object.matrixAutoUpdate && object.children.length === 0;
+}
+
 /** A canonical paint range, or the single instance a Multiply pass expands to. */
 interface DrawRunRange {
   run: VectorDrawRun;
@@ -52,6 +108,11 @@ export class ThreeVectorDrawRuns {
   private sourceCount: number;
   private sourceVersion = -1;
   private enabled = true;
+  /** Whether every batch's visibility already reflects `enabled` and its instances. */
+  private visibilityApplied = false;
+  private renderedCount = 0;
+  /** See threeVectorDrawRunsRevision. */
+  revision = ++revisions;
   private readonly scene: VectorScene;
   private readonly kind: VectorDrawRun["kind"];
   private readonly parent: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>;
@@ -83,6 +144,8 @@ export class ThreeVectorDrawRuns {
     this.kind = kind;
     this.parent = parent;
     this.attribute = attribute;
+    installBatchMatrixPropagation(parent);
+    drawRunsByParent.set(parent, this);
     this.visibility = new ScenePaintVisibility(scene);
     this.snapshot = createDefaultOptionalContentSnapshot(scene);
     this.visibility.setVisibility(this.snapshot);
@@ -337,10 +400,16 @@ export class ThreeVectorDrawRuns {
     mesh.userData.heprScheduled = this.plan.version > 0;
     mesh.userData.heprInstanceAttribute = this.attribute;
     mesh.frustumCulled = false;
+    // The parent propagates its world matrix; see installBatchMatrixPropagation.
+    mesh.matrixAutoUpdate = false;
+    mesh.matrixWorldNeedsUpdate = true;
+    mesh.userData.heprStaticBatch = true;
     mesh.renderOrder = vectorDrawRunRenderOrder(order, this.scene.drawRuns!.length);
     this.parent.add(mesh);
     this.entries.push({ mesh, ranges, ids, idValues: ids.array as Float32Array,
       clipCodes, clipValues: (clipCodes?.array as Float32Array | undefined) ?? null });
+    this.visibilityApplied = false;
+    this.revision = ++revisions;
   }
 
   private updateEntries(): void {
@@ -367,6 +436,7 @@ export class ThreeVectorDrawRuns {
       }
       redundancy.update(candidates, count);
     }
+    let modified = false, rendered = 0;
     for (const entry of this.entries) {
       let visible = 0;
       let changed = false;
@@ -402,17 +472,33 @@ export class ThreeVectorDrawRuns {
           visible++;
         }
       }
+      const shown = this.enabled && visible > 0;
+      if (changed || clipsChanged || entry.mesh.geometry.instanceCount !== visible || entry.mesh.visible !== shown) modified = true;
       entry.mesh.geometry.instanceCount = visible;
-      entry.mesh.visible = this.enabled && visible > 0;
+      entry.mesh.visible = shown;
+      if (shown) rendered += visible;
       if (changed) markInstanceUpdate(entry.ids, visible);
       if (clipsChanged && entry.clipCodes) markInstanceUpdate(entry.clipCodes, visible);
     }
+    this.renderedCount = rendered;
+    this.visibilityApplied = true;
+    if (modified) this.revision = ++revisions;
     profile?.endSection("three.batchUpdate");
   }
 
   setEnabled(enabled: boolean): void {
+    // Stroke LOD layers call this every frame; an unchanged state is already applied.
+    if (enabled === this.enabled && this.visibilityApplied) return;
     this.enabled = enabled;
-    for (const entry of this.entries) entry.mesh.visible = enabled && entry.mesh.geometry.instanceCount > 0;
+    let rendered = 0;
+    for (const entry of this.entries) {
+      const count = entry.mesh.geometry.instanceCount;
+      entry.mesh.visible = enabled && count > 0;
+      if (entry.mesh.visible) rendered += count;
+    }
+    this.renderedCount = rendered;
+    this.visibilityApplied = true;
+    this.revision = ++revisions;
   }
 
   setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
@@ -428,8 +514,10 @@ export class ThreeVectorDrawRuns {
     if (this.strokeRedundancy) this.updateEntries();
   }
 
+  /** Instances this layer's own selection submits, before any mixed-batch substitution. */
   getRenderedCount(): number {
-    return this.entries.reduce((count, entry) => count + (entry.mesh.visible ? entry.mesh.geometry.instanceCount : 0), 0);
+    return this.visibilityApplied ? this.renderedCount
+      : this.entries.reduce((count, entry) => count + (entry.mesh.visible ? entry.mesh.geometry.instanceCount : 0), 0);
   }
 
   dispose(): void {
@@ -456,6 +544,8 @@ export class ThreeVectorDrawRuns {
       geometry.dispose();
     }
     this.entries = [];
+    this.visibilityApplied = false;
+    this.revision = ++revisions;
   }
 }
 
