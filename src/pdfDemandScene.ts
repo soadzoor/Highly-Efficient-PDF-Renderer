@@ -3,6 +3,7 @@ import { copyRasterLayer } from "./monochromeRaster";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 import { PAGE_PRIMITIVE_KINDS, scenePrimitiveCounts } from "./scenePageViews";
 import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
+import { translateRasterRepeat } from "./rasterRepeat";
 
 const transparent = Uint8Array.of(0, 0, 0, 0);
 
@@ -40,6 +41,7 @@ export function createOcrDetailDemandScene(overview: VectorScene, detail: Vector
   const detailGeometry = alternative(detail, true);
   detailGeometry.rasterLayers = detail.rasterLayers.map(layer => ({ pageDemandSlot: true,
     width: 1, height: 1, data: transparent, opacity: 0, matrix: layer.matrix,
+    ...(layer.repeat ? { repeat: layer.repeat } : {}),
     paintOrder: layer.paintOrder, pageIndex: 0 }));
   const scene = composeOverlappingVectorScenes([alternative(overview, false), detailGeometry]);
   scene.pageCount = scene.pagesPerRow = 1;
@@ -60,7 +62,8 @@ export function createOcrDetailDemandScene(overview: VectorScene, detail: Vector
 
 export function placeDemandRaster(layer: RasterLayer, scene: VectorScene, page: VectorScene, index: number): RasterLayer {
   const matrix = layer.matrix.slice();
-  matrix[4] += scene.pageRects[index * 4] - page.pageRects[0];
-  matrix[5] += scene.pageRects[index * 4 + 1] - page.pageRects[1];
-  return copyRasterLayer(layer, { matrix, pageIndex: index, pageDemandSlot: true });
+  const tx = scene.pageRects[index * 4] - page.pageRects[0], ty = scene.pageRects[index * 4 + 1] - page.pageRects[1];
+  matrix[4] += tx; matrix[5] += ty;
+  return copyRasterLayer(layer, { matrix, ...(layer.repeat ? { repeat: translateRasterRepeat(layer.repeat, tx, ty) } : {}),
+    pageIndex: index, pageDemandSlot: true });
 }

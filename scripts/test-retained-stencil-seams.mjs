@@ -12,6 +12,7 @@ try {
   const { validateScenePaintGraph } = await import("../src/scenePaintGraph.ts");
   const { buildRasterAtlasBatches } = await import("../src/rasterAtlasBatches.ts");
   const { compositeBinaryStencilPlates } = await import("../src/retainedStencilRaster.ts");
+  const { rasterRepeatMatrix } = await import("../src/rasterRepeat.ts");
 
   const first = "q 20 0 0 10 10 10 cm .643137255 .682352941 .674509804 rg /A Do Q";
   const second = "q 20 0 0 10 10 10 cm .549019608 .588235294 .580392157 rg /B Do Q";
@@ -137,8 +138,12 @@ try {
           visit(node.children, alpha * node.alpha);
         } else {
           const run = scene.drawRuns[node.runIndex]; assert.equal(run.kind, "raster");
-          for (let index = run.first; index < run.first + run.count; index++) paints.push({ layer: scene.rasterLayers[index],
-            clipIndex: run.clipIndex ?? -1, alpha });
+          for (let index = run.first; index < run.first + run.count; index++) {
+            const layer = scene.rasterLayers[index], repeat = layer.repeat;
+            if (repeat) for (let y = repeat.yFirst; y <= repeat.yLast; y++) for (let x = repeat.xFirst; x <= repeat.xLast; x++) {
+              paints.push({ layer: { ...layer, matrix: rasterRepeatMatrix(repeat, x, y) }, clipIndex: run.clipIndex ?? -1, alpha });
+            } else paints.push({ layer, clipIndex: run.clipIndex ?? -1, alpha });
+          }
         }
       }
     };
@@ -171,7 +176,10 @@ try {
   for (const matrix of ["1 0 0 1 0 0", "-1 0 0 1 40 0", "0 1 -1 0 40 0", "2 0 0 3 .25 -.5"]) {
     const optimized = await patternScene({ matrix }), generic = await patternScene({ matrix, generic: true });
     const fastPaints = rasterPaints(optimized), originalPaints = rasterPaints(generic);
-    assert.equal(optimized.rasterLayers.length, generic.rasterLayers.length, "every original cell retains its raster instance");
+    assert.equal(fastPaints.length, originalPaints.length, "every original cell retains its logical raster instance");
+    assert.equal(optimized.imagePaintOpCount, generic.imagePaintOpCount, "paint counts include every cell in the compact grid");
+    assert.equal(optimized.rasterLayers.length, 1, "one reusable stencil grid replaces per-cell resource objects");
+    assert(optimized.rasterLayers[0].repeat, "the source pattern remains explicit in canonical scene data");
     assert.equal(optimized.drawRuns.length, 1, "a proven simple cell batches its source-ordered placements");
     assert(generic.drawRuns.length > 1, "metadata in the cell keeps the conservative executor path");
     assert(optimized.clipPaths.length < generic.clipPaths.length, "cell clips are encoded in cropped placements");
@@ -208,7 +216,7 @@ try {
     const scene = await patternScene(options);
     assert(scene.drawRuns.length > 1, "sheared placements, nonuniform masks, holes and crossing clips use the exact executor");
   }
-  for (const lowerOptions of [{ maxPatternCells: 1 }, { maxCoordinates: 1 }, { maxPrimitives: 0 }]) {
+  for (const lowerOptions of [{ maxPatternCells: 1 }, { maxCoordinates: 1 }, { maxCoordinates: 6 }, { maxPrimitives: 0 }, { maxPrimitives: 1 }]) {
     await assert.rejects(patternScene({ lowerOptions }), error => error.code === "resource-limit",
       "the cached cell template preserves caller cell and geometry limits");
   }

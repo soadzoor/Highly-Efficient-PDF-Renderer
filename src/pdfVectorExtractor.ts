@@ -26,6 +26,7 @@ import { copyRasterLayer, type MonochromeRaster } from "./monochromeRaster";
 import type { PreparedRasterCompression } from "./rasterCompression";
 import type { PreparedRasterPixels } from "./rasterPreparationCore";
 import { resolvePdfViewingOptions } from "./pdfViewingOptions";
+import { translateRasterRepeat, type RasterRepeat } from "./rasterRepeat";
 
 type Mat2D = [number, number, number, number, number, number];
 
@@ -37,6 +38,8 @@ export interface Bounds {
 }
 
 export interface RasterLayer {
+  /** Reusable uniform stencil cell; matrix encloses its grid rather than sampling it once. */
+  repeat?: RasterRepeat;
   /** Viewing-only GPU blocks; canonical pixels remain available for export and recovery. */
   gpuCompression?: PreparedRasterCompression;
   /** Viewing-only packed/compact monochrome atlases prepared before scene upload. */
@@ -1397,6 +1400,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
       matrix[5] = layer.matrix[5] + ty;
       rasterLayers.push(copyRasterLayer(layer, {
         matrix,
+        ...(layer.repeat ? { repeat: translateRasterRepeat(layer.repeat, tx, ty) } : {}),
         paintOrder: layer.paintOrder,
         pageIndex: pageRectBase + layer.pageIndex
       }));

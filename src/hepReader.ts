@@ -51,6 +51,7 @@ import {
   HEP_JBIG2_NO_GLOBALS, HEP_JBIG2_MAX_DECODE_BYTES, hepJbig2GlobalsFile
 } from "./hepJbig2Raster";
 import { createMonochromeRasterLayer } from "./monochromeRaster";
+import { decodeHepRasterRepeats, hepRasterRepeatsByteLength, SCENE_RASTER_REPEATS_PATH } from "./hepRasterRepeats";
 import {
   SCENE_RASTER_LAYERS_PATH,
   copyRasterRect,
@@ -76,6 +77,7 @@ import {
   PARSED_DATA_JBIG2_FORMAT_VERSION,
   PARSED_DATA_BINARY_FORMAT_VERSION,
   PARSED_DATA_GROUP_RUN_FORMAT_VERSION,
+  PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION,
   readTexturePayloadAsFloat32,
   readNonNegativeInt,
   preparedStrokeGeometry,
@@ -477,9 +479,10 @@ async function loadSceneFromHepInternal(
       manifest.formatVersion !== PARSED_DATA_MONOCHROME_FORMAT_VERSION &&
       manifest.formatVersion !== PARSED_DATA_JBIG2_FORMAT_VERSION &&
       manifest.formatVersion !== PARSED_DATA_BINARY_FORMAT_VERSION &&
-      manifest.formatVersion !== PARSED_DATA_GROUP_RUN_FORMAT_VERSION) {
+      manifest.formatVersion !== PARSED_DATA_GROUP_RUN_FORMAT_VERSION &&
+      manifest.formatVersion !== PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION) {
     throw new Error(
-      `HEP format v${String(manifest.formatVersion)} is not supported; expected v${PARSED_DATA_FORMAT_VERSION}–v${PARSED_DATA_GROUP_RUN_FORMAT_VERSION}. Re-export the HEP file with the current version.`
+      `HEP format v${String(manifest.formatVersion)} is not supported; expected v${PARSED_DATA_FORMAT_VERSION}–v${PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION}. Re-export the HEP file with the current version.`
     );
   }
 
@@ -1319,6 +1322,7 @@ async function readRasterLayersFromParsedData(
     throw new Error("Transposed binary raster layers require HEP scene format v12.");
   }
   validateRasterLayerPayloads(archive, table);
+  const repeats = await readRasterRepeatsFromParsedData(archive, meta.repeats, count, formatVersion, signal);
 
   // Decode an atlas when its first cell is needed and release it after its last.
   const lastCellIndex = new Map<number, number>();
@@ -1340,6 +1344,7 @@ async function readRasterLayersFromParsedData(
       matrix: record.matrix,
       paintOrder: record.paintOrder,
       pageIndex: record.pageIndex,
+      ...(repeats?.has(i) ? { repeat: repeats.get(i)! } : {}),
       ...(typeof interpolation === "string" && interpolation[i] !== "-" ? { interpolate: interpolation[i] === "1" } : {}),
       ...(record.opacity === undefined ? {} : { opacity: record.opacity })
     };
@@ -1407,6 +1412,24 @@ async function readRasterLayersFromParsedData(
   }
 
   return layers;
+}
+
+async function readRasterRepeatsFromParsedData(archive: HepArchive, value: unknown, layerCount: number,
+  formatVersion: number, signal?: AbortSignal) {
+  if (value === undefined) return undefined;
+  if (formatVersion < PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION) {
+    throw new Error(`Raster repeats require HEP scene format v${PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION}.`);
+  }
+  const meta = readSceneSectionDescriptor(value, SCENE_RASTER_REPEATS_PATH, "raster repeats");
+  const count = readSceneSectionCount(meta, "count", "raster repeats");
+  const translationCount = readSceneSectionCount(meta, "translationCount", "raster repeats");
+  if (count > layerCount) throw new Error("Scene raster repeat count exceeds its layers.");
+  const entry = archive.file(SCENE_RASTER_REPEATS_PATH);
+  if (!entry || readHepEntryUncompressedSize(entry) !== hepRasterRepeatsByteLength(count, translationCount)) {
+    throw new Error("Scene raster repeats are missing or do not match their declared byte length.");
+  }
+  return decodeHepRasterRepeats(await readSceneSectionBytes(archive, SCENE_RASTER_REPEATS_PATH, signal),
+    layerCount, count, translationCount, signal);
 }
 
 /** Straight-alpha RGBA8 of one raw, PNG or WebP section with known dimensions. */

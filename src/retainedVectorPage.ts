@@ -29,6 +29,7 @@ import type { DensePdfTextClip } from "./pdf/nativeContentCompiler";
 import { PdfError } from "./pdf/nativeTypes";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import { createMonochromeRasterLayer, type MonochromeRaster } from "./monochromeRaster";
+import { rasterRepeatBounds, rasterRepeatCount, validateRasterRepeat, type RasterRepeat } from "./rasterRepeat";
 
 const IDENTITY: PdfMatrix = [1, 0, 0, 1, 0, 0];
 type Color = readonly [number, number, number, number];
@@ -310,9 +311,10 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const fail = (message: string, reason = "vector-retained-program"): never => {
     throw new PdfError("unsupported-content", `VectorScene retained program: ${message}`, { details: { reason } });
   };
-  const budget = (added: number): void => {
+  const budget = (added: number, primitives = 1): void => {
     signal.throwIfAborted(); coordinates += added;
-    if (++count > maximum || coordinates > maxCoordinates) throw new PdfError("resource-limit", "Retained vector expansion exceeds its geometry budget.", { details: { reason: "vector-expansion-limit" } });
+    count += primitives;
+    if (count > maximum || coordinates > maxCoordinates) throw new PdfError("resource-limit", "Retained vector expansion exceeds its geometry budget.", { details: { reason: "vector-expansion-limit" } });
   };
   const transform = (index: number): PdfMatrix => Array.from(page.stores.transforms.values.subarray(index * 6, index * 6 + 6)) as unknown as PdfMatrix;
   const inverseMatrix = (matrix: PdfMatrix): PdfMatrix => {
@@ -935,6 +937,36 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
         }
         const first = scene.rasterLayers.length, cropped: PdfMatrix = [bounds.maxX - bounds.minX, 0, 0,
           bounds.minY - bounds.maxY, bounds.minX, bounds.maxY];
+        let repeat: RasterRepeat | undefined, repeatMatrix: Float32Array | undefined;
+        if (amount > 0 && bounds.maxX - bounds.minX <= Math.abs(xs) && bounds.maxY - bounds.minY <= Math.abs(ys)) {
+          const candidate: RasterRepeat = { transform: Float64Array.from(toScene),
+            bounds: Float64Array.of(bounds.minX, bounds.minY, bounds.maxX, bounds.maxY),
+            xStep: xs, yStep: ys, xFirst: x0, xLast: x1, yFirst: y0, yLast: y1 };
+          // An affine grid reaches its coordinate extrema at its corner cells.
+          // Keep overflow diagnostics on the original path when any corner
+          // would exceed its Float32 placement storage.
+          let finite = true;
+          for (const y of [y0, y1]) for (const x of [x0, x1]) {
+            const cell = Float32Array.from(multiplyHeprMatrices(toScene, [1, 0, 0, 1, x * xs, y * ys]));
+            if (!cell.every(Number.isFinite) ||
+                !Float32Array.from(multiplyHeprMatrices(cell as unknown as PdfMatrix, cropped)).every(Number.isFinite)) finite = false;
+          }
+          if (finite) {
+            validateRasterRepeat(candidate);
+            const grid = rasterRepeatBounds(candidate), enclosing = Float32Array.of(grid.maxX - grid.minX, 0, 0,
+              grid.maxY - grid.minY, grid.minX, grid.minY);
+            if (enclosing.every(Number.isFinite)) { repeat = candidate; repeatMatrix = enclosing; }
+          }
+        }
+        if (repeat) {
+          // Charge the same logical cells and coordinates even though the
+          // canonical scene now stores one reusable grid, not one object per cell.
+          budget(amount * 6, amount);
+          scene.rasterLayers.push({ ...pixels, matrix: repeatMatrix!, repeat, paintOrder: first, pageIndex: 0,
+            interpolate: images.interpolate[image] !== 0 });
+          appendRun("raster", first, 1, paintedClip, condition);
+          return;
+        }
         for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
           signal.throwIfAborted();
           transforms.set(multiplyHeprMatrices(toScene, [1, 0, 0, 1, x * xs, y * ys]), cellOffset);
@@ -1313,7 +1345,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     options.textPositions, signal);
   scene.sourceTextCount = source.stores.glyphs.glyphIds.length;
   scene.pathCount = scene.fillPathCount + scene.segmentCount;
-  scene.imagePaintOpCount = scene.rasterLayers.length;
+  scene.imagePaintOpCount = scene.rasterLayers.reduce((sum, layer) => sum + (layer.repeat ? rasterRepeatCount(layer.repeat) : 1), 0);
   const image = scene.rasterLayers[0];
   if (image) {
     scene.rasterLayerWidth = image.width; scene.rasterLayerHeight = image.height; scene.rasterLayerMatrix = image.matrix;

@@ -34,6 +34,7 @@ import {
 } from "./rasterImageCodec";
 import { encodeHepMonochromeRaster } from "./hepMonochromeRaster";
 import { encodeHepBinaryRaster } from "./hepBinaryRaster";
+import { encodeHepRasterRepeats, SCENE_RASTER_REPEATS_PATH } from "./hepRasterRepeats";
 import {
   IdenticalRasterFinder,
   SCENE_RASTER_LAYERS_PATH,
@@ -64,6 +65,7 @@ import {
   PARSED_DATA_MONOCHROME_FORMAT_VERSION,
   PARSED_DATA_BINARY_FORMAT_VERSION,
   PARSED_DATA_GROUP_RUN_FORMAT_VERSION,
+  PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION,
   TEXT_INDEX_JSON_PATH,
   TEXT_CHAR_MAP_PATH,
   TEXT_FALLBACK_PATH,
@@ -145,6 +147,8 @@ export async function buildHepBlobForLayout(
   });
   const textureEntries = buildTextureExportEntries(scene, sceneStats, textureLayout);
   const rasterLayers = sceneRasterLayers;
+  const rasterRepeats = encodeHepRasterRepeats(rasterLayers, options.signal);
+  if (rasterRepeats) archive.file(SCENE_RASTER_REPEATS_PATH, rasterRepeats.bytes);
 
   for (const entry of textureEntries) {
     throwIfBuildAborted(options.signal);
@@ -245,7 +249,8 @@ export async function buildHepBlobForLayout(
   reportBuildProgress(hepBuildStart, { stage: "hep-build" });
 
   const manifest = {
-    formatVersion: paintGraphExport?.repeatedGroups ? PARSED_DATA_GROUP_RUN_FORMAT_VERSION :
+    formatVersion: rasterRepeats ? PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION :
+      paintGraphExport?.repeatedGroups ? PARSED_DATA_GROUP_RUN_FORMAT_VERSION :
       rasterLayersManifest?.binary ? PARSED_DATA_BINARY_FORMAT_VERSION :
       rasterLayers.some(layer => layer.monochrome)
       ? PARSED_DATA_MONOCHROME_FORMAT_VERSION : PARSED_DATA_FORMAT_VERSION,
@@ -315,6 +320,8 @@ export async function buildHepBlobForLayout(
       textGlyphPrimitiveCount: scene.textGlyphSegmentCount,
       rasterLayers: rasterLayersManifest && {
         file: rasterLayersManifest.file, count: rasterLayersManifest.count, atlasCount: rasterLayersManifest.atlasCount,
+        ...(rasterRepeats ? { repeats: { file: SCENE_RASTER_REPEATS_PATH,
+          count: rasterRepeats.count, translationCount: rasterRepeats.translationCount } } : {}),
         ...(rasterLayers.some(layer => layer.interpolate !== undefined) ? {
           interpolation: rasterLayers.map(layer => layer.interpolate === undefined ? "-" : layer.interpolate ? "1" : "0").join("")
         } : {})

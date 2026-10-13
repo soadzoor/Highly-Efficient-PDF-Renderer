@@ -6,6 +6,7 @@ import { findSceneContentItem, type SceneContentItem } from "./structureData";
 import { sampleSceneGradientChannel } from "./gradientSampling";
 import { getGradientMeshTriangle, gradientMeshTriangleCount, type GradientMeshTriangle } from "./gradientMesh";
 import { isScenePaintRunVisible, scenePaintOrderedRuns, scenePaintRunConditions, scenePaintRunAlpha, releaseScenePaintQuery, type ScenePaintSample } from "./scenePaintQuery";
+import { rasterRepeatBounds, rasterRepeatPoint } from "./rasterRepeat";
 
 export type PrimitiveKind = "stroke" | "fill" | "text" | "raster" | "gradient-fill" | "gradient-stroke";
 /** An index in the canonical loaded scene, never an index in a rendering LOD. */
@@ -344,6 +345,8 @@ function primitiveBounds(scene: VectorScene, ref: PrimitiveRef): Bounds {
   if (ref.kind === "raster") {
     const retained = retainedRasterBounds(scene, ref.index);
     if (retained) return { ...retained };
+    const repeat = scene.rasterLayers[ref.index].repeat;
+    if (repeat) return rasterRepeatBounds(repeat);
     for (const point of rasterQuad(scene, ref.index)) include(bounds, point);
   } else if (ref.kind === "text") {
     const glyph = Math.round(scene.textInstanceB[i + 2]) * 4;
@@ -503,7 +506,8 @@ function gradientAlpha(scene: VectorScene, index: number, point: PrimitivePoint)
 }
 
 function rasterAlpha(scene: VectorScene, index: number, point: PrimitivePoint, replacement?: RasterLayer): number {
-  const layer = replacement ?? scene.rasterLayers[index], uv = inverse(point, layer.matrix);
+  const layer = replacement ?? scene.rasterLayers[index], uv = layer.repeat
+    ? rasterRepeatPoint(layer.repeat, point.x, point.y) : inverse(point, layer.matrix);
   if (!uv || uv.x < 0 || uv.y < 0 || uv.x > 1 || uv.y > 1 || !layer.width || !layer.height) return 0;
   const x = uv.x * layer.width - 0.5, y = uv.y * layer.height - 0.5, ix = Math.floor(x), iy = Math.floor(y);
   const alpha = (px: number, py: number): number => layer.data[(Math.max(0, Math.min(layer.height - 1, py)) * layer.width +
@@ -1011,7 +1015,8 @@ export class ScenePrimitivePicker {
     const hit = await this.hit(ref, { ...options, point, clientPoint }, 0, work, true);
     if (!hit) return empty;
     if (ref.kind === "raster") {
-      const layer = options.rasterLayers?.get(ref.index) ?? this.scene.rasterLayers[ref.index], uv = inverse(point, layer.matrix);
+      const layer = options.rasterLayers?.get(ref.index) ?? this.scene.rasterLayers[ref.index], uv = layer.repeat
+        ? rasterRepeatPoint(layer.repeat, point.x, point.y) : inverse(point, layer.matrix);
       if (!uv) return empty;
       const x = uv.x * layer.width - 0.5, y = uv.y * layer.height - 0.5, ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
       const sample = (channel: number): number => {
