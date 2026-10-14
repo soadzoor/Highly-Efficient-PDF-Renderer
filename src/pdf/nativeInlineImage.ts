@@ -93,11 +93,14 @@ interface InlineBoundary {
   readonly dataEnd: number;
   readonly eiStart: number;
   readonly eiEnd: number;
+  /** Ordinary content already validated up to the next BI or source-stream end. */
+  readonly continuationEnd?: number;
 }
 
 interface ParsedInline {
   readonly record: NativeInlineImageRecord;
   readonly end: number;
+  readonly continuationEnd?: number;
 }
 
 const INLINE_KEY_NAMES: Readonly<Record<string, string>> = Object.freeze({
@@ -364,8 +367,8 @@ class NativeInlineImageParser {
         const record = Object.freeze({ ...parsed.record, imageIndex: this.images.length });
         this.images.push(record);
         this.segments.push(record);
-        offset = parsed.end;
-        contentStart = offset;
+        contentStart = parsed.end;
+        offset = parsed.continuationEnd ?? parsed.end;
         operandCount = 0;
         continue;
       }
@@ -523,7 +526,7 @@ class NativeInlineImageParser {
       idOffset: this.absolute(idStart),
       eiOffset: this.absolute(boundary.eiStart)
     });
-    return { record, end: boundary.eiEnd };
+    return { record, end: boundary.eiEnd, continuationEnd: boundary.continuationEnd };
   }
 
   private findBoundary(
@@ -680,10 +683,24 @@ class NativeInlineImageParser {
       dataStart + this.limits.maxPayloadBytes + 1
     );
     let match: InlineBoundary | null = null;
-    for (let eiStart = dataStart + 1; eiStart <= maximumE; eiStart += 1) {
-      this.budget.consume(1);
+    for (let scanStart = dataStart + 1; scanStart <= maximumE;) {
+      // Bound native work before inspecting it, both to the remaining caller
+      // budget and to a cancellation checkpoint. This is a work chunk, not a
+      // payload limit; every chunk up to maximumE is still searched.
+      const scanEnd = Math.min(maximumE + 1, scanStart + Math.min(0x10000, this.budget.remaining));
+      if (scanEnd <= scanStart) this.budget.consume(1);
+      const relativeE = this.bytes.subarray(scanStart, scanEnd).indexOf(0x45);
+      if (relativeE < 0) {
+        this.budget.consume(scanEnd - scanStart);
+        scanStart = scanEnd;
+        continue;
+      }
+      const eiStart = scanStart + relativeE;
+      // Charge every inspected byte, including the native search's skipped
+      // prefix, while avoiding a method call for each ordinary content byte.
+      this.budget.consume(eiStart - scanStart + 1);
+      scanStart = eiStart + 1;
       if (
-        this.bytes[eiStart] !== 0x45 ||
         this.bytes[eiStart + 1] !== 0x49 ||
         !isPdfWhitespace(this.bytes[eiStart - 1]) ||
         !isTokenBoundary(this.bytes[eiStart + 2])
@@ -701,7 +718,7 @@ class NativeInlineImageParser {
       // Later EI operators belong to the next structurally parsed image, not
       // this payload. Continue checking ambiguity only before that next BI.
       maximumE = Math.min(maximumE, continuationEnd - 1);
-      const candidate = { dataEnd, eiStart, eiEnd: eiStart + 2 };
+      const candidate = { dataEnd, eiStart, eiEnd: eiStart + 2, continuationEnd };
       if (match) {
         throw imageError(
           "inline-image-ambiguous-boundary",
@@ -933,6 +950,31 @@ function readContentItem(
   }
   if (isPdfDelimiter(byte)) {
     throw syntaxError(errorCode, "Unexpected PDF content delimiter.", baseOffset + offset);
+  }
+  // CAD continuations contain millions of numeric operands. Their values are
+  // not needed here: recognize the exact PDF_NUMBER grammar in bytes instead
+  // of allocating a string and running its regular expression twice. At most
+  // 308 digits cannot overflow a finite double; longer forms keep Number's
+  // handling of leading zeros, tiny fractions and overflow.
+  if ((byte >= 0x30 && byte <= 0x39) || byte === 0x2b || byte === 0x2d || byte === 0x2e) {
+    let end = offset + (byte === 0x2b || byte === 0x2d ? 1 : 0);
+    const integerStart = end;
+    while (end < bytes.length && bytes[end] >= 0x30 && bytes[end] <= 0x39) end += 1;
+    let digits = end - integerStart;
+    if (bytes[end] === 0x2e) {
+      const fractionalStart = ++end;
+      while (end < bytes.length && bytes[end] >= 0x30 && bytes[end] <= 0x39) end += 1;
+      digits += end - fractionalStart;
+    }
+    if (digits > 0 && (end === bytes.length || isTokenBoundary(bytes[end]))) {
+      budget.consume(end - offset);
+      if (digits > 308 && !Number.isFinite(Number(asciiWord(bytes, offset, end, errorCode, baseOffset)))) {
+        throw syntaxError(errorCode, "PDF content number is non-finite.", baseOffset + offset);
+      }
+      return { kind: "value", start, end };
+    }
+    // A numeric-shaped keyword is still a word here; the content compiler
+    // owns operator validation. Keep the existing ASCII/error path below.
   }
   let end = offset;
   while (end < bytes.length && !isTokenBoundary(bytes[end])) end += 1;

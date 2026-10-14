@@ -6,6 +6,7 @@ import { detectMonochromeRaster } from "./monochromeRaster";
 import { preparedRasterPlaceholder, type PreparedRasterSection } from "./preparedRasterSections";
 import { encodeRasterRgbaCandidates, pickBestRasterImage } from "./rasterImageCodec";
 import { prepareSourceJpxRaster } from "./hepJpxPreparation";
+import { rasterPixelDigest } from "./rasterPixelDigest";
 
 /** Encodes one parsed page's larger images before the next page is decoded. */
 export type HepRasterPagePreparer = (scene: VectorScene, signal?: AbortSignal) => Promise<void>;
@@ -31,10 +32,10 @@ export function createHepRasterPagePreparer(): HepRasterPagePreparer {
       const { width, height } = layer;
       const rgba = layer.data.subarray(0, width * height * 4);
       const original = await prepareSourceJpxRaster(layer, signal);
-      // Hash the small retained stream instead of copying a potentially
-      // gigabyte-sized RGBA plane through WebCrypto solely to deduplicate it.
+      // Hash the small retained stream instead of visiting a potentially
+      // gigabyte-sized RGBA plane solely to deduplicate it.
       const digestBytes = original?.bytes ?? rgba;
-      const hash = await pixelDigest(digestBytes, width, height);
+      const hash = await rasterPixelDigest(digestBytes, width, height, signal);
       const digest = hash === undefined ? undefined : `${original ? "jpx" : "rgba"}:${hash}`;
       signal?.throwIfAborted();
       let section = digest === undefined ? undefined : sectionsByDigest.get(digest);
@@ -46,15 +47,16 @@ export function createHepRasterPagePreparer(): HepRasterPagePreparer {
         if (digest !== undefined) sectionsByDigest.set(digest, section);
       }
       scene.rasterLayers[index] = { ...layer, data: preparedRasterPlaceholder(section) };
-      replaced = true;
-    }
-    // A page's legacy first-raster accessor would otherwise retain its pixels.
-    if (replaced) {
-      Object.defineProperty(scene, "rasterLayerData", {
-        configurable: true,
-        enumerable: true,
-        get: () => scene.rasterLayers[0]?.data ?? new Uint8Array(0)
-      });
+      if (!replaced) {
+        // Release the legacy first-raster reference before preparing later
+        // images, rather than retaining its full pixels until the loop ends.
+        Object.defineProperty(scene, "rasterLayerData", {
+          configurable: true,
+          enumerable: true,
+          get: () => scene.rasterLayers[0]?.data ?? new Uint8Array(0)
+        });
+        replaced = true;
+      }
     }
   };
 }
@@ -84,19 +86,4 @@ async function encodeRasterSection(
   const image = pickBestRasterImage(width, height, await encodeRasterRgbaCandidates(width, height, rgba));
   signal?.throwIfAborted();
   return image ? { storage: image.encoding, bytes: image.bytes } : null;
-}
-
-/**
- * Dimensions and SHA-256 of the bytes, or undefined without WebCrypto (for
- * example on an insecure origin); identical images are then encoded twice.
- */
-async function pixelDigest(rgba: Uint8Array, width: number, height: number): Promise<string | undefined> {
-  const subtle = globalThis.crypto?.subtle;
-  if (!subtle) return undefined;
-  const view = rgba.buffer instanceof ArrayBuffer
-    ? new Uint8Array(rgba.buffer, rgba.byteOffset, rgba.byteLength) : new Uint8Array(rgba);
-  const digest = new Uint8Array(await subtle.digest("SHA-256", view as Uint8Array<ArrayBuffer>));
-  let hex = "";
-  for (const byte of digest) hex += byte.toString(16).padStart(2, "0");
-  return `${width}x${height}:${hex}`;
 }

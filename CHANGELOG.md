@@ -8,10 +8,20 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
+- Speed up inline-image preprocessing in large CAD PDFs by reusing validated
+  content after image boundaries, searching candidate boundaries in bounded
+  native byte scans, and recognizing numeric operands without temporary
+  strings. Preserve boundary ambiguity checks, caller scan limits and cancellation.
+- Avoid a second copy of captured retained path and paint resources during
+  compiler finalization. Freeze the already-owned snapshots in place, preserving
+  geometry, graphics-state isolation and immutable metadata while reducing
+  peak memory and temporary allocations on drawings with many path paints.
 - Reduce PDF-to-HEP peak memory by reusing decoded images and fonts when retrying
   retained rendering, releasing the PDF worker before final image encoding, and
   adopting the bundled JPEG 2000 decoder's owned sample buffers. Upload Node
   canvas images in reusable row bands instead of another full-size pixel copy.
+  Hash raster data incrementally in Node without a full-image snapshot and
+  release the legacy first-image reference as soon as its pixels are replaced.
   Full resolution, canonical pixels and image encoding settings are preserved.
 - Keep eligible oversized JPEG 2000 images in their original compressed form
   during HEP export instead of expanding them to PNG when they exceed WebP's

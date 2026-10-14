@@ -2182,6 +2182,33 @@ class DenseContentCompiler {
         }));
       }
     }
+    // Capturing a retained path/paint already copies its mutable graphics
+    // state. This compiler is consumed by finish(), so freeze those owned
+    // snapshots in place instead of allocating another complete object graph.
+    for (let index = 0; index < this.pagePaths.length; index++) {
+      const path = this.pagePaths[index];
+      Object.freeze(path.transform);
+      Object.freeze(path.bounds);
+      Object.freeze(path);
+      if ((index & 0x1fff) === 0) await checkpoint();
+    }
+    for (let index = 0; index < this.genericPathPaints.length; index++) {
+      const paint = this.genericPathPaints[index];
+      if (paint.fill) {
+        Object.freeze(paint.fill.color);
+        Object.freeze(paint.fill);
+      }
+      if (paint.stroke) {
+        Object.freeze(paint.stroke.color);
+        Object.freeze(paint.stroke);
+      }
+      if (paint.strokeStyle) {
+        Object.freeze(paint.strokeStyle.dash);
+        Object.freeze(paint.strokeStyle);
+      }
+      Object.freeze(paint);
+      if ((index & 0x1fff) === 0) await checkpoint();
+    }
     const result: DensePdfCompiledPage = {
       operatorCount: this.operatorCount,
       pathCount: this.pathCount,
@@ -2268,25 +2295,8 @@ class DenseContentCompiler {
           ...(paint.inheritType3Paint === true ? { inheritType3Paint: true } : {})
         }))
       ),
-      pagePaths: Object.freeze(
-        this.pagePaths.map((path) => Object.freeze({
-          data: path.data.slice(),
-          transform: Object.freeze([...path.transform]) as DensePdfMatrix,
-          bounds: Object.freeze({ ...path.bounds })
-        }))
-      ),
-      genericPathPaints: Object.freeze(
-        this.genericPathPaints.map((paint) => Object.freeze({
-          pathIndex: paint.pathIndex,
-          fillRule: paint.fillRule,
-          fill: paint.fill === null ? null : freezeSolidPaint(paint.fill),
-          stroke: paint.stroke === null ? null : freezeSolidPaint(paint.stroke),
-          strokeStyle: paint.strokeStyle === null ? null : Object.freeze({
-            ...paint.strokeStyle,
-            dash: Object.freeze([...paint.strokeStyle.dash])
-          })
-        }))
-      ),
+      pagePaths: Object.freeze(this.pagePaths),
+      genericPathPaints: Object.freeze(this.genericPathPaints),
       clipPaths: Object.freeze(
         this.clipPaths.map((clip) => Object.freeze({ ...clip }))
       ),

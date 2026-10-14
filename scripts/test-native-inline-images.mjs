@@ -301,6 +301,74 @@ const consecutiveRunLength = concat(
 );
 assert.equal(prepareNativeInlineImages(consecutiveRunLength).images.length, 2);
 
+// An unknown filtered boundary validates the ordinary continuation once. A
+// long CAD suffix must remain an exact view without being parsed a second time.
+const cadSuffix = bytes(" 0 0 m 1 1 l S\n".repeat(2_000));
+const filteredCad = concat(inline("/W 1 /H 1 /BPC 8 /CS /G /F /RL", Uint8Array.of(128)), cadSuffix);
+const preparedCad = prepareNativeInlineImages(filteredCad, { sourceOffset: 500,
+  limits: { maxScanBytes: filteredCad.length * 2 + 100 } });
+assert.equal(preparedCad.images.length, 1);
+assert.deepEqual(preparedCad.contentSpans[0].bytes, cadSuffix);
+assert.equal(preparedCad.contentSpans[0].bytes.buffer, filteredCad.buffer);
+assert.equal(preparedCad.contentSpans[0].sourceOffset, 500 + preparedCad.images[0].sourceLength);
+expectPdfError(() => prepareNativeInlineImages(filteredCad, { limits: { maxScanBytes: filteredCad.length } }),
+  "resource-limit", "inline-image-scan");
+
+// The native candidate search must honor a small scan budget before searching
+// a large binary payload, rather than charging the full search afterward.
+const largeSearch = inline("/W 1 /H 1 /BPC 8 /CS /G /F /RL", bytes("X".repeat(1_000_000)));
+const indexOf = Uint8Array.prototype.indexOf;
+let searchCalls = 0;
+try {
+  Uint8Array.prototype.indexOf = function(...args) {
+    searchCalls++;
+    assert.ok(this.length <= 100, "native image-boundary search stays within the remaining scan budget");
+    return indexOf.apply(this, args);
+  };
+  expectPdfError(() => prepareNativeInlineImages(largeSearch, { limits: { maxScanBytes: 100 } }),
+    "resource-limit", "inline-image-scan");
+  assert.ok(searchCalls > 0);
+} finally { Uint8Array.prototype.indexOf = indexOf; }
+
+const edgePayload = bytes("X".repeat(65_535));
+assert.deepEqual(prepareNativeInlineImages(inline("/W 1 /H 1 /BPC 8 /CS /G /F /RL", edgePayload)).images[0].stream.bytes,
+  edgePayload, "EI may start at the last byte of a native search chunk");
+const searchAbort = new AbortController();
+let interruptedSearches = 0;
+try {
+  Uint8Array.prototype.indexOf = function(...args) {
+    interruptedSearches++;
+    const result = indexOf.apply(this, args); searchAbort.abort(); return result;
+  };
+  expectPdfError(() => prepareNativeInlineImages(largeSearch, { signal: searchAbort.signal }), "aborted");
+  assert.equal(interruptedSearches, 1, "cancellation is observed after the first bounded native search");
+} finally { Uint8Array.prototype.indexOf = indexOf; }
+
+const numericTokens = ["0", "-0", "+0", "00012", ".5", "-.5", "+12.", "12.003",
+  "0".repeat(400) + "1", "0." + "0".repeat(400) + "1", "." + "9".repeat(400), "1" + "0".repeat(308)];
+const numericTail = bytes(numericTokens.map(token => `${token} m`).join(" "));
+const numericContent = concat(inline("/W 1 /H 1 /BPC 8 /CS /G /F /RL", Uint8Array.of(128)), " ", numericTail);
+assert.deepEqual(prepareNativeInlineImages(numericContent).contentSpans[0].bytes, concat(" ", numericTail),
+  "short and long finite PDF numbers retain their exact continuation bytes");
+for (const token of ["+", "-", ".", "1.2.3", "1e3", "--1", "12abc"]) {
+  assert.equal(prepareNativeInlineImages(concat(inline("/W 1 /H 1 /BPC 8 /CS /G /F /RL", Uint8Array.of(128)),
+    ` ${token} q`)).images.length, 1, "numeric-shaped keywords keep the original word fallback");
+}
+const overflow = "9".repeat(309);
+expectPdfError(() => prepareNativeInlineImages(concat(inline("/W 1 /H 1 /BPC 8 /CS /G", Uint8Array.of(128)),
+  ` ${overflow} m`)), "unsupported-content");
+expectPdfError(() => prepareNativeInlineImages(concat(inline("/W 1 /H 1 /BPC 8 /CS /G /F /RL", Uint8Array.of(128)),
+  ` ${overflow} m`)), "unsupported-image", "inline-image-missing-ei");
+
+const numericFirst = concat(inline("/W 1 /H 1 /BPC 8 /CS /G", Uint8Array.of(128)), " -123.");
+const numericSplit = concat(numericFirst, "45 m Q");
+assert.deepEqual(prepareNativeInlineImages(numericSplit, { streamEndOffsets: [numericFirst.length, numericSplit.length] })
+  .contentSpans[0].bytes, bytes(" -123.45 m Q"), "ordinary numeric content can continue across recorded stream boundaries");
+
+const splitCad = concat(filteredCad, " ", inline("/W 1 /H 1 /BPC 8 /CS /G /F /RL", Uint8Array.of(128)), " Q");
+assert.equal(prepareNativeInlineImages(splitCad).images.length, 2,
+  "cached ordinary continuation stops at the next structurally parsed BI");
+
 // Candidates within one region remain ambiguous, including when apparent BI
 // tokens occur in comments, strings, names, arrays, or dictionaries.
 const ambiguous = concat(
