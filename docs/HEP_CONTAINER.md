@@ -464,7 +464,9 @@ Eligibility requires a trusted bundled decode of unsigned eight-bit opaque
 transparency, matte adjustments, embedded opacity, precision conversion and
 resolution reduction exclude retention. Packed monochrome layers and repeat
 grids use their existing storage. Constant layer opacity and placement remain
-ordinary layer metadata. Export rechecks both canonical RGBA and encoded-byte
+ordinary layer metadata. Eligible images also retain their source through
+retained page lowering; masks on other images do not prevent their reuse.
+Export rechecks both canonical RGBA and encoded-byte
 fingerprints; changed pixels or source bytes take the normal encoding path.
 `encodeRasterImages: false` also selects decoded-pixel storage rather than
 retaining original JPX.

@@ -30,6 +30,8 @@ import { PdfError } from "./pdf/nativeTypes";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import { createMonochromeRasterLayer, type MonochromeRaster } from "./monochromeRaster";
 import { rasterRepeatBounds, rasterRepeatCount, validateRasterRepeat, type RasterRepeat } from "./rasterRepeat";
+import type { SourceJpxRaster } from "./sourceJpxRaster";
+import { sourceJpxForStoreImage } from "./pdf/nativeSourceJpx";
 
 const IDENTITY: PdfMatrix = [1, 0, 0, 1, 0, 0];
 type Color = readonly [number, number, number, number];
@@ -292,7 +294,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const gradients: GradientSceneData[] = [];
   const gradientColorTables = new Map<number, Uint8Array>();
   const imagePixels = new Map<number | string, { readonly data: Uint8Array; readonly width: number; readonly height: number;
-    readonly monochrome?: MonochromeRaster }>();
+    readonly monochrome?: MonochromeRaster; readonly sourceJpx?: SourceJpxRaster }>();
   const binaryStencils = new Map<number, boolean>();
   let pendingStencil: { plates: BinaryStencilPlate[]; width: number; height: number; index: number;
     matrix: Float32Array; clip: DensePdfTextClip | null; clipIndex: number | undefined;
@@ -1209,14 +1211,16 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
             data = applyHeprImageSoftMask(owned ? data : Uint8Array.from(data), width, height,
               mask, images.widths[maskIndex], images.heights[maskIndex], images.interpolate[maskIndex] !== 0, signal, matte);
           }
-          imagePixels.set(key, pixels = { data, width, height });
+          const sourceJpx = !stencil && maskIndex < 0 && width === images.widths[index] && height === images.heights[index]
+            ? sourceJpxForStoreImage(images, index, signal) : undefined;
+          imagePixels.set(key, pixels = { data, width, height, ...(sourceJpx ? { sourceJpx } : {}) });
         }
         const first = scene.rasterLayers.length; budget(6);
         const base = { width: pixels.width, height: pixels.height, matrix: layerMatrix, paintOrder: first, pageIndex: 0,
           interpolate: images.interpolate[index] !== 0 };
         scene.rasterLayers.push(pixels.monochrome
           ? createMonochromeRasterLayer(base, pixels.monochrome)
-          : { ...base, data: pixels.data });
+          : { ...base, data: pixels.data, ...(pixels.sourceJpx ? { sourceJpx: pixels.sourceJpx } : {}) });
         appendRun("raster", first, 1, clip, condition);
       }
     } else return fail(`${command.source} requires a specialized vector adapter.`);

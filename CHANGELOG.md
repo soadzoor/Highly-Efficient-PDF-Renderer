@@ -11,8 +11,10 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 - Keep eligible oversized JPEG 2000 images in their original compressed form
   during HEP export instead of expanding them to PNG when they exceed WebP's
   dimension limit. Preserve full resolution and decoded pixels without another
-  lossy encoding, and reuse shared image sections. Edited images, masks and color
-  conversions continue through ordinary encoding. These exports use scene v16
+  lossy encoding, and reuse shared image sections. Preserve eligible originals
+  through retained page rendering too, including when a different image's mask
+  requires that path. Edited images, masks and color conversions continue through
+  ordinary encoding. These exports use scene v16
   and require the updated reader; existing scene v9–v15 HEPs remain supported.
 - Include successfully copied duplicate PDFs in CLI attempted/successful counts,
   original PDF and output HEP size totals, size comparisons, and raster-fallback

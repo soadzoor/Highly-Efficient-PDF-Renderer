@@ -30,8 +30,19 @@ const mixB = (hash: number, word: number): number => Math.imul(hash ^ (word >>> 
  */
 export function hashSourceJpxRgba(data: Uint8Array, width: number, height: number,
   signal?: AbortSignal): readonly [number, number] {
+  return hashSourceJpxPixels(data, width, height, false, signal);
+}
+
+/** Fingerprint canonical opaque Gray8 expansion without allocating an RGBA plane. */
+export function hashSourceJpxGray(data: Uint8Array, width: number, height: number,
+  signal?: AbortSignal): readonly [number, number] {
+  return hashSourceJpxPixels(data, width, height, true, signal);
+}
+
+function hashSourceJpxPixels(data: Uint8Array, width: number, height: number, gray: boolean,
+  signal?: AbortSignal): readonly [number, number] {
   signal?.throwIfAborted();
-  const bytes = width * height * 4;
+  const count = width * height, bytes = count * (gray ? 1 : 4);
   if (!(data instanceof Uint8Array) || !Number.isSafeInteger(width) || !Number.isSafeInteger(height) ||
       width < 1 || height < 1 || !Number.isSafeInteger(bytes) || data.length < bytes) {
     throw new RangeError("Invalid source JPEG 2000 RGBA dimensions or pixels.");
@@ -40,12 +51,11 @@ export function hashSourceJpxRgba(data: Uint8Array, width: number, height: numbe
   for (const value of [width >>> 0, Math.floor(width / 0x100000000), height >>> 0, Math.floor(height / 0x100000000)]) {
     a = mixA(a, value); b = mixB(b, value);
   }
-  const count = bytes / 4;
-  const words = LITTLE_ENDIAN && (data.byteOffset & 3) === 0 ? new Uint32Array(data.buffer, data.byteOffset, count) : undefined;
-  const view = words ? undefined : new DataView(data.buffer, data.byteOffset, bytes);
+  const words = !gray && LITTLE_ENDIAN && (data.byteOffset & 3) === 0 ? new Uint32Array(data.buffer, data.byteOffset, count) : undefined;
+  const view = words || gray ? undefined : new DataView(data.buffer, data.byteOffset, bytes);
   for (let index = 0; index < count; index++) {
     if ((index & 0xffff) === 0) signal?.throwIfAborted();
-    const word = words ? words[index] : view!.getUint32(index * 4, true);
+    const word = gray ? 0xff000000 | data[index] * 0x010101 : words ? words[index] : view!.getUint32(index * 4, true);
     a = mixA(a, word); b = mixB(b, word);
   }
   signal?.throwIfAborted();

@@ -175,6 +175,7 @@ import {
 } from "./pdf/nativeFormGeometry";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { buildNativeVectorPage } from "./pdf/nativeVectorPage";
+import { bindNativeSourceJpxStore } from "./pdf/nativeSourceJpx";
 
 import { placeSceneAnnotation, validateAnnotationAppearanceMode, type PdfAnnotation } from "./annotationData";
 import { NativePdfAnnotationMetadataRegistry } from "./pdf/nativeAnnotations";
@@ -920,6 +921,8 @@ class NativePdfSession implements NativeVectorPdfSession {
           this.info.byteLength
         ));
       }
+      const imageStore = imageResources.registry.buildStore();
+      bindNativeSourceJpxStore(imageStore, imageResources.registry, signal);
       const densePageData = createHeprPageDataFromDense(pageInfo, compiled, {
         signal,
         retainOptionalContent: (options as NativeVectorCompileOptions).retainOptionalContent === true,
@@ -929,7 +932,7 @@ class NativePdfSession implements NativeVectorPdfSession {
         type3: compiledType3,
         compositing: compositingPrograms.compositing,
         images: {
-          store: imageResources.registry.buildStore(),
+          store: imageStore,
           colors: imageResources.registry.colors.buildStore(),
           functions: imageResources.registry.colors.functions.buildStore(),
           gradients: imageResources.shadings.buildGradientStore(),

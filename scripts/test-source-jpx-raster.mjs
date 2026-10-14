@@ -7,7 +7,7 @@ const hooks = registerHooks({ resolve(s, c, n) {
   return n(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+(?:[?#]|$)/i.test(s) ? `${s}.ts` : s, c);
 } });
 try {
-  const { hashSourceJpxRgba, hashSourceJpxEncoded, isSourceJpxRaster, registerBundledJpxResolver, isBundledJpxResolver } =
+  const { hashSourceJpxRgba, hashSourceJpxGray, hashSourceJpxEncoded, isSourceJpxRaster, registerBundledJpxResolver, isBundledJpxResolver } =
     await import("../src/sourceJpxRaster.ts");
   const { createBundledImageCodecResolver } = await import("../src/pdf/nativeJpegCodec.ts");
   const { openNativePdfDocument } = await import("../src/pdf/nativeDocument.ts");
@@ -33,6 +33,18 @@ try {
   assert.throws(() => hashSourceJpxRgba(new Uint8Array(65537 * 4), 65537, 1,
     { throwIfAborted() { if (++checks === 3) throw new DOMException("cancelled", "AbortError"); } }), { name: "AbortError" });
   assert.equal(checks, 3, "long fingerprints check cancellation during the pixel loop");
+  const grayPixels = Uint8Array.of(0, 1, 64, 128, 254, 255), grayRgba = new Uint8Array(grayPixels.length * 4);
+  grayPixels.forEach((value, index) => grayRgba.set([value, value, value, 255], index * 4));
+  assert.deepEqual(hashSourceJpxGray(grayPixels, 3, 2), hashSourceJpxRgba(grayRgba, 3, 2),
+    "a compact gray plane binds the exact opaque RGBA fingerprint without expanding it");
+  const grayBacking = new Uint8Array(grayPixels.length + 1); grayBacking.set(grayPixels, 1);
+  assert.deepEqual(hashSourceJpxGray(grayBacking.subarray(1), 3, 2), hashSourceJpxRgba(grayRgba, 3, 2));
+  assert.throws(() => hashSourceJpxGray(grayPixels, 7, 1), /dimensions/);
+  assert.throws(() => hashSourceJpxGray(grayPixels, 3, 2, aborted.signal), { name: "AbortError" });
+  checks = 0;
+  assert.throws(() => hashSourceJpxGray(new Uint8Array(65537), 65537, 1,
+    { throwIfAborted() { if (++checks === 3) throw new DOMException("cancelled", "AbortError"); } }), { name: "AbortError" });
+  assert.equal(checks, 3, "compact gray fingerprints check cancellation during the pixel loop");
   assert(isBundledJpxResolver(createBundledImageCodecResolver()));
   assert(!isBundledJpxResolver(async () => {}), "a caller resolver is not automatically trusted");
 
@@ -110,6 +122,13 @@ try {
   assert.equal(graySource.components, 1);
   assert.equal(grayScene.rasterLayers[0].data.length, graySource.width * 4, "Gray8 widens once before its canonical fingerprint");
   assert.deepEqual(graySource.rgbaHash, hashSourceJpxRgba(grayScene.rasterLayers[0].data, graySource.width, graySource.height));
+  const authoritativeGrayHash = [...graySource.rgbaHash], authoritativeEncodedHash = [...graySource.encodedHash];
+  for (const hash of [graySource.rgbaHash, graySource.encodedHash]) {
+    try { hash[0] ^= 1; } catch (error) { assert(error instanceof TypeError); }
+  }
+  const grayReplay = (await build(grayRegistry)).rasterLayers[0].sourceJpx;
+  assert.deepEqual(grayReplay.rgbaHash, authoritativeGrayHash, "public fingerprint edits cannot change a later replay's pixel authority");
+  assert.deepEqual(grayReplay.encodedHash, authoritativeEncodedHash, "public fingerprint edits cannot change a later replay's encoded authority");
   const cropped = await build(grayRegistry, "q 0 0 1 2 re W n 4 0 0 2 0 0 cm /Im Do Q");
   assert(cropped.rasterLayers[0].width < 16384, "fixture exercises a real texel crop");
   assert.equal(cropped.rasterLayers[0].sourceJpx, undefined, "cropped pixels cannot reuse the full original source");

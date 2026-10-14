@@ -109,6 +109,7 @@ export const fastTests = [
   "hep-jpx-reader",
   "hep-jpx-export",
   "source-jpx-raster",
+  "retained-source-jpx",
   "webgpu-raster-memory-budget",
   "raster-compression",
   "pdf-raster-compression",

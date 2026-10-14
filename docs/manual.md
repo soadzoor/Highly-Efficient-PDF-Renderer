@@ -1217,7 +1217,9 @@ This retention applies to unsigned eight-bit opaque Gray/RGB images decoded by
 the bundled codec, with original dimensions, unchanged color interpretation,
 absent or identity `Decode`, and no masks or embedded opacity. Images requiring
 other color conversions, precision changes or reduced resolution use ordinary
-encoding. Export checks fingerprints of the canonical pixels and original
+encoding. Eligible images retain their originals through retained page rendering
+too, including when a different image's mask requires that path.
+Export checks fingerprints of the canonical pixels and original
 encoded bytes; edited pixels or stale provenance use ordinary encoding too.
 These checks detect accidental changes, not cryptographic tampering.
 
