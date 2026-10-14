@@ -1273,8 +1273,13 @@ async function resolveCodecThroughCaller(
       { expectedBytes, actualBytes: raw.samples.byteLength }
     );
   }
-  const samples = allocateBytes(expectedBytes, "owned image codec samples");
-  samples.set(raw.samples);
+  // The bundled JPX bridge returns an operation-owned JavaScript plane and
+  // clears its kernel reference before resolving. Its validated bytes can be
+  // consumed directly; caller codecs still receive the defensive ownership
+  // copy so later edits or reuse of their buffers cannot change PDF resources.
+  const ownedJpx = trustedResolver && request.codec === "jpeg2000" && isBundledJpxResolver(resolver);
+  const samples = ownedJpx ? raw.samples : allocateBytes(expectedBytes, "owned image codec samples");
+  if (!ownedJpx) samples.set(raw.samples);
   throwIfAborted(signal);
   return Object.freeze({
     samples,

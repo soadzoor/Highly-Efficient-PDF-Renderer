@@ -1078,6 +1078,10 @@ class NativePdfSession implements NativeVectorPdfSession {
     // the caller's options. Subsequent operations still take their own snapshot.
     options = { ...options, retainOptionalContent: options.retainOptionalContent !== false && this.optionalContent.groupCount > 0,
       ...(options.limits ? { limits: { ...options.limits } } : {}) };
+    // Stack-local to this operation, including a retained retry after direct
+    // adaptation fails. Graphics/text compilers remain independent; only
+    // prepared input and resource registries are reused under the same limits.
+    const reuse: NativePagePreparationReuse | undefined = reusePageResources ? {} : undefined;
     let retainedAttempted = false;
     const lowerRetained = async (page: HeprPageData): Promise<VectorScene | null> => {
       retainedAttempted = true;
@@ -1110,10 +1114,6 @@ class NativePdfSession implements NativeVectorPdfSession {
       }
     };
     try {
-      // Stack-local to this operation: never shared across pages, queued calls,
-      // changed limits, cancellation, or session close. Graphics/text compilers
-      // remain independent; only prepared input and resource registries are reused.
-      const reuse: NativePagePreparationReuse | undefined = reusePageResources ? {} : undefined;
       const {
         pageInfo,
         pageBounds,
@@ -1319,7 +1319,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       if (options.vectorFallback === "error" && normalized instanceof PdfError &&
           isNativeGlyphStrokeRepresentationReason(normalized.details?.reason)) throw normalized;
       if (!retainedAttempted && isNativeVectorRepresentationFailure(normalized)) {
-        const retainedPage = await this.compilePageUnlocked(sourcePageIndex, options, signal);
+        const retainedPage = await this.compilePageUnlocked(sourcePageIndex, options, signal, false, undefined, reuse);
         const retainedScene = await lowerRetained(retainedPage);
         if (retainedScene) return retainedScene;
       }

@@ -101,9 +101,96 @@ try {
     }
     await assert.rejects(session.compileVectorPage(0), error => error?.code === "closed");
   }
+  await testRetainedRetryReuse(openPdf);
   console.log("native operation-scoped resource reuse tests passed");
 } finally {
   hooks.deregister();
+}
+
+async function testRetainedRetryReuse(openPdf) {
+  const source = retainedFixture(), snapshot = source.slice(), counts = { codecs: 0, fonts: 0 }, diagnostics = [];
+  const samples = Uint8Array.of(10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120), sampleSnapshot = samples.slice();
+  const session = await openPdf({ kind: "bytes", bytes: source }, {
+    missingFontResolver() {
+      counts.fonts++;
+      return { identifier: "retained-reuse-font", sfntBytes: buildTinySfnt() };
+    },
+    imageCodecResolver(request, signal) {
+      signal.throwIfAborted(); counts.codecs++;
+      assert.equal(request.codec, "jpeg");
+      return { samples, width: request.width, height: request.height, components: 3, bitsPerComponent: 8 };
+    },
+    onDiagnostic(diagnostic) { diagnostics.push(diagnostic); }
+  });
+  const options = { vectorFallback: "error", optimization: "none" };
+  const compile = (page = 0, extra = {}) => session.compileVectorPage(page, { ...options, ...extra });
+  try {
+    // Explicit /Mask defeats the direct adapter but the retained vector path
+    // keeps the image and text without invoking a raster compositor.
+    const without = await session.compileVectorPageWithTimings(0, options, { reusePageResources: false });
+    assert.equal(counts.codecs, 2, "the instrumentation baseline decodes the retained retry again");
+    assert.equal(counts.fonts, 2);
+    assert.equal(without.timings.selectiveCompilation, undefined, "fixture exercises the catch retry rather than selective compilation");
+    const expectedHash = sceneFingerprint(without.scene), expectedDiagnostics = session.getDiagnostics();
+    assert.equal(without.scene.rasterLayers.length, 2);
+    assert.equal(without.scene.rasterLayers[0].data, without.scene.rasterLayers[1].data);
+    assert.deepEqual([...without.scene.rasterLayers[0].data],
+      [10, 20, 30, 255, 40, 50, 60, 0, 70, 80, 90, 0, 100, 110, 120, 255]);
+    assert.ok(without.scene.textIndex.pages[0].text.includes("A"));
+    assert.ok(!expectedDiagnostics.some(diagnostic => /raster-fallback/.test(diagnostic.code)));
+    const emitted = diagnostics.length;
+    counts.codecs = counts.fonts = 0;
+    const reused = await session.compileVectorPageWithTimings(0, options);
+    assert.equal(counts.codecs, 1, "a retained catch retry must reuse the prepared decoded image");
+    assert.equal(counts.fonts, 1, "a retained catch retry must reuse the prepared font");
+    assert.equal(sceneFingerprint(reused.scene), expectedHash, "retained reuse preserves pixels, text, clips and paint ordering");
+    assert.deepEqual(session.getDiagnostics(), expectedDiagnostics, "reuse preserves the same diagnostics");
+    assert.equal(diagnostics.length, emitted, "a reused retry does not emit duplicate warnings");
+
+    const beforeOtherPage = counts.codecs;
+    const otherPage = await compile(1);
+    assert.deepEqual(otherPage.rasterLayers[0].data, reused.scene.rasterLayers[0].data);
+    assert.equal(otherPage.textIndex.pages[0].text, reused.scene.textIndex.pages[0].text);
+    assert.equal(counts.codecs - beforeOtherPage, 1, "a different page owns its own decoded resources");
+    const abort = new AbortController(); let passes = 0;
+    const beforeCancelled = counts.codecs;
+    await assert.rejects(compile(0, { signal: abort.signal, onProgress(event) {
+      if (event.stage === "content" && event.completed === 0 && ++passes === 2) abort.abort();
+    } }), error => error?.code === "aborted");
+    assert.equal(passes, 2, "cancellation reaches the retained retry's fresh content compiler");
+    assert.equal(counts.codecs - beforeCancelled, 1);
+    const beforeRetry = counts.codecs;
+    assert.equal(sceneFingerprint(await compile()), expectedHash);
+    assert.equal(counts.codecs - beforeRetry, 1, "cancelled operation resources cannot leak into another compilation");
+    const changing = { limits: { maxDecodedStreamBytes: 1024 * 1024 }, onProgress(event) {
+      if (event.stage === "content") changing.limits.maxDecodedStreamBytes = 8;
+    } };
+    assert.equal(sceneFingerprint(await compile(0, changing)), expectedHash, "retained retry shares the operation's limits snapshot");
+    await assert.rejects(compile(0, changing), error => error?.code === "resource-limit");
+    const beforeQueued = counts.codecs;
+    const queued = await Promise.all([compile(), compile()]);
+    queued.forEach(scene => assert.equal(sceneFingerprint(scene), expectedHash));
+    assert.equal(counts.codecs - beforeQueued, 2, "queued retained retries keep separate preparation caches");
+    assert.deepEqual(samples, sampleSnapshot, "retained mask composition cannot mutate caller codec samples");
+    assert.deepEqual(source, snapshot);
+    assert.equal(sceneFingerprint(reused.scene), expectedHash);
+  } finally { await session.close(); }
+}
+
+function retainedFixture() {
+  const page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << " +
+    "/Font << /F1 7 0 R >> /XObject << /Im 5 0 R /Alias 5 0 R >> >> /Contents 4 0 R >>";
+  return writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Count 2 /Kids [3 0 R 8 0 R] >>" },
+    { number: 3, body: page }, { number: 8, body: page },
+    { number: 4, body: tinyPdfStream("", "q 8 0 0 8 0 0 cm /Im Do Q q 8 0 0 8 10 0 cm /Alias Do Q BT /F1 8 Tf 0 12 Td (A) Tj ET") },
+    { number: 5, body: tinyPdfStream("/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB " +
+      "/BitsPerComponent 8 /Filter /DCTDecode /Mask 6 0 R", Uint8Array.of(255, 216, 255, 217)) },
+    { number: 6, body: tinyPdfStream("/Type /XObject /Subtype /Image /Width 2 /Height 2 /ImageMask true /BitsPerComponent 1",
+      Uint8Array.of(0x40, 0x80)) },
+    { number: 7, body: "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>" }
+  ] });
 }
 
 function fixture(withForm) {

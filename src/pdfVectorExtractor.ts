@@ -533,6 +533,14 @@ async function extractPdfPageScenesWithNative(
       await scanCompressor?.preparePage(scene, selectedPageCount, sourcePageIndex, signal);
       signal?.throwIfAborted();
       if (preparePage) {
+        if (selectionIndex + 1 === selectedPageCount) {
+          // Every selected page is now owned by the host. Release the worker's
+          // decoded-image cache and codec heap before final image encoding,
+          // rather than keeping both working sets alive until it finishes.
+          await vectorSession.close();
+          session = null;
+          signal?.throwIfAborted();
+        }
         await preparing;
         preparing = preparePage(scene, signal);
         // Observed by the next await; avoids an unhandled rejection meanwhile.

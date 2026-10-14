@@ -8,6 +8,11 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
+- Reduce PDF-to-HEP peak memory by reusing decoded images and fonts when retrying
+  retained rendering, releasing the PDF worker before final image encoding, and
+  adopting the bundled JPEG 2000 decoder's owned sample buffers. Upload Node
+  canvas images in reusable row bands instead of another full-size pixel copy.
+  Full resolution, canonical pixels and image encoding settings are preserved.
 - Keep eligible oversized JPEG 2000 images in their original compressed form
   during HEP export instead of expanding them to PNG when they exceed WebP's
   dimension limit. Preserve full resolution and decoded pixels without another

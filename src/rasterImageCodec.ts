@@ -41,7 +41,9 @@ interface NodeRasterImageCodec {
     getContext: (kind: "2d") => NodeRasterCanvasContext | null;
     encode: (format: RasterImageEncoding, quality?: number) => Promise<Uint8Array>;
   };
-  ImageData: new (data: Uint8ClampedArray, width: number, height: number) => unknown;
+  ImageData: new (data: Uint8ClampedArray, width: number, height: number) => {
+    readonly data?: Uint8Array | Uint8ClampedArray;
+  };
   loadImage?: (encoded: Uint8Array) => Promise<{ width: number; height: number }>;
 }
 
@@ -496,6 +498,41 @@ function clampedRasterPixels(rgba: Uint8Array<ArrayBufferLike>, length: number):
     : new Uint8ClampedArray(rgba.subarray(0, length));
 }
 
+/** A reusable upload chunk, not a limit on image dimensions or decoded pixels. */
+const NODE_RASTER_UPLOAD_BYTES = 1024 * 1024;
+
+/**
+ * Node ImageData owns a copy of its input. Reuse one small writable band rather
+ * than a second full image plane while uploading into the encoding canvas.
+ * Browser ImageData borrows the caller's view and keeps its single upload.
+ */
+function uploadNodeRasterPixels(
+  codec: NodeRasterImageCodec,
+  context: NodeRasterCanvasContext,
+  width: number,
+  height: number,
+  rgba: Uint8Array<ArrayBufferLike>
+): void {
+  const rowBytes = width * 4;
+  const rows = Math.max(1, Math.min(height, Math.floor(NODE_RASTER_UPLOAD_BYTES / rowBytes)));
+  if (rows < height) {
+    const band = new codec.ImageData(clampedRasterPixels(rgba, rowBytes * rows), width, rows);
+    const pixels = band.data;
+    // API shims may omit data, return a fresh copy, or borrow the input like a
+    // browser. Only reuse a stable owned plane, so no caller pixels are changed.
+    if ((pixels instanceof Uint8Array || pixels instanceof Uint8ClampedArray) &&
+        pixels.length === rowBytes * rows && band.data === pixels && pixels.buffer !== rgba.buffer) {
+      for (let top = 0; top < height; top += rows) {
+        pixels.set(rgba.subarray(top * rowBytes, Math.min(height, top + rows) * rowBytes));
+        // The canvas clips any unused rows in the final partial band.
+        context.putImageData(band, 0, top);
+      }
+      return;
+    }
+  }
+  context.putImageData(new codec.ImageData(clampedRasterPixels(rgba, rowBytes * height), width, height), 0, 0);
+}
+
 function rasterImageDimensionsMatch(
   encoding: RasterImageEncoding,
   bytes: Uint8Array<ArrayBufferLike>,
@@ -563,7 +600,6 @@ async function encodeRasterRgbaAsNodeImages(
     return result;
   }
 
-  const expectedBytes = width * height * 4;
   const canvas = codec.createCanvas(width, height);
   try {
     const context = canvas.getContext("2d");
@@ -571,7 +607,7 @@ async function encodeRasterRgbaAsNodeImages(
       return result;
     }
 
-    context.putImageData(new codec.ImageData(clampedRasterPixels(rgba, expectedBytes), width, height), 0, 0);
+    uploadNodeRasterPixels(codec, context, width, height, rgba);
     for (const encoding of encodings) {
       if (shouldEncode && !(await shouldEncode(encoding, result))) continue;
       try {
