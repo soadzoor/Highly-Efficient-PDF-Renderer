@@ -322,6 +322,8 @@ export interface NativeGlyphPostScriptFinalState {
 }
 
 export interface NativePdfFont {
+  /** Session caches retain completed programs independently of the parsing operation. */
+  releaseParseSignal?(): void;
   readonly subtype: NativePdfFontSubtype;
   readonly baseFont: string;
   readonly writingMode: 0 | 1;
@@ -333,8 +335,8 @@ export interface NativePdfFont {
   readonly type1?: NativeType1Font | null;
   readonly substitution: NativeFontSubstitution | null;
   readonly diagnostics: readonly PdfDiagnostic[];
-  decode(bytes: Uint8Array, offset?: number): NativeMappedCharacter;
-  getGlyphOutline(glyphId: number): NativeGlyphOutline;
+  decode(bytes: Uint8Array, offset?: number, signal?: AbortSignal): NativeMappedCharacter;
+  getGlyphOutline(glyphId: number, signal?: AbortSignal): NativeGlyphOutline;
 }
 
 interface CMapEntry {
@@ -535,7 +537,7 @@ class ParsedNativeFont implements NativePdfFont {
   private sfntDiagnosticCount: number;
   private cffDiagnosticCount: number;
   private type1DiagnosticCount: number;
-  private readonly decodeCharacter: (bytes: Uint8Array, offset: number) => NativeMappedCharacter;
+  private readonly decodeCharacter: (bytes: Uint8Array, offset: number, signal?: AbortSignal) => NativeMappedCharacter;
   private readonly unsupportedOutlineReason: string | null;
   private readonly onDiagnostic: ParseNativePdfFontOptions["onDiagnostic"];
   private readonly embeddedFontPaint: NativeEmbeddedFontPaint;
@@ -552,7 +554,7 @@ class ParsedNativeFont implements NativePdfFont {
     cff: NativeCffFont | null,
     substitution: NativeFontSubstitution | null,
     diagnostics: readonly PdfDiagnostic[],
-    decodeCharacter: (bytes: Uint8Array, offset: number) => NativeMappedCharacter,
+    decodeCharacter: (bytes: Uint8Array, offset: number, signal?: AbortSignal) => NativeMappedCharacter,
     unsupportedOutlineReason: string | null,
     onDiagnostic?: ParseNativePdfFontOptions["onDiagnostic"],
     type1: NativeType1Font | null = null,
@@ -599,26 +601,33 @@ class ParsedNativeFont implements NativePdfFont {
     return this.diagnosticData;
   }
 
-  decode(bytes: Uint8Array, offset = 0): NativeMappedCharacter {
+  decode(bytes: Uint8Array, offset = 0, signal?: AbortSignal): NativeMappedCharacter {
+    throwIfAborted(signal);
     if (!Number.isSafeInteger(offset) || offset < 0 || offset >= bytes.length) {
       throw new RangeError("PDF font decode offset is outside the source string.");
     }
     const previousDiagnosticCount = this.diagnostics.length;
-    const character = this.decodeCharacter(bytes, offset);
+    const character = this.decodeCharacter(bytes, offset, signal);
     this.reportNewDiagnostics(previousDiagnosticCount);
     return character;
   }
 
-  getGlyphOutline(glyphId: number): NativeGlyphOutline {
+  releaseParseSignal(): void {
+    this.sfnt?.releaseParseSignal();
+    this.type1?.releaseParseSignal();
+  }
+
+  getGlyphOutline(glyphId: number, signal?: AbortSignal): NativeGlyphOutline {
+    throwIfAborted(signal);
     const provider = this.sfnt ?? this.cff ?? this.type1;
     if (provider) {
       const previousCount = this.diagnostics.length;
       const applyIntrinsicPaint = this.embeddedFontPaint === "font";
       const outline = this.sfnt
-        ? this.sfnt.getGlyphOutline(glyphId, applyIntrinsicPaint)
+        ? this.sfnt.getGlyphOutline(glyphId, applyIntrinsicPaint, signal)
         : this.cff
-          ? this.cff.getGlyphOutline(glyphId, undefined, applyIntrinsicPaint)
-          : this.type1!.getGlyphOutline(glyphId, applyIntrinsicPaint);
+          ? this.cff.getGlyphOutline(glyphId, signal, applyIntrinsicPaint)
+          : this.type1!.getGlyphOutline(glyphId, applyIntrinsicPaint, signal);
       if (outline.intrinsicStroke && !this.intrinsicPaintReported) {
         this.intrinsicPaintReported = true;
         this.diagnosticData = Object.freeze([...this.diagnosticData, Object.freeze({
@@ -698,7 +707,7 @@ async function parseSimpleFont(
       const glyphIds = new Set(encoding.glyphNames.map(name => type1.glyphIdForName(name)));
       for (const glyphId of glyphIds) {
         throwIfAborted(signal);
-        embeddedType1.getGlyphOutline(glyphId, options.embeddedFontPaint === "font");
+        embeddedType1.getGlyphOutline(glyphId, options.embeddedFontPaint === "font", signal);
       }
     } catch (error) {
       if (!(error instanceof PdfError) || error.code !== "unsupported-font") throw error;
@@ -788,7 +797,7 @@ async function parseSimpleFont(
       ...toUnicodeRepairDiagnostics,
       ...(toUnicode?.diagnostics ?? EMPTY_DIAGNOSTICS)
     ]),
-    (bytes, offset) => {
+    (bytes, offset, operationSignal) => {
       const code = bytes[offset];
       const glyphName = encoding.glyphNames[code] ?? null;
       const mappedUnicode = toUnicode?.mappings.get(cmapKey(code, 1));
@@ -832,8 +841,8 @@ async function parseSimpleFont(
         width = sfnt
           ? sfnt.getHorizontalMetric(glyphId).advanceWidth * 1000 / sfnt.unitsPerEm
           : embeddedType1
-            ? embeddedType1.getGlyphOutline(glyphId, options.embeddedFontPaint === "font").advanceWidth * 1000 / embeddedType1.unitsPerEm
-            : embeddedCff!.getGlyphOutline(glyphId, signal, options.embeddedFontPaint === "font").advanceWidth * 1000 / embeddedCff!.unitsPerEm;
+            ? embeddedType1.getGlyphOutline(glyphId, options.embeddedFontPaint === "font", operationSignal).advanceWidth * 1000 / embeddedType1.unitsPerEm
+            : embeddedCff!.getGlyphOutline(glyphId, operationSignal, options.embeddedFontPaint === "font").advanceWidth * 1000 / embeddedCff!.unitsPerEm;
       }
       if (type3Widths && type3Matrix) {
         // Type3 widths are expressed through FontMatrix; normalize to the same
@@ -932,7 +941,7 @@ async function parseCompositeFont(
   // Unicode cmap can identify a glyph exactly only when that glyph has one
   // Unicode scalar; shared-glyph aliases and opaque symbol cmaps stay unmapped.
   const sfntUnicode = useCidUnicodeFallback && nativeCidToUnicodeCollection(descendantSystemInfo) === null
-    ? embeddedSfnt?.getGlyphUnicodeFallback() : undefined;
+    ? embeddedSfnt?.getGlyphUnicodeFallback(signal) : undefined;
   if (sfntUnicode && sfntUnicode.size > parserLimits.maxCMapMappings) {
     throw new PdfError("resource-limit", "Embedded glyph-to-Unicode fallback exceeds the configured CMap mapping limit.", {
       details: { reason: "font-cid-unicode-mapping-limit", collection: "embedded-sfnt",
@@ -3368,6 +3377,7 @@ interface SfntCmaps {
 
 /** Bounds-checked sfnt reader for TrueType/OpenType cmap, metrics, and glyf/CFF outlines. */
 export class NativeSfntFont {
+  private signal?: AbortSignal;
   readonly unitsPerEm: number;
   readonly numGlyphs: number;
   readonly ascender: number;
@@ -3394,7 +3404,6 @@ export class NativeSfntFont {
   private readonly glyphLocations: Uint32Array | null;
   private readonly maxpProfile: MaxpTrueTypeProfile | null;
   private readonly cffParserLimits: Readonly<Partial<NativeCffParserLimits>>;
-  private readonly signal?: AbortSignal;
   private cffFont: NativeCffFont | null = null;
   private readonly outlineCache = new Map<number, NativeGlyphOutline>();
   private readonly pdfOutlineCache = new Map<number, NativeGlyphOutline>();
@@ -3413,6 +3422,7 @@ export class NativeSfntFont {
     this.limits = limits;
     this.validation = validation;
     this.cffParserLimits = Object.freeze({ ...cffParserLimits });
+    throwIfAborted(signal);
     this.signal = signal;
     this.tables = readSfntTables(
       this.view,
@@ -3764,7 +3774,10 @@ export class NativeSfntFont {
   }
 
   /** Recover text from the selected Unicode cmap without changing painted glyphs. */
-  getGlyphUnicodeFallback(): ReadonlyMap<number, string> {
+  releaseParseSignal(): void { this.signal = undefined; }
+
+  getGlyphUnicodeFallback(signal?: AbortSignal): ReadonlyMap<number, string> {
+    signal ??= this.signal;
     if (this.glyphUnicodeFallback !== null) return this.glyphUnicodeFallback;
     const result = new Map<number, string>();
     const cmap = this.unicodeCmap;
@@ -3772,12 +3785,12 @@ export class NativeSfntFont {
       const scalars = new Int32Array(this.numGlyphs).fill(-1);
       let operations = 0;
       const record = (glyph: number, scalar: number): void => {
-        if ((operations++ & 0xfff) === 0) throwIfAborted(this.signal);
+        if ((operations++ & 0xfff) === 0) throwIfAborted(signal);
         if (glyph <= 0 || glyph >= this.numGlyphs || scalar >= 0xd800 && scalar <= 0xdfff) return;
         scalars[glyph] = scalars[glyph] === -1 || scalars[glyph] === scalar ? scalar : -2;
       };
       cmap.forEachRange((first, last, glyph, incrementing) => {
-        if ((operations++ & 0xfff) === 0) throwIfAborted(this.signal);
+        if ((operations++ & 0xfff) === 0) throwIfAborted(signal);
         if (incrementing) {
           // Invalid/unreachable GIDs carry no glyph identity. A large Unicode
           // range therefore costs at most the embedded face's glyph count.
@@ -3790,7 +3803,7 @@ export class NativeSfntFont {
         }
       });
       for (let glyph = 1; glyph < scalars.length; glyph += 1) {
-        if ((glyph & 0xfff) === 0) throwIfAborted(this.signal);
+        if ((glyph & 0xfff) === 0) throwIfAborted(signal);
         const scalar = scalars[glyph];
         // Opaque private codes and control/noncharacter aliases do not reveal
         // reliable searchable text, even when they name only one glyph.
@@ -3824,11 +3837,11 @@ export class NativeSfntFont {
     return nativeCffUsesPostScript(new Uint8Array(this.view.buffer, this.view.byteOffset + table.offset, table.length), this.signal);
   }
 
-  private requireCffFont(): NativeCffFont {
+  private requireCffFont(signal?: AbortSignal): NativeCffFont {
     if (this.cffFont === null) {
       const table = this.requireTable(this.outlineFormat === "cff2" ? "CFF2" : "CFF ");
       const bytes = new Uint8Array(this.view.buffer, this.view.byteOffset + table.offset, table.length);
-      const cff = NativeCffFont.parse(bytes, this.cffParserLimits, undefined, this.signal);
+      const cff = NativeCffFont.parse(bytes, this.cffParserLimits, undefined, signal);
       if (cff.numGlyphs !== this.numGlyphs) throw unsupportedFont("The OpenType CFF/CFF2 CharStrings count disagrees with maxp.numGlyphs.");
       this.cffFont = cff;
       if (cff.diagnostics.length) this.diagnosticData = Object.freeze([...this.diagnosticData, ...cff.diagnostics]);
@@ -3836,16 +3849,17 @@ export class NativeSfntFont {
     return this.cffFont;
   }
 
-  getGlyphOutline(glyphId: number, applyIntrinsicPaint = true): NativeGlyphOutline {
-    throwIfAborted(this.signal);
+  getGlyphOutline(glyphId: number, applyIntrinsicPaint = true, signal?: AbortSignal): NativeGlyphOutline {
+    signal ??= this.signal;
+    throwIfAborted(signal);
     this.requireGlyphId(glyphId);
     const cache = !applyIntrinsicPaint && this.outlineFormat !== "glyf" ? this.pdfOutlineCache : this.outlineCache;
     const cached = cache.get(glyphId);
     if (cached) return cached;
     if (this.outlineFormat === "cff" || this.outlineFormat === "cff2") {
-      this.cffFont = this.requireCffFont();
+      this.cffFont = this.requireCffFont(signal);
       const previousDiagnosticCount = this.cffFont.diagnostics.length;
-      const source = this.cffFont.getGlyphOutline(glyphId, this.signal, applyIntrinsicPaint);
+      const source = this.cffFont.getGlyphOutline(glyphId, signal, applyIntrinsicPaint);
       if (this.cffFont.diagnostics.length > previousDiagnosticCount) {
         this.diagnosticData = Object.freeze([
           ...this.diagnosticData,

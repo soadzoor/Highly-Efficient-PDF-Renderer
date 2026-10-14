@@ -363,6 +363,11 @@ async function verifyReducedResolution(createBundledImageCodecResolver, openPdf)
   const full = await createBundledImageCodecResolver(16 * 1024 * 1024)({ ...largeRequest, maxReduction: 8 });
   assert.equal(full.width, 1024);
   assert.equal(full.height, 1024);
+  const thumbnail = await createBundledImageCodecResolver(16 * 1024 * 1024)({ ...largeRequest,
+    maxReduction: 8, previewMaxDimension: 128 });
+  assert.equal(thumbnail.width, 128, "thumbnail target selects IDCT reduction even when full decoding fits");
+  assert.equal(thumbnail.height, 128);
+  assert.ok(thumbnail.samples.every(sample => sample === 128));
   const reduced = await createBundledImageCodecResolver(limit)({ ...largeRequest, maxReduction: 8 });
   assert.equal(reduced.width, 512);
   assert.equal(reduced.height, 512);

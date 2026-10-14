@@ -120,7 +120,7 @@ export class NativeType1Font {
   private readonly subrs: ReadonlyMap<number, Uint8Array>;
   private readonly matrix: Type1Matrix;
   private readonly limits: Readonly<NativeType1ParserLimits>;
-  private readonly signal?: AbortSignal;
+  private signal?: AbortSignal;
   private otherSubrExecutorFactory?: NativeFontPostScriptResult["createOtherSubrExecutor"];
 
   get usesPostScript(): boolean {
@@ -396,19 +396,22 @@ export class NativeType1Font {
 
   get diagnostics(): readonly PdfDiagnostic[] { return this.fontDiagnostics; }
 
-  getGlyphOutline(glyphId: number, applyIntrinsicPaint = true): NativeGlyphOutline {
-    throwIfAborted(this.signal);
+  releaseParseSignal(): void { this.signal = undefined; }
+
+  getGlyphOutline(glyphId: number, applyIntrinsicPaint = true, signal?: AbortSignal): NativeGlyphOutline {
+    signal ??= this.signal;
+    throwIfAborted(signal);
     if (!Number.isSafeInteger(glyphId) || glyphId < 0 || glyphId >= this.numGlyphs) {
       throw invalid(`Type1 glyph ${glyphId} is outside CharStrings.`, "glyph-index");
     }
     const cache = applyIntrinsicPaint ? this.outlineCache : this.pdfOutlineCache;
     const cached = cache.get(glyphId);
     if (cached) return cached;
-    const raw = this.getRawOutline(glyphId);
+    const raw = this.getRawOutline(glyphId, signal);
     const transform = Object.freeze(this.matrix.map(value => value * 1000));
     const paintType = applyIntrinsicPaint ? this.paintType : 0;
     const painted = paintNativeGlyphCommands(raw.commands, paintType, this.strokeWidth, {
-      transform, signal: this.signal, maxPathCommands: this.limits.maxType1PathCommands
+      transform, signal: signal, maxPathCommands: this.limits.maxType1PathCommands
     });
     if (painted.approximated && !this.fontDiagnostics.some(diagnostic => diagnostic.code === "font.type1-stroke-approximated")) {
       this.fontDiagnostics = Object.freeze([...this.fontDiagnostics, Object.freeze({
@@ -439,7 +442,7 @@ export class NativeType1Font {
     let normalBounds = painted.bounds ?? measureBounds(commands);
     if (paintType === 2 && raw.postScriptFinalState && !raw.postScriptFinalState.omitFinalPaint) {
       const state = raw.postScriptFinalState, stroke = state.stroke;
-      const centerline = paintNativeGlyphCommands(raw.commands, 0, 0, { transform, signal: this.signal,
+      const centerline = paintNativeGlyphCommands(raw.commands, 0, 0, { transform, signal: signal,
         maxPathCommands: this.limits.maxType1PathCommands }).commands;
       const finalStroke = transformNativeGlyphPostScriptFinalState({ ...state, stroke: {
         width: state.changedStrokeFields?.includes("width") && stroke ? stroke.width : Math.abs(this.strokeWidth),
@@ -468,17 +471,17 @@ export class NativeType1Font {
     return outline;
   }
 
-  private getRawOutline(glyphId: number): NativeType1RawOutline {
+  private getRawOutline(glyphId: number, signal?: AbortSignal): NativeType1RawOutline {
     if (this.otherSubrExecutorFactory) {
       const cached = this.rawCache.get(glyphId);
       if (cached) return cached;
       let executeOtherSubr: ReturnType<NativeFontPostScriptResult["createOtherSubrExecutor"]> | undefined;
       let otherSubrFailure: PdfError | undefined;
       const raw = evaluateNativeType1CompositeGlyph({ source: this.charStrings[glyphId], glyphId, subrs: this.subrs }, {
-        limits: this.limits, signal: this.signal, blendWeights: this.blendWeights ?? undefined,
+        limits: this.limits, signal: signal, blendWeights: this.blendWeights ?? undefined,
         executeOtherSubr: (index, args, context) => {
           otherSubrFailure = undefined;
-          try { executeOtherSubr ??= this.otherSubrExecutorFactory!(this.signal, context); return executeOtherSubr(index, args); }
+          try { executeOtherSubr ??= this.otherSubrExecutorFactory!(signal, context); return executeOtherSubr(index, args); }
           catch (error) { if (!isUnsupported(error)) throw error; otherSubrFailure = error; return null; }
         },
         onUnknownOtherSubr: index => {
@@ -510,7 +513,7 @@ export class NativeType1Font {
     type Composite = { baseId: number; accentId: number; x: number; y: number };
     const evaluated = new Map<number, { raw: NativeType1RawOutline; composite?: Composite }>();
     while (pending.length) {
-      throwIfAborted(this.signal);
+      throwIfAborted(signal);
       ceiling(pending.length, this.limits.maxType1SubrDepth, "composite-depth");
       const id = pending[pending.length - 1];
       if (this.rawCache.has(id)) { pending.pop(); active.delete(id); continue; }
@@ -521,11 +524,11 @@ export class NativeType1Font {
         let executeOtherSubr: ReturnType<NonNullable<typeof executorFactory>> | undefined;
         let otherSubrFailure: PdfError | undefined;
         const raw = evaluateNativeType1CharString(this.charStrings[id], {
-          subrs: this.subrs, glyphId: id, limits: this.limits, signal: this.signal, budget,
+          subrs: this.subrs, glyphId: id, limits: this.limits, signal: signal, budget,
           ...(this.blendWeights ? { blendWeights: this.blendWeights } : {}),
           executeOtherSubr: executorFactory ? (index, args, context) => {
             otherSubrFailure = undefined;
-            try { executeOtherSubr ??= executorFactory(this.signal, context); return executeOtherSubr(index, args); }
+            try { executeOtherSubr ??= executorFactory(signal, context); return executeOtherSubr(index, args); }
             catch (error) { if (!isUnsupported(error)) throw error; otherSubrFailure = error; return null; }
           } : undefined,
           onUnknownOtherSubr: index => {

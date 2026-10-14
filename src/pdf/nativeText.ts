@@ -573,7 +573,7 @@ export class NativeTextCompiler {
     let offset = 0;
     while (offset < bytes.length) {
       this.checkGlyphLimit();
-      const mapped = resource.font.decode(bytes, offset);
+      const mapped = resource.font.decode(bytes, offset, this.signal);
       if (
         typeof mapped !== "object" || mapped === null ||
         !Number.isSafeInteger(mapped.codeByteLength) || mapped.codeByteLength < 1 ||

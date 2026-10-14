@@ -527,7 +527,8 @@ async function waitForPromiseWithAbort<T>(
   });
 }
 
-function resolveSourceKind(
+/** @internal Shared source detection for lightweight document sessions. */
+export function resolveSourceKind(
   source: PdfObjectSource,
   sourceBytes: Uint8Array,
   sourceKindOption: PdfObjectGeneratorOptions["sourceKind"]
@@ -563,7 +564,8 @@ function resolveSourceKind(
   );
 }
 
-function resolveSourceLabel(source: PdfObjectSource, sourceKind: PdfObjectSourceKind): string {
+/** @internal Shared source labels for document sessions. */
+export function resolveSourceLabel(source: PdfObjectSource, sourceKind: PdfObjectSourceKind): string {
   const sourceName = readSourceName(source);
   if (sourceName) {
     return sourceName;

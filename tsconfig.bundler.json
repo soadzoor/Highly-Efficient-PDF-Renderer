@@ -12,6 +12,7 @@
     "src/roomDetectorWorker.ts",
     "src/lodWorkerEntry.ts",
     "src/rasterPreparationWorker.ts",
+    "src/thumbnailEncodeWorker.ts",
     "src/vite-env.d.ts"
   ]
 }

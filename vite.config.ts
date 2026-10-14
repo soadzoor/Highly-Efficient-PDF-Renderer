@@ -49,7 +49,8 @@ export default defineConfig(({ mode }) => {
         input: {
           main: resolve(import.meta.dirname, "index.html"),
           three: resolve(import.meta.dirname, "three-example.html"),
-          roomOverlay: resolve(import.meta.dirname, "room-overlay-demo.html")
+          roomOverlay: resolve(import.meta.dirname, "room-overlay-demo.html"),
+          thumbnailBenchmark: resolve(import.meta.dirname, "thumbnail-benchmark.html")
         }
       }
     }

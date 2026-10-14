@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
+import { Worker } from "node:worker_threads";
 
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
 import { buildTinySfnt } from "./lib/tinySfnt.mjs";
@@ -55,6 +56,7 @@ try {
 
   const [hostEndpoint, workerEndpoint] = linkedCloneEndpoints();
   let vectorTransferChecked = false;
+  let thumbnailTransferChecked = false;
   let vectorRequestOptions = null;
   let openRequestOptions = null;
   hostEndpoint.onPost = (message) => {
@@ -66,6 +68,10 @@ try {
     }
   };
   workerEndpoint.onPost = (message, transfer = []) => {
+    if (message.type === "hepr-pdf-result" && message.ok && message.operation === "render-thumbnail-page") {
+      assert(transfer.includes(message.result.rgba.buffer), "thumbnail transfers its newly owned output buffer");
+      thumbnailTransferChecked = true;
+    }
     if (
       message.type !== "hepr-pdf-result" || !message.ok ||
       message.operation !== "compile-vector-page"
@@ -102,6 +108,10 @@ try {
   });
 
   assert.equal(session.info.pageCount, 2);
+  const thumbnail = await session.renderThumbnailPage(0, { maxDimension: 40, backend: "canvas2d", background: [1, 1, 1, 1] });
+  assert.deepEqual([thumbnail.width, thumbnail.height], [40, 20]);
+  assert.equal(thumbnail.rgba.byteLength, 40 * 20 * 4);
+  assert.equal(thumbnailTransferChecked, true);
   assert.equal(openRequestOptions.embeddedFontPaint, "font", "worker open retains the explicit embedded font paint policy");
   const workerAnnotations = await session.getPageAnnotations(0);
   assert.equal(workerAnnotations.length, 1);
@@ -184,6 +194,9 @@ try {
 
   await testCancellation(openPdfWithWorkerEndpoint, PDF_WORKER_PROTOCOL_VERSION);
   await testQueuedCancellation(openPdfWithWorkerEndpoint, PDF_WORKER_PROTOCOL_VERSION);
+  await testOpenCancellationTerminates(openPdfWithWorkerEndpoint, PDF_WORKER_PROTOCOL_VERSION);
+  await testImmediateTermination(openPdfWithWorkerEndpoint, PDF_WORKER_PROTOCOL_VERSION);
+  await testBusyWorkerTermination(openPdfWithWorkerEndpoint, PDF_WORKER_PROTOCOL_VERSION);
   await testCrash(openPdfWithWorkerEndpoint, PDF_WORKER_PROTOCOL_VERSION);
   await testCrashClosesRange(openPdfWithWorkerEndpoint, PDF_WORKER_PROTOCOL_VERSION);
 
@@ -200,7 +213,7 @@ async function testCancellation(openPdfWithWorkerEndpoint, protocolVersion) {
   endpoint.onRequest = (request) => {
     if (request.operation === "open") endpoint.open(request.requestId);
     else if (request.operation === "close") endpoint.close(request.requestId);
-    else if (request.operation === "compile-page") {
+    else if (request.operation === "compile-page" || request.operation === "render-thumbnail-page") {
       const waiter = compileWaiters.shift();
       if (waiter) waiter(request.requestId);
       else compileRequestIds.push(request.requestId);
@@ -220,6 +233,13 @@ async function testCancellation(openPdfWithWorkerEndpoint, protocolVersion) {
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(cancelledRequestIds, [compileRequestId]);
 
+  const thumbnailController = new AbortController();
+  const thumbnailPromise = session.renderThumbnailPage(0, { maxDimension: 40, backend: "auto", background: [1, 1, 1, 1],
+    signal: thumbnailController.signal });
+  const thumbnailRequestId = await nextCompileRequest();
+  thumbnailController.abort();
+  await assert.rejects(thumbnailPromise, error => error.code === "aborted");
+
   const iterator = session.compilePages()[Symbol.asyncIterator]();
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(compileRequestIds.length, 0,
@@ -230,7 +250,7 @@ async function testCancellation(openPdfWithWorkerEndpoint, protocolVersion) {
   await iterator.return();
   await nextPageRejection;
   await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.deepEqual(cancelledRequestIds, [compileRequestId, iteratorRequestId]);
+  assert.deepEqual(cancelledRequestIds, [compileRequestId, thumbnailRequestId, iteratorRequestId]);
   await session.close();
 
   function nextCompileRequest() {
@@ -265,10 +285,119 @@ async function testQueuedCancellation(openPdfWithWorkerEndpoint, protocolVersion
     "queued worker cancellation");
   assert.equal(compileRequestIds.length, 1,
     "a cancelled queued operation must never overlap the active compilation");
+  const queuedThumbnailController = new AbortController();
+  const queuedThumbnail = session.renderThumbnailPage(0, { maxDimension: 40, backend: "auto", background: [1, 1, 1, 1],
+    signal: queuedThumbnailController.signal });
+  queuedThumbnailController.abort();
+  await rejectsPromptly(queuedThumbnail, error => error.code === "aborted", "queued thumbnail cancellation");
+  assert.equal(compileRequestIds.length, 1, "cancelled thumbnails never dispatch behind the active page");
 
   activeController.abort("finish active fixture operation");
   await assert.rejects(active, (error) => error?.code === "aborted");
   await session.close();
+}
+
+async function testImmediateTermination(openPdfWithWorkerEndpoint, protocolVersion) {
+  const endpoint = scriptedEndpoint(protocolVersion);
+  let closeRequests = 0, compileRequests = 0, terminated = 0, rangeClosed = 0;
+  endpoint.onRequest = request => {
+    if (request.operation === "open") endpoint.open(request.requestId);
+    else if (request.operation === "compile-page") compileRequests++;
+    else if (request.operation === "close") closeRequests++; // Deliberately never respond.
+  };
+  const session = await openPdfWithWorkerEndpoint({ kind: "range", byteLength: 3,
+    async read() { return new Uint8Array(3); }, close() { rangeClosed++; }
+  }, {}, endpoint, { onCrash() { return () => {}; }, terminate() { terminated++; } });
+  const compilation = assert.rejects(session.compilePage(0), error => error.code === "aborted");
+  await waitFor(() => compileRequests === 1);
+  const cooperativeClose = assert.rejects(session.close(), error => error.code === "closed");
+  await session.terminate();
+  await Promise.all([compilation, cooperativeClose]);
+  await session.terminate();
+  await session.close();
+  assert.equal(closeRequests, 1, "termination never waits for a busy worker's close reply");
+  assert.equal(terminated, 1, "forced terminal cleanup remains idempotent");
+  assert.equal(rangeClosed, 1, "forced cleanup also closes the host range source");
+}
+
+async function testOpenCancellationTerminates(openPdfWithWorkerEndpoint, protocolVersion) {
+  for (const responded of [false, true]) {
+    const endpoint = scriptedEndpoint(protocolVersion), controller = new AbortController();
+    const reason = Error("thumbnail removed while opening");
+    let started, terminated = 0, rangeClosed = 0, closeRequests = 0;
+    const openingStarted = new Promise(resolve => { started = resolve; });
+    endpoint.onRequest = request => {
+      if (request.operation === "open") {
+        started();
+        if (responded) {
+          endpoint.open(request.requestId);
+          // Dispatch resolves the request, then this abort runs before the
+          // awaiting open continuation can create the public session.
+          queueMicrotask(() => controller.abort(reason));
+        }
+      } else if (request.operation === "close") closeRequests++; // No response.
+    };
+    const opening = openPdfWithWorkerEndpoint({ kind: "range", byteLength: 3,
+      async read() { return new Uint8Array(3); }, close() { rangeClosed++; }
+    }, { signal: controller.signal }, endpoint, {
+      onCrash() { return () => {}; }, terminate() { terminated++; }
+    });
+    const rejected = rejectsPromptly(opening, error => error.code === "aborted" && error.cause === reason,
+      responded ? "open cancelled immediately after response" : "nonresponding open cancelled");
+    await openingStarted;
+    if (!responded) controller.abort(reason);
+    await rejected;
+    assert.equal(terminated, 1, "cancelled opening immediately terminates its owned worker");
+    assert.equal(rangeClosed, 1, "cancelled opening closes its host range source");
+    assert.equal(closeRequests, 0, "cancelled opening never waits for a cooperative close reply");
+  }
+}
+
+async function testBusyWorkerTermination(openPdfWithWorkerEndpoint, protocolVersion) {
+  const info = scriptedEndpoint(protocolVersion).info;
+  // Actual worker_threads verifies termination can stop a synchronous CPU loop
+  // whose event loop cannot process either cancellation or a close request.
+  const worker = new Worker(`const { parentPort } = require("node:worker_threads");
+const info = ${JSON.stringify(info)};
+parentPort.on("message", request => {
+  if (request.operation === "open") parentPort.postMessage({ type: "hepr-pdf-result", protocolVersion: ${protocolVersion}, requestId: request.requestId,
+    ok: true, operation: "open", info, diagnostics: [] });
+  else if (request.operation === "render-thumbnail-page") {
+    parentPort.postMessage({ testStarted: true });
+    const counter = new Int32Array(new SharedArrayBuffer(4));
+    while (true) Atomics.add(counter, 0, 1);
+  }
+});`, { eval: true });
+  const listeners = new Set();
+  let started;
+  const busy = new Promise(resolve => { started = resolve; });
+  worker.on("message", message => {
+    if (message.testStarted) started();
+    else for (const listener of listeners) listener({ data: message });
+  });
+  const endpoint = {
+    addEventListener(_type, listener) { listeners.add(listener); },
+    removeEventListener(_type, listener) { listeners.delete(listener); },
+    postMessage(message, transfer) { worker.postMessage(message, transfer); }
+  };
+  let terminationCount = 0;
+  try {
+    const session = await openPdfWithWorkerEndpoint({ kind: "bytes", bytes: new Uint8Array(3) }, {}, endpoint, {
+      onCrash(listener) { worker.on("error", listener); return () => worker.off("error", listener); },
+      terminate() { terminationCount++; return worker.terminate(); }
+    });
+    const thumbnail = assert.rejects(session.renderThumbnailPage(0,
+      { maxDimension: 40, backend: "auto", background: [1, 1, 1, 1] }), error => error.code === "aborted");
+    await busy;
+    let timeout;
+    try {
+      await Promise.race([session.terminate(), new Promise((_resolve, reject) => {
+        timeout = setTimeout(() => reject(Error("Busy parser worker did not terminate promptly.")), 1000);
+      })]);
+    } finally { clearTimeout(timeout); }
+    await thumbnail;
+    assert.equal(terminationCount, 1, "owned parser cleanup actually terminates synchronous CPU work");
+  } finally { await worker.terminate(); }
 }
 
 async function testWorkerMissingFontResolver(
@@ -762,6 +891,7 @@ function scriptedEndpoint(protocolVersion) {
     metadata: {}
   };
   return {
+    info,
     onRequest: null,
     onCancel: null,
     addEventListener(type, listener) {

@@ -4,7 +4,6 @@ import { createThreeLinkNavigation } from "./threeLinkNavigation";
 import { createReaderViewport, type ReaderView } from "./readerViewport";
 import { computeReaderPageRects, readerContentMetrics, readerFitZoom, readerViewFromScroll } from "./readerGeometry";
 import type { VectorScene } from "./pdfVectorExtractor";
-import { createDefaultOptionalContentSnapshot } from "./optionalContent";
 import { createAnnotationOverlay, isLinkAnnotation } from "./annotationOverlay";
 import { createAnnotationInteractionController, type AnnotationInteractionController } from "./annotationInteraction";
 import { createThreeAnnotationInteractionAdapter } from "./threeAnnotationInteraction";
@@ -505,26 +504,14 @@ const reader = createReaderViewport({
     applyReaderCameraView(view, currentPdfObject);
     requestRender();
   },
-  getPagePreviewScene: async (pageIndex, options) => {
+  getPageThumbnail: async (pageIndex, options) => {
     const object = currentPdfObject;
     if (!object) throw new DOMException("No document is loaded.", "AbortError");
-    return object.getPagePreviewScene(pageIndex, options);
+    return object.getPageThumbnail(pageIndex, { maxDimension: options.maxDimension, backend: "auto",
+      background: readPageBackgroundColor(), vectorOverride: readVectorOverrideColor(),
+      optionalContent: object.getOptionalContentVisibility() ?? undefined, signal: options.signal });
   },
-  configureThumbnailRenderer: (thumbnailRenderer, scene) => {
-    const background = readPageBackgroundColor();
-    const vector = readVectorOverrideColor();
-    thumbnailRenderer.setPageBackgroundColor(...background);
-    thumbnailRenderer.setVectorColorOverride(...vector);
-    const visibility = currentPdfObject?.getOptionalContentVisibility();
-    if (visibility) {
-      const values = new Map(visibility.layers.map(layer => [layer.id, layer.visible]));
-      const local = createDefaultOptionalContentSnapshot({ ...scene,
-        optionalContent: scene.optionalContent ? { ...scene.optionalContent,
-          groups: scene.optionalContent.groups.map(group => ({ ...group, defaultVisible: values.get(group.id) ?? group.defaultVisible }))
-        } : undefined });
-      thumbnailRenderer.setOptionalContentVisibility?.({ ...local, revision: visibility.revision });
-    }
-  },
+  releaseThumbnails: () => currentPdfObject?.releaseThumbnailRenderer(),
   onFind: () => { setPanelCollapsed(false); textSearchInputElement.focus(); },
   onSettings: () => setPanelCollapsed(!panelElement.classList.contains("collapsed"))
 });

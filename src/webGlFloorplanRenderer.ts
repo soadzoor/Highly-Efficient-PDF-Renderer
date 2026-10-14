@@ -291,6 +291,8 @@ export interface WebGlFloorplanRendererOptions {
   preserveDrawingBuffer?: boolean;
   /** Combine compatible ordered fill/stroke draws; defaults to true. */
   mixedVectorBatching?: boolean;
+  /** @internal Static offscreen rendering without interactive preparation. */
+  thumbnail?: boolean;
 }
 
 type FrameListener = (stats: DrawStats) => void;
@@ -407,7 +409,8 @@ interface InstanceRange {
 }
 
 export class WebGlFloorplanRenderer {
-  private readonly canvas: HTMLCanvasElement;
+  private readonly canvas: HTMLCanvasElement | OffscreenCanvas;
+  private readonly thumbnailMode: boolean;
 
   private readonly gl: WebGL2RenderingContext;
 
@@ -421,7 +424,7 @@ export class WebGlFloorplanRenderer {
 
   private readonly textProgram: WebGLProgram;
 
-  private readonly vectorCompositeProgram: WebGLProgram;
+  private readonly vectorCompositeProgram: WebGLProgram | null;
 
   private readonly rasterProgram: WebGLProgram;
 
@@ -430,7 +433,7 @@ export class WebGlFloorplanRenderer {
   private readonly pageBackgroundVao: WebGLVertexArrayObject;
   private readonly pageBackgroundBuffer: WebGLBuffer;
 
-  private readonly highlightProgram: WebGLProgram;
+  private readonly highlightProgram: WebGLProgram | null;
 
   private readonly segmentVao: WebGLVertexArrayObject;
 
@@ -442,11 +445,11 @@ export class WebGlFloorplanRenderer {
 
   private readonly blitVao: WebGLVertexArrayObject;
 
-  private readonly highlightOthersVao: WebGLVertexArrayObject;
+  private readonly highlightOthersVao: WebGLVertexArrayObject | null;
 
-  private readonly highlightCurrentVao: WebGLVertexArrayObject;
+  private readonly highlightCurrentVao: WebGLVertexArrayObject | null;
 
-  private readonly highlightSelectionVao: WebGLVertexArrayObject;
+  private readonly highlightSelectionVao: WebGLVertexArrayObject | null;
 
   private readonly cornerBuffer: WebGLBuffer;
 
@@ -459,13 +462,13 @@ export class WebGlFloorplanRenderer {
   private readonly allTextInstanceIdBuffer: WebGLBuffer;
 
   /** Source-ordered exact/coarse selection used only while text LOD is active. */
-  private readonly selectedTextInstanceIdBuffer: WebGLBuffer;
+  private readonly selectedTextInstanceIdBuffer: WebGLBuffer | null;
 
-  private readonly highlightOthersBuffer: WebGLBuffer;
+  private readonly highlightOthersBuffer: WebGLBuffer | null;
 
-  private readonly highlightCurrentBuffer: WebGLBuffer;
+  private readonly highlightCurrentBuffer: WebGLBuffer | null;
 
-  private readonly highlightSelectionBuffer: WebGLBuffer;
+  private readonly highlightSelectionBuffer: WebGLBuffer | null;
 
   private highlightOthersCount = 0;
 
@@ -638,9 +641,9 @@ export class WebGlFloorplanRenderer {
 
   private readonly uTextVectorOverride: WebGLUniformLocation;
 
-  private readonly uVectorLayerTex: WebGLUniformLocation;
+  private readonly uVectorLayerTex: WebGLUniformLocation | null;
 
-  private readonly uVectorLayerViewportPx: WebGLUniformLocation;
+  private readonly uVectorLayerViewportPx: WebGLUniformLocation | null;
 
   private readonly uRasterTex: WebGLUniformLocation;
   private readonly uRasterMonoMips: WebGLUniformLocation;
@@ -672,23 +675,23 @@ export class WebGlFloorplanRenderer {
 
   private readonly uRasterLocalToClip: WebGLUniformLocation;
 
-  private readonly uHighlightViewport: WebGLUniformLocation;
+  private readonly uHighlightViewport: WebGLUniformLocation | null;
 
-  private readonly uHighlightCameraCenter: WebGLUniformLocation;
+  private readonly uHighlightCameraCenter: WebGLUniformLocation | null;
 
-  private readonly uHighlightZoom: WebGLUniformLocation;
+  private readonly uHighlightZoom: WebGLUniformLocation | null;
 
-  private readonly uHighlightUseLocalToClip: WebGLUniformLocation;
+  private readonly uHighlightUseLocalToClip: WebGLUniformLocation | null;
 
-  private readonly uHighlightLocalToClip: WebGLUniformLocation;
+  private readonly uHighlightLocalToClip: WebGLUniformLocation | null;
 
-  private readonly uHighlightBorderPx: WebGLUniformLocation;
+  private readonly uHighlightBorderPx: WebGLUniformLocation | null;
 
-  private readonly uHighlightMinSizePx: WebGLUniformLocation;
+  private readonly uHighlightMinSizePx: WebGLUniformLocation | null;
 
-  private readonly uHighlightFillColor: WebGLUniformLocation;
+  private readonly uHighlightFillColor: WebGLUniformLocation | null;
 
-  private readonly uHighlightBorderColor: WebGLUniformLocation;
+  private readonly uHighlightBorderColor: WebGLUniformLocation | null;
 
   private multiplyPass: 0 | 1 | null = null;
   private readonly multiplyUniforms = new Map<WebGLProgram, WebGLUniformLocation | null>();
@@ -1005,24 +1008,31 @@ export class WebGlFloorplanRenderer {
   private localUnitsPerPixel = 1;
   private isDisposed = false;
 
-  constructor(canvas: HTMLCanvasElement, options: WebGlFloorplanRendererOptions = {}) {
+  constructor(canvas: HTMLCanvasElement | OffscreenCanvas, options: WebGlFloorplanRendererOptions = {}) {
     this.canvas = canvas;
+    this.thumbnailMode = options.thumbnail === true;
+    if (this.thumbnailMode) {
+      this.externalFrameDriver = true;
+      this.vectorLodMode = "off";
+      this.textLodMode = "off";
+      this.textVectorOnly = true;
+    }
 
     const context = canvas.getContext("webgl2", {
       antialias: false,
       depth: false,
       stencil: false,
-      alpha: false,
-      premultipliedAlpha: false,
+      alpha: this.thumbnailMode,
+      premultipliedAlpha: this.thumbnailMode,
       powerPreference: "high-performance",
       preserveDrawingBuffer: options.preserveDrawingBuffer === true
-    });
+    }) as WebGL2RenderingContext | null;
 
     if (!context) {
       throw new Error("WebGL2 is required for this proof-of-concept renderer.");
     }
 
-    this.gl = context;
+    this.gl = context as WebGL2RenderingContext;
     this.mixedVectorBatchingEnabled = options.mixedVectorBatching !== false;
     // Separate sampler slots prevent stroke/fill/text switches from rebinding
     // one another's textures. Other rendering paths retain their existing slots.
@@ -1048,7 +1058,7 @@ export class WebGlFloorplanRenderer {
       GRADIENT_STROKE_FRAGMENT_SHADER_SOURCE
     );
     this.textProgram = this.createProgram(TEXT_VERTEX_SHADER_SOURCE, multiplyFragmentGlsl(TEXT_FRAGMENT_SHADER_SOURCE, true));
-    this.vectorCompositeProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE);
+    this.vectorCompositeProgram = this.thumbnailMode ? null : this.createProgram(BLIT_VERTEX_SHADER_SOURCE, VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE);
     this.rasterProgram = this.createProgram(rasterTileSeamVertexGlsl(RASTER_VERTEX_SHADER_SOURCE),
       foldable(monochromeRasterFragmentGlsl(rasterTileSeamFragmentGlsl(RASTER_FRAGMENT_SHADER_SOURCE)), true));
     this.pageBackgroundProgram = this.createProgram(
@@ -1057,7 +1067,7 @@ export class WebGlFloorplanRenderer {
     this.pageBackgroundUniforms = this.mustGetUniformMap(this.pageBackgroundProgram, [
       "uRasterTex", "uRasterOpacity", "uViewport", "uCameraCenter", "uZoom", "uUseLocalToClip", "uLocalToClip", "uPagePlaceholderTime"
     ]);
-    this.highlightProgram = this.createProgram(HIGHLIGHT_VERTEX_SHADER_SOURCE, HIGHLIGHT_FRAGMENT_SHADER_SOURCE);
+    this.highlightProgram = this.thumbnailMode ? null : this.createProgram(HIGHLIGHT_VERTEX_SHADER_SOURCE, HIGHLIGHT_FRAGMENT_SHADER_SOURCE);
 
     this.segmentVao = this.createVertexArray();
     this.fillVao = this.createVertexArray();
@@ -1065,9 +1075,9 @@ export class WebGlFloorplanRenderer {
     this.textVao = this.createVertexArray();
     this.blitVao = this.createVertexArray();
     this.pageBackgroundVao = this.createVertexArray();
-    this.highlightOthersVao = this.createVertexArray();
-    this.highlightCurrentVao = this.createVertexArray();
-    this.highlightSelectionVao = this.createVertexArray();
+    this.highlightOthersVao = this.thumbnailMode ? null : this.createVertexArray();
+    this.highlightCurrentVao = this.thumbnailMode ? null : this.createVertexArray();
+    this.highlightSelectionVao = this.thumbnailMode ? null : this.createVertexArray();
 
     this.cornerBuffer = this.mustCreateBuffer();
     this.pageBackgroundBuffer = this.mustCreateBuffer();
@@ -1075,10 +1085,10 @@ export class WebGlFloorplanRenderer {
     this.visibleSegmentIdBuffer = this.mustCreateBuffer();
     this.allFillPathIdBuffer = this.mustCreateBuffer();
     this.allTextInstanceIdBuffer = this.mustCreateBuffer();
-    this.selectedTextInstanceIdBuffer = this.mustCreateBuffer();
-    this.highlightOthersBuffer = this.mustCreateBuffer();
-    this.highlightCurrentBuffer = this.mustCreateBuffer();
-    this.highlightSelectionBuffer = this.mustCreateBuffer();
+    this.selectedTextInstanceIdBuffer = this.thumbnailMode ? null : this.mustCreateBuffer();
+    this.highlightOthersBuffer = this.thumbnailMode ? null : this.mustCreateBuffer();
+    this.highlightCurrentBuffer = this.thumbnailMode ? null : this.mustCreateBuffer();
+    this.highlightSelectionBuffer = this.thumbnailMode ? null : this.mustCreateBuffer();
 
     this.segmentTextureA = this.mustCreateTexture();
     this.segmentTextureB = this.mustCreateTexture();
@@ -1221,8 +1231,8 @@ export class WebGlFloorplanRenderer {
     this.uTextVectorOverride = this.mustGetUniformLocation(this.textProgram, "uVectorOverride");
 
 
-    this.uVectorLayerTex = this.mustGetUniformLocation(this.vectorCompositeProgram, "uVectorLayerTex");
-    this.uVectorLayerViewportPx = this.mustGetUniformLocation(this.vectorCompositeProgram, "uViewportPx");
+    this.uVectorLayerTex = this.vectorCompositeProgram ? this.mustGetUniformLocation(this.vectorCompositeProgram, "uVectorLayerTex") : null;
+    this.uVectorLayerViewportPx = this.vectorCompositeProgram ? this.mustGetUniformLocation(this.vectorCompositeProgram, "uViewportPx") : null;
 
     this.uRasterTex = this.mustGetUniformLocation(this.rasterProgram, "uRasterTex");
     this.uRasterMonoMips = this.mustGetUniformLocation(this.rasterProgram, "uRasterMonoMips");
@@ -1245,15 +1255,15 @@ export class WebGlFloorplanRenderer {
     this.uRasterUseLocalToClip = this.mustGetUniformLocation(this.rasterProgram, "uUseLocalToClip");
     this.uRasterLocalToClip = this.mustGetUniformLocation(this.rasterProgram, "uLocalToClip");
 
-    this.uHighlightViewport = this.mustGetUniformLocation(this.highlightProgram, "uViewport");
-    this.uHighlightCameraCenter = this.mustGetUniformLocation(this.highlightProgram, "uCameraCenter");
-    this.uHighlightZoom = this.mustGetUniformLocation(this.highlightProgram, "uZoom");
-    this.uHighlightUseLocalToClip = this.mustGetUniformLocation(this.highlightProgram, "uUseLocalToClip");
-    this.uHighlightLocalToClip = this.mustGetUniformLocation(this.highlightProgram, "uLocalToClip");
-    this.uHighlightBorderPx = this.mustGetUniformLocation(this.highlightProgram, "uBorderPx");
-    this.uHighlightMinSizePx = this.mustGetUniformLocation(this.highlightProgram, "uMinSizePx");
-    this.uHighlightFillColor = this.mustGetUniformLocation(this.highlightProgram, "uFillColor");
-    this.uHighlightBorderColor = this.mustGetUniformLocation(this.highlightProgram, "uBorderColor");
+    this.uHighlightViewport = this.highlightProgram ? this.mustGetUniformLocation(this.highlightProgram, "uViewport") : null;
+    this.uHighlightCameraCenter = this.highlightProgram ? this.mustGetUniformLocation(this.highlightProgram, "uCameraCenter") : null;
+    this.uHighlightZoom = this.highlightProgram ? this.mustGetUniformLocation(this.highlightProgram, "uZoom") : null;
+    this.uHighlightUseLocalToClip = this.highlightProgram ? this.mustGetUniformLocation(this.highlightProgram, "uUseLocalToClip") : null;
+    this.uHighlightLocalToClip = this.highlightProgram ? this.mustGetUniformLocation(this.highlightProgram, "uLocalToClip") : null;
+    this.uHighlightBorderPx = this.highlightProgram ? this.mustGetUniformLocation(this.highlightProgram, "uBorderPx") : null;
+    this.uHighlightMinSizePx = this.highlightProgram ? this.mustGetUniformLocation(this.highlightProgram, "uMinSizePx") : null;
+    this.uHighlightFillColor = this.highlightProgram ? this.mustGetUniformLocation(this.highlightProgram, "uFillColor") : null;
+    this.uHighlightBorderColor = this.highlightProgram ? this.mustGetUniformLocation(this.highlightProgram, "uBorderColor") : null;
 
     if (this.paintFoldUnit >= 0) this.initializePaintFold();
     this.initializeGeometry();
@@ -1340,6 +1350,67 @@ export class WebGlFloorplanRenderer {
 
   renderExternalFrame(timestamp: number = performance.now()): void {
     this.render(timestamp);
+  }
+
+  /** @internal One static page, without camera animation, LOD selection or overlays. */
+  renderThumbnailFrame(bounds: Bounds, width: number, height: number, signal?: AbortSignal,
+    onTiming?: (stage: "draw" | "readback", durationMs: number) => void): Uint8Array<ArrayBuffer> {
+    signal?.throwIfAborted();
+    if (!this.thumbnailMode || this.isDisposed || !this.scene) throw new Error("A live thumbnail renderer and scene are required.");
+    const pageWidth = bounds.maxX - bounds.minX, pageHeight = bounds.maxY - bounds.minY;
+    if (![bounds.minX, bounds.minY, bounds.maxX, bounds.maxY].every(Number.isFinite) ||
+        !(pageWidth > 0) || !(pageHeight > 0) || !Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1) {
+      throw new RangeError("Invalid thumbnail viewport.");
+    }
+    if (this.canvas.width !== width || this.canvas.height !== height) throw new Error("Thumbnail backing dimensions must be set before uploading the scene.");
+    const gl = this.gl;
+    if (gl.isContextLost()) throw new Error("The thumbnail WebGL context was lost.");
+    if (gl.drawingBufferWidth < width || gl.drawingBufferHeight < height) throw new RangeError("The GPU cannot allocate the requested thumbnail dimensions.");
+    const drawStarted = performance.now();
+    const zoom = Math.min(width / pageWidth, height / pageHeight);
+    this.cameraCenterX = (bounds.minX + bounds.maxX) / 2;
+    this.cameraCenterY = (bounds.minY + bounds.maxY) / 2;
+    this.zoom = zoom;
+    this.localToClipRenderingEnabled = false;
+    this.orderedCullingBounds = null;
+    this.frameDrawCalls = 0;
+    this.setAllPagesAndTextVisible();
+    this.visibleSegmentCount = this.segmentCount;
+    this.usingAllSegments = true;
+    this.ensureRenderState();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, width, height);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    if (!this.scene.drawRuns) throw new Error("Thumbnail scenes require ordered paint runs.");
+    this.drawSourceOrderedContent(width, height, this.cameraCenterX, this.cameraCenterY, zoom);
+    onTiming?.("draw", performance.now() - drawStarted);
+    signal?.throwIfAborted();
+    const readbackStarted = performance.now();
+    const rgba = new Uint8Array(width * height * 4);
+    gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+    if (gl.isContextLost()) throw new Error("The thumbnail WebGL context was lost during rendering.");
+    // GL stores accumulated premultiplied color. Public pixels use straight
+    // alpha and top-to-bottom rows, independently of canvas presentation.
+    const rowBytes = width * 4;
+    for (let y = 0; y < Math.ceil(height / 2); y++) {
+      signal?.throwIfAborted();
+      const opposite = height - y - 1;
+      for (let x = 0; x < rowBytes; x++) {
+        const first = y * rowBytes + x, last = opposite * rowBytes + x;
+        const value = rgba[first]; rgba[first] = rgba[last]; rgba[last] = value;
+      }
+    }
+    for (let row = 0; row < height; row++) {
+      signal?.throwIfAborted();
+      for (let offset = row * rowBytes; offset < (row + 1) * rowBytes; offset += 4) {
+        const alpha = rgba[offset + 3];
+        for (let channel = 0; channel < 3; channel++) rgba[offset + channel] = alpha > 0
+          ? Math.min(255, Math.round(rgba[offset + channel] * 255 / alpha)) : 0;
+      }
+    }
+    onTiming?.("readback", performance.now() - readbackStarted);
+    return rgba;
   }
 
   renderProjectedFrame(options: ProjectedFrameOptions): DrawStats {
@@ -1733,6 +1804,7 @@ export class WebGlFloorplanRenderer {
   }
 
   resize(): void {
+    if (!("clientWidth" in this.canvas)) return;
     const devicePixelRatio = window.devicePixelRatio || 1;
     const nextWidth = Math.max(1, Math.floor(this.canvas.clientWidth * devicePixelRatio));
     const nextHeight = Math.max(1, Math.floor(this.canvas.clientHeight * devicePixelRatio));
@@ -1917,7 +1989,7 @@ export class WebGlFloorplanRenderer {
     this.textLodRuntime?.dispose();
     this.orderedTextLod = null;
     const lodStarted = performance.now();
-    const textLodBuildResult = this.scenePaintVisibility.requiresCompositing ? null : this.textLodMode === "auto"
+    const textLodBuildResult = this.thumbnailMode || this.scenePaintVisibility.requiresCompositing ? null : this.textLodMode === "auto"
       ? getOrBuildTextLod(scene)
       : getCachedTextLod(scene);
     this.recordPerformanceTransition("pageSwap.textLod", performance.now() - lodStarted);
@@ -1931,7 +2003,7 @@ export class WebGlFloorplanRenderer {
     }
     this.visiblePageRectCount = 0;
     this.visibleTextRanges = [];
-    this.buildSegmentBounds(scene);
+    if (!this.thumbnailMode) this.buildSegmentBounds(scene);
     this.isPanInteracting = false;
     this.destroyVectorMinifyResources();
     this.destroyVectorLodResources();
@@ -1942,7 +2014,7 @@ export class WebGlFloorplanRenderer {
     this.uploadGradientPaintData(scene);
     const fillTextureStats = this.uploadFillPaths(scene);
     const vectorLodActive = this.rebuildVectorLod(scene);
-    this.grid = !vectorLodActive && !scene.drawRuns && this.segmentCount > 0 ? buildSpatialGrid(scene) : null;
+    this.grid = !this.thumbnailMode && !vectorLodActive && !scene.drawRuns && this.segmentCount > 0 ? buildSpatialGrid(scene) : null;
     let textLodUploadData: TextLodBuildData | null = null;
     if (this.textLodMode === "auto" && textLodBuildResult?.data) {
       const data = textLodBuildResult.data;
@@ -2262,7 +2334,7 @@ export class WebGlFloorplanRenderer {
     this.vectorClipHeaders = null;
     this.vectorClipUniforms.clear();
 
-    const buffers: WebGLBuffer[] = [
+    const buffers: (WebGLBuffer | null)[] = [
       this.cornerBuffer,
       this.pageBackgroundBuffer,
       this.allSegmentIdBuffer,
@@ -2278,7 +2350,7 @@ export class WebGlFloorplanRenderer {
       gl.deleteBuffer(buffer);
     }
 
-    const vaos: WebGLVertexArrayObject[] = [
+    const vaos: (WebGLVertexArrayObject | null)[] = [
       this.segmentVao,
       this.fillVao,
       this.gradientPaintVao,
@@ -2293,7 +2365,7 @@ export class WebGlFloorplanRenderer {
       gl.deleteVertexArray(vao);
     }
 
-    const programs: WebGLProgram[] = [
+    const programs: (WebGLProgram | null)[] = [
       this.segmentProgram,
       this.fillProgram,
       this.gradientFillProgram,
@@ -4624,7 +4696,7 @@ export class WebGlFloorplanRenderer {
       localToClip,
       viewportWidth,
       viewportHeight,
-      pixelRatio: this.canvas.clientWidth > 0 ? this.canvas.width / this.canvas.clientWidth : 1
+      pixelRatio: "clientWidth" in this.canvas && this.canvas.clientWidth > 0 ? this.canvas.width / this.canvas.clientWidth : 1
     });
     this.selectedTextInstanceCount = selection.instanceIds.length;
     if (this.orderedTextLod) {
@@ -5938,7 +6010,7 @@ export class WebGlFloorplanRenderer {
     this.vectorLodStats = null;
     this.orderedBatches = scene.drawRuns ? new VectorOrderedBatches(scene,
       this.vectorLodRuntime && this.vectorLodRuntime.levels.length > 1 ? this.vectorLodRuntime : null) : null;
-    this.orderedRunCuller = this.orderedBatches?.createRunCuller() ?? null;
+    this.orderedRunCuller = this.thumbnailMode ? null : this.orderedBatches?.createRunCuller() ?? null;
     if (this.orderedTextLod) this.orderedRunCuller?.includeTextLod(this.orderedTextLod.data);
     this.runLookup = buildCanonicalRunLookup(scene);
     this.orderedBatches?.setColorCommutationEnabled(!this.primitiveColors?.has("stroke") &&
@@ -6070,7 +6142,7 @@ export class WebGlFloorplanRenderer {
 
     const glyphRasterMetaData = new Float32Array(glyphMetaTexelCount * 4);
     const atlasStarted = performance.now();
-    const textRasterAtlas = buildTextRasterAtlas(scene, maxTextureSize);
+    const textRasterAtlas = this.thumbnailMode ? null : buildTextRasterAtlas(scene, maxTextureSize);
     this.recordPerformanceTransition("pageSwap.glyphAtlas", performance.now() - atlasStarted);
     if (textRasterAtlas) {
       glyphRasterMetaData.set(textRasterAtlas.glyphUvRects);
@@ -6347,6 +6419,7 @@ export class WebGlFloorplanRenderer {
       [this.highlightCurrentVao, this.highlightCurrentBuffer],
       [this.highlightSelectionVao, this.highlightSelectionBuffer]
     ] as const) {
+      if (!vao) continue;
       gl.bindVertexArray(vao);
       gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuffer);
       gl.enableVertexAttribArray(0);
@@ -6589,6 +6662,7 @@ export class WebGlFloorplanRenderer {
     if (providerRect) {
       return providerRect;
     }
+    if (!("getBoundingClientRect" in this.canvas)) throw new Error("Offscreen rendering has no interaction viewport.");
     return this.canvas.getBoundingClientRect();
   }
 

@@ -28,7 +28,8 @@ export function buildNativeGlyphHairline(
   commands: readonly NativeGlyphPathCommand[],
   glyphTransform: ArrayLike<number>,
   stroke: NativeGlyphStrokeStyle,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  curveTolerance = CURVE_ERROR
 ): NativeGlyphHairlineGeometry | null {
   throwIfAborted(signal);
   if (stroke.width !== 0 || ![0, 1, 2].includes(stroke.lineCap) ||
@@ -123,7 +124,7 @@ export function buildNativeGlyphHairline(
       const error = Math.max(
         Math.hypot((a[0] + 2 * control[0]) / 3 - b[0], (a[1] + 2 * control[1]) / 3 - b[1]),
         Math.hypot((d[0] + 2 * control[0]) / 3 - c[0], (d[1] + 2 * control[1]) / 3 - c[1]));
-      if (error <= CURVE_ERROR) {
+      if (error <= curveTolerance) {
         emit([a, control, d], round);
         continue;
       }
@@ -140,7 +141,7 @@ export function buildNativeGlyphHairline(
   const scale = Math.hypot(ctm[0], ctm[1], ctm[2], ctm[3]);
   const positiveDash = dash.filter(value => value > 0);
   const smallestDash = positiveDash.length ? positiveDash.reduce((smallest, value) => Math.min(smallest, value), Infinity) : 0;
-  const dashTolerance = dash.length ? Math.min(CURVE_ERROR / scale, smallestDash / 32) : 0;
+  const dashTolerance = dash.length ? Math.min(curveTolerance / scale, smallestDash / 32) : 0;
   for (const contour of contours) {
     checkpoint();
     if (!contour.segments.length) continue;

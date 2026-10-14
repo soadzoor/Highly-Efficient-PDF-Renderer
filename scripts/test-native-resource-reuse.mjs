@@ -49,8 +49,8 @@ try {
       counts.fonts = 0;
       const reused = await session.compileVectorPageWithTimings(0, { preserveDrawingOrder: false });
       assert.equal(sceneFingerprint(reused.scene), expectedHash, "reuse preserves every scene field and pixel");
-      assert.equal(counts.fonts, 1);
-      assert.equal(oldFontCount, counts.fonts * 2, "the second pass must not prepare the font again");
+      assert.equal(oldFontCount, 1, "a cold session parses the shared font once even without operation-resource reuse");
+      assert.equal(counts.fonts, 0, "the warm session reuses the parsed font across separate operations and retry passes");
       assert.deepEqual(counts.codecs, withForm ? [3, 4] : [3], "image aliases remain resource-scope local");
       assert.equal(oldCodecCount, counts.codecs.length * 2, "codec calls are no longer doubled");
       assert.equal(reused.timings.selectiveCompilation.preparedFonts, 0);
@@ -61,6 +61,7 @@ try {
 
       const perOperationCalls = counts.codecs.length;
       await compile(1);
+      assert.equal(counts.fonts, 0, "the same font dictionary shares its parsed program across pages");
       assert.equal(counts.codecs.length, perOperationCalls * 2, "resources cannot leak across source pages");
       assert.equal(sceneFingerprint(reused.scene), expectedHash, "later operations cannot mutate returned scenes");
       await assert.rejects(compile(0, { limits: { maxDecodedStreamBytes: 8 } }),
@@ -95,6 +96,7 @@ try {
       assert.equal(counts.codecs.length - beforeQueued, perOperationCalls * 2,
         "queued compilations own separate preparation caches");
       for (const item of samples) assert.deepEqual(item.data, item.snapshot, "caller-owned codec samples stay intact");
+      assert.equal(counts.fonts, 0, "cancellation and queued retries preserve completed session font programs");
       assert.deepEqual(source, snapshot, "caller-owned PDF bytes stay intact");
     } finally {
       await session.close();
@@ -129,7 +131,7 @@ async function testRetainedRetryReuse(openPdf) {
     // keeps the image and text without invoking a raster compositor.
     const without = await session.compileVectorPageWithTimings(0, options, { reusePageResources: false });
     assert.equal(counts.codecs, 2, "the instrumentation baseline decodes the retained retry again");
-    assert.equal(counts.fonts, 2);
+    assert.equal(counts.fonts, 1, "the cold session parses the shared font only once across the retained retry");
     assert.equal(without.timings.selectiveCompilation, undefined, "fixture exercises the catch retry rather than selective compilation");
     const expectedHash = sceneFingerprint(without.scene), expectedDiagnostics = session.getDiagnostics();
     assert.equal(without.scene.rasterLayers.length, 2);
@@ -142,7 +144,7 @@ async function testRetainedRetryReuse(openPdf) {
     counts.codecs = counts.fonts = 0;
     const reused = await session.compileVectorPageWithTimings(0, options);
     assert.equal(counts.codecs, 1, "a retained catch retry must reuse the prepared decoded image");
-    assert.equal(counts.fonts, 1, "a retained catch retry must reuse the prepared font");
+    assert.equal(counts.fonts, 0, "the retained retry reuses the previous operation's completed font program");
     assert.equal(sceneFingerprint(reused.scene), expectedHash, "retained reuse preserves pixels, text, clips and paint ordering");
     assert.deepEqual(session.getDiagnostics(), expectedDiagnostics, "reuse preserves the same diagnostics");
     assert.equal(diagnostics.length, emitted, "a reused retry does not emit duplicate warnings");
@@ -174,6 +176,7 @@ async function testRetainedRetryReuse(openPdf) {
     assert.deepEqual(samples, sampleSnapshot, "retained mask composition cannot mutate caller codec samples");
     assert.deepEqual(source, snapshot);
     assert.equal(sceneFingerprint(reused.scene), expectedHash);
+    assert.equal(counts.fonts, 0, "later pages, cancelled work and queued retries do not reparse the shared font");
   } finally { await session.close(); }
 }
 

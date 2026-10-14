@@ -8,6 +8,7 @@ import {
 import type { NativePdfDocument } from "./nativeDocument";
 import {
   parseNativePdfFont,
+  type NativePdfFont,
   type NativeEmbeddedFontPaint,
   type NativeMissingFontResolver
 } from "./nativeFont";
@@ -21,6 +22,25 @@ import { PdfError, type PdfDiagnostic } from "./nativeTypes";
 export interface NativeFontScopeOptions {
   readonly label: string;
   readonly allowType3: boolean;
+}
+
+/** Session-owned parsed programs; page indices and Type3 resource scopes stay local. */
+export class NativePdfFontProgramCache {
+  private programs = new WeakMap<PdfDictionary, Promise<NativePdfFont>>();
+
+  async load(dictionary: PdfDictionary, parse: () => Promise<NativePdfFont>): Promise<NativePdfFont> {
+    const cached = this.programs.get(dictionary);
+    if (cached) return await cached;
+    const pending = parse().then(font => { font.releaseParseSignal?.(); return font; });
+    this.programs.set(dictionary, pending);
+    try { return await pending; }
+    catch (error) {
+      if (this.programs.get(dictionary) === pending) this.programs.delete(dictionary);
+      throw error;
+    }
+  }
+
+  clear(): void { this.programs = new WeakMap(); }
 }
 
 /**
@@ -40,6 +60,7 @@ export class NativePageFontRegistry {
   private readonly pageIndex: number;
   private readonly missingFontResolver: NativeMissingFontResolver | undefined;
   private readonly embeddedFontPaint: NativeEmbeddedFontPaint;
+  private readonly programs?: NativePdfFontProgramCache;
   private readonly type3Registry: NativePdfType3Registry;
   private readonly cache = new Map<string, Promise<NativeTextFontResource>>();
   private readonly directIds = new WeakMap<PdfDictionary, number>();
@@ -52,7 +73,8 @@ export class NativePageFontRegistry {
     pageIndex: number,
     missingFontResolver?: NativeMissingFontResolver,
     type3Registry = new NativePdfType3Registry(document),
-    embeddedFontPaint: NativeEmbeddedFontPaint = "pdf"
+    embeddedFontPaint: NativeEmbeddedFontPaint = "pdf",
+    programs?: NativePdfFontProgramCache
   ) {
     if (!Number.isSafeInteger(pageIndex) || pageIndex < 0) {
       throw new RangeError("Native page font registry requires a non-negative page index.");
@@ -61,6 +83,7 @@ export class NativePageFontRegistry {
     this.pageIndex = pageIndex;
     this.missingFontResolver = missingFontResolver;
     this.embeddedFontPaint = embeddedFontPaint;
+    this.programs = programs;
     this.type3Registry = type3Registry;
   }
 
@@ -175,11 +198,12 @@ export class NativePageFontRegistry {
     signal: AbortSignal,
     type3: boolean
   ): Promise<NativeTextFontResource> {
-    const font = await parseNativePdfFont(value, this.document, {
+    const parse = () => parseNativePdfFont(value, this.document, {
       signal,
       missingFontResolver: this.missingFontResolver,
       embeddedFontPaint: this.embeddedFontPaint
     });
+    const font = this.programs ? await this.programs.load(dictionary, parse) : await parse();
     let prepared: NativePdfPreparedType3Font | undefined;
     if (type3) {
       prepared = await this.type3Registry.prepareFont(dictionary, {

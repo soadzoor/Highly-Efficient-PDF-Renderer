@@ -52,7 +52,8 @@ export function buildNativeGlyphStroke(
   commands: readonly NativeGlyphPathCommand[],
   glyphTransform: ArrayLike<number>,
   stroke: NativeGlyphStrokeStyle,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  curveTolerance?: number
 ): NativeGlyphStrokeGeometry | null {
   throwIfAborted(signal);
   const ctm = matrix(stroke.transform);
@@ -76,7 +77,7 @@ export function buildNativeGlyphStroke(
   inverse[5] = -inverse[1] * ctm[4] - inverse[3] * ctm[5];
   const local = multiply(inverse, glyph);
   const radius = stroke.width / 2;
-  const tolerance = Math.min(0.01 / scale, radius / 32);
+  const tolerance = curveTolerance === undefined ? Math.min(0.01 / scale, radius / 32) : curveTolerance / scale;
   const contours: Contour[] = [];
   let current: Contour | null = null;
   let approximated = false;

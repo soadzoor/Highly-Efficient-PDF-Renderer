@@ -127,6 +127,13 @@ export interface RetainedTextPositions {
 }
 
 export interface RetainedVectorPageOptions {
+  /** Viewing-only page-space tolerance; canonical compilation keeps its existing defaults. */
+  readonly curveTolerance?: number;
+  /** Viewing-only target for stencil preparation. */
+  readonly imageMaxDimension?: number;
+  readonly omitMetadata?: boolean;
+  /** Static snapshots may execute only the current visible commands. */
+  readonly defaultVisibilityOnly?: boolean;
   readonly optionalContent?: SceneOptionalContent;
   readonly textPositions?: RetainedTextPositions;
   /**
@@ -260,7 +267,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const maxCells = options.maxPatternCells ?? Number.MAX_SAFE_INTEGER;
   for (const limit of [maximum, maxCoordinates, maxCells]) if (!Number.isSafeInteger(limit) || limit < 0) throw new RangeError("Retained vector budgets must be nonnegative safe integers.");
   // Execute every retained command; visibility is applied by the scene controller later.
-  const page: HeprPageData = { ...source, stores: { ...source.stores, optionalContent: {
+  const page: HeprPageData = options.defaultVisibilityOnly ? source : { ...source, stores: { ...source.stores, optionalContent: {
     ...source.stores.optionalContent, defaultVisible: new Uint8Array(source.stores.optionalContent.defaultVisible.length).fill(1)
   } } };
   const scene = createEmptyVectorScene(), { width, height } = page.pageInfo;
@@ -274,7 +281,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const fillsA: number[] = [], fillsB: number[] = [], fillsC: number[] = [], segmentsA: number[] = [], segmentsB: number[] = [];
   const textA: number[] = [], textB: number[] = [], textC: number[] = [], glyphMetaA: number[] = [], glyphMetaB: number[] = [], glyphA: number[] = [], glyphB: number[] = [];
   const endpoints = new RetainedStrokeBuffer(), primitiveMeta = new RetainedStrokeBuffer(), primitiveBounds = new RetainedStrokeBuffer(), styles = new RetainedStrokeBuffer();
-  const clipBuilder = new NativeVectorClipBuilder(), clipCache = new WeakMap<HeprExecutionClipScope, DensePdfTextClip>();
+  const clipBuilder = new NativeVectorClipBuilder(options.curveTolerance), clipCache = new WeakMap<HeprExecutionClipScope, DensePdfTextClip>();
   const glyphConditions = new Int32Array(page.stores.glyphs.glyphIds.length).fill(-1);
   // Search references the first instance painting each glyph. A glyph whose
   // every placement misses its clip chain or the page leaves the index.
@@ -306,6 +313,8 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   }
   const maxStencilPixels = options.maxStencilPixels ?? Number.MAX_SAFE_INTEGER;
   const stencilScale = stencilPixels > maxStencilPixels ? Math.sqrt(maxStencilPixels / stencilPixels) : 1;
+  const previewStencilScale = (width: number, height: number) => Math.min(stencilScale,
+    options.imageMaxDimension === undefined ? 1 : options.imageMaxDimension / Math.max(width, height));
   const glyphAtlas = new Map<string, number>();
   const hairlineAtlas = new Map<string, ReturnType<typeof buildNativeGlyphHairline>>();
   let gradientSegments = 0, meshVertices = 0, meshIndices = 0;
@@ -369,6 +378,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const itemRanges = new ContentItemRangeBuilder();
   let currentItem = -1, ignoredFormContentItems = false;
   const itemOf = (scope: HeprExecutionIndexScope | null): number => {
+    if (options.omitMetadata) return -1;
     if (!scope || !pageMarkedContentCount) return -1;
     let item = itemScopes.get(scope);
     if (item === undefined) {
@@ -440,7 +450,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       // Fill and clip geometry must include its eventual closing edge as well.
       lineTo: (px, py) => { open = true; line(...point(matrix, px, py)); },
       quadraticTo: (cx, cy, px, py) => { open = true; quadratic(...point(matrix, cx, cy), ...point(matrix, px, py)); },
-      cubicTo: (c1x, c1y, c2x, c2y, px, py) => { open = true; emitCubicAsQuadratics(x, y, ...point(matrix, c1x, c1y), ...point(matrix, c2x, c2y), ...point(matrix, px, py), quadratic); },
+      cubicTo: (c1x, c1y, c2x, c2y, px, py) => { open = true; emitCubicAsQuadratics(x, y, ...point(matrix, c1x, c1y), ...point(matrix, c2x, c2y), ...point(matrix, px, py), quadratic, options.curveTolerance); },
       close: () => { if (open) line(sx, sy); open = false; }
     });
     if (open) line(sx, sy);
@@ -572,9 +582,11 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     let pixels: { readonly data: Uint8Array; readonly width: number; readonly height: number };
     if (pending.plates.length === 1) {
       const plate = pending.plates[0], key = `${pending.index}:${plate.color.join(",")}`;
-      pixels = imagePixels.get(key) ?? tintHeprStencilMask(plate.coverage, pending.width, pending.height, plate.color, stencilScale, signal);
+      pixels = imagePixels.get(key) ?? tintHeprStencilMask(plate.coverage, pending.width, pending.height, plate.color,
+        previewStencilScale(pending.width, pending.height), signal);
       imagePixels.set(key, pixels);
-    } else pixels = compositeBinaryStencilPlates(pending.plates, pending.width, pending.height, stencilScale, signal);
+    } else pixels = compositeBinaryStencilPlates(pending.plates, pending.width, pending.height,
+      previewStencilScale(pending.width, pending.height), signal);
     const first = scene.rasterLayers.length;
     scene.rasterLayers.push({ ...pixels, matrix: pending.matrix, paintOrder: first, pageIndex: 0, interpolate: false });
     const previousItem = currentItem;
@@ -658,7 +670,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     if (g.approximated && !reportedHairlineCurveApproximation) {
       reportedHairlineCurveApproximation = true;
       options.onDiagnostic?.({ code: "glyph-stroke-curve-approximation", severity: "warning", pageIndex: page.pageInfo.sourcePageIndex,
-        message: "Stroke curves use vector centerlines with a maximum 0.01-point subdivision tolerance." });
+        message: `Stroke curves use vector centerlines with a maximum ${options.curveTolerance ?? 0.01}-point subdivision tolerance.` });
     }
     if (g.approximateStyle && !reportedHairlineStyleApproximation) {
       reportedHairlineStyleApproximation = true;
@@ -685,7 +697,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     omittable = false): Geometry | null => {
     let g;
     try {
-      g = buildNativeGlyphStroke(pathCommands(indices), matrix, strokeStyle(style, matrix), signal);
+      g = buildNativeGlyphStroke(pathCommands(indices), matrix, strokeStyle(style, matrix), signal, options.curveTolerance);
     } catch (error) {
       omitStrokeError(error, omittable);
       return null;
@@ -696,7 +708,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     clip: DensePdfTextClip | null, condition?: number, omittable = false): void => {
     if (page.stores.strokes.lineWidths[style] === 0) {
       if (rgba[3] <= 1e-3) return;
-      const g = buildNativeGlyphHairline(pathCommands(indices), matrix, strokeStyle(style, matrix), signal);
+      const g = buildNativeGlyphHairline(pathCommands(indices), matrix, strokeStyle(style, matrix), signal, options.curveTolerance);
       if (g) packedStroke(g, IDENTITY, rgba, clip, condition);
       return;
     }
@@ -724,7 +736,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       const singleLine = commands.length === 2 && commands[0].kind === "move" && commands[1].kind === "line";
       if (stroke.lineCap === 1 && (stroke.lineJoin === 1 || singleLine)) {
         if (rgba[3] <= 1e-3) return;
-        const g = buildNativeGlyphHairline(commands, matrix, { ...stroke, width: 0 }, signal);
+        const g = buildNativeGlyphHairline(commands, matrix, { ...stroke, width: 0 }, signal, options.curveTolerance);
         if (g) {
           packedStroke(g, IDENTITY, rgba, clip, condition, halfWidth);
           if (!uniform && !reportedStrokePenApproximation) {
@@ -748,7 +760,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       if (rgba[3] <= 1e-3) return;
       let g = hairlineAtlas.get(key);
       if (g === undefined) {
-        g = buildNativeGlyphHairline(pathCommands(indices), [placement[0], placement[1], placement[2], placement[3], 0, 0], stroke, signal);
+        g = buildNativeGlyphHairline(pathCommands(indices), [placement[0], placement[1], placement[2], placement[3], 0, 0], stroke, signal, options.curveTolerance);
         hairlineAtlas.set(key, g);
       }
       if (!g) return;
@@ -1061,7 +1073,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
               : { kind: "line", x: store.primitiveMeta[i], y: store.primitiveMeta[i + 1] }
           ];
           const g = buildNativeGlyphStroke(commands, matrix, { transform: matrix, width: store.styles[i] * 2,
-            lineCap: (flags & 2) !== 0 ? 1 : 0, lineJoin: 1, miterLimit: 10, dashArray: [], dashPhase: 0 }, signal);
+            lineCap: (flags & 2) !== 0 ? 1 : 0, lineJoin: 1, miterLimit: 10, dashArray: [], dashPhase: 0 }, signal, options.curveTolerance);
           if (g) {
             // One packed paint remains one knockout object. Union its cap and
             // curve contours before applying alpha, avoiding darkened joins.
@@ -1187,7 +1199,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
             if (images.formats[index] !== HEPR_IMAGE_FORMAT.Gray8 || source.length !== width * height) {
               return fail(`a stencil image mask stored as format ${images.formats[index]} requires preparation.`);
             }
-            ({ data, width, height } = tintHeprStencilMask(source, width, height, stencil, stencilScale, signal));
+            ({ data, width, height } = tintHeprStencilMask(source, width, height, stencil, previewStencilScale(width, height), signal));
             owned = true;
           } else {
             // Raster layers are straight RGBA8; a grayscale store widens once here.
@@ -1344,7 +1356,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     message: `${annotationLayers.unavailableCount} annotation appearance(s) exceed the layer limit and cannot be hidden individually.`,
     details: { annotationCount: annotationLayers.unavailableCount } });
   // Annotation layers alone condition text only when an appearance paints some.
-  scene.textIndex = buildRetainedTextIndex(source, glyphInstances, glyphReach,
+  scene.textIndex = options.omitMetadata ? null : buildRetainedTextIndex(source, glyphInstances, glyphReach,
     options.optionalContent || (optionalContent && glyphConditions.some(condition => condition >= 0)) ? glyphConditions : undefined,
     options.textPositions, signal);
   scene.sourceTextCount = source.stores.glyphs.glyphIds.length;

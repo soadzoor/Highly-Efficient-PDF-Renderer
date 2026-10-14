@@ -27,6 +27,9 @@ const MAX_INT32 = 0x7fff_ffff;
 const MAX_UINT32 = 0xffff_ffff;
 
 export interface NativePageTextResourceOptions {
+  /** Viewing-only scale. Unreadable ordinary glyphs use a pen-cell mark before deriving outlines. */
+  readonly previewScale?: number;
+  readonly omitTextIndex?: boolean;
   readonly maxPaths: number;
   readonly maxGlyphs?: number;
   readonly maxFonts?: number;
@@ -101,6 +104,7 @@ export function buildNativePageTextResources(
   }
 
   const used = byIndex.map(() => new Map<number, boolean>());
+  const previewGlyphs = byIndex.map(() => new Map<number, { pixels: number; width: number }>());
   const clippingGlyphs = byIndex.map(() => new Set<number>());
   for (let index = 0; index < compilation.glyphs.glyphIds.length; index += 1) {
     if ((index & 0x3fff) === 0) throwIfAborted(options.signal);
@@ -111,6 +115,14 @@ export function buildNativePageTextResources(
       throw new PdfError("invalid-object", "A native glyph references a missing page font.");
     }
     const font = byIndex[fontIndex]!;
+    if (options.previewScale !== undefined) {
+      const offset = compilation.glyphs.transformIndices[index] * 6, values = compilation.transforms.values;
+      const pixels = Math.max(Math.hypot(values[offset], values[offset + 1]),
+        Math.hypot(values[offset + 2], values[offset + 3])) * font.unitsPerEm * options.previewScale;
+      const previous = previewGlyphs[fontIndex].get(glyphId);
+      previewGlyphs[fontIndex].set(glyphId, { pixels: Math.max(pixels, previous?.pixels ?? 0),
+        width: Math.max(compilation.glyphWidthEms?.[index] ?? .5, previous?.width ?? 0) });
+    }
     const glyphFlags = compilation.glyphs.flags[index];
     if (((glyphFlags & HEPR_GLYPH_FLAG.Vertical) !== 0) !== (font.writingMode === 1)) {
       throw new PdfError("invalid-object", "A native glyph writing-mode flag does not match its font.");
@@ -145,6 +157,7 @@ export function buildNativePageTextResources(
   const outlinePathCounts: number[] = [];
   const type3ProgramIndices: number[] = [];
   const intrinsicGlyphStrokes = new Map<string, NonNullable<NativeGlyphOutline["intrinsicStroke"]>>();
+  let approximatedGlyphs = 0;
 
   // Font-store encoding is deterministic and page-local: glyphOffsets spans
   // ascending glyphIds for each contiguous font index. An ordinary outline is
@@ -189,7 +202,19 @@ export function buildNativePageTextResources(
         type3ProgramIndices.push(programIndex);
         continue;
       }
-      const sourceOutline = font.getGlyphOutline(glyphId);
+      const preview = previewGlyphs[fontIndex].get(glyphId);
+      // Clipping and self-painting fonts require their original geometry at every output size.
+      const tiny = preview && preview.pixels < 4 && !clippingGlyphs[fontIndex].has(glyphId) &&
+        !font.type1 && !font.cff && font.sfnt?.outlineFormat === "glyf" && glyphId !== font.sfnt.mapCodePoint(32);
+      if (tiny) approximatedGlyphs++;
+      const sourceOutline: NativeGlyphOutline = tiny ? {
+        glyphId, advanceWidth: preview.width * font.unitsPerEm, leftSideBearing: 0,
+        bounds: [0, 0, preview.width * font.unitsPerEm * .7, font.unitsPerEm * .5],
+        commands: [ { kind: "move", x: 0, y: 0 },
+          { kind: "line", x: preview.width * font.unitsPerEm * .7, y: 0 },
+          { kind: "line", x: preview.width * font.unitsPerEm * .7, y: font.unitsPerEm * .5 },
+          { kind: "line", x: 0, y: font.unitsPerEm * .5 }, { kind: "close" } ]
+      } : font.getGlyphOutline(glyphId, options.signal);
       if (sourceOutline.intrinsicStroke) intrinsicGlyphStrokes.set(`${fontIndex}:${glyphId}`, sourceOutline.intrinsicStroke);
       // PDF's explicit stroke/fill-stroke modes and text clipping use the
       // character path, independently of the font's intrinsic PaintType2.
@@ -238,9 +263,15 @@ export function buildNativePageTextResources(
   }
 
   const fonts = byIndex as NativePdfFont[];
-  const textIndex = buildPageTextIndex(compilation, fonts, limits, options.signal);
+  const textIndex = options.omitTextIndex ? { version: 1 as const, text: "", charGlyphIndices: new Int32Array(0),
+    fallbackQuads: new Float32Array(0) } : buildPageTextIndex(compilation, fonts, limits, options.signal);
   return Object.freeze({
     ...compilation,
+    ...(approximatedGlyphs ? { diagnostics: Object.freeze([...compilation.diagnostics, {
+      code: "thumbnail.text-approximation", severity: "info" as const,
+      message: "Unreadable ordinary glyphs use compact pen-cell marks in this thumbnail.",
+      details: { glyphCount: approximatedGlyphs }
+    }]) } : {}),
     textIndex,
     intrinsicGlyphStrokes,
     fonts: {

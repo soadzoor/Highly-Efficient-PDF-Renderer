@@ -213,6 +213,15 @@ export function attachPdfWorkerRuntime(
 
       const activeSession = session;
       if (!activeSession) throw new PdfError("closed", "The PDF worker session is not open.");
+      if (request.operation === "render-thumbnail-page") {
+        const result = await activeSession.renderThumbnailPage(request.sourcePageIndex,
+          { ...request.options, signal: controller.signal });
+        controller.signal.throwIfAborted();
+        endpoint.postMessage({ type: "hepr-pdf-result", protocolVersion: PDF_WORKER_PROTOCOL_VERSION,
+          requestId: request.requestId, ok: true, operation: "render-thumbnail-page", result,
+          diagnostics: activeSession.getDiagnostics() }, collectPdfTransferables(result));
+        return;
+      }
       if (request.operation === "get-page-annotations") {
         const annotations = await activeSession.getPageAnnotations(request.sourcePageIndex, { signal: controller.signal });
         endpoint.postMessage({ type: "hepr-pdf-result", protocolVersion: PDF_WORKER_PROTOCOL_VERSION,

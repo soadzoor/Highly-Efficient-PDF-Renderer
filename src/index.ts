@@ -46,6 +46,10 @@ export interface CreateThreePdfObjectOptions extends HeprThreeObjectOptions {
 }
 
 export { buildStrokeScene } from "./strokeSceneBuilder";
+export { renderPdfThumbnail } from "./pdfThumbnail";
+export type { PdfThumbnailOptions, PdfThumbnailResult, PdfThumbnailTiming } from "./pdfThumbnail";
+export { openDocumentSession } from "./documentSession";
+export type { DocumentSession, DocumentSessionInfo, DocumentSessionOpenOptions, DocumentSessionHepOptions } from "./documentSession";
 export type { StrokeScenePoint, StrokeSceneStyle, StrokeScenePolyline } from "./strokeSceneBuilder";
 
 const LOAD_PROGRESS_SCENE_END = 0.34;

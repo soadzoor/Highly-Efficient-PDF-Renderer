@@ -6,6 +6,30 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Added
+
+- Add `renderPdfThumbnail()` for single-page PDF/HEP overviews with requested
+  pixel dimensions, transparent or colored backgrounds, cancellation, and
+  lossless WebP output by default (PNG is also available). Prepare thumbnail
+  detail before drawing, approximate unreadable ordinary text, and omit viewer
+  LOD, interaction resources and full glyph atlases. Unsupported WebP encoding
+  falls back to PNG with a diagnostic.
+- Add caller-owned `openDocumentSession()` sessions that reuse PDF parsing and
+  font programs across thumbnails and canonical HEP conversion. Cancelling a
+  thumbnail preserves the session; closing it releases parser, rendering and
+  encoding resources. Thumbnail approximations never enter full-quality HEPs.
+- Add a local browser thumbnail benchmark comparing fresh/reused sessions,
+  WebGL/Canvas2D, lossless WebP/PNG, and an interactive preparation baseline,
+  with stage timings and downloadable reports. Browser speed and visual checks
+  remain manual.
+
+### Changed
+
+- Use the shared thumbnail pipeline in native and Three Reader sidebars, with
+  direct pixels instead of an encode/decode round trip. Share active PDF parser
+  sessions, prioritize viewport work, and preserve appearance controls and
+  cancellation when thumbnails become obsolete.
+
 ## [0.1.64] - 2026-10-14
 
 ### Fixed

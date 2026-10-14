@@ -49,13 +49,13 @@ try {
   for (const base of ["/hepr-smoke/", "./"]) {
     const result = await build({ ...consumerConfig, base });
     files = new Map(result.output.map(file => [file.fileName, file]));
-    for (const prefix of ["libjpeg-turbo-", "openjpeg-", "jbig2-", "lcms-", "qcms-"]) {
+    for (const prefix of ["libjpeg-turbo-", "openjpeg-", "jbig2-", "lcms-", "qcms-", "libwebp-"]) {
       assert([...files.keys()].some(name => name.startsWith(`assets/${prefix}`) && name.endsWith(".wasm")),
         `${prefix} WASM must be emitted by the consumer`);
     }
     assert([...files.keys()].some(name => /LiberationSans-Regular-.*\.ttf$/.test(name)),
       "standard fonts must be emitted by the consumer");
-    for (const worker of ["pdfWorkerEntry", "roomDetectorWorker", "lodWorkerEntry", "rasterPreparationWorker"]) {
+    for (const worker of ["pdfWorkerEntry", "roomDetectorWorker", "lodWorkerEntry", "rasterPreparationWorker", "thumbnailEncodeWorker"]) {
       assert([...files.keys()].some(name => new RegExp(`/${worker}-.*\\.js$`).test(name)),
         `${worker} must be built by the consumer`);
     }

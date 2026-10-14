@@ -6,6 +6,7 @@ import type {
   PdfDocumentInfo
 } from "../heprDocumentData";
 import type { VectorScene } from "../pdfVectorExtractor";
+import type { ThumbnailPageResult, ThumbnailRenderOptions } from "../thumbnailTypes";
 import { restoreMonochromeSceneTransfer } from "../monochromeRaster";
 import type {
   NativeVectorCompileOptions,
@@ -271,7 +272,8 @@ export async function openPdfWithWorkerEndpoint(
       hasIccTransformResolver: options.iccTransformResolver !== undefined
     }, prepared.transfer, signal);
     if (signal?.aborted) {
-      await connection.close();
+      // Failed opens cannot be reused. The catch below disposes immediately,
+      // including when abort arrives just after the worker's open response.
       throw abortedError(signal);
     }
     return new WorkerPdfSession(
@@ -293,6 +295,7 @@ class WorkerPdfSession implements NativeVectorPdfSession {
   private readonly lifetime = new AbortController();
   private operationTail: Promise<void> = Promise.resolve();
   private closePromise: Promise<void> | null = null;
+  private terminationPromise: Promise<void> | null = null;
   private removeSourceAbort: (() => void) | null = null;
   private closed = false;
 
@@ -321,6 +324,17 @@ class WorkerPdfSession implements NativeVectorPdfSession {
     try {
       release = await this.acquireOperation(signal);
       return await this.connection.getPageAnnotations(sourcePageIndex, signal);
+    } finally { release?.(); }
+  }
+
+  async renderThumbnailPage(sourcePageIndex: number,
+    options: ThumbnailRenderOptions & { signal?: AbortSignal }): Promise<ThumbnailPageResult> {
+    const signal = combineSignals(this.lifetime.signal, options.signal);
+    let release: (() => void) | null = null;
+    try {
+      release = await this.acquireOperation(signal);
+      const { signal: _signal, ...renderOptions } = options;
+      return await this.connection.renderThumbnailPage(sourcePageIndex, renderOptions, signal);
     } finally { release?.(); }
   }
 
@@ -451,6 +465,21 @@ class WorkerPdfSession implements NativeVectorPdfSession {
     return this.closePromise;
   }
 
+  /** An owning document session can discard this worker immediately. Waiting
+   * for a close response would leave a cancelled synchronous codec running. */
+  terminate(): Promise<void> {
+    if (this.terminationPromise) return this.terminationPromise;
+    this.closed = true;
+    this.removeSourceAbort?.();
+    this.removeSourceAbort = null;
+    this.lifetime.abort(new PdfError("closed", "The PDF worker session is closed."));
+    // Disposal rejects a close request already in flight. Drain that promise
+    // too, including source-triggered closure, while returning termination.
+    void this.closePromise?.catch(() => undefined);
+    this.closePromise = this.terminationPromise = this.connection.dispose();
+    return this.terminationPromise;
+  }
+
   private async acquireOperation(signal?: AbortSignal): Promise<() => void> {
     this.assertOpen();
     if (signal?.aborted) throw abortedError(signal);
@@ -557,6 +586,14 @@ class PdfWorkerConnection {
       Extract<PdfWorkerSuccess, { operation: "get-page-annotations" }>;
     this.replaceDiagnostics(response.diagnostics);
     return response.annotations;
+  }
+
+  async renderThumbnailPage(sourcePageIndex: number, options: ThumbnailRenderOptions,
+    signal?: AbortSignal): Promise<ThumbnailPageResult> {
+    const response = await this.request({ operation: "render-thumbnail-page", sourcePageIndex, options }, [], signal) as
+      Extract<PdfWorkerSuccess, { operation: "render-thumbnail-page" }>;
+    this.replaceDiagnostics(response.diagnostics);
+    return response.result;
   }
 
   compilePage(
@@ -1011,6 +1048,8 @@ class PdfWorkerConnection {
 }
 
 type RequestBody =
+  | Omit<Extract<PdfWorkerRequest, { operation: "render-thumbnail-page" }>,
+      "type" | "protocolVersion" | "requestId">
   | Omit<Extract<PdfWorkerRequest, { operation: "get-page-annotations" }>,
       "type" | "protocolVersion" | "requestId">
   | Omit<Extract<PdfWorkerRequest, { operation: "open" }>,

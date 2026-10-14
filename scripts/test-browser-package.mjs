@@ -65,6 +65,8 @@ assert.ok(entry?.exports.includes("pdfObjectGenerator"));
 assert.ok(entry.exports.includes("buildStrokeScene"));
 assert.ok(entry.exports.includes("createThreePdfObject"));
 assert.ok(entry.exports.includes("detectRooms"), "the root package must retain its room detection API");
+assert.ok(entry.exports.includes("renderPdfThumbnail"), "the root package must retain its thumbnail API");
+assert.ok(entry.exports.includes("openDocumentSession"), "the root package must retain its reusable document API");
 
 const chunksByName = new Map(chunks.map(chunk => [chunk.fileName, chunk]));
 function collectReachableChunks(includeDynamicImports, rootChunk = entry) {
@@ -90,6 +92,22 @@ const staticChunks = collectReachableChunks(false);
 const allReachableChunks = collectReachableChunks(true);
 const workerStaticChunks = collectReachableChunks(false, pdfWorkerEntry);
 const workerReachableChunks = collectReachableChunks(true, pdfWorkerEntry);
+// The pixel codec can be coalesced into the encoder chunk or worker asset.
+// Check the dynamic implementation boundaries, not a forced codec chunk name.
+for (const moduleName of ["documentSessionRuntime", "thumbnailEncoder", "thumbnailRenderer"]) {
+  const implementationChunks = chunks.filter(chunk => Object.keys(chunk.modules).some(id =>
+    new RegExp(`/${moduleName}(?:-[^/]+)?\\.js$`).test(id)));
+  assert(implementationChunks.length > 0, `${moduleName} remains reachable as a lazy implementation`);
+  for (const chunk of implementationChunks) {
+    assert(!staticChunks.has(chunk.fileName), `${moduleName} must stay out of the initial root module graph`);
+    assert(!workerStaticChunks.has(chunk.fileName), `${moduleName} must stay out of the initial parser worker graph`);
+    assert(allReachableChunks.has(chunk.fileName) || workerReachableChunks.has(chunk.fileName),
+      `${moduleName} must remain reachable through a dynamic implementation`);
+  }
+}
+for (const name of [...staticChunks, ...workerStaticChunks]) {
+  assert(!chunksByName.get(name).code.includes("libwebp-3757b8a"), "thumbnail codec assets must stay out of both initial module graphs");
+}
 for (const engine of ["Lcms", "Qcms"]) {
   const engineChunks = chunks.filter(chunk => Object.keys(chunk.modules).some(id =>
     new RegExp(`/nativeIcc${engine}(?:-[^/]+)?\\.js$`).test(id)
@@ -130,12 +148,14 @@ console.log(`All-exports entry: ${size(entry.code)}`);
 console.log(`All ${chunks.length} JavaScript chunks: ${(chunks.reduce((sum, file) => sum + Buffer.byteLength(file.code), 0) / 1000).toFixed(1)} kB / ${(chunks.reduce((sum, file) => sum + gzipSync(file.code).length, 0) / 1000).toFixed(1)} kB gzip (sum per chunk).`);
 console.log("Worker files and fonts are separate assets, excluded from these JavaScript totals.");
 const assets = (await readdir(`${libDir}assets`)).sort();
-for (const engine of ["libjpeg-turbo", "lcms", "qcms", "openjpeg", "jbig2"]) {
+for (const engine of ["libjpeg-turbo", "lcms", "qcms", "openjpeg", "jbig2", "libwebp"]) {
   assert(assets.some(name => new RegExp(`^${engine}-.*\\.wasm$`).test(name)),
     `${engine} must ship as a package-relative WASM asset`);
 }
 assert.ok(assets.some(name => /^roomDetectorWorker-.*\.js$/.test(name)),
   "the package must ship the browser room detector worker");
+assert.ok(assets.some(name => /^thumbnailEncodeWorker-.*\.js$/.test(name)),
+  "the package must ship the cancellable thumbnail encoder worker");
 for (const name of assets) {
   if (/^(?:pdfWorkerEntry|roomDetectorWorker)-.*\.js$/.test(name)) {
     const source = await readFile(`${libDir}assets/${name}`);

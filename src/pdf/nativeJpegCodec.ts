@@ -478,7 +478,10 @@ function chooseJpegReduction(
     ? request.maxReduction ?? 1
     : 1;
   let firstError: unknown;
-  for (let reduction = 1; reduction <= maxReduction; reduction *= 2) {
+  let initialReduction = 1;
+  if (request.previewMaxDimension !== undefined) while (initialReduction * 2 <= maxReduction &&
+      Math.max(request.width, request.height) / (initialReduction * 2) >= request.previewMaxDimension) initialReduction *= 2;
+  for (let reduction = initialReduction; reduction <= maxReduction; reduction *= 2) {
     try {
       validateAggregateWorkingSet(request, decodePlan, limit, reduction);
       return reduction;

@@ -6,6 +6,8 @@ import type { NativeVectorPdfSession } from "./pdfSession";
 import { automaticRasterMemoryBudget } from "./rasterMemoryBudget";
 import { buildRasterScenePreview, sceneCpuBytes } from "./pageRasterPreview";
 import type { RasterResolutionView } from "./rasterResolution";
+import type { ThumbnailPixels, ThumbnailRenderOptions } from "./thumbnailTypes";
+import type { ThumbnailSceneRenderer } from "./thumbnailRenderer";
 
 const PREVIEW_DIMENSION = 96;
 const MAX_DETAILED_PAGES = 12;
@@ -21,6 +23,14 @@ interface PagePreviewRequest {
   index: number;
   maximumDimension: number;
   resolve: (scene: VectorScene) => void;
+  reject: (error: unknown) => void;
+  cleanup: () => void;
+}
+
+interface PageThumbnailRequest {
+  index: number;
+  options: ThumbnailRenderOptions;
+  resolve: (pixels: ThumbnailPixels) => void;
   reject: (error: unknown) => void;
   cleanup: () => void;
 }
@@ -55,6 +65,10 @@ export class PdfPageDemandLoader {
   private completeOperation: AbortController | null = null;
   private readonly pagePreviewRequests = new Set<PagePreviewRequest>();
   private activePagePreview: PagePreviewRequest | null = null;
+  private readonly thumbnailRequests = new Set<PageThumbnailRequest>();
+  private activeThumbnail: PageThumbnailRequest | null = null;
+  private thumbnailRenderer: ThumbnailSceneRenderer | undefined;
+  private thumbnailCanvas2dOnly = false;
   private readonly session: NativeVectorPdfSession;
   private onChange: () => void | Promise<void>;
   private onTiming: ((name: string, durationMs: number) => void) | null = null;
@@ -119,6 +133,26 @@ export class PdfPageDemandLoader {
       options.signal?.addEventListener("abort", abort, { once: true });
       if (options.signal?.aborted) abort();
       else this.start();
+    });
+  }
+
+  /** Independent static snapshots, sharing this loader's parser and viewport priority. */
+  async getPageThumbnail(index: number, options: ThumbnailRenderOptions & { signal?: AbortSignal }): Promise<ThumbnailPixels> {
+    options.signal?.throwIfAborted();
+    if (this.closed) throw new Error("The PDF page loader is closed.");
+    if (!Number.isInteger(index) || index < 0 || index >= this.pageCount) throw new RangeError("Invalid page index.");
+    if (!Number.isSafeInteger(options.maxDimension) || options.maxDimension < 1) throw new RangeError("Invalid thumbnail dimension.");
+    return new Promise<ThumbnailPixels>((resolve, reject) => {
+      const abort = (): void => {
+        this.thumbnailRequests.delete(request); request.cleanup();
+        if (this.activeThumbnail === request) this.operation?.abort(options.signal?.reason);
+        reject(options.signal?.reason ?? new DOMException("Thumbnail cancelled.", "AbortError"));
+      };
+      const request: PageThumbnailRequest = { index, options, resolve, reject,
+        cleanup: () => options.signal?.removeEventListener("abort", abort) };
+      this.thumbnailRequests.add(request);
+      options.signal?.addEventListener("abort", abort, { once: true });
+      if (options.signal?.aborted) abort(); else this.start();
     });
   }
 
@@ -238,7 +272,7 @@ export class PdfPageDemandLoader {
     }
     this.detailCandidates = visible.filter(page => page.detail).map(page => page.index);
     this.refreshDetailDemand();
-    if (this.activePagePreview && this.next()) this.operation?.abort();
+    if ((this.activePagePreview || this.activeThumbnail) && this.next(false)) this.operation?.abort();
     this.start();
   }
 
@@ -352,9 +386,14 @@ export class PdfPageDemandLoader {
       request.reject(new DOMException("PDF page loader closed.", "AbortError"));
     }
     this.pagePreviewRequests.clear();
+    for (const request of this.thumbnailRequests) {
+      request.cleanup(); request.reject(new DOMException("PDF page loader closed.", "AbortError"));
+    }
+    this.thumbnailRequests.clear();
     try { await this.session.close(); }
     finally { await this.running; this.previews.clear(); this.detailed.clear(); this.overviewKinds.clear();
-      this.displayPages.clear(); this.boundDisplayPages = null; this.boundDisplayScene = null; this.onTiming = null; }
+      this.displayPages.clear(); this.boundDisplayPages = null; this.boundDisplayScene = null; this.onTiming = null;
+      this.thumbnailRenderer?.close(); this.thumbnailRenderer = undefined; }
   }
 
   /** Test/host synchronization without polling or forcing additional pages. */
@@ -369,20 +408,20 @@ export class PdfPageDemandLoader {
     if (this.running || this.closed || this.paused || this.completeOperation) return;
     this.running = this.pump().finally(() => {
       this.running = null;
-      if (this.next() || this.pagePreviewRequests.size) this.start();
+      if (this.next() || this.pagePreviewRequests.size || this.thumbnailRequests.size) this.start();
     });
     // A host callback failure is reported, never an unhandled promise rejection.
     void this.running.catch(error => console.warn("[HEPR] Demand-driven PDF page update failed.", error));
   }
 
-  private next(): { index: number; detail: boolean } | null {
+  private next(includeBackground = true): { index: number; detail: boolean } | null {
     for (const index of this.wantedDetail) {
       if (this.previews.has(index) && !this.detailed.has(index) && !this.attempted.has(index) && !this.failed.has(index)) return { index, detail: true };
     }
     for (const index of this.wanted) {
       if (!this.previews.has(index) && !this.failed.has(index) && !this.evictedPreviews.has(index)) return { index, detail: false };
     }
-    if (this.allPreviews) for (let index = 0; index < this.pageCount; index++) {
+    if (includeBackground && this.allPreviews) for (let index = 0; index < this.pageCount; index++) {
       if (!this.previews.has(index) && !this.failed.has(index) && !this.evictedPreviews.has(index)) return { index, detail: false };
     }
     return null;
@@ -390,7 +429,12 @@ export class PdfPageDemandLoader {
 
   private async pump(): Promise<void> {
     while (!this.closed && !this.paused) {
-      const request = this.next();
+      let request = this.next(false);
+      if (!request && this.thumbnailRequests.size) {
+        await this.loadThumbnail(this.thumbnailRequests.values().next().value!);
+        continue;
+      }
+      request ??= this.next();
       if (!request) {
         const preview = this.pagePreviewRequests.values().next().value;
         if (!preview) return;
@@ -474,6 +518,61 @@ export class PdfPageDemandLoader {
       this.activePagePreview = null;
     }
     await new Promise<void>(resolve => setTimeout(resolve, 0));
+  }
+
+  private async loadThumbnail(request: PageThumbnailRequest): Promise<void> {
+    const operation = this.operation = new AbortController();
+    this.activeThumbnail = request;
+    try {
+      const cached = this.pagePreviewSource(request.index);
+      let pixels: ThumbnailPixels | undefined;
+      const renderScene = async (scene: VectorScene): Promise<ThumbnailPixels> => {
+        const { ThumbnailSceneRenderer } = await import("./thumbnailRenderer");
+        operation.signal.throwIfAborted(); this.thumbnailRenderer ??= new ThumbnailSceneRenderer();
+        return this.thumbnailRenderer.render(scene, request.options, operation.signal);
+      };
+      const renderPage = async (result: Extract<import("./thumbnailTypes").ThumbnailPageResult, { page: unknown }>): Promise<ThumbnailPixels> => {
+        const { renderThumbnailPageCanvas2d } = await import("./thumbnailCanvas2d");
+        operation.signal.throwIfAborted();
+        return renderThumbnailPageCanvas2d(result.page, request.options, operation.signal, result.limits, this.options.onDiagnostic);
+      };
+      const capabilityFallback = (error: unknown): void => {
+        operation.signal.throwIfAborted();
+        if (request.options.backend !== "auto" || (error as { code?: string })?.code !== "thumbnail.webgl-unavailable") throw error;
+        this.thumbnailCanvas2dOnly = true;
+      };
+      if (cached && request.options.backend !== "canvas2d" && !this.thumbnailCanvas2dOnly) {
+        try { pixels = await renderScene(cached); } catch (error) { capabilityFallback(error); }
+      }
+      if (!pixels) {
+        let result = await this.session.renderThumbnailPage(this.sourcePages[request.index], {
+          ...request.options, backend: this.thumbnailCanvas2dOnly && request.options.backend === "auto" ? "canvas2d" : request.options.backend,
+          ocrTextOnly: this.options.ocrTextOnly, signal: operation.signal
+        });
+        if ("page" in result && !("scene" in result)) pixels = await renderPage(result);
+        else if ("scene" in result) {
+          try { pixels = await renderScene(result.scene); }
+          catch (error) {
+            capabilityFallback(error);
+            result = result.page ? { page: result.page, limits: result.limits, timings: result.timings }
+              : await this.session.renderThumbnailPage(this.sourcePages[request.index], {
+              ...request.options, backend: "canvas2d", ocrTextOnly: this.options.ocrTextOnly, signal: operation.signal
+            });
+            if ("scene" in result) throw error;
+            pixels = "page" in result ? await renderPage(result) : result;
+          }
+        } else pixels = result;
+      }
+      if (operation.signal.aborted || !this.thumbnailRequests.has(request)) return;
+      this.thumbnailRequests.delete(request); request.cleanup(); request.resolve(pixels);
+    } catch (error) {
+      // Viewport preemption retries the same request after visible pages are ready.
+      if (operation.signal.aborted || !this.thumbnailRequests.has(request)) return;
+      this.thumbnailRequests.delete(request); request.cleanup(); request.reject(error);
+    } finally {
+      if (this.operation === operation) this.operation = null;
+      this.activeThumbnail = null;
+    }
   }
 
   private trim(cache: Map<number, CachedPage>, detail: boolean): void {

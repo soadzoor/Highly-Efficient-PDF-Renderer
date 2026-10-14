@@ -4,6 +4,7 @@ import type { RendererApi } from "./rendererTypes";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { RetainedPageReplay } from "./retainedPageReplay";
 import { createDefaultOptionalContentSnapshot } from "./optionalContent";
+import type { ThumbnailPixels } from "./thumbnailTypes";
 import {
   READER_ACTUAL_SIZE_ZOOM, READER_MARGIN, readerCaptureAnchor, readerContentMetrics,
   readerFitZoom, readerPageAtPoint, readerRestoreAnchor, readerScrollFromView,
@@ -22,7 +23,9 @@ export interface ReaderViewportOptions {
   layouts: readonly { value: string; label: string }[];
   onLayoutChange(layout: string): void | Promise<void>;
   onViewChange(view: ReaderView): void;
-  getPagePreviewScene(pageIndex: number, options: { maximumDimension: number; signal?: AbortSignal }): Promise<VectorScene>;
+  getPagePreviewScene?(pageIndex: number, options: { maximumDimension: number; signal?: AbortSignal }): Promise<VectorScene>;
+  getPageThumbnail?(pageIndex: number, options: { maxDimension: number; signal?: AbortSignal }): Promise<ThumbnailPixels>;
+  releaseThumbnails?(): void;
   configureThumbnailRenderer?(renderer: RendererApi, scene: VectorScene): void;
   onFind(): void;
   onSettings(): void;
@@ -233,6 +236,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     (visible ? hideToolbar : showToolbar).focus({ preventScroll: true });
   }
   function releaseScratch(): void {
+    options.releaseThumbnails?.();
     scratchRenderer?.dispose(); scratchRenderer = null;
     if (scratchCanvas) scratchCanvas.width = scratchCanvas.height = 0;
     scratchCanvas = null;
@@ -347,6 +351,19 @@ export function createReaderViewport(options: ReaderViewportOptions) {
           const ratio = window.devicePixelRatio || 1;
           const width = Math.max(1, Math.round(Number.parseFloat(box.style.width) * ratio));
           const height = Math.max(1, Math.round(Number.parseFloat(box.style.height) * ratio));
+          if (options.getPageThumbnail) {
+            const pixels = await options.getPageThumbnail(page, { maxDimension: Math.max(width, height), signal: controller.signal });
+            controller.signal.throwIfAborted();
+            if (revision !== thumbnailRevision || disposed || !thumbnailWanted.has(page)) continue;
+            const image = document.createElement("canvas"); image.width = pixels.width; image.height = pixels.height;
+            const context = image.getContext("2d");
+            if (!context) throw new Error("Page thumbnail canvas is unavailable.");
+            context.putImageData(new ImageData(new Uint8ClampedArray(pixels.rgba.buffer, pixels.rgba.byteOffset, pixels.rgba.byteLength), pixels.width, pixels.height), 0, 0);
+            box.append(image); thumbnailCanvases.set(page, image);
+            await new Promise<void>(resolve => window.setTimeout(resolve, 0));
+            continue;
+          }
+          if (!options.getPagePreviewScene) throw new Error("Page thumbnails are unavailable.");
           const scene = await options.getPagePreviewScene(page, { maximumDimension: Math.max(16, Math.min(4096, Math.max(width, height))), signal: controller.signal });
           if (controller.signal.aborted || revision !== thumbnailRevision || !thumbnailWanted.has(page)) continue;
           scratchCanvas ??= document.createElement("canvas");

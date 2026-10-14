@@ -15,6 +15,7 @@ import { createPdfLayerControls } from "./pdfLayerControls";
 import { createPdfAnnotationControls } from "./pdfAnnotationControls";
 import { waitForLoad, yieldAfterPaint, yieldForLoad } from "./loadCancellation";
 import { warmViewerRendering } from "./viewerRenderWarmup";
+import type { ThumbnailSceneRenderer } from "./thumbnailRenderer";
 
 import { WebGlFloorplanRenderer, type DrawStats, type SceneStats, type ViewState } from "./webGlFloorplanRenderer";
 import {
@@ -84,7 +85,6 @@ import { createDrawCallMeter } from "./drawCallMetrics";
 import { ScenePageViews } from "./scenePageViews";
 import { createReaderViewport, type ReaderView, type ReaderViewportSnapshot } from "./readerViewport";
 import { computeReaderPageRects, readerCaptureAnchor } from "./readerGeometry";
-import { createDefaultOptionalContentSnapshot } from "./optionalContent";
 import { buildRasterScenePreview } from "./pageRasterPreview";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#viewport");
@@ -643,35 +643,30 @@ async function createWebGpuRenderer(targetCanvas: HTMLCanvasElement): Promise<Re
 
 renderer = createWebGlRenderer(canvasElement);
 
+let readerThumbnailRenderer: ThumbnailSceneRenderer | undefined;
 readerViewport = createReaderViewport({
   getCanvas: () => canvasElement,
   layouts: [{ value: "reader", label: "Reader" }, { value: "grid", label: "Grid" }],
   onLayoutChange: changeNativeLayout,
   onViewChange: applyReaderView,
-  getPagePreviewScene: async (pageIndex, options) => {
+  getPageThumbnail: async (pageIndex, options) => {
+    const appearance = { maxDimension: options.maxDimension, backend: "auto" as const,
+      background: uiControlManager.readPageBackgroundColorInput(),
+      vectorOverride: uiControlManager.readVectorColorOverrideInput(),
+      optionalContent: nativeLoadPreparation && nativeLoadPreparation.identity !== lastLoadedSource?.bytes
+        ? undefined : layerVisibility.getOptionalContentVisibility() ?? undefined };
     const pageLoader = nativeLoadPreparation ? nativeLoadPreparation.pageLoader : activePdfPageLoader;
-    if (pageLoader) return pageLoader.getPagePreviewScene(pageIndex, options);
+    if (pageLoader) return pageLoader.getPageThumbnail(pageIndex, { ...appearance, signal: options.signal });
     const scene = nativeLoadPreparation?.scene ?? lastParsedScene;
-    if (!scene) throw new Error("No document is loaded.");
+    if (!scene) throw new DOMException("No document is loaded.", "AbortError");
     let pages = thumbnailPartitions.get(scene);
     if (!pages) { pages = new ScenePageViews(scene); thumbnailPartitions.set(scene, pages); }
+    const { ThumbnailSceneRenderer } = await import("./thumbnailRenderer");
     options.signal?.throwIfAborted();
-    return buildRasterScenePreview(pages.extract(pageIndex).scene, options.maximumDimension);
+    readerThumbnailRenderer ??= new ThumbnailSceneRenderer();
+    return readerThumbnailRenderer.render(pages.extract(pageIndex).scene, appearance, options.signal);
   },
-  configureThumbnailRenderer: (target, scene) => {
-    const background = uiControlManager.readPageBackgroundColorInput();
-    target.setPageBackgroundColor(...background);
-    target.setVectorColorOverride(...uiControlManager.readVectorColorOverrideInput());
-    const applied = nativeLoadPreparation && nativeLoadPreparation.identity !== lastLoadedSource?.bytes
-      ? null : layerVisibility.getOptionalContentVisibility();
-    if (applied && scene.optionalContent) {
-      const visible = new Map(applied.layers.map(layer => [layer.id, layer.visible]));
-      target.setOptionalContentVisibility?.(createDefaultOptionalContentSnapshot({ ...scene, optionalContent: {
-        ...scene.optionalContent,
-        groups: scene.optionalContent.groups.map(group => ({ ...group, defaultVisible: visible.get(group.id) ?? group.defaultVisible }))
-      } }));
-    }
-  },
+  releaseThumbnails: () => { readerThumbnailRenderer?.close(); readerThumbnailRenderer = undefined; },
   onFind: () => { setHudCollapsed(false); textSearchWidget.focusInput(); },
   onSettings: () => setHudCollapsed(!hudPanelElement.classList.contains("collapsed"))
 });

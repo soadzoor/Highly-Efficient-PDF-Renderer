@@ -1,0 +1,23 @@
+{
+  "upstreamRepository": "https://github.com/microsoft/playwright",
+  "upstreamRevision": "f3114b3e9f1aea9f0c123551ebf67ded08dddca2",
+  "upstreamPath": "packages/utils/webp/webp_codec.wasm",
+  "libwebpRevision": "3757b8afeb54e305eaef18502812a9a88b7ed662",
+  "libwebpVersion": "post-1.6.0",
+  "toolchain": "Emscripten 6.0.2",
+  "upstreamSha256": "164cd9583a3e4d081f767d3b41ff0a730443dc7535fcc5caff83561463384b79",
+  "runtime": {
+    "file": "libwebp-3757b8a-simd.wasm",
+    "byteLength": 565391,
+    "sha256": "069564c010f60e59f179182d84d5cb334bc42990806244ec4af15c2f142e3efa"
+  },
+  "configuration": {
+    "lossless": 1,
+    "quality": 0,
+    "method": 0,
+    "near_lossless": 100,
+    "exact": 1
+  },
+  "patch": "prepare-runtime.mjs",
+  "licenses": "webp_codec.LICENSE"
+}

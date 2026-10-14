@@ -20,6 +20,26 @@ Open the [standalone viewer](https://soadzoor.github.io/Highly-Efficient-PDF-Ren
 - **Drawing selection:** select drawing elements, inspect their geometry and layer membership, and temporarily recolor vectors.
 - **PDF layers:** toggle optional content in the main viewer, inspect layer dependencies when picking geometry, or use the shared library APIs.
 - **Reusable documents:** export `.hep` files with geometry, images, and a searchable text index to skip PDF parsing on subsequent loads.
+- **Fast thumbnails:** prepare one PDF/HEP page for its requested pixel size, with cancellation, lossless WebP output, and reusable thumbnail-to-HEP sessions.
+
+## Thumbnails
+
+```js
+import { renderPdfThumbnail } from "@soadzoor/hepr/bundler";
+
+const { blob, width, height } = await renderPdfThumbnail(file, {
+  page: 1,
+  maxDimension: 400,
+  background: "transparent",
+  signal: controller.signal,
+});
+```
+
+Thumbnails prioritize a quick overview: fine text and geometry can be approximated
+at the requested resolution. WebP encoding is lossless; full-quality HEP conversion
+keeps its normal preparation settings. Use
+[`openDocumentSession`](docs/api.md#opendocumentsessionsource-options) to share PDF
+parsing and font resources between thumbnails and HEP conversion.
 
 ## See it in action
 

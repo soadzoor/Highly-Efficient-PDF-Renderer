@@ -7,6 +7,7 @@ import type {
 } from "../heprDocumentData";
 import type { VectorScene } from "../pdfVectorExtractor";
 import type { NativeVectorCompileOptions } from "../pdfSession";
+import type { ThumbnailPageResult, ThumbnailRenderOptions } from "../thumbnailTypes";
 import {
   PdfError,
   type PdfDiagnostic,
@@ -41,7 +42,8 @@ import type {
 // Version 13 preserves vector overviews and substitutes OCR before scan decoding.
 // Version 14 requires workers to honor the embedded-font painting policy.
 // Version 15 preserves scan appearance for independent page thumbnails.
-export const PDF_WORKER_PROTOCOL_VERSION = 16 as const;
+// Version 17 adds resolution-aware snapshot preparation and worker rendering.
+export const PDF_WORKER_PROTOCOL_VERSION = 17 as const;
 
 // Thousands of tiny matrices cost far more to transfer individually than to
 // clone. This selects the cheaper transport; it does not limit response data.
@@ -119,6 +121,14 @@ export type PdfWorkerRequest =
       readonly type: "hepr-pdf-request";
       readonly protocolVersion: typeof PDF_WORKER_PROTOCOL_VERSION;
       readonly requestId: number;
+      readonly operation: "render-thumbnail-page";
+      readonly sourcePageIndex: number;
+      readonly options: ThumbnailRenderOptions;
+    }
+  | {
+      readonly type: "hepr-pdf-request";
+      readonly protocolVersion: typeof PDF_WORKER_PROTOCOL_VERSION;
+      readonly requestId: number;
       readonly operation: "get-page-annotations";
       readonly sourcePageIndex: number;
     }
@@ -170,6 +180,15 @@ export interface SerializedPdfError {
 }
 
 export type PdfWorkerSuccess =
+  | {
+      readonly type: "hepr-pdf-result";
+      readonly protocolVersion: typeof PDF_WORKER_PROTOCOL_VERSION;
+      readonly requestId: number;
+      readonly ok: true;
+      readonly operation: "render-thumbnail-page";
+      readonly result: ThumbnailPageResult;
+      readonly diagnostics: readonly PdfDiagnostic[];
+    }
   | {
       readonly type: "hepr-pdf-result";
       readonly protocolVersion: typeof PDF_WORKER_PROTOCOL_VERSION;

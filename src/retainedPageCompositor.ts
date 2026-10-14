@@ -14,7 +14,8 @@ export type NativeSelectiveRasterLayer = RasterLayer & {
 export async function renderNativeRetainedCommandSpan(
   page: HeprPageData, firstCommand: number, count: number, signal: AbortSignal,
   limits?: Readonly<PdfResourceLimits>,
-  onDiagnostic?: (diagnostic: PdfDiagnostic) => void
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void,
+  preview?: { readonly maxDimension?: number }
 ): Promise<NativeSelectiveRasterLayer | null> {
   signal.throwIfAborted();
   const commands = page.displayProgram.groups[page.displayProgram.rootGroupIndex]?.commands;
@@ -27,7 +28,7 @@ export async function renderNativeRetainedCommandSpan(
   try {
     return await renderNativeCompositeCommandSpan(page, firstCommand, firstCommand + count - 1,
       firstCommand + count - 1, signal, surfaceFactory, renderHeprPageToCanvas2d,
-      { imageSurfaces, boundSoftMasks: true, onDiagnostic }, true, limits);
+      { imageSurfaces, boundSoftMasks: true, onDiagnostic }, true, limits, preview?.maxDimension);
   } finally { imageSurfaces.dispose(); surfaceFactory.releaseAll(); }
 }
 
@@ -39,11 +40,13 @@ export async function renderNativeCompositeCommandSpan(
     readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   },
   boundCompositeWork: boolean,
-  limits?: Readonly<PdfResourceLimits>
+  limits?: Readonly<PdfResourceLimits>,
+  maxDimension?: number
 ): Promise<NativeSelectiveRasterLayer | null> {
   const rootCommands = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands;
   const commands = rootCommands.slice(first, last + 1);
-  const scale = nativeSelectiveCompositeScale(page, rootCommands, last, limits);
+  const scale = maxDimension === undefined ? nativeSelectiveCompositeScale(page, rootCommands, last, limits)
+    : maxDimension / Math.max(page.pageInfo.width, page.pageInfo.height);
   const rendered = await renderNativeCompositePixels(createSelectiveCompositePage(page, commands), {
     scale, background: null, surfaceFactory, signal
   }, renderHeprPageToCanvas2d, renderInternals);
@@ -397,7 +400,7 @@ export async function renderNativeCompositePixels(
   }
 }
 
-export async function createNativeCompositeSurfaceFactory() {
+export async function createNativeCompositeSurfaceFactory(options: { readonly domFallback?: boolean } = {}) {
   type Canvas = { width: number; height: number };
   const canvases = new Set<Canvas>();
   const retained = new Set<Canvas>();
@@ -420,36 +423,52 @@ export async function createNativeCompositeSurfaceFactory() {
     releaseScratch();
   };
   const lifetime = { releaseAll, releaseScratch, release, retain: (canvas: Canvas) => retained.add(canvas) };
-  if (typeof OffscreenCanvas === "function") {
-    return Object.assign((width: number, height: number) => {
-      const canvas = new OffscreenCanvas(width, height);
-      canvases.add(canvas);
-      const context = canvas.getContext("2d", { willReadFrequently: true });
-      if (!context) throw new PdfError("unsupported-content", "OffscreenCanvas 2D is unavailable.");
-      return { canvas, context: context as unknown as CanvasRenderingContext2D };
-    }, lifetime);
-  }
-  let module: { createCanvas?: (width: number, height: number) => HTMLCanvasElement } | null;
-  try {
-    module = loadNodeCanvas() as typeof module;
-  } catch (cause) {
-    const message = cause instanceof Error ? cause.message : "No worker Canvas2D surface is available.";
-    throw new PdfError("unsupported-content", message, {
-      cause,
-      details: { reason: "selective-composite-surface" }
+  type SurfaceCanvas = HTMLCanvasElement | OffscreenCanvas;
+  const factories: Array<(width: number, height: number) => SurfaceCanvas> = [];
+  const offscreenCanvases = new WeakSet<Canvas>();
+  if (typeof OffscreenCanvas === "function") factories.push((width, height) => {
+    const canvas = new OffscreenCanvas(width, height); offscreenCanvases.add(canvas); return canvas;
+  });
+  if (options.domFallback && typeof document !== "undefined" && typeof document.createElement === "function") factories.push((width, height) => {
+    const canvas = document.createElement("canvas"); canvas.width = width; canvas.height = height; return canvas;
+  });
+  const nodeRuntime = typeof (globalThis as { process?: { versions?: { node?: string } } }).process?.versions?.node === "string";
+  if (nodeRuntime && !factories.length) {
+    let module: { createCanvas?: (width: number, height: number) => HTMLCanvasElement } | null;
+    try {
+      module = loadNodeCanvas() as typeof module;
+      if (typeof module?.createCanvas !== "function") throw new Error("Node Canvas2D is unavailable.");
+    } catch (cause) {
+      throw new PdfError("unsupported-content", cause instanceof Error ? cause.message : "Node Canvas2D is unavailable.", {
+        cause, details: { reason: "selective-composite-surface" }
+      });
+    }
+    factories.push((width, height) => {
+      return module!.createCanvas!(width, height);
     });
   }
-  if (typeof module?.createCanvas !== "function") {
-    throw new PdfError("unsupported-content", "No worker Canvas2D surface is available.", {
-      details: { reason: "selective-composite-surface" }
-    });
-  }
+  if (!factories.length) throw new PdfError("unsupported-content", "No Canvas2D surface is available.", {
+    details: { reason: "selective-composite-surface" }
+  });
   return Object.assign((width: number, height: number) => {
-    const canvas = module.createCanvas!(width, height);
-    canvases.add(canvas);
-    const context = canvas.getContext("2d", { willReadFrequently: true });
-    if (!context) throw new PdfError("unsupported-content", "Node Canvas2D is unavailable.");
-    return { canvas, context };
+    let failure: unknown;
+    for (let index = 0; index < factories.length; index++) {
+      let canvas: SurfaceCanvas | undefined;
+      try {
+        canvas = factories[index](width, height);
+        canvases.add(canvas);
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        if (!context) throw new Error(offscreenCanvases.has(canvas) ? "OffscreenCanvas 2D is unavailable." : "Canvas2D context is unavailable.");
+        if (index > 0) factories.unshift(factories.splice(index, 1)[0]);
+        return { canvas, context: context as unknown as CanvasRenderingContext2D };
+      } catch (cause) {
+        failure = cause;
+        if (canvas) release(canvas);
+      }
+    }
+    throw new PdfError("unsupported-content", failure instanceof Error ? failure.message : "No Canvas2D surface is available.", {
+      cause: failure, details: { reason: "selective-composite-surface" }
+    });
   }, lifetime);
 }
 

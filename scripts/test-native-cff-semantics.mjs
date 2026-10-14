@@ -1180,6 +1180,26 @@ async function testCidCffOutlinesAndPdfSelection() {
   }
 }
 
+async function testCachedCffOperationSignal() {
+  const { NativePdfFontProgramCache } = await import("../src/pdf/nativeFontResources.ts");
+  const name = value => ({ kind: "name", value });
+  const dictionary = new Map([["Subtype", name("Type1")], ["BaseFont", name("FixtureCff")],
+    ["Encoding", new Map([["Differences", [65, name("A")]]])],
+    ["FontDescriptor", new Map([["Flags", 4], ["FontFile3", { kind: "stream", bytes: buildCffFixture(),
+      dictionary: new Map([["Subtype", name("Type1C")]]) }]])]]);
+  const resolver = { async resolveValue(value) { return value; }, async decodeStream(value) { return value.bytes; } };
+  const controller = new AbortController(), cache = new NativePdfFontProgramCache();
+  const font = await cache.load(dictionary, () => parseNativePdfFont(dictionary, resolver, { signal: controller.signal }));
+  controller.abort();
+  assert.equal(font.decode(Uint8Array.of(65)).width, 600,
+    "cached CFF missing-width lookup uses the current operation rather than its finished parse signal");
+  assert(font.getGlyphOutline(1).commands.length > 0);
+  const cancelled = new AbortController(); cancelled.abort();
+  assert.throws(() => font.decode(Uint8Array.of(65), 0, cancelled.signal), error => error.code === "aborted");
+  assert.throws(() => font.getGlyphOutline(1, cancelled.signal), error => error.code === "aborted");
+}
+
+await testCachedCffOperationSignal();
 testCffStructureAndType2Outlines();
 testFontMatrixNormalization();
 testBaseFontBlendIsNotMultipleMaster();

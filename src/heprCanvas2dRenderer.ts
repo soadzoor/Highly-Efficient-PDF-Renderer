@@ -180,6 +180,9 @@ export interface HeprCanvas2dTimings {
 
 /** @internal Kept separate from the rendering/public parser options. */
 export interface HeprCanvas2dRenderInternals {
+  /** Snapshot-only rounded backing dimensions, independent of canonical page geometry. */
+  readonly outputSize?: { readonly width: number; readonly height: number };
+  readonly vectorOverride?: readonly [number, number, number, number];
   readonly timings?: HeprCanvas2dTimings;
   readonly imageSurfaces?: HeprCanvas2dImageSurfaceCache;
   readonly boundSoftMasks?: boolean;
@@ -377,6 +380,7 @@ interface PatternRuntime {
 }
 
 interface InternalCanvasBackendOptions {
+  readonly vectorOverride?: readonly [number, number, number, number];
   readonly deviceMatrix: PdfMatrix;
   readonly width: number;
   readonly height: number;
@@ -443,7 +447,8 @@ export async function renderHeprPageToCanvas2d(
 ): Promise<HeprCanvas2dRenderResult> {
   const startedAt = internal.timings ? performance.now() : 0;
   const resolved = resolveOptions(options);
-  const size = computeHeprCanvas2dSize(page, resolved.scale);
+  const size = internal.outputSize ? { ...internal.outputSize, scale: resolved.scale }
+    : computeHeprCanvas2dSize(page, resolved.scale);
   assertPixelLimit(size.width, size.height, resolved.maxCanvasPixels, "output canvas");
   const surface = createSurface(
     resolved.surfaceFactory,
@@ -453,10 +458,12 @@ export async function renderHeprPageToCanvas2d(
   );
   const backend = new HeprCanvas2dBackend(page, surface, resolved, {
     width: size.width, height: size.height,
-    deviceMatrix: [size.scale, 0, 0, -size.scale, 0, size.height],
+    deviceMatrix: internal.outputSize ? [size.width / page.pageInfo.width, 0, 0,
+      -size.height / page.pageInfo.height, 0, size.height] : [size.scale, 0, 0, -size.scale, 0, size.height],
     patternRuntime: { active: new Set(), cache: new Map(), depth: 0, cells: 0, pixels: 0 },
     ownsPatternRuntime: true,
     timings: internal.timings,
+    vectorOverride: internal.vectorOverride,
     imageSurfaces: internal.imageSurfaces,
     boundSoftMasks: internal.boundSoftMasks
   });
@@ -492,6 +499,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
   private readonly localImageSurfaces = new Map<string, CachedImage>();
   private readonly diagnosedOverprintPaints = new Set<number>();
   private readonly timings: HeprCanvas2dTimings | undefined;
+  private readonly vectorOverride?: readonly [number, number, number, number];
   private readonly sharedImages: HeprCanvas2dImageSurfaceCache | undefined;
   private readonly boundSoftMasks: boolean;
   private functionEvaluator: HeprFunctionEvaluator | null = null;
@@ -510,6 +518,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
   ) {
     this.page = page;
     this.timings = internal?.timings;
+    this.vectorOverride = internal?.vectorOverride;
     this.boundSoftMasks = internal?.boundSoftMasks === true;
     this.options = isResolvedOptions(options) ? options : resolveOptions(options);
     this.sharedImages = internal?.imageSurfaces;
@@ -2812,7 +2821,12 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
       };
     }
     const colorIndex = paints.resourceIndices[index];
-    const rgb = this.readSimpleColor(colorIndex, path);
+    let rgb = this.readSimpleColor(colorIndex, path);
+    if (this.vectorOverride && !this.frames.some(frame => frame.execution.role === "soft-mask")) {
+      const [red, green, blue, amount] = this.vectorOverride;
+      rgb = [rgb[0] * (1 - amount) + red * amount, rgb[1] * (1 - amount) + green * amount,
+        rgb[2] * (1 - amount) + blue * amount];
+    }
     return {
       kind: "solid",
       css: rgbCss(rgb[0], rgb[1], rgb[2]),

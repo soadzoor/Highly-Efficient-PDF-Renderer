@@ -988,7 +988,7 @@ function buildVectorText(
       }
       const fontIndex = compilation.glyphs.fontIndices[glyph];
       const glyphId = compilation.glyphs.glyphIds[glyph];
-      const outline = paintsFill ? fonts[fontIndex].getGlyphOutline(glyphId) : undefined;
+      const outline = paintsFill ? fonts[fontIndex].getGlyphOutline(glyphId, signal) : undefined;
       if (outline?.postScriptPaints?.length || outline?.postScriptFinalState) {
         throw unsupported("PostScript glyph paints require the retained graphics renderer.",
           pageIndex, "legacy-vector-postscript-glyph");
@@ -1090,7 +1090,7 @@ function buildVectorText(
         let ink = geometryBounds ? [geometryBounds.minX, geometryBounds.minY,
           geometryBounds.maxX, geometryBounds.maxY] as const : glyphInkBounds.get(key);
         if (ink === undefined) {
-          const outline = fonts[fontIndex].getGlyphOutline(glyphId);
+          const outline = fonts[fontIndex].getGlyphOutline(glyphId, signal);
           ink = outline.commands.length === 0 ? null : outline.bounds;
           glyphInkBounds.set(key, ink);
         }
@@ -1213,7 +1213,7 @@ function deriveGlyphGeometry(
   throwIfAborted(signal);
   let outline;
   try {
-    outline = font.getGlyphOutline(glyphId);
+    outline = font.getGlyphOutline(glyphId, signal);
   } catch (error) {
     if (error instanceof PdfError) throw error;
     throw new PdfError("unsupported-font", `Unable to derive glyph outline ${glyphId}.`, {
@@ -1332,10 +1332,11 @@ export function emitCubicAsQuadratics(
   y2: number,
   x3: number,
   y3: number,
-  emit: (controlX: number, controlY: number, x: number, y: number) => void
+  emit: (controlX: number, controlY: number, x: number, y: number) => void,
+  maximumError = TEXT_CUBIC_TO_QUAD_ERROR
 ): void {
   const stack = [x0, y0, x1, y1, x2, y2, x3, y3, 0];
-  const maximumErrorSquared = TEXT_CUBIC_TO_QUAD_ERROR ** 2;
+  const maximumErrorSquared = maximumError ** 2;
   while (stack.length > 0) {
     const depth = stack.pop()!;
     const q3y = stack.pop()!;

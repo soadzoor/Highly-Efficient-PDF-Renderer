@@ -85,6 +85,8 @@ export interface NativeImageCodecRequest {
    * such a reduction as a diagnostic. Without it, output must match exactly.
    */
   readonly maxReduction?: number;
+  /** Thumbnail-only decode target; absent for canonical image preparation. */
+  readonly previewMaxDimension?: number;
 }
 
 /**
@@ -118,6 +120,8 @@ export type NativeImageCodecResolver = (
 ) => NativeImageCodecResult | Promise<NativeImageCodecResult>;
 
 export interface NativePdfImageOptions {
+  /** Thumbnail-only preparation; canonical registries never reduce their pixels. */
+  readonly previewMaxDimension?: number;
   /**
    * `request` preserves payloads for external codecs; `error` fails instead.
    * Fully supported CCITT payloads are always decoded by the native kernel.
@@ -152,6 +156,40 @@ export interface NativePdfImageDescription {
   readonly matte: readonly number[];
   readonly data: Uint8Array;
   readonly codecRequest: Readonly<NativeImageCodecRequest> | null;
+}
+
+/** Area-average raw samples before building thumbnail stores, without expanding packed scans. */
+export function reduceNativeThumbnailImage(record: NativePdfImageDescription, maximumDimension: number,
+  signal?: AbortSignal): NativePdfImageDescription {
+  const scale = Math.min(1, maximumDimension / Math.max(record.width, record.height));
+  if (scale === 1 || (record.format !== HEPR_IMAGE_FORMAT.Gray1 && record.format !== HEPR_IMAGE_FORMAT.Gray8 && record.format !== HEPR_IMAGE_FORMAT.Rgba8)) return record;
+  const width = Math.max(1, Math.round(record.width * scale)), height = Math.max(1, Math.round(record.height * scale));
+  const rgba = record.format === HEPR_IMAGE_FORMAT.Rgba8, channels = rgba ? 4 : 1;
+  const data = new Uint8Array(width * height * channels);
+  const packed = record.format === HEPR_IMAGE_FORMAT.Gray1, stride = Math.ceil(record.width / 8);
+  for (let y = 0; y < height; y++) {
+    throwIfAborted(signal);
+    const top = Math.floor(y * record.height / height), bottom = Math.max(top + 1, Math.floor((y + 1) * record.height / height));
+    for (let x = 0; x < width; x++) {
+      const left = Math.floor(x * record.width / width), right = Math.max(left + 1, Math.floor((x + 1) * record.width / width));
+      let red = 0, green = 0, blue = 0, alpha = 0;
+      for (let sy = top; sy < bottom; sy++) for (let sx = left; sx < right; sx++) {
+        if (rgba) {
+          const offset = (sy * record.width + sx) * 4, a = record.data[offset + 3];
+          red += record.data[offset] * a; green += record.data[offset + 1] * a; blue += record.data[offset + 2] * a; alpha += a;
+        } else red += packed ? (record.data[sy * stride + (sx >>> 3)] >>> (7 - (sx & 7)) & 1) * 255
+          : record.data[sy * record.width + sx];
+      }
+      const offset = (y * width + x) * channels, count = (bottom - top) * (right - left);
+      data[offset] = Math.round(red / (rgba ? alpha || 1 : count));
+      if (rgba) {
+        data[offset + 1] = Math.round(green / (alpha || 1)); data[offset + 2] = Math.round(blue / (alpha || 1));
+        data[offset + 3] = Math.round(alpha / count);
+      }
+    }
+  }
+  return Object.freeze({ ...record, width, height, data, format: rgba ? HEPR_IMAGE_FORMAT.Rgba8 : HEPR_IMAGE_FORMAT.Gray8,
+    originalJpx: undefined, jbig2Symbols: undefined });
 }
 
 interface ImageParseStack {
@@ -193,6 +231,7 @@ export class NativePdfImageRegistry {
   private readonly trustedCodecResolver: boolean;
   private readonly codecDecodedByteLimit: number;
   private readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
+  private readonly previewMaxDimension?: number;
   private readonly records: NativePdfImageDescription[] = [];
   private readonly requests: NativeImageCodecRequest[] = [];
   private readonly refCache = new Map<string, Promise<number>>();
@@ -212,6 +251,7 @@ export class NativePdfImageRegistry {
     this.codecResolver = options.codecResolver;
     this.trustedCodecResolver = options.trustedCodecResolver === true;
     this.onDiagnostic = options.onDiagnostic;
+    this.previewMaxDimension = options.previewMaxDimension;
     this.codecDecodedByteLimit = Math.min(
       document.limits.maxDecodedStreamBytes,
       options.limits?.maxDecodedStreamBytes ?? document.limits.maxDecodedStreamBytes
@@ -668,7 +708,8 @@ export class NativePdfImageRegistry {
           encoded: requestEncoded,
           globals: requestGlobals,
           decodeParameters: metadata,
-          ...(reducible ? { maxReduction: MAX_CODEC_REDUCTION } : {})
+          ...(reducible ? { maxReduction: MAX_CODEC_REDUCTION,
+            ...(this.previewMaxDimension === undefined ? {} : { previewMaxDimension: this.previewMaxDimension }) } : {})
         });
         let unresolvedPayload: Uint8Array | null = null;
         if (!codecResolver) {
@@ -744,11 +785,12 @@ export class NativePdfImageRegistry {
             decodedWidth = resolved.width;
             decodedHeight = resolved.height;
             this.onDiagnostic?.({
-              code: "image.resolution-reduced",
-              severity: "warning",
+              code: this.previewMaxDimension === undefined ? "image.resolution-reduced" : "thumbnail.image-resolution-reduced",
+              severity: this.previewMaxDimension === undefined ? "warning" : "info",
               message:
-                `A ${width}x${height} ${terminalCodec} image exceeds the decode memory limit; ` +
-                `it was decoded at ${decodedWidth}x${decodedHeight}.`,
+                this.previewMaxDimension === undefined
+                  ? `A ${width}x${height} ${terminalCodec} image exceeds the decode memory limit; it was decoded at ${decodedWidth}x${decodedHeight}.`
+                  : `A ${width}x${height} ${terminalCodec} image was decoded at ${decodedWidth}x${decodedHeight} for the thumbnail.`,
               details: {
                 codec: terminalCodec,
                 width,
@@ -929,7 +971,8 @@ export class NativePdfImageRegistry {
       codecRequest
     });
     const index = this.records.length;
-    this.records.push(record);
+    this.records.push(this.previewMaxDimension === undefined || record.imageMask ? record
+      : reduceNativeThumbnailImage(record, this.previewMaxDimension, signal));
     return index;
   }
 

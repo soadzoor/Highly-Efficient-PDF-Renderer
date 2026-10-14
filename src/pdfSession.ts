@@ -75,6 +75,7 @@ import {
 } from "./densePdfPageData";
 import {
   HEPR_GLYPH_FLAG,
+  HEPR_ANNOTATION_MARKED_CONTENT_TAG,
   HEPR_DOCUMENT_DATA_VERSION,
   HEPR_PAINT_KIND,
   HEPR_VIEW_TRANSFORM_FLAG,
@@ -116,7 +117,10 @@ import {
 } from "./pdf/nativePdf";
 import type { NativeOptionalContentRegistry } from "./pdf/nativeOptionalContent";
 import type { NativeEmbeddedFontPaint, NativeMissingFontResolver, NativeGlyphPostScriptPaint } from "./pdf/nativeFont";
-import { NativePageFontRegistry } from "./pdf/nativeFontResources";
+import { NativePageFontRegistry, NativePdfFontProgramCache } from "./pdf/nativeFontResources";
+import { thumbnailSize, type ThumbnailPageResult, type ThumbnailRenderOptions } from "./thumbnailTypes";
+import { createDefaultOptionalContentSnapshot } from "./optionalContent";
+import { createEmptyVectorScene } from "./emptyVectorScene";
 import {
   NativeTextCompiler,
   type NativeTextCompilation,
@@ -221,6 +225,9 @@ export interface PdfSession {
 
 /** @internal Native parser output that targets the established renderer ABI. */
 export interface NativeVectorPdfSession extends PdfSession {
+  /** @internal Terminal owned-worker cleanup, including synchronous work. */
+  terminate?(): Promise<void>;
+  renderThumbnailPage(sourcePageIndex: number, options: ThumbnailRenderOptions & { signal?: AbortSignal }): Promise<ThumbnailPageResult>;
   compileVectorPage(
     sourcePageIndex: number,
     options?: NativeVectorCompileOptions
@@ -229,6 +236,10 @@ export interface NativeVectorPdfSession extends PdfSession {
 
 /** @internal Established-renderer controls which are intentionally absent from the page-native API. */
 export interface NativeVectorCompileOptions extends PdfCompileOptions {
+  /** Internal, operation-local snapshot preparation. Never used for HEP compilation. */
+  readonly thumbnailScale?: number;
+  readonly thumbnailMaxDimension?: number;
+  readonly thumbnailOmitMetadata?: boolean;
   /** Viewing approximation: draw stored text with substitute fonts and skip image decoding. */
   readonly ocrTextOnly?: boolean;
   /** Content-aware overview: preserve vectors, use OCR for scans, bound scans without OCR. */
@@ -451,6 +462,8 @@ class NativePdfSession implements NativeVectorPdfSession {
   private readonly diagnostics: PdfDiagnostic[];
   private readonly diagnosticKeys = new Set<string>();
   private readonly document: NativePdfDocument;
+  private readonly fontPrograms = new NativePdfFontProgramCache();
+  private thumbnailRenderer: import("./thumbnailRenderer").ThumbnailSceneRenderer | null = null;
   private readonly formRegistry: NativePdfFormAppearanceRegistry;
   private readonly annotationMetadata: NativePdfAnnotationMetadataRegistry;
   private readonly structure: NativePdfStructureTree;
@@ -620,6 +633,107 @@ class NativePdfSession implements NativeVectorPdfSession {
     }
   }
 
+  async renderThumbnailPage(sourcePageIndex: number,
+    options: ThumbnailRenderOptions & { signal?: AbortSignal }): Promise<ThumbnailPageResult> {
+    const operation = new AbortController();
+    const signal = combineSignals(this.lifetime.signal, operation.signal, options.signal);
+    let release: (() => void) | null = null;
+    try {
+      release = await this.acquireOperation(signal);
+      this.document.getPage(sourcePageIndex);
+      const prepareStarted = performance.now();
+      const size = thumbnailSize(this.info.pages[sourcePageIndex].width, this.info.pages[sourcePageIndex].height, options.maxDimension);
+      const compileOptions: NativeVectorCompileOptions = { signal, optimization: "none", enableSegmentMerge: false,
+        enableInvisibleCull: false, thumbnailScale: size.scale, thumbnailMaxDimension: options.maxDimension,
+        thumbnailOmitMetadata: true, retainOptionalContent: options.optionalContent !== undefined };
+      if (options.ocrTextOnly) {
+        const { compileNativeOcrTextPage } = await import("./pdf/nativeOcrText");
+        const scene = await compileNativeOcrTextPage(this.document, sourcePageIndex, compileOptions, signal,
+          this.missingFontResolver, this.optionalContent, diagnostic => this.appendDiagnostics([diagnostic]));
+        const prepareMs = performance.now() - prepareStarted;
+        const { ThumbnailSceneRenderer } = await import("./thumbnailRenderer");
+        this.thumbnailRenderer ??= new ThumbnailSceneRenderer();
+        try {
+          const result = await this.thumbnailRenderer.render(scene, options, signal);
+          return { ...result, timings: [{ stage: "prepare", durationMs: prepareMs }, ...(result.timings ?? [])] };
+        } catch (error) {
+          signal.throwIfAborted();
+          if ((error as { code?: string })?.code === "thumbnail.webgl-unavailable") {
+            return { scene, timings: [{ stage: "prepare", durationMs: prepareMs }] };
+          }
+          throw error;
+        }
+      }
+      let page = await this.compilePageUnlocked(sourcePageIndex, compileOptions, signal);
+      const canvasLimits = { maxImagePixels: this.document.limits.maxImagePixels,
+        maxDecodedStreamBytes: this.document.limits.maxDecodedStreamBytes };
+      if (options.optionalContent) {
+        const hiddenAnnotations = new Set(options.optionalContent.layers
+          .filter(layer => !layer.visible && layer.id.startsWith("annotation:")).map(layer => layer.id.slice("annotation:".length)));
+        if (hiddenAnnotations.size) {
+          const keep = (command: HeprDisplayCommand) => page.stores.markedContent.tags[command.markedContentIndex] !== HEPR_ANNOTATION_MARKED_CONTENT_TAG ||
+            !hiddenAnnotations.has(page.stores.markedContent.propertyNames[command.markedContentIndex] ?? "");
+          page = { ...page, displayProgram: { ...page.displayProgram,
+            groups: page.displayProgram.groups.map(group => ({ ...group, commands: group.commands.filter(keep) })),
+            programs: page.displayProgram.programs.map(program => ({ ...program, commands: program.commands.filter(keep) })) } };
+        }
+        const data = await this.optionalContent.sceneData(signal);
+        if (data) {
+          const values = new Map(options.optionalContent.layers.map(layer => [layer.id, layer.visible]));
+          const visibility = createDefaultOptionalContentSnapshot({ ...createEmptyVectorScene(), optionalContent: { ...data,
+            groups: data.groups.map(group => ({ ...group, defaultVisible: values.get(group.id) ?? group.defaultVisible })) } });
+          page = { ...page, stores: { ...page.stores, optionalContent: { ...page.stores.optionalContent,
+            defaultVisible: visibility.conditions.slice(0, page.stores.optionalContent.defaultVisible.length) } } };
+        }
+      }
+      if (options.backend !== "canvas2d") {
+        let preparedScene: VectorScene | undefined;
+        let prepareMs = 0;
+        try {
+          const scene = await lowerRetainedPageToVectorScene(page, { signal,
+            curveTolerance: 1 / size.scale, imageMaxDimension: options.maxDimension,
+            omitMetadata: true, defaultVisibilityOnly: true,
+            maxPrimitives: this.document.limits.maxPathsPerPage,
+            maxCoordinates: this.document.limits.maxPathCoordinatesPerPage,
+            onDiagnostic: diagnostic => this.appendDiagnostics([diagnostic]) });
+          preparedScene = scene;
+          prepareMs = performance.now() - prepareStarted;
+          const { ThumbnailSceneRenderer } = await import("./thumbnailRenderer");
+          this.thumbnailRenderer ??= new ThumbnailSceneRenderer();
+          const result = await this.thumbnailRenderer.render(scene, options, signal);
+          return { ...result, timings: [{ stage: "prepare", durationMs: prepareMs }, ...(result.timings ?? [])] };
+        } catch (error) {
+          signal.throwIfAborted();
+          const nodeRuntime = typeof (globalThis as { process?: { versions?: { node?: string } } }).process?.versions?.node === "string";
+          if (!nodeRuntime && preparedScene && (error as { code?: string })?.code === "thumbnail.webgl-unavailable") {
+            return { scene: preparedScene, ...(options.backend === "auto" ? { page, limits: canvasLimits } : {}),
+              timings: [{ stage: "prepare", durationMs: prepareMs }] };
+          }
+          if (options.backend === "webgl") throw error;
+          this.appendDiagnostics([{ code: "thumbnail.canvas2d-fallback", severity: "info", pageIndex: sourcePageIndex,
+            message: "This thumbnail uses the retained Canvas2D compatibility renderer.",
+            details: { reason: error instanceof Error ? error.message : String(error) } }]);
+        }
+      }
+      const prepareMs = performance.now() - prepareStarted;
+      try {
+        const { renderThumbnailPageCanvas2d } = await import("./thumbnailCanvas2d");
+        const pixels = await renderThumbnailPageCanvas2d(page, options, signal, canvasLimits,
+          diagnostic => this.appendDiagnostics([diagnostic]));
+        return { ...pixels, timings: [{ stage: "prepare", durationMs: prepareMs }, ...(pixels.timings ?? [])] };
+      } catch (error) {
+        signal.throwIfAborted();
+        const nodeRuntime = typeof (globalThis as { process?: { versions?: { node?: string } } }).process?.versions?.node === "string";
+        if (!nodeRuntime && typeof document === "undefined" && error instanceof PdfError &&
+            error.details?.reason === "selective-composite-surface") {
+          return { page, limits: canvasLimits, timings: [{ stage: "prepare", durationMs: prepareMs }] };
+        }
+        throw error;
+      }
+    } catch (error) { throw normalizeAbortError(error, signal); }
+    finally { operation.abort(new PdfError("aborted", "The PDF thumbnail operation ended.")); release?.(); }
+  }
+
   /**
    * Toggleable layers also compile content that is hidden by default. When only
    * that content is unusable, open the page in its default view without layer
@@ -783,6 +897,8 @@ class NativePdfSession implements NativeVectorPdfSession {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
     this.lifetime.abort(new PdfError("closed", "The PDF session is closed."));
+    this.thumbnailRenderer?.close(); this.thumbnailRenderer = null;
+    this.fontPrograms.clear();
     this.closePromise = this.document.close();
     return this.closePromise;
   }
@@ -798,7 +914,8 @@ class NativePdfSession implements NativeVectorPdfSession {
     this.assertOpen();
     signal.throwIfAborted();
     try {
-      const annotations = await this.annotationMetadata.getPageAnnotations(sourcePageIndex, signal);
+      const annotations = (options as NativeVectorCompileOptions).thumbnailOmitMetadata ? []
+        : await this.annotationMetadata.getPageAnnotations(sourcePageIndex, signal);
       const initialFonts = reuse?.prepared?.fontRegistry.resources.length ?? 0;
       const initialImages = reuse?.prepared?.imageResources.registry.size ?? 0;
       const {
@@ -893,6 +1010,8 @@ class NativePdfSession implements NativeVectorPdfSession {
               maxPaths: options.limits?.maxPathsPerPage ??
                 this.document.limits.maxPathsPerPage,
               type3ProgramIndices: compiledType3.fontGlyphProgramIndices,
+              previewScale: (options as NativeVectorCompileOptions).thumbnailScale,
+              omitTextIndex: (options as NativeVectorCompileOptions).thumbnailOmitMetadata,
               signal
             }
           )
@@ -945,7 +1064,7 @@ class NativePdfSession implements NativeVectorPdfSession {
         optionalContent: buildOptionalContentStore(this.optionalContent),
         limits: densePathCompileLimits(this.document, options)
       });
-      const invocationText = text
+      const invocationText = text && !(options as NativeVectorCompileOptions).thumbnailOmitMetadata
         ? buildInvocationOrderedTextIndex(
             compiled,
             compositingPrograms.forms,
@@ -1503,7 +1622,8 @@ class NativePdfSession implements NativeVectorPdfSession {
       sourcePageIndex,
       this.missingFontResolver,
       type3Registry,
-      this.embeddedFontPaint
+      this.embeddedFontPaint,
+      this.fontPrograms
     );
     const fontResources = await fontRegistry.loadScope(
       resources,
@@ -1524,7 +1644,8 @@ class NativePdfSession implements NativeVectorPdfSession {
       { iccTransformResolver: this.iccTransformResolver, iccEngine: this.iccEngine },
       (diagnostic) => this.appendDiagnostics([{ ...diagnostic, pageIndex: sourcePageIndex }]),
       options.limits,
-      (options as NativeVectorCompileOptions).retainOptionalContent === true
+      (options as NativeVectorCompileOptions).retainOptionalContent === true,
+      (options as NativeVectorCompileOptions).thumbnailMaxDimension
     );
     const xObjectReferences = imageResources.xObjectReferences;
     const pageContentSegments = await bindPreparedInlineImages(
@@ -1644,7 +1765,8 @@ class NativePdfSession implements NativeVectorPdfSession {
       sourcePageIndex,
       this.missingFontResolver,
       new NativePdfType3Registry(this.document),
-      this.embeddedFontPaint
+      this.embeddedFontPaint,
+      this.fontPrograms
     );
     const imageResources = await loadPageImages(
       this.document,
@@ -1657,7 +1779,8 @@ class NativePdfSession implements NativeVectorPdfSession {
       { iccTransformResolver: this.iccTransformResolver, iccEngine: this.iccEngine },
       (diagnostic) => this.appendDiagnostics([{ ...diagnostic, pageIndex: sourcePageIndex }]),
       options.limits,
-      retainOptionalContent
+      retainOptionalContent,
+      (options as NativeVectorCompileOptions).thumbnailMaxDimension
     );
     // Forms join the graph as the content first names them; annotation
     // appearances follow once the content is compiled, as in preparation.
@@ -4434,7 +4557,7 @@ function assertVectorFormTextWithinClip(
     }
     for (let glyph = run.first; glyph < run.first + run.count; glyph += 1) {
       const font = fonts[text.glyphs.fontIndices[glyph]]?.font;
-      const outline = font?.getGlyphOutline(text.glyphs.glyphIds[glyph]);
+      const outline = font?.getGlyphOutline(text.glyphs.glyphIds[glyph], signal);
       if (!outline || outline.commands.length === 0) continue;
       const transformIndex = text.glyphs.transformIndices[glyph] * 6;
       const transform = text.transforms.values.subarray(transformIndex, transformIndex + 6);
@@ -5469,7 +5592,8 @@ async function compileNativeType3Programs(
     glyphId: number,
     initialGraphicsState: DensePdfInitialGraphicsState
   ): Promise<{ readonly index: number; readonly includesImplicitFill: boolean } | null> => {
-    const outline = resource.font.getGlyphOutline(glyphId);
+    if ((options as NativeVectorCompileOptions).thumbnailScale !== undefined && resource.font.sfnt?.outlineFormat === "glyf") return null;
+    const outline = resource.font.getGlyphOutline(glyphId, signal);
     const finalState = outline.postScriptFinalState;
     if (!outline.postScriptPaints?.length && !finalState) return null;
     const definitionKey = `font-postscript:${resource.fontIndex}:${glyphId}|${type3SpecializationKey(initialGraphicsState)}`;
@@ -7167,7 +7291,8 @@ async function loadPageImages(
   iccOptions: PdfIccOptions = {},
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void,
   limits?: Partial<PdfResourceLimits>,
-  retainOptionalContent = false
+  retainOptionalContent = false,
+  previewMaxDimension?: number
 ): Promise<LoadedPageImages> {
   const colorSpaceValue = resources.get("ColorSpace");
   const colorSpaces = colorSpaceValue === undefined || colorSpaceValue === null
@@ -7248,6 +7373,7 @@ async function loadPageImages(
     codecPolicy: "request",
     codecResolver: imageCodecResolver ?? createBundledImageCodecResolver(codecDecodedByteLimit),
     trustedCodecResolver: usesBundledCodec,
+    previewMaxDimension,
     limits,
     onDiagnostic
   });

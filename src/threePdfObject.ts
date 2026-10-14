@@ -870,6 +870,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   readonly sourceOptions: LoadedPdfScene["sourceOptions"];
   private readonly pageDemand: PdfPageDemandLoader | undefined;
   private previewPagePartition: ScenePageViews | null = null;
+  private thumbnailSceneRenderer: import("./thumbnailRenderer").ThumbnailSceneRenderer | undefined;
   private loadingAnimationActive = false;
   private demandUpdateTimer: ReturnType<typeof setTimeout> | null = null;
   private demandUpdatePending = false;
@@ -1276,6 +1277,24 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     signal.throwIfAborted();
     return scene;
   }
+
+  /** @internal Ready pixels for the shared Reader sidebar. */
+  async getPageThumbnail(index: number, options: import("./thumbnailTypes").ThumbnailRenderOptions & { signal?: AbortSignal }): Promise<import("./thumbnailTypes").ThumbnailPixels> {
+    const signal = options.signal ? AbortSignal.any([options.signal, this.pagePreparationAbort.signal]) : this.pagePreparationAbort.signal;
+    signal.throwIfAborted();
+    if (!Number.isInteger(index) || index < 0 || index >= this.pageCount) throw new RangeError("Invalid page index.");
+    if (this.pageDemand) return this.pageDemand.getPageThumbnail(index, { ...options, signal });
+    const partition = this.pagePartition?.scene === this.sceneData ? this.pagePartition
+      : this.previewPagePartition?.scene === this.sceneData ? this.previewPagePartition
+      : this.previewPagePartition = new ScenePageViews(this.sceneData);
+    const { ThumbnailSceneRenderer } = await import("./thumbnailRenderer");
+    signal.throwIfAborted();
+    this.thumbnailSceneRenderer ??= new ThumbnailSceneRenderer();
+    return this.thumbnailSceneRenderer.render(partition.extract(index).scene, options, signal);
+  }
+
+  /** @internal Release sidebar GPU resources while retaining the document. */
+  releaseThumbnailRenderer(): void { this.thumbnailSceneRenderer?.close(); this.thumbnailSceneRenderer = undefined; }
 
   /** Complete geometry for analysis/export, reusing loaded canonical pages and the active PDF session. */
   async loadCompleteScene(options: { signal?: AbortSignal; pages?: string; onProgress?: LoadProgressCallback } = {}): Promise<LoadedPdfScene["scene"]> {
@@ -2889,6 +2908,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     this.demandUpdateTimer = null; this.demandUpdatePending = false;
     void this.pageDemand?.close().catch(error => console.warn("[HEPR] PDF worker cleanup failed.", error));
     this.pagePreparationAbort.abort(new DOMException("PDF object disposed.", "AbortError"));
+    this.releaseThumbnailRenderer();
     for (const page of this.pageViews ?? []) { page.object.removeFromParent(); page.object.dispose(); }
     this.pageBatch?.removeFromParent(); this.pageBatch?.dispose(); this.pageBatch = null; this.pageBatchActive = false;
     this.pageTransforms?.dispose();

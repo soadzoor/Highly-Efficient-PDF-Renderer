@@ -72,7 +72,7 @@ export function buildNativeVectorTextStrokes(
       const fontIndex = text.glyphs.fontIndices[glyph], glyphId = text.glyphs.glyphIds[glyph];
       const transform = text.glyphs.transformIndices[glyph] * 6;
       const glyphPlacement = text.transforms.values.subarray(transform, transform + 6);
-      const sourceOutline = fonts[fontIndex].getGlyphOutline(glyphId);
+      const sourceOutline = fonts[fontIndex].getGlyphOutline(glyphId, signal);
       const intrinsic = sourceOutline.intrinsicStroke;
       const intrinsicHairline = !externalStroke && fontPaint && intrinsic?.width === 0 && sidecar.glyphRunMeta[run * 3 + 2] === 0;
       if (!externalStroke && !intrinsicHairline) continue;

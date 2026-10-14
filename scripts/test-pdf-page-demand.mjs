@@ -47,6 +47,36 @@ try {
   };
 
   {
+    const f = fixture(3), options = { maxDimension: 144, background: [1,1,1,1], backend: "canvas2d" };
+    let entered, interrupt = true;
+    const started = new Promise(resolve => { entered = resolve; });
+    f.session.renderThumbnailPage = async (index, options) => {
+      f.calls.push({ index, thumbnail: true, signal: options.signal });
+      if (interrupt) {
+        interrupt = false; entered();
+        await new Promise((_, reject) => options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true }));
+      }
+      options.signal.throwIfAborted();
+      return { width: 1, height: 1, rgba: Uint8Array.of(0,0,0,255) };
+    };
+    const thumbnail = f.loader.getPageThumbnail(2, options);
+    await started;
+    f.loader.update(baseView, f.rectangles);
+    assert.equal((await thumbnail).rgba[3], 255);
+    await f.loader.whenIdle();
+    assert.deepEqual(f.calls.map(call => [call.index, call.thumbnail ? "thumbnail" : call.preview ? "overview" : "detail"]),
+      [[2,"thumbnail"],[0,"overview"],[0,"detail"],[2,"thumbnail"]], "viewport work preempts and resumes the shared thumbnail request");
+    assert.equal(f.loader.previewCount, 1, "independent thumbnails do not populate overview caches");
+    const count = f.calls.length;
+    await f.loader.getPageThumbnail(0, options);
+    assert.equal(f.calls.length, count + 1, "explicit Canvas2D uses PDF preparation even when a canonical GPU scene is cached");
+    const aborted = new AbortController(); aborted.abort(new Error("thumbnail hidden"));
+    await assert.rejects(f.loader.getPageThumbnail(1, { ...options, signal: aborted.signal }), /thumbnail hidden/);
+    assert.equal(f.calls.length, count + 1, "already cancelled thumbnails never enter the worker");
+    await f.loader.close();
+  }
+
+  {
     const f = fixture(3);
     const display = f.loader.pageScenes;
     const thumbnail = await f.loader.getPagePreviewScene(2, { maximumDimension: 144 });

@@ -18,7 +18,9 @@ export async function checkBundlerSizes(fixture, consumerConfig) {
     // in writer-only modules so the reader's chunk never carries them.
     ["createThreePdfObject", 310_000],
     ["pdfObjectGenerator", 310_000],
-    ["buildHep", 12_000]
+    ["buildHep", 12_000],
+    ["renderPdfThumbnail", 12_000],
+    ["openDocumentSession", 12_000]
   ]) {
     const entryPath = resolve(fixture, `size-${symbol}.js`);
     await writeFile(entryPath, `import { ${symbol} } from "@soadzoor/hepr/bundler";\nglobalThis.hepr = ${symbol};\n`);
@@ -53,9 +55,15 @@ export async function checkBundlerSizes(fixture, consumerConfig) {
       assert(!initial.some(chunk => chunk.imports.some(id => id === "three/webgpu" || id === "three/tsl")),
         `${symbol} must not eagerly import the WebGPU node graph`);
     }
-    if (["buildStrokeScene", "createSceneTextSearcher", "buildHep"].includes(symbol)) {
+    if (["buildStrokeScene", "createSceneTextSearcher", "buildHep", "renderPdfThumbnail", "openDocumentSession"].includes(symbol)) {
       assert(!initial.some(chunk => chunk.imports.some(id => id === "three" || id.startsWith("three/"))),
         `${symbol} must not import Three.js`);
+    }
+    if (["renderPdfThumbnail", "openDocumentSession"].includes(symbol)) {
+      for (const module of modules) {
+        assert(!/\/(?:documentSessionRuntime|pdfSession|nativeVectorPage|webGlFloorplanRenderer|webGpuFloorplanRenderer|thumbnailRenderer|thumbnailEncoder|thumbnailEncodingCore|hepReader|hepWriter|hepBuilderRuntime)\.js$/.test(module),
+          `${symbol} eagerly includes thumbnail preparation, rendering or encoding: ${module}`);
+      }
     }
     rows.push(`${symbol}: ${(gzip / 1000).toFixed(1)} kB gzip`);
   }

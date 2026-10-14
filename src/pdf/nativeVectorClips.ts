@@ -206,6 +206,8 @@ export class NativeVectorClipBuilder {
   // may be released as soon as their numeric clip IDs have been recorded.
   private readonly ids = new WeakMap<DensePdfTextClip, number>();
   private readonly shapes = new Map<string, number>();
+  private readonly curveTolerance: number;
+  constructor(curveTolerance = CLIP_CURVE_TOLERANCE) { this.curveTolerance = curveTolerance; }
   add(clip: DensePdfTextClip | null | undefined, signal?: AbortSignal): number | undefined {
     if (!clip) return undefined;
     throwIfAborted(signal);
@@ -226,7 +228,7 @@ export class NativeVectorClipBuilder {
   }
 
   private addNode(clip: DensePdfTextClip, parent: number, signal?: AbortSignal): number {
-    const flattened = flattenVectorClip(clip.path, CLIP_CURVE_TOLERANCE, signal);
+    const flattened = flattenVectorClip(clip.path, this.curveTolerance, signal);
     if (flattened.curves) this.approximatedCurves = true;
     if (flattened.precisionLimitedCurves) this.precisionLimitedCurves = true;
     const packedEdges = Float32Array.from(flattened.edges);

@@ -47,6 +47,97 @@ Shader comments are removed only from build output; TypeScript sources keep thei
 comments and indentation. Shader code whitespace remains intact for exact source
 patches. Vite builds requesting source maps retain the original strings and mappings.
 
+## `renderPdfThumbnail(source, options?)`
+
+Returns `Promise<{ blob, width, height }>` for a fast, single-page overview.
+Accepts the same PDF/HEP source forms as `pdfObjectGenerator`, including HEPs
+without an original PDF. This browser API constructs no Three object, interaction
+controller, or vector/text LOD hierarchy.
+
+```js
+import { renderPdfThumbnail } from "@soadzoor/hepr/bundler";
+
+const controller = new AbortController();
+const thumbnail = await renderPdfThumbnail(file, {
+  page: 1, maxDimension: 400, background: "#ffffff", signal: controller.signal,
+});
+// controller.abort() cancels when a file is removed or the wizard closes.
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `page` | `1` | One-based source page number. |
+| `maxDimension` | `400` | Longest output side in physical pixels, preserving page aspect ratio with integer rounding. No implicit device-pixel-ratio multiplier. |
+| `background` | `"#ffffff"` | `"transparent"`, short/six-digit hex, CSS named colors, packed `0xRRGGBB`, or normalized RGB tuples. |
+| `format` | `"webp"` | True lossless WebP or `"png"`. |
+| `backend` | `"auto"` | Prefer lightweight WebGL with capability/compatibility fallback, or explicitly select `"webgl"` / PDF-only `"canvas2d"` for comparisons. |
+| `signal` | — | Cancels source loading, queued work, preparation, rendering, and encoding. |
+| `onDiagnostic` | — | Receives compatibility approximations and encoding fallback diagnostics. |
+| `onTiming` | — | Receives stage names and `durationMs` for browser performance comparisons. |
+
+PDF password, ICC, font policy, codec, and parser options can also be supplied
+to the one-shot call. The requested resolution reaches preparation before rendering:
+images, curves, clipping and compatibility surfaces use thumbnail detail, and
+unreadable ordinary glyphs may use inexpensive ink marks. These approximations
+prioritize layout, orientation, dominant shapes and colors over tiny labels or
+exact fine detail. Public thumbnails retain scanned-page appearance.
+
+The parser and snapshot renderer run in a module worker when supported; browser
+capabilities determine fallback. The lossless WebP codec is a lazy package-local
+WASM asset. WebP is configured for low compression effort to prioritize latency.
+If encoding is unavailable or the requested dimensions exceed the WebP format,
+PNG is returned with `thumbnail.webp-png-fallback`; inspect `blob.type`.
+Encoding settings for HEP images are independent and unchanged.
+
+Aborting rejects with `signal.reason` (normally `AbortError`). Pending work is
+cancelled, late results are discarded, and temporary resources are released.
+The encoding worker can be terminated without discarding a reusable PDF session.
+Individual synchronous native calls, and inline WASM when workers are unavailable,
+cannot be interrupted midway; checkpoints run around them.
+
+Both Reader sidebars use the shared snapshot pipeline and direct pixels, avoiding
+an encode/decode round trip. Their existing layer, color and OCR viewing settings
+apply to previews; viewport loading takes priority over sidebar work.
+
+## `openDocumentSession(source, options?)`
+
+Returns a caller-owned `DocumentSession` for multiple thumbnails and later HEP
+conversion. It reuses one PDF document/parser and completed font programs, or
+one decoded HEP scene. Opening does not prepare viewer LOD or interactive resources.
+
+```js
+import { openDocumentSession } from "@soadzoor/hepr/bundler";
+
+const session = await openDocumentSession(file, { password });
+try {
+  const preview = await session.renderThumbnail({ maxDimension: 400, signal });
+  const hep = await session.buildHep({ signal });
+} finally {
+  await session.close();
+}
+```
+
+| Member | Behavior |
+| --- | --- |
+| `info` | Read-only source kind, page count and page dimensions. |
+| `renderThumbnail(options?)` | Same thumbnail options and result as above. |
+| `buildHep(options?)` | Canonical HEP conversion with existing page selection, compression and LOD options. Default vector/text LOD export stays enabled. |
+| `getDiagnostics()` | Copy of accumulated diagnostics. |
+| `close()` | Idempotently cancel pending work and release parser, renderer, encoder and scene resources. |
+
+Source/password, font policy, codecs, and ICC configuration are fixed at opening;
+changing them requires another session. Each operation accepts its own cancellation
+signal. Cancelling one thumbnail leaves the session usable. Operations are serialized;
+thumbnail derivatives never replace canonical HEP resources. HEP sessions re-encode
+their existing canonical scene without recovering detail absent from that HEP.
+
+For local browser timing and visual checks, open `thumbnail-benchmark.html` on the
+manually started development or production-preview server. Select a local document;
+it stays in the browser. The matrix compares cold calls and reused sessions,
+WebGL/Canvas2D, sizes, and lossless WebP/PNG. Presentation timing is an estimate;
+use a browser performance trace to inspect actual paint. No browser speed claim
+is established by the offline tests.
+
 ## `pdfObjectGenerator(source, options?, rendererType?)`
 
 Returns `Promise<HeprThreePdfObject>`. The result is a `THREE.Group` that follows

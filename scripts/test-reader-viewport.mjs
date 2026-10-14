@@ -194,7 +194,8 @@ class Element {
   releasePointerCapture(id) { this.captures.delete(id); }
   getContext(kind) {
     assert.equal(kind, "2d");
-    return { drawImage: source => { assert(source.renderedFrame, "render the GPU page before copying it"); this.copiedFrame = { ...source.renderedFrame }; gpu.copies.push(this); } };
+    return { drawImage: source => { assert(source.renderedFrame, "render the GPU page before copying it"); this.copiedFrame = { ...source.renderedFrame }; gpu.copies.push(this); },
+      putImageData: image => { this.pixelData = image; } };
   }
 }
 
@@ -234,6 +235,37 @@ try {
   const { READER_ACTUAL_SIZE_ZOOM, readerContentMetrics, readerViewFromScroll } = await import("../src/readerGeometry.ts");
   const { createViewerLinkNavigation, resolveAnnotationView } = await import("../src/viewerLinkNavigation.ts");
   const { createAnnotationInteractionController } = await import("../src/annotationInteraction.ts");
+  {
+    const savedImageData = Object.getOwnPropertyDescriptor(globalThis, "ImageData");
+    Object.defineProperty(globalThis, "ImageData", { configurable: true, value: class {
+      constructor(data, width, height) { this.data = data; this.width = width; this.height = height; }
+    } });
+    const env = environment(1000), requests = [], beforeGpu = gpu.instances.length;
+    let releases = 0;
+    env.options.getPagePreviewScene = () => { throw Error("The pixel pipeline must bypass interactive scene previews."); };
+    env.options.getPageThumbnail = async (page, options) => {
+      requests.push({ page, ...options });
+      return { width: 3, height: 4, rgba: new Uint8Array(48).fill(73) };
+    };
+    env.options.releaseThumbnails = () => { releases++; };
+    const reader = createReaderViewport(env.options);
+    try {
+      reader.setDocument({ identity: "direct-pixels", pageRects: pageRects(3) }); reader.setLayout("reader");
+      const box = env.document.querySelector(".reader-thumbnail-image");
+      await until(() => box.children[0]?.pixelData !== undefined);
+      assert.equal(gpu.instances.length, beforeGpu, "ready thumbnail pixels never create an interactive renderer");
+      assert.equal(requests[0].maxDimension, 320, "requested preparation size includes actual display DPR");
+      assert.deepEqual([box.children[0].width, box.children[0].height], [3, 4]);
+      assert.equal(box.children[0].pixelData.data[0], 73);
+      const old = box.children[0];
+      env.document.querySelector('[data-reader="thumbnails"]').emit("click");
+      assert.equal(old.width, 0); assert.equal(old.height, 0);
+      assert(releases > 0, "hiding thumbnails releases the host snapshot service");
+    } finally {
+      reader.dispose();
+      if (savedImageData) Object.defineProperty(globalThis, "ImageData", savedImageData); else delete globalThis.ImageData;
+    }
+  }
   {
     const env = environment(), reader = createReaderViewport(env.options), doc = env.document;
     const scroller = doc.querySelector(".reader-scroll"), sidebar = doc.querySelector(".reader-thumbnails");
