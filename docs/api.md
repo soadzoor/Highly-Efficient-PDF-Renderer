@@ -12,8 +12,9 @@ This page covers the main integration APIs. The package ships TypeScript declara
 | `@soadzoor/hepr` | Three.js objects, HEP export, search, selection, LOD utilities, and room detection. |
 | `@soadzoor/hepr/three` | Alias for the main entry point, with the same exports. |
 | `@soadzoor/hepr/bundler` | Same public API as the main entry, with modules and assets prepared for browser application bundlers. |
-| `@soadzoor/hepr/node` | Node file sources, PDF worker sessions, and bundled standard-font resolution. |
+| `@soadzoor/hepr/node` | Node PDF thumbnails and reusable conversion sessions, file sources, PDF workers, and bundled standard-font resolution. |
 | `@soadzoor/hepr/experimental/pdf-worker` | Worker entry used by the PDF session infrastructure. |
+| `@soadzoor/hepr/experimental/thumbnail-encoder-worker` | Node worker entry used for cancellable thumbnail encoding. |
 
 For bundled browser applications, consistently use the `/bundler` entry and the
 [Vite settings in the quick start](../README.md#quick-start). This entry provides
@@ -137,6 +138,79 @@ it stays in the browser. The matrix compares cold calls and reused sessions,
 WebGL/Canvas2D, sizes, and lossless WebP/PNG. Presentation timing is an estimate;
 use a browser performance trace to inspect actual paint. No browser speed claim
 is established by the offline tests.
+
+## Node thumbnails
+
+`@soadzoor/hepr/node` exports `renderPdfThumbnail` and `openDocumentSession` with
+the same thumbnail options, `Blob` result and reusable-session methods shown
+above. Node inputs are PDFs: local path strings, `URL` objects or `file:` URL
+strings, byte buffers (`Uint8Array`, `Buffer`, `ArrayBuffer`), blobs, and explicit
+`PdfSource` objects. Local files use random-access reads rather than loading the
+entire PDF into a temporary buffer.
+
+```sh
+npm install @soadzoor/hepr @napi-rs/canvas
+```
+
+```js
+import { writeFile } from "node:fs/promises";
+import { renderPdfThumbnail, openDocumentSession } from "@soadzoor/hepr/node";
+
+const { blob, width, height } = await renderPdfThumbnail("drawing.pdf", {
+  page: 1,
+  maxDimension: 400,
+  background: "transparent",
+  format: "webp",
+});
+const outputPath = blob.type === "image/webp" ? "drawing.webp" : "drawing.png";
+await writeFile(outputPath, new Uint8Array(await blob.arrayBuffer()));
+
+const session = await openDocumentSession(new URL("file:///data/drawing.pdf"));
+try {
+  const controller = new AbortController();
+  const preview = await session.renderThumbnail({ maxDimension: 160, signal: controller.signal });
+  const hep = await session.buildHep();
+  await writeFile("drawing.hep", new Uint8Array(await hep.arrayBuffer()));
+} finally {
+  await session.close();
+}
+```
+
+Node `backend: "auto"` uses Canvas2D directly; `"canvas2d"` selects the same
+path, and explicit `"webgl"` rejects. `@napi-rs/canvas` remains an optional
+package dependency, but is required to render these server thumbnails. The
+API does not install `Worker`, `document` or `OffscreenCanvas` globals.
+Lossless WebP remains the default, with the same diagnostic PNG fallback and
+independent full-quality HEP conversion policy as the browser API.
+
+`NodeDocumentSessionOpenOptions` also accepts `NodePdfWorkerOpenOptions`:
+`workerUrl` and `workerName` configure the parser worker, while
+`encoderWorkerUrl` overrides the thumbnail encoder worker. Published defaults
+resolve workers and bundled font files from the installed HEPR package and
+remain usable when the Node entry is included in an SSR bundle. Source-checkout
+tests provide explicit compiled worker URLs or TypeScript bootstraps. Each session owns its
+workers and closes them through `close()`; an aborted thumbnail rejects with
+its original `signal.reason` and leaves the session available for later work.
+
+HEP input is rejected by this Node thumbnail entry: rendering an existing HEP
+scene currently requires the browser snapshot backend. Use the browser API for
+HEP thumbnails, or retain the original PDF for Node thumbnail generation.
+
+The checkout CLI exposes the same Node thumbnail pipeline with
+`--output=thumbnail` or `--output=both`; its existing default is
+`--output=hep`. Until these flags are included in a published release, use
+the local launcher:
+
+```sh
+node bin/pdf-to-hep.js drawing.pdf --output=thumbnail --thumbnail-page=1 --thumbnail-max-dimension=400 --thumbnail-format=webp --thumbnail-background=transparent
+node bin/pdf-to-hep.js drawing.pdf --output=both --output-dir=./output
+```
+
+The thumbnail flag defaults match the API: page 1, 400 pixels, lossless WebP,
+and white background. `both` reuses a document session for overview rendering
+and canonical HEP conversion; existing artifacts are skipped independently.
+See [Thumbnail CLI output](manual.md#thumbnail-cli-output) for naming, force
+behavior, requirements and failure reporting.
 
 ## `pdfObjectGenerator(source, options?, rendererType?)`
 

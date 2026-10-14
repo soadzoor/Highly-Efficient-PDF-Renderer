@@ -68,6 +68,44 @@ assert.deepEqual(parsePdfToHepArguments(["--help"]), {
 assert.throws(() => parsePdfToHepArguments([]), /Pass a PDF file or directory/);
 assert.throws(() => parsePdfToHepArguments(["--unknown", "input"]), /Unknown option/);
 assert.throws(() => parsePdfToHepArguments(["one", "two"]), /exactly one/);
+assert.equal(parsePdfToHepArguments(["--output=hep", "plan.pdf"]).output, "hep");
+for (const output of ["thumbnail", "both"]) {
+  assert.deepEqual(parsePdfToHepArguments([`--output=${output}`, "plan.pdf"]), {
+    force: false, help: false, inputPath: "plan.pdf", withVectorLod: true, withTextLod: true,
+    output, thumbnailPage: 1, thumbnailMaxDimension: 400, thumbnailFormat: "webp", thumbnailBackground: "#ffffff"
+  }, "thumbnail modes expose defaults without changing canonical HEP LOD defaults");
+}
+assert.deepEqual(parsePdfToHepArguments(["plan.pdf", "--thumbnail-background=transparent", "--thumbnail-format=png",
+  "--thumbnail-max-dimension=160", "--thumbnail-page=2", "--output=both"]), {
+  force: false, help: false, inputPath: "plan.pdf", withVectorLod: true, withTextLod: true,
+  output: "both", thumbnailPage: 2, thumbnailMaxDimension: 160, thumbnailFormat: "png", thumbnailBackground: "transparent"
+}, "mode flags may follow thumbnail settings and the input path");
+for (const value of ["", "HEP", "image", "all"]) {
+  assert.throws(() => parsePdfToHepArguments([`--output=${value}`, "plan.pdf"]), /--output=/);
+}
+assert.throws(() => parsePdfToHepArguments(["--output=hep", "--output=both", "plan.pdf"]), /exactly one/);
+for (const flag of ["thumbnail-page", "thumbnail-max-dimension"]) {
+  for (const value of ["", "0", "-1", "1.5", "NaN", "Infinity", "2e3", " 2", "9007199254740992"]) {
+    assert.throws(() => parsePdfToHepArguments(["--output=thumbnail", `--${flag}=${value}`, "plan.pdf"]), /positive integer/);
+  }
+  assert.throws(() => parsePdfToHepArguments(["--output=both", `--${flag}=1`, `--${flag}=2`, "plan.pdf"]), /exactly one/);
+}
+for (const value of ["", "jpeg", "WEBP"]) {
+  assert.throws(() => parsePdfToHepArguments(["--output=thumbnail", `--thumbnail-format=${value}`, "plan.pdf"]), /thumbnail-format/);
+}
+assert.throws(() => parsePdfToHepArguments(["--output=thumbnail", "--thumbnail-format=png", "--thumbnail-format=webp", "plan.pdf"]), /exactly one/);
+for (const value of ["", " "]) {
+  assert.throws(() => parsePdfToHepArguments(["--output=thumbnail", `--thumbnail-background=${value}`, "plan.pdf"]), /non-empty/);
+}
+assert.throws(() => parsePdfToHepArguments(["--output=thumbnail", "--thumbnail-background=red", "--thumbnail-background=blue", "plan.pdf"]), /exactly one/);
+for (const flag of ["--thumbnail-page=1", "--thumbnail-max-dimension=400", "--thumbnail-format=webp", "--thumbnail-background=#fff"]) {
+  for (const output of [[], ["--output=hep"]]) {
+    assert.throws(() => parsePdfToHepArguments([...output, flag, "plan.pdf"]), /Thumbnail options require/,
+      "HEP-only invocations must not silently ignore thumbnail options");
+  }
+}
+assert.throws(() => parsePdfToHepArguments(["--output=thumbnail", "--force", "--keep-unchanged", "plan.pdf"]), /requires HEP output/);
+assert.equal(parsePdfToHepArguments(["--output=both", "--force", "--keep-unchanged", "plan.pdf"]).keepUnchanged, true);
 assert.deepEqual(parsePdfToHepArguments(["--output-dir=./heps", "./pdfs"]), {
   force: false,
   help: false,
@@ -342,6 +380,24 @@ assert.equal(passwordInvocation.options.env.HEPR_PDF_PASSWORD, "s3cr3t");
 assert.equal(passwordInvocation.args.some((argument) => argument.includes("s3cr3t")), false);
 passwordChild.emit("close", 0, null);
 await passwordWorker.completion;
+
+let thumbnailInvocation;
+const thumbnailChild = new FakeChild();
+const thumbnailWorker = startPdfToHepWorker({
+  pdfPath: unusualWorkerPdf, fileNumber: 1, fileCount: 1,
+  output: "both", thumbnailPage: 3, thumbnailMaxDimension: 160,
+  thumbnailFormat: "png", thumbnailBackground: " lightblue "
+}, false, 8_192, (command, args) => {
+  thumbnailInvocation = { command, args };
+  return thumbnailChild;
+}, path.resolve("bin/pdf-to-hep.js"));
+assert.equal(thumbnailInvocation.args[1], path.resolve("bin/pdf-to-hep.js"), "the existing worker entry parameter retains its position");
+assert.deepEqual(parsePdfToHepArguments(thumbnailInvocation.args.slice(2)), {
+  force: false, help: false, inputPath: unusualWorkerPdf, withVectorLod: true, withTextLod: true,
+  output: "both", thumbnailPage: 3, thumbnailMaxDimension: 160, thumbnailFormat: "png", thumbnailBackground: " lightblue "
+}, "worker forwarding preserves thumbnail mode, sizing, encoding and color strings");
+thumbnailChild.emit("close", 0, null);
+await thumbnailWorker.completion;
 
 const failingChild = new FakeChild();
 const failingWorker = startPdfToHepWorker(

@@ -8,7 +8,19 @@ import { ScenePageViews } from "./scenePageViews";
 import { PdfError, type PdfDiagnostic } from "./pdf/nativeTypes";
 import { waitForLoad } from "./loadCancellation";
 import type { ThumbnailSceneRenderer } from "./thumbnailRenderer";
-import type { ThumbnailEncoder } from "./thumbnailEncoder";
+import type { ThumbnailPixels } from "./thumbnailTypes";
+
+interface ProcessingSessionEncoder {
+  encode(pixels: ThumbnailPixels, format: "webp" | "png", signal?: AbortSignal,
+    onDiagnostic?: (diagnostic: PdfDiagnostic) => void): Promise<Blob>;
+  close(): void | Promise<void>;
+}
+
+/** Platform-specific resources stay owned by the same reusable session. */
+export interface ProcessingSessionServices {
+  readonly canvas2dOnly?: boolean;
+  readonly createEncoder?: () => Promise<ProcessingSessionEncoder>;
+}
 
 export async function openDocumentSessionRuntime(source: PdfObjectSource, options: DocumentSessionOpenOptions): Promise<DocumentSession> {
   let bytes = await readPdfObjectSourceBytes(source, undefined, options.signal);
@@ -57,25 +69,28 @@ export async function openDocumentSessionRuntime(source: PdfObjectSource, option
   } catch (error) { if (pdf) await (pdf.terminate?.() ?? pdf.close()).catch(() => undefined); options.signal?.throwIfAborted(); throw error; }
 }
 
-class ProcessingSession implements DocumentSession {
+export class ProcessingSession implements DocumentSession {
   readonly info: DocumentSessionInfo;
   private readonly lifetime = new AbortController();
   private tail: Promise<void> = Promise.resolve();
   private closing: Promise<void> | undefined;
   private renderer: ThumbnailSceneRenderer | undefined;
-  private encoder: ThumbnailEncoder | undefined;
+  private encoder: ProcessingSessionEncoder | undefined;
   private partition: ScenePageViews | undefined;
   private canvas2dOnly = false;
   private readonly sourceByteLength: number;
   private readonly label: string;
   private readonly openOptions: DocumentSessionOpenOptions;
   private readonly diagnostics: PdfDiagnostic[];
+  private readonly services: ProcessingSessionServices;
   private pdf: NativeVectorPdfSession | undefined;
   private scene: VectorScene | undefined;
 
   constructor(kind: "pdf" | "hep", sourceByteLength: number, label: string,
     openOptions: DocumentSessionOpenOptions, diagnostics: PdfDiagnostic[],
-    pdf?: NativeVectorPdfSession, scene?: VectorScene) {
+    pdf?: NativeVectorPdfSession, scene?: VectorScene,
+    services: ProcessingSessionServices = {}) {
+    this.services = services;
     this.sourceByteLength = sourceByteLength; this.label = label; this.openOptions = openOptions;
     this.diagnostics = diagnostics; this.pdf = pdf; this.scene = scene;
     const pages = pdf ? pdf.info.pages.map(page => ({ width: page.width, height: page.height })) :
@@ -87,7 +102,11 @@ class ProcessingSession implements DocumentSession {
   }
 
   async renderThumbnail(options: PdfThumbnailOptions = {}): Promise<PdfThumbnailResult> {
-    const renderOptions = normalizeThumbnailOptions(options);
+    const normalized = normalizeThumbnailOptions(options);
+    if (this.services.canvas2dOnly && normalized.backend === "webgl") {
+      throw new RangeError("Node thumbnails support the auto and canvas2d backends.");
+    }
+    const renderOptions = this.services.canvas2dOnly ? { ...normalized, backend: "canvas2d" as const } : normalized;
     const page = (options.page ?? 1) - 1;
     if (page >= this.info.pageCount) throw new RangeError("page is outside this document.");
     const started = performance.now();
@@ -144,9 +163,14 @@ class ProcessingSession implements DocumentSession {
         signal.throwIfAborted();
         options.onTiming?.({ stage: "prepare-render", durationMs: performance.now() - prepareStart });
         signal.throwIfAborted();
-        const { ThumbnailEncoder } = await import("./thumbnailEncoder");
+        if (!this.encoder) {
+          if (this.services.createEncoder) this.encoder = await this.services.createEncoder();
+          else {
+            const { ThumbnailEncoder } = await import("./thumbnailEncoder");
+            this.encoder = new ThumbnailEncoder();
+          }
+        }
         signal.throwIfAborted();
-        this.encoder ??= new ThumbnailEncoder();
         const encodeStart = performance.now();
         const blob = await this.encoder.encode(pixels, options.format ?? "webp", signal, diagnostic => {
           this.diagnostics.push(diagnostic); this.openOptions.onDiagnostic?.(diagnostic);
@@ -212,14 +236,25 @@ class ProcessingSession implements DocumentSession {
 
   private async closeInternal(): Promise<void> {
     this.lifetime.abort(new DOMException("Document session closed.", "AbortError"));
-    this.encoder?.close();
-    try { if (this.pdf) await (this.pdf.terminate?.() ?? this.pdf.close()); }
+    const encoder = this.encoder;
+    try {
+      await Promise.all([
+        encoder?.close(),
+        this.pdf ? (this.pdf.terminate?.() ?? this.pdf.close()) : undefined
+      ]);
+    }
     finally {
       try { await this.tail; }
       finally {
-        const renderer = this.renderer;
-        this.renderer = undefined; this.pdf = undefined; this.scene = undefined; this.partition = undefined;
-        renderer?.close();
+        try {
+          // An operation can finish creating its lazy encoder after close
+          // began. Drain that operation before releasing this final owner.
+          if (this.encoder !== encoder) await this.encoder?.close();
+        } finally {
+          const renderer = this.renderer;
+          this.encoder = undefined; this.renderer = undefined; this.pdf = undefined; this.scene = undefined; this.partition = undefined;
+          renderer?.close();
+        }
       }
     }
   }

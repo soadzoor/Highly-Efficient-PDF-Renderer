@@ -10,6 +10,11 @@ export const fastTests = [
   "changelog",
   "document-loading",
   "pdf-thumbnail",
+  "node-pdf-thumbnail",
+  "node-thumbnail-encoder",
+  "node-document-session-resources",
+  "pdf-thumbnail-cli",
+  "pdf-thumbnail-cli-worker",
   "thumbnail-renderer",
   "thumbnail-encoder",
   "pdf-thumbnail-preparation",
@@ -320,7 +325,7 @@ export const fastTests = [
 // Suites with prerequisites are opt-in. HEP package conversion deliberately
 // stays outside the packaging gate invoked by build:lib.
 export const explicitSuites = {
-  package: ["browser-package", "bundler-package", "lod-worker-package", "raster-worker-package", "thumbnail-worker-package", "built-material-shaders", "pdf-to-hep-package"],
+  package: ["browser-package", "bundler-package", "lod-worker-package", "raster-worker-package", "thumbnail-worker-package", "node-thumbnail-package", "built-material-shaders", "pdf-to-hep-package", "pdf-thumbnail-cli-package"],
   browser: [
     "example-assets",
     "pdf-source-cancellation",

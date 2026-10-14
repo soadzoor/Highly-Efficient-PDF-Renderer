@@ -44,14 +44,20 @@ const RASTER_FALLBACK_DIAGNOSTIC_CODES = new Set([
 ]);
 
 export const PDF_TO_HEP_USAGE = `Usage:
-  node PDFtoHEP.js [--force] [--workers=<count>] [--output-dir=<directory>] <pdf-or-directory>
+  node PDFtoHEP.js [--output=hep|thumbnail|both] [--force] [--workers=<count>] [--output-dir=<directory>] <pdf-or-directory>
 
 Options:
-  -f, --force  Replace existing regular HEP files after conversion succeeds.
+  --output=hep|thumbnail|both  Select outputs (default: hep).
+  --thumbnail-page=<number>  One-based thumbnail page (default: 1).
+  --thumbnail-max-dimension=<pixels>  Longest thumbnail side (default: 400).
+  --thumbnail-format=webp|png  Thumbnail encoding (default: lossless webp).
+  --thumbnail-background=<color>  HEPR hex/named color or transparent
+      (default: #ffffff). Thumbnail options require --output=thumbnail or both.
+  -f, --force  Replace existing regular output files after conversion succeeds.
   --keep-unchanged  With --force, leave an existing HEP file untouched when the
-      new conversion would only change its generatedAt timestamp.
+      new conversion would only change its generatedAt timestamp. Requires HEP output.
   -h, --help   Show this help text.
-  --output-dir=<directory>  Write all HEP files into this directory.
+  --output-dir=<directory>  Write all requested outputs into this directory.
   --log-file=<path>  Append detailed warnings, errors and worker output to this
       file (default: a timestamped pdf-to-hep-*.log in the current directory).
   --workers=<count>  Maximum simultaneous conversions (default: limited by available
@@ -67,9 +73,9 @@ Options:
       alternate: skip engines and use approximate colors, with a warning.
       none:      disable built-in conversion and approximation; reject ICC content.
       Fallback warnings identify affected pages and the engine used.
-  --annotation-appearances=render|forms|none  Annotation appearances compiled
+  --annotation-appearances=render|forms|none  HEP annotation appearances compiled
       into page content (default: render). forms keeps only form-field widgets;
-      none draws no annotation. Annotation metadata is kept in every mode.
+      none draws no annotation. HEP annotation metadata is kept in every mode.
   --password=<password>  User or owner password for PDFs that require one.
       The same password is tried for every PDF. A command-line password can
       show up in process lists and shell history; set the HEPR_PDF_PASSWORD
@@ -82,36 +88,49 @@ Examples:
   node PDFtoHEP.js --force ./pdfs
   node PDFtoHEP.js --force --keep-unchanged ./pdfs
   node PDFtoHEP.js --workers=4 ./pdfs
+  node PDFtoHEP.js --output=thumbnail ./pdfs
+  node PDFtoHEP.js --output=both --thumbnail-max-dimension=160 ./pdfs
+  node PDFtoHEP.js --output=thumbnail --thumbnail-background=transparent ./Level1.pdf
 
 When given a directory, the script scans it recursively and processes regular
 .pdf files in isolated child processes. Automatic concurrency is limited by
 available CPU threads and the number of pending PDFs. Each freed slot
 immediately takes the next PDF; finished processes release their memory.
-Outputs use the client export convention <name>-parsed-data.hep and are written
+HEP outputs use the client export convention <name>-parsed-data.hep and are written
 beside their PDFs, unless --output-dir is supplied. Output name collisions are
 rejected.
+Thumbnails use <name>-thumbnail-p<page>.webp (or .png for PNG output/fallback).
+They prioritize a fast overview at the requested resolution. Thumbnail detail
+does not change full-quality HEP conversion or its default LOD caches.
+In both mode, each output is skipped independently when it already exists.
+Changing thumbnail options requires --force. Encoding fallback reports the
+actual filename and format; PNG data is never written with a .webp extension.
 HEP files larger than their source PDFs are written with a warning; selected
 LOD caches are retained.
-Each run ends with a filename, status, time and size table, including percentage
+HEP-only runs end with a filename, status, time and size table, including percentage
 changes (green for smaller HEPs, red for larger HEPs in color terminals).
 A final summary table shows conversion counts, size totals, average and median
 attempt times, summed conversion time and elapsed batch wall time.
+Thumbnail/both runs report status, generation/write time, size and dimensions
+for each output, with separate output totals and elapsed batch wall time.
+Per-PDF progress also includes worker startup, document opening and cleanup.
 Detailed warnings, failures and raster-fallback pages/reasons are saved in the
 diagnostics log; ordinary embedded PDF images are not counted as fallback.
 
-PDFs with identical content (same size and SHA-256) are converted once per
-batch; the others receive a copy of that HEP and count as successful PDFs,
-with a separate duplicate count and their actual copy time.
-Warning totals count warnings actually emitted. Copies inherit the source
+PDFs with identical content (same size and SHA-256) and matching pending outputs
+are converted once per batch; the others receive copies of outputs produced by
+this batch, with a separate duplicate count and their actual copy time.
+PDFs with different missing outputs are processed independently.
+HEP warning totals count warnings actually emitted. Copies inherit the source
 HEP's raster-fallback status without repeating its conversion warnings.
 
-Existing HEP files are skipped unless --force is supplied. Each child has its
+Existing requested output files are skipped unless --force is supplied. Each child has its
 own heap limit (default: 12288 MiB, not preallocated); HEPR_PDF_TO_HEP_HEAP_MB
 overrides it. Available RAM and heap limits do not affect the worker count.
 Use --workers to control concurrency. The heap limit is not a hard process
 memory limit: typed arrays and canvas allocations are outside it.`;
 
-class ExistingOutputError extends Error {
+export class ExistingOutputError extends Error {
   constructor(outputPath) {
     super(`Output already exists: ${outputPath}`);
     this.name = "ExistingOutputError";
@@ -134,6 +153,11 @@ export function parsePdfToHepArguments(args) {
   let withTextLod = true;
   let vectorLodPrecision;
   let workers;
+  let output;
+  let thumbnailPage;
+  let thumbnailMaxDimension;
+  let thumbnailFormat;
+  let thumbnailBackground;
 
   for (const argument of args) {
     if (!positionalOnly && argument === "--") {
@@ -142,6 +166,48 @@ export function parsePdfToHepArguments(args) {
     }
     if (!positionalOnly && (argument === "--help" || argument === "-h")) {
       help = true;
+      continue;
+    }
+    if (!positionalOnly && argument.startsWith("--output=")) {
+      const value = argument.slice("--output=".length);
+      if (output !== undefined || !["hep", "thumbnail", "both"].includes(value)) {
+        throw new Error("Pass exactly one --output=hep, --output=thumbnail, or --output=both.");
+      }
+      output = value;
+      continue;
+    }
+    if (!positionalOnly && argument.startsWith("--thumbnail-page=")) {
+      const value = argument.slice("--thumbnail-page=".length);
+      if (thumbnailPage !== undefined || !/^\d+$/.test(value) ||
+          !Number.isSafeInteger(Number(value)) || Number(value) < 1) {
+        throw new Error("Pass exactly one --thumbnail-page=<positive integer>.");
+      }
+      thumbnailPage = Number(value);
+      continue;
+    }
+    if (!positionalOnly && argument.startsWith("--thumbnail-max-dimension=")) {
+      const value = argument.slice("--thumbnail-max-dimension=".length);
+      if (thumbnailMaxDimension !== undefined || !/^\d+$/.test(value) ||
+          !Number.isSafeInteger(Number(value)) || Number(value) < 1) {
+        throw new Error("Pass exactly one --thumbnail-max-dimension=<positive integer>.");
+      }
+      thumbnailMaxDimension = Number(value);
+      continue;
+    }
+    if (!positionalOnly && argument.startsWith("--thumbnail-format=")) {
+      const value = argument.slice("--thumbnail-format=".length);
+      if (thumbnailFormat !== undefined || !["webp", "png"].includes(value)) {
+        throw new Error("Pass exactly one --thumbnail-format=webp or --thumbnail-format=png.");
+      }
+      thumbnailFormat = value;
+      continue;
+    }
+    if (!positionalOnly && argument.startsWith("--thumbnail-background=")) {
+      const value = argument.slice("--thumbnail-background=".length);
+      if (thumbnailBackground !== undefined || !value.trim()) {
+        throw new Error("Pass exactly one non-empty --thumbnail-background=<color>.");
+      }
+      thumbnailBackground = value;
       continue;
     }
     if (!positionalOnly && (argument === "--force" || argument === "-f")) {
@@ -229,9 +295,24 @@ export function parsePdfToHepArguments(args) {
     // Without --force, existing HEP files are skipped before conversion.
     throw new Error("--keep-unchanged only applies together with --force.");
   }
+  const hasThumbnailOptions = thumbnailPage !== undefined || thumbnailMaxDimension !== undefined ||
+    thumbnailFormat !== undefined || thumbnailBackground !== undefined;
+  if (hasThumbnailOptions && output !== "thumbnail" && output !== "both") {
+    throw new Error("Thumbnail options require --output=thumbnail or --output=both.");
+  }
+  if (keepUnchanged && output === "thumbnail") {
+    throw new Error("--keep-unchanged requires HEP output (--output=hep or --output=both).");
+  }
 
   return {
     force, help, inputPath, withVectorLod, withTextLod,
+    ...(output === undefined ? {} : { output }),
+    ...(output === "thumbnail" || output === "both" ? {
+      thumbnailPage: thumbnailPage ?? 1,
+      thumbnailMaxDimension: thumbnailMaxDimension ?? 400,
+      thumbnailFormat: thumbnailFormat ?? "webp",
+      thumbnailBackground: thumbnailBackground ?? "#ffffff"
+    } : {}),
     ...(workers === undefined ? {} : { workers }),
     ...(vectorLodPrecision === undefined ? {} : { vectorLodPrecision }),
     ...(keepUnchanged ? { keepUnchanged } : {}),
@@ -384,7 +465,8 @@ export function resolvePdfToHepWorkerCount(pendingCount, options, dependencies =
 
 export function pdfToHepWorkerArguments(
   pdfPath, force, heapMb, outputDirectory, iccEngine, annotationAppearances, keepUnchanged, withVectorLod, withTextLod, vectorLodPrecision,
-  workerScriptPath = scriptPath
+  workerScriptPath = scriptPath,
+  options = {}
 ) {
   return [
     `--max-old-space-size=${heapMb}`,
@@ -397,6 +479,11 @@ export function pdfToHepWorkerArguments(
     ...(outputDirectory === undefined ? [] : [`--output-dir=${outputDirectory}`]),
     ...(iccEngine === undefined ? [] : [`--icc-engine=${iccEngine}`]),
     ...(annotationAppearances === undefined ? [] : [`--annotation-appearances=${annotationAppearances}`]),
+    ...(options.output === undefined ? [] : [`--output=${options.output}`]),
+    ...(options.thumbnailPage === undefined ? [] : [`--thumbnail-page=${options.thumbnailPage}`]),
+    ...(options.thumbnailMaxDimension === undefined ? [] : [`--thumbnail-max-dimension=${options.thumbnailMaxDimension}`]),
+    ...(options.thumbnailFormat === undefined ? [] : [`--thumbnail-format=${options.thumbnailFormat}`]),
+    ...(options.thumbnailBackground === undefined ? [] : [`--thumbnail-background=${options.thumbnailBackground}`]),
     "--",
     pdfPath
   ];
@@ -406,7 +493,7 @@ function isPdfToHepWorkerProcess() {
   return process.env[PDF_TO_HEP_WORKER_ENV] === "1";
 }
 
-function readWorkerBatchPosition(fallbackIndex, fallbackTotal) {
+export function readWorkerBatchPosition(fallbackIndex, fallbackTotal) {
   const configuredIndex = Number(process.env[PDF_TO_HEP_BATCH_INDEX_ENV]);
   const configuredTotal = Number(process.env[PDF_TO_HEP_BATCH_TOTAL_ENV]);
   return {
@@ -419,7 +506,7 @@ function readWorkerBatchPosition(fallbackIndex, fallbackTotal) {
   };
 }
 
-async function assertNodeCanvasAvailable() {
+export async function assertNodeCanvasAvailable() {
   let canvasModule;
   try {
     canvasModule = await import("@napi-rs/canvas");
@@ -497,7 +584,7 @@ function isPasswordError(error) {
     (error.details?.reason === "password-required" || error.details?.reason === "password-incorrect");
 }
 
-async function regularOutputExists(filePath) {
+export async function regularOutputExists(filePath) {
   try {
     const outputStats = await lstat(filePath);
     if (!outputStats.isFile()) {
@@ -554,7 +641,7 @@ export async function hepDiffersOnlyInGeneratedAt(existingBytes, candidateBytes,
   return Buffer.compare(restamped, existingBytes) === 0;
 }
 
-async function existingHepDiffersOnlyInGeneratedAt(outputPath, hepBlob, HepArchive, signal) {
+export async function existingHepDiffersOnlyInGeneratedAt(outputPath, hepBlob, HepArchive, signal) {
   try {
     const existingBytes = await readFile(outputPath, { signal });
     const candidateBytes = new Uint8Array(await hepBlob.arrayBuffer());
@@ -672,7 +759,7 @@ async function filesHaveSameBytes(leftPath, rightPath) {
  * Gives a duplicate PDF the HEP of its identical PDF. Returns false when
  * --keep-unchanged keeps an existing HEP that already has the same bytes.
  */
-async function copyDuplicateHep(sourcePath, outputPath, { force, keepUnchanged }) {
+export async function copyDuplicateHep(sourcePath, outputPath, { force, keepUnchanged }) {
   if (keepUnchanged && await filesHaveSameBytes(sourcePath, outputPath)) return false;
   await copyHepFileAtomically(sourcePath, outputPath, force);
   return true;
@@ -764,7 +851,7 @@ function formatError(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-function formatBytes(byteLength) {
+export function formatBytes(byteLength) {
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let value = Math.max(0, Number(byteLength) || 0);
   let unitIndex = 0;
@@ -794,7 +881,7 @@ export function formatPdfToHepDuration(durationMs) {
   return formatDurationSeconds(durationSeconds(durationMs));
 }
 
-function formatPdfToHepTable(headers, rows, rightAlignedColumns = []) {
+export function formatPdfToHepTable(headers, rows, rightAlignedColumns = []) {
   const cells = [headers, ...rows].map((row) => row.map((value) =>
     String(value).replace(/[\r\n\t]/g, " ")
   ));
@@ -975,7 +1062,7 @@ function hasPdfToHepOutput(status) {
   return status === "generated" || status === "duplicate";
 }
 
-function normalizeRasterFallbackDiagnostic(diagnostic) {
+export function normalizeRasterFallbackDiagnostic(diagnostic) {
   if (
     !RASTER_FALLBACK_DIAGNOSTIC_CODES.has(diagnostic.code) ||
     typeof diagnostic.message !== "string" || diagnostic.message.trim().length === 0 ||
@@ -1007,7 +1094,7 @@ function appendPdfToHepTiming(timings, item, status, durationMs, report) {
   return timing;
 }
 
-async function assertSeparatePdfToHepDiagnosticLog(logPath, items) {
+export async function assertSeparatePdfToHepDiagnosticLog(logPath, items) {
   const logStats = await lstat(logPath).catch((error) => {
     if (error?.code !== "ENOENT") throw error;
   });
@@ -1032,14 +1119,14 @@ async function assertSeparatePdfToHepDiagnosticLog(logPath, items) {
   for (const item of items) {
     for (const filePath of [item.pdfPath, item.outputPath]) {
       if (canonicalLogPath === await canonicalPath(filePath)) {
-        throw new Error("The diagnostics log must be separate from the PDF and HEP files.");
+        throw new Error("The diagnostics log must be separate from PDF inputs and output files.");
       }
       if (logStats) {
         const fileStats = await stat(filePath).catch((error) => {
           if (error?.code !== "ENOENT") throw error;
         });
         if (fileStats && fileStats.dev === logStats.dev && fileStats.ino === logStats.ino) {
-          throw new Error("The diagnostics log must be separate from the PDF and HEP files.");
+          throw new Error("The diagnostics log must be separate from PDF inputs and output files.");
         }
       }
     }
@@ -1072,7 +1159,8 @@ export async function createPdfToHepDiagnosticLog(options, pending) {
       }
     }
   };
-  log.write(`\nPDF-to-HEP run started at ${new Date().toISOString()}\n` +
+  const kind = options.output && options.output !== "hep" ? "PDF output" : "PDF-to-HEP";
+  log.write(`\n${kind} run started at ${new Date().toISOString()}\n` +
     `Input: ${path.resolve(options.inputPath ?? (pending[0] ? path.dirname(pending[0].pdfPath) : process.cwd()))}`);
   try {
     await writes;
@@ -1110,7 +1198,7 @@ export function startPdfToHepWorker(
     process.execPath,
     pdfToHepWorkerArguments(
       item.pdfPath, force, heapMb, item.outputDirectory, item.iccEngine, item.annotationAppearances, item.keepUnchanged,
-      item.withVectorLod, item.withTextLod, item.vectorLodPrecision, workerScriptPath
+      item.withVectorLod, item.withTextLod, item.vectorLodPrecision, workerScriptPath, item
     ),
     {
       // Raw output includes native crashes and third-party diagnostics that
@@ -1158,6 +1246,32 @@ export function startPdfToHepWorker(
       for (const key of ["sourceBytes", "outputBytes"]) {
         if (Number.isSafeInteger(message[key]) && message[key] >= 0) report[key] = message[key];
       }
+    } else if (message?.type === "pdf-output-artifact") {
+      if (!["hep", "thumbnail"].includes(message.kind) ||
+          !["generated", "skipped", "failed"].includes(message.status) ||
+          typeof message.outputPath !== "string" || !message.outputPath.trim() || message.outputPath.includes("\0") ||
+          !Number.isFinite(message.durationMs) || message.durationMs < 0) return;
+      if (message.outputBytes !== undefined &&
+          (!Number.isSafeInteger(message.outputBytes) || message.outputBytes < 0)) return;
+      for (const key of ["width", "height"]) {
+        if (message[key] !== undefined && (!Number.isSafeInteger(message[key]) || message[key] < 1)) return;
+      }
+      if (message.format !== undefined && !["webp", "png"].includes(message.format)) return;
+      if (message.kind === "thumbnail" && message.status === "generated" &&
+          (message.format === undefined || message.width === undefined || message.height === undefined || message.outputBytes === undefined)) return;
+      if (message.format !== undefined && path.extname(message.outputPath).toLowerCase() !== `.${message.format}`) return;
+      if (message.errorMessage !== undefined && typeof message.errorMessage !== "string") return;
+      (report.artifacts ??= []).push({
+        kind: message.kind,
+        status: message.status,
+        outputPath: message.outputPath,
+        durationMs: message.durationMs,
+        ...(message.outputBytes === undefined ? {} : { outputBytes: message.outputBytes }),
+        ...(message.width === undefined ? {} : { width: message.width }),
+        ...(message.height === undefined ? {} : { height: message.height }),
+        ...(message.format === undefined ? {} : { format: message.format }),
+        ...(message.errorMessage === undefined ? {} : { errorMessage: message.errorMessage })
+      });
     }
   });
 
@@ -1179,7 +1293,7 @@ export function startPdfToHepWorker(
   return { child, completion, workerToken, report };
 }
 
-async function cleanupPdfToHepWorkerTemps(outputPath, workerPid, workerToken, onWarning = console.warn) {
+export async function cleanupPdfToHepWorkerTemps(outputPath, workerPid, workerToken, onWarning = console.warn) {
   if (
     !Number.isSafeInteger(workerPid) ||
     workerPid <= 0 ||
@@ -1510,6 +1624,10 @@ export async function runPdfToHep(args = process.argv.slice(2), dependencies = {
   }
 
   assertSupportedNodeVersion();
+  if (options.output !== undefined && options.output !== "hep") {
+    const { runPdfThumbnailCli } = await import("./bin/thumbnail-cli.mjs");
+    return runPdfThumbnailCli(options, dependencies);
+  }
   const workerProcess = isPdfToHepWorkerProcess();
   const password = options.password ?? (process.env[PDF_PASSWORD_ENV] || undefined);
   const pdfPaths = await discoverPdfFiles(options.inputPath);
@@ -1741,7 +1859,7 @@ if (isMainModule()) {
       process.exitCode = exitCode;
     },
     (error) => {
-      console.error(`PDF-to-HEP conversion failed: ${formatError(error)}`);
+      console.error(`PDF conversion failed: ${formatError(error)}`);
       console.error(`Run node PDFtoHEP.js --help for usage.`);
       process.exitCode = 1;
     }

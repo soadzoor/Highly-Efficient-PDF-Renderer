@@ -41,6 +41,31 @@ keeps its normal preparation settings. Use
 [`openDocumentSession`](docs/api.md#opendocumentsessionsource-options) to share PDF
 parsing and font resources between thumbnails and HEP conversion.
 
+For Node.js, import the same thumbnail and session functions from
+`@soadzoor/hepr/node`. Install the optional Canvas2D backend for server rendering:
+
+```sh
+npm install @soadzoor/hepr @napi-rs/canvas
+```
+
+```js
+import { writeFile } from "node:fs/promises";
+import { renderPdfThumbnail } from "@soadzoor/hepr/node";
+
+const { blob, width, height } = await renderPdfThumbnail("drawing.pdf", {
+  maxDimension: 400,
+  background: "transparent",
+});
+const outputPath = blob.type === "image/webp" ? "drawing.webp" : "drawing.png";
+await writeFile(outputPath, new Uint8Array(await blob.arrayBuffer()));
+```
+
+The Node API accepts PDF paths, file URLs and bytes, uses Canvas2D and Node
+workers, and requires no browser globals. Its reusable `openDocumentSession`
+also supports later full-quality HEP conversion. HEP input thumbnails remain
+available through the browser API. See [Node thumbnails](docs/api.md#node-thumbnails)
+for cancellation, source and worker options.
+
 ## See it in action
 
 ### Toggle PDF layers
@@ -180,6 +205,23 @@ Convert a local PDF or a directory of PDFs from the command line:
 npx @soadzoor/hepr ./input.pdf --output-dir=./heps
 npx @soadzoor/hepr ./pdfs --workers=4 --output-dir=./heps
 ```
+
+Thumbnail CLI modes are available in this checkout. Until a version containing
+them is published, use the local launcher with the compiled library prepared:
+
+```bash
+node bin/pdf-to-hep.js ./drawing.pdf --output=thumbnail
+node bin/pdf-to-hep.js ./pdfs --output=both --thumbnail-max-dimension=400 --output-dir=./output
+```
+
+`--output=hep` remains the default. Thumbnail output defaults to page 1, a
+400-pixel longest side, lossless WebP and a white background; for example,
+`drawing-thumbnail-p1.webp`. Select PNG, another page or a transparent background
+with `--thumbnail-format=png`, `--thumbnail-page=2` and
+`--thumbnail-background=transparent`. `both` reuses the document session for
+the thumbnail and canonical HEP conversion. Existing HEP and thumbnail outputs
+are skipped independently; use `--force` to regenerate them. See the
+[CLI thumbnail options](docs/manual.md#thumbnail-cli-output) for details.
 
 The CLI includes applicable vector and text LOD caches by default, matching
 `buildHep` and both example viewers. Use

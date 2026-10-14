@@ -13,6 +13,7 @@
     "src/lodWorkerEntry.ts",
     "src/rasterPreparationWorker.ts",
     "src/thumbnailEncodeWorker.ts",
+    "src/nodeThumbnailEncodeWorker.ts",
     "src/vite-env.d.ts"
   ]
 }

@@ -379,6 +379,24 @@ for (const event of [selectiveFallback, ...differentDiagnostics]) diagnosticChil
 assert.deepEqual(diagnosticWorker.report.rasterFallbacks, differentDiagnostics.map(({ type, ...diagnostic }, index) =>
   ({ ...diagnostic, count: index === 0 ? 2 : 1 })),
   "deduplication preserves differences in page, code, message, and reason");
+const thumbnailArtifact = { type: "pdf-output-artifact", kind: "thumbnail", status: "generated",
+  outputPath: path.resolve("dedup-thumbnail-p1.png"), durationMs: 12.5, outputBytes: 256,
+  width: 160, height: 80, format: "png" };
+const hepArtifact = { type: "pdf-output-artifact", kind: "hep", status: "skipped",
+  outputPath: path.resolve("dedup-parsed-data.hep"), durationMs: 0, outputBytes: 1024 };
+const failedArtifact = { type: "pdf-output-artifact", kind: "thumbnail", status: "failed",
+  outputPath: path.resolve("dedup-thumbnail-p2.webp"), durationMs: 5, errorMessage: "Page 2 does not exist." };
+for (const event of [thumbnailArtifact, hepArtifact, failedArtifact]) diagnosticChild.emit("message", { ...event, unexpected: "ignored" });
+for (const invalid of [
+  { kind: "pdf" }, { status: "interrupted" }, { outputPath: "" }, { outputPath: "invalid\0.png" }, { outputPath: 42 },
+  { durationMs: -1 }, { durationMs: Infinity }, { durationMs: "1" },
+  { outputBytes: -1 }, { outputBytes: 1.5 }, { outputBytes: Number.MAX_SAFE_INTEGER + 1 }, { outputBytes: "1" },
+  { width: 0 }, { width: 1.5 }, { height: -1 }, { height: Number.MAX_SAFE_INTEGER + 1 },
+  { format: "jpeg" }, { format: undefined }, { width: undefined }, { height: undefined },
+  { outputBytes: undefined }, { format: "webp" }, { errorMessage: {} }
+]) diagnosticChild.emit("message", { ...thumbnailArtifact, ...invalid });
+assert.deepEqual(diagnosticWorker.report.artifacts, [thumbnailArtifact, hepArtifact, failedArtifact].map(({ type, ...artifact }) => artifact),
+  "artifact IPC preserves actual fallback names and per-output results while rejecting invalid metadata");
 diagnosticChild.emit("close", 0, null);
 await diagnosticWorker.completion;
 await withBatch({

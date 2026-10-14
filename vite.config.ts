@@ -19,7 +19,8 @@ export default defineConfig(({ mode }) => {
             index: resolve(import.meta.dirname, "src/index.ts"),
             node: resolve(import.meta.dirname, "src/nodePdfSource.ts"),
             "pdf-to-hep-runtime": resolve(import.meta.dirname, "src/pdfToHepRuntime.ts"),
-            "pdf-worker": resolve(import.meta.dirname, "src/pdf/pdfWorkerEntry.ts")
+            "pdf-worker": resolve(import.meta.dirname, "src/pdf/pdfWorkerEntry.ts"),
+            "thumbnail-encoder-worker": resolve(import.meta.dirname, "src/nodeThumbnailEncodeWorker.ts")
           },
           formats: ["es"],
           fileName: (_format, entryName) => `${entryName}.js`

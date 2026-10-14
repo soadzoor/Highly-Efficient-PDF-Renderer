@@ -14,7 +14,7 @@ runPdfToHep(process.argv.slice(2), {
     process.exitCode = exitCode;
   },
   (error) => {
-    console.error(`PDF-to-HEP conversion failed: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`PDF conversion failed: ${error instanceof Error ? error.message : String(error)}`);
     console.error("Run pdf-to-hep --help for usage.");
     process.exitCode = 1;
   }

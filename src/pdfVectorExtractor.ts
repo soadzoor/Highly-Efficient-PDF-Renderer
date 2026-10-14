@@ -596,7 +596,7 @@ let nativeVectorMissingFontResolverPromise: Promise<NativeMissingFontResolver> |
  */
 export function nativeVectorMissingFontResolver(): Promise<NativeMissingFontResolver> {
   nativeVectorMissingFontResolverPromise ??= isNodeRuntime()
-    ? import("./nodePdfSource").then(({ createNodeBundledStandardFontResolver }) =>
+    ? import("./nodePdfResources").then(({ createNodeBundledStandardFontResolver }) =>
         createNodeBundledStandardFontResolver())
     : import("./standardFontResolver").then(({ createBundledStandardFontResolver }) =>
         createBundledStandardFontResolver());

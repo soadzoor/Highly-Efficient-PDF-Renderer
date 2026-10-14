@@ -16,6 +16,8 @@
     "**/lodWorkerEntry*.js",
     "**/rasterPreparationWorker*.js",
     "**/thumbnailEncodeWorker*.js",
+    "**/nodeThumbnailEncodeWorker*.js",
+    "**/thumbnail-encoder-worker.js",
     "**/roomDetectorWorker*.js",
     "**/*.css"
   ],
@@ -64,6 +66,10 @@
     "./experimental/pdf-worker": {
       "import": "./dist/lib/pdf-worker.js",
       "default": "./dist/lib/pdf-worker.js"
+    },
+    "./experimental/thumbnail-encoder-worker": {
+      "import": "./dist/lib/thumbnail-encoder-worker.js",
+      "default": "./dist/lib/thumbnail-encoder-worker.js"
     }
   },
   "files": [

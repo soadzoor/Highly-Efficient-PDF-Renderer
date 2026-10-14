@@ -22,6 +22,18 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   WebGL/Canvas2D, lossless WebP/PNG, and an interactive preparation baseline,
   with stage timings and downloadable reports. Browser speed and visual checks
   remain manual.
+- Expose PDF thumbnails and reusable conversion sessions through
+  `@soadzoor/hepr/node`, accepting local paths, file URLs, byte buffers and
+  random-access sources. Use the optional `@napi-rs/canvas` backend and owned
+  Node parser/encoding workers with cancellation and session reuse. Resolve
+  worker and standard-font assets from the installed package for SSR bundles.
+  Source-free HEP thumbnails still require the browser renderer.
+- Add CLI `--output=hep|thumbnail|both`, keeping HEP as the default. Select
+  thumbnail page, pixel size, WebP/PNG format and background; generate both
+  outputs through one reusable document session. Preserve existing outputs
+  independently, copy matching duplicate PDFs, and report each artifact's
+  time, size, dimensions and status. PNG fallback uses a matching filename;
+  successful outputs remain available when another requested output fails.
 
 ### Changed
 

@@ -1404,6 +1404,56 @@ the same flags:
 node PDFtoHEP.js --output-dir=./heps ./pdfs
 ```
 
+### Thumbnail CLI output
+
+The thumbnail CLI options below are available in this checkout. Until a release
+containing them is published, invoke `node bin/pdf-to-hep.js` locally. Prepare
+its compiled runtime with `npm run build:lib` after installing dependencies;
+the launcher does not start a development server.
+
+```bash
+# One overview image: drawing-thumbnail-p1.webp
+node bin/pdf-to-hep.js ./drawing.pdf --output=thumbnail
+
+# A transparent PNG of page 2, with a 160-pixel longest side
+node bin/pdf-to-hep.js ./drawing.pdf --output=thumbnail --thumbnail-page=2 --thumbnail-max-dimension=160 --thumbnail-format=png --thumbnail-background=transparent
+
+# Thumbnail and canonical HEP for each PDF, sharing document/font preparation
+node bin/pdf-to-hep.js ./pdfs --output=both --output-dir=./output
+```
+
+| Flag | Behavior |
+| --- | --- |
+| `--output=hep\|thumbnail\|both` | Select generated artifacts. Default: `hep`. |
+| `--thumbnail-page=<number>` | One-based source PDF page, independently of HEP page layout. Default: `1`. |
+| `--thumbnail-max-dimension=<pixels>` | Positive integer longest output side; preserves aspect ratio. Default: `400`. |
+| `--thumbnail-format=webp\|png` | Lossless WebP or PNG. Default: `webp`. |
+| `--thumbnail-background=<color>` | HEPR color string, such as `"#ffffff"`, `rebeccapurple`, or `transparent`. Default: white. |
+
+Thumbnail-specific options require `--output=thumbnail` or `--output=both`.
+Each PDF produces one thumbnail. For `drawing.pdf`, page 1 is named
+`drawing-thumbnail-p1.webp`, or `.png` when PNG is selected. Output goes beside
+the source unless `--output-dir` is supplied. Diagnosed PNG fallback also uses
+`.png` and reports the actual output filename. Page and format affect the
+thumbnail filename; dimension and background do not. Existing artifacts are
+skipped independently, so `both` generates a missing thumbnail while keeping an
+existing HEP, or generates a missing HEP while keeping an existing thumbnail.
+Use `--force` after changing options to replace existing outputs.
+
+If WebP encoding falls back to PNG, a diagnostic identifies the actual `.png`
+filename, which is also recognized on later skip checks. Forced WebP regeneration
+replaces the previous WebP/PNG variant only after the new image is committed.
+The output table reports generation/write time in milliseconds or seconds;
+per-PDF progress and batch wall time also include opening and worker overhead.
+
+`both` uses one reusable document session. Thumbnail approximations remain
+separate from full-quality HEP geometry, fonts, images and applicable default
+LODs. A thumbnail failure, including a requested page absent from the PDF, is
+reported as a failure while canonical HEP generation is still attempted.
+`--keep-unchanged` applies to HEP output and requires `hep` or `both` mode.
+
+The remaining batch-conversion details describe the default HEP output mode.
+
 Directory input is scanned recursively and converted in isolated child processes,
 with one worker per available CPU thread, capped by the number of pending PDFs.
 Whenever a child finishes, its slot takes the next PDF without waiting for other
