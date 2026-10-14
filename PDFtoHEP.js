@@ -100,7 +100,10 @@ Detailed warnings, failures and raster-fallback pages/reasons are saved in the
 diagnostics log; ordinary embedded PDF images are not counted as fallback.
 
 PDFs with identical content (same size and SHA-256) are converted once per
-batch; the others receive a copy of that HEP and are counted as duplicates.
+batch; the others receive a copy of that HEP and count as successful PDFs,
+with a separate duplicate count and their actual copy time.
+Warning totals count warnings actually emitted. Copies inherit the source
+HEP's raster-fallback status without repeating its conversion warnings.
 
 Existing HEP files are skipped unless --force is supplied. Each child has its
 own heap limit (default: 12288 MiB, not preallocated); HEPR_PDF_TO_HEP_HEAP_MB
@@ -844,7 +847,7 @@ export function formatPdfToHepTimingSummary(timings, { color = false } = {}) {
 
 export function formatPdfToHepRasterFallbackSummary(timings) {
   const affected = timings.filter((timing) =>
-    timing.status === "generated" && timing.rasterFallbacks?.length > 0
+    hasPdfToHepOutput(timing.status) && timing.rasterFallbacks?.length > 0
   );
   const lines = ["Raster fallback by PDF:"];
   if (affected.length === 0) {
@@ -854,6 +857,10 @@ export function formatPdfToHepRasterFallbackSummary(timings) {
   lines.push(`  Successful PDFs using raster fallback: ${affected.length}`);
   for (const timing of affected) {
     lines.push(`  ${timing.pdfPath}:`);
+    if (timing.status === "duplicate" && typeof timing.duplicateOf === "string") {
+      lines.push(`    Same raster fallback as ${timing.duplicateOf}`);
+      continue;
+    }
     for (const fallback of timing.rasterFallbacks) {
       const page = fallback.pageIndex === undefined ? "" : `Page ${fallback.pageIndex + 1} `;
       const repeated = fallback.count > 1 ? ` (${fallback.count} times)` : "";
@@ -872,11 +879,11 @@ export function formatPdfToHepSummary(
   notAttemptedCount = 0,
   { wallTimeMs, color = false } = {}
 ) {
-  // Copies for duplicate PDFs are not conversion attempts; they are counted
-  // separately and kept out of the timing statistics.
+  // Each processed PDF counts, including successful duplicate copies. Timing
+  // statistics use their actual copy cost, not the saved conversion estimate.
   const duplicates = timings.filter((timing) => timing.status === "duplicate");
-  const attempted = timings.filter((timing) => timing.status !== "duplicate");
-  const successful = timings.filter((timing) => timing.status === "generated");
+  const attempted = timings;
+  const successful = timings.filter((timing) => hasPdfToHepOutput(timing.status));
   const failed = timings.filter((timing) => timing.status === "failed");
   const interrupted = timings.filter((timing) => timing.status === "interrupted");
   // Compare the same documents; failed and skipped PDFs have no new HEP.
@@ -1299,7 +1306,8 @@ async function runPdfToHepWorkerBatchWithLog(pending, options, skippedCount, dep
         appendPdfToHepTiming(timings, duplicate, "duplicate", now() - startedAt, {
           ...sizes,
           duplicateOf: item.pdfPath,
-          savedDurationMs: timing.durationMs
+          savedDurationMs: timing.durationMs,
+          ...(timing.rasterFallbacks ? { rasterFallbacks: timing.rasterFallbacks } : {})
         });
         duplicateCount += 1;
         console.log(

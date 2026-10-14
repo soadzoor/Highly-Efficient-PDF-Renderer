@@ -255,6 +255,62 @@ assert.match(formatPdfToHepSummary([
 ], 0), /Generated HEPs \(successful\)\s*\| 0 B/);
 assert(!formatPdfToHepSummary([{ status: "generated", sourceBytes: 0, outputBytes: 0 }], 0).includes("NaN"));
 
+// A duplicate is a successfully processed PDF with its own copied output and
+// measured copy time. Its avoided conversion estimate is a separate metric.
+const canonicalFallbacks = [{ code: "page-raster-fallback", pageIndex: 1,
+  message: "Canonical output rasterized one page.", reason: "unsupported blend", count: 1 }];
+const duplicateAccounting = [
+  { pdfPath: "canonical.pdf", status: "generated", durationMs: 10_000, sourceBytes: 1024, outputBytes: 2048,
+    warnings: [{ message: "canonical conversion warning", count: 1 }], rasterFallbacks: canonicalFallbacks },
+  { pdfPath: "ordinary.pdf", status: "generated", durationMs: 4_000, sourceBytes: 4096, outputBytes: 2048 },
+  { pdfPath: "copied.pdf", status: "duplicate", durationMs: 2_000, savedDurationMs: 10_000,
+    sourceBytes: 1024, outputBytes: 2048, duplicateOf: "canonical.pdf", rasterFallbacks: canonicalFallbacks },
+  { pdfPath: "failed-copy.pdf", status: "failed", durationMs: 3_000,
+    sourceBytes: 1_000_000, outputBytes: 2_000_000, errorMessage: "copy destination unavailable" },
+  { pdfPath: "skipped-copy.pdf", status: "skipped", durationMs: 1_000, sourceBytes: 1_000_000, outputBytes: 2_000_000 }
+];
+const duplicateTotals = metrics(formatPdfToHepSummary(duplicateAccounting, 3, 2, { wallTimeMs: 12_000 }));
+assert.equal(duplicateTotals["PDFs attempted"], "5", "actual copy, failure and runtime skip attempts count once");
+assert.equal(duplicateTotals.Successful, "3", "generated and copied outputs are successful PDFs");
+assert.equal(duplicateTotals.Failed, "1"); assert.equal(duplicateTotals.Skipped, "3");
+assert.equal(duplicateTotals["Not attempted"], "2", "pending and upfront skips never become copy attempts");
+assert.equal(duplicateTotals["Duplicate PDFs (HEP copied)"], "1");
+assert.equal(duplicateTotals["Original PDFs (successful)"], "6.00 KiB");
+assert.equal(duplicateTotals["Generated HEPs (successful)"], "6.00 KiB");
+assert.equal(duplicateTotals["Size change (successful)"], "0 B (0.00%)");
+assert.equal(duplicateTotals["HEPs larger than original PDFs"], "2", "the copied larger output counts separately");
+assert.equal(duplicateTotals["Total attempted conversion time (summed)"], "0h 00m 20s");
+assert.equal(duplicateTotals["Average attempted PDF time"], "0h 00m 04s");
+assert.equal(duplicateTotals["Median attempted PDF time"], "0h 00m 03s");
+assert.equal(duplicateTotals["Fastest attempted PDF time"], "0h 00m 01s");
+assert.equal(duplicateTotals["Slowest attempted PDF time"], "0h 00m 10s");
+assert.equal(duplicateTotals["Conversion time saved by duplicates (est.)"], "0h 00m 10s",
+  "the saved estimate is not added to actual attempted time or used instead of copy duration");
+assert.equal(duplicateTotals["Batch wall time (elapsed)"], "0h 00m 12s");
+assert.equal(duplicateTotals.Warnings, "1 across 1 PDF(s)", "copying an output does not emit its conversion warning again");
+assert.equal(duplicateTotals["Successful PDFs using raster fallback"], "2", "copied HEPs retain the canonical output's fallback provenance");
+const copiedFallbackSummary = formatPdfToHepRasterFallbackSummary(duplicateAccounting);
+assert.match(copiedFallbackSummary, /Successful PDFs using raster fallback: 2/);
+assert.match(copiedFallbackSummary, /copied\.pdf:\n    Same raster fallback as canonical\.pdf/);
+assert.equal((copiedFallbackSummary.match(/Canonical output rasterized one page/g) ?? []).length, 1,
+  "duplicate fallback details link to the canonical conversion without repeating its reasons");
+assert(!copiedFallbackSummary.includes("failed-copy.pdf")); assert(!copiedFallbackSummary.includes("skipped-copy.pdf"));
+const partialDuplicateSizes = metrics(formatPdfToHepSummary([
+  { status: "generated", sourceBytes: 100, durationMs: 1000 },
+  { status: "duplicate", sourceBytes: 100, outputBytes: 50, durationMs: 100 }
+], 0));
+assert.equal(partialDuplicateSizes["File sizes available (successful)"], "1/2");
+assert.equal(partialDuplicateSizes["Original PDFs (successful)"], "100 B");
+assert.equal(partialDuplicateSizes["Generated HEPs (successful)"], "50 B");
+const copiesOnly = metrics(formatPdfToHepSummary([
+  { status: "duplicate", durationMs: 600, savedDurationMs: 9000, sourceBytes: 0, outputBytes: 0 },
+  { status: "duplicate", durationMs: 600, savedDurationMs: 9000, sourceBytes: 0, outputBytes: 0 }
+], 0));
+assert.equal(copiesOnly["PDFs attempted"], "2"); assert.equal(copiesOnly.Successful, "2");
+assert.equal(copiesOnly["Total attempted conversion time (summed)"], "0h 00m 01s", "sum actual copy milliseconds before rounding");
+assert.equal(copiesOnly["Generated HEPs (successful)"], "0 B");
+assert.equal(copiesOnly["Size change (successful)"], "0 B (--)");
+
 const timingCases = [
   { pdfPath: path.resolve("private/nested/smaller.pdf"), fileNumber: 1, fileCount: 5,
     status: "generated", durationMs: 100, sourceBytes: 1024, outputBytes: 512 },

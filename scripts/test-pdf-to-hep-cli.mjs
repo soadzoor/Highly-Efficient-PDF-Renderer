@@ -911,27 +911,31 @@ process.exitCode = await runPdfToHep(process.argv.slice(2), {
   }), 2);
   assert.deepEqual(hashedPdfs, ["a.pdf", "b.pdf", "c.pdf", "e.pdf"], "PDFs with a unique size are never hashed");
 
-  const runDuplicateBatch = async (options, failingPdfs = []) => {
+  const runDuplicateBatch = async (options, failingPdfs = [], reports = {}, fixture = {}) => {
     const items = duplicateItems();
     assert.equal(await markDuplicatePdfs(items), 2, "SHA-256 finds both copies of a.pdf");
     const converted = [];
     const logs = [];
     const diagnostics = [];
+    const errors = [];
     const originalConsole = { log: console.log, error: console.error };
+    let time = 0;
     let result;
     try {
       console.log = (message) => logs.push(String(message));
-      console.error = () => {};
+      console.error = (message) => errors.push(String(message));
       result = await runPdfToHepWorkerBatch(items, { workers: 2, ...options }, 0, {
         heapMb: 512,
         signalTarget: new EventEmitter(),
-        now: () => 0,
+        now: () => { const value = time; time += fixture.clockStepMs ?? 0; return value; },
         createDiagnosticLog: async () => ({
           path: "/synthetic/duplicates.log", fd: 99,
           write: (message) => diagnostics.push(String(message)),
           async close() {}
         }),
-        cleanupWorkerTemps: async () => {},
+        cleanupWorkerTemps: async outputPath => {
+          if (fixture.cleanupFailure && outputPath === duplicateOutput("a.pdf")) throw new Error("synthetic canonical cleanup failure");
+        },
         startWorker(item, force, heapMb) {
           const name = path.basename(item.pdfPath);
           converted.push(name);
@@ -939,7 +943,10 @@ process.exitCode = await runPdfToHep(process.argv.slice(2), {
           const worker = startPdfToHepWorker(item, force, heapMb, () => child);
           const code = failingPdfs.includes(name) ? 1 : 0;
           (code === 0 ? writeFile(item.outputPath, `HEP converted from ${name}`) : Promise.resolve()).then(() => {
-            child.emit("message", { type: "pdf-to-hep-sizes", sourceBytes: 9, outputBytes: 24 });
+            time += fixture.workerTimeMs ?? 0;
+            const sourceBytes = Buffer.byteLength(duplicateSources.find(([sourceName]) => sourceName === name)[1]);
+            child.emit("message", { type: "pdf-to-hep-sizes", sourceBytes, outputBytes: 24 });
+            for (const report of reports[name] ?? []) child.emit("message", report);
             child.emit("close", code, null);
           });
           return worker;
@@ -948,12 +955,19 @@ process.exitCode = await runPdfToHep(process.argv.slice(2), {
     } finally {
       Object.assign(console, originalConsole);
     }
-    const summary = Object.fromEntries(logs.at(-1).split("\n").filter((line) => line.startsWith("|"))
-      .map((line) => line.split("|").slice(1, -1).map((cell) => cell.trim())));
-    return { result, converted, logs, diagnostics, summary };
+    const rows = text => text.split("\n").filter(line => line.startsWith("|"))
+      .map(line => line.split("|").slice(1, -1).map(cell => cell.trim()));
+    const summary = Object.fromEntries(rows(logs.at(-1)));
+    const timingRows = rows(logs.find(line => line.startsWith("Conversion time summary:"))).slice(1);
+    return { result, converted, logs, diagnostics, errors, summary, timingRows };
   };
 
-  const duplicateRun = await runDuplicateBatch({ force: false });
+  const canonicalFallback = { type: "pdf-to-hep-raster-fallback", code: "page-raster-fallback", pageIndex: 2,
+    message: "Canonical output used raster fallback.", reason: "unsupported paint" };
+  const canonicalReports = { "a.pdf": [
+    { type: "pdf-to-hep-warning", message: "canonical conversion warning" }, canonicalFallback
+  ] };
+  const duplicateRun = await runDuplicateBatch({ force: false }, [], canonicalReports);
   assert.equal(duplicateRun.result, 0);
   assert.deepEqual(duplicateRun.converted.sort(), ["a.pdf", "b.pdf", "d.pdf"]);
   for (const name of ["c.pdf", "e.pdf"]) {
@@ -965,27 +979,104 @@ process.exitCode = await runPdfToHep(process.argv.slice(2), {
     "[5/5] Copied the HEP for e.pdf; same content as a.pdf",
     "Finished: 3 generated, 2 copied for duplicates, 0 skipped, 0 failed."
   ]) assert(duplicateRun.logs.includes(line), `batch output includes: ${line}`);
-  assert.match(duplicateRun.logs.join("\n"), /\| 3\/5 \| c\.pdf\s+\| duplicate \| 0h 00m 00s \| 9 B \| 24 B \|/);
-  assert.equal(duplicateRun.summary["PDFs attempted"], "3", "copies are not conversion attempts");
-  assert.equal(duplicateRun.summary.Successful, "3");
+  assert.deepEqual(duplicateRun.timingRows[2], ["3/5", "c.pdf", "duplicate", "0h 00m 00s", "9 B", "24 B", "+166.67%"]);
+  assert.equal(duplicateRun.summary["PDFs attempted"], "5", "each converted or copied PDF is processed once");
+  assert.equal(duplicateRun.summary.Successful, "5", "copied duplicate HEPs are successful outputs");
   assert.equal(duplicateRun.summary["Duplicate PDFs (HEP copied)"], "2");
+  assert.equal(duplicateRun.summary["Original PDFs (successful)"], "52 B", "copied PDFs contribute their source bytes");
+  assert.equal(duplicateRun.summary["Generated HEPs (successful)"], "120 B", "each copied HEP contributes its output bytes");
+  assert.equal(duplicateRun.summary["Size change (successful)"], "+68 B (+130.77%)");
+  assert.equal(duplicateRun.summary["HEPs larger than original PDFs"], "5");
+  assert.equal(duplicateRun.summary.Warnings, "1 across 1 PDF(s)", "two copies do not emit the canonical warning again");
+  assert.equal(duplicateRun.summary["Successful PDFs using raster fallback"], "3",
+    "both copied HEPs inherit the canonical output's raster fallback provenance");
+  const fallbackRecap = duplicateRun.diagnostics.find(line => line.includes("Raster fallback by PDF:"));
+  for (const name of ["c.pdf", "e.pdf"]) assert(fallbackRecap.includes(
+    `${path.join(duplicateDirectory, name)}:\n    Same raster fallback as ${path.join(duplicateDirectory, "a.pdf")}`));
+  assert.equal((fallbackRecap.match(/Canonical output used raster fallback/g) ?? []).length, 1,
+    "duplicate provenance links preserve fallback details without repeating conversion diagnostics");
   assert.equal(duplicateRun.summary["Conversion time saved by duplicates (est.)"], "0h 00m 00s");
   assert.match(duplicateRun.diagnostics.join("\n"),
     new RegExp(`${path.join(duplicateDirectory, "e.pdf").replace(/[\\.]/g, "\\$&")}: same content as .*a\\.pdf`));
 
+  // Advance only the injected clock: ten seconds per canonical conversion,
+  // one second per copy, without delaying real filesystem operations.
+  const timedCopies = await runDuplicateBatch({ force: true, workers: 1 }, [], {}, { clockStepMs: 1000, workerTimeMs: 9000 });
+  assert.deepEqual(timedCopies.timingRows.map(row => row[3]), ["0h 00m 10s", "0h 00m 10s", "0h 00m 01s", "0h 00m 10s", "0h 00m 01s"]);
+  assert.equal(timedCopies.summary["Total attempted conversion time (summed)"], "0h 00m 32s");
+  assert.equal(timedCopies.summary["Average attempted PDF time"], "0h 00m 06s");
+  assert.equal(timedCopies.summary["Median attempted PDF time"], "0h 00m 10s");
+  assert.equal(timedCopies.summary["Fastest attempted PDF time"], "0h 00m 01s");
+  assert.equal(timedCopies.summary["Conversion time saved by duplicates (est.)"], "0h 00m 20s",
+    "avoided conversion estimates remain separate from the two actual one-second copies");
+  const cleanupCopies = await runDuplicateBatch({ force: true }, [], {}, { cleanupFailure: true });
+  assert.equal(cleanupCopies.result, 0, "a cleanup warning does not turn copied outputs into failures");
+  assert.equal(cleanupCopies.summary.Successful, "5");
+  assert.equal(cleanupCopies.summary.Warnings, "1 across 1 PDF(s)", "canonical cleanup warnings are not multiplied by duplicate copies");
+
   // --keep-unchanged leaves a byte-identical duplicate HEP untouched.
   const keptInode = (await stat(duplicateOutput("c.pdf"))).ino;
-  const keptRun = await runDuplicateBatch({ force: true, keepUnchanged: true });
+  const keptRun = await runDuplicateBatch({ force: true, keepUnchanged: true }, [], canonicalReports);
   assert(keptRun.logs.includes("[3/5] Kept the HEP for c.pdf; same content as a.pdf"));
   assert.equal((await stat(duplicateOutput("c.pdf"))).ino, keptInode);
+  assert.equal(keptRun.summary["PDFs attempted"], "5"); assert.equal(keptRun.summary.Successful, "5");
+  assert.equal(keptRun.summary["Generated HEPs (successful)"], "120 B", "kept identical duplicate outputs count as successful HEPs");
+  assert.equal(keptRun.summary["Successful PDFs using raster fallback"], "3");
+  assert.equal(keptRun.summary.Warnings, "1 across 1 PDF(s)");
 
   // Without a HEP to copy, the next duplicate converts and serves the rest.
-  const failedRun = await runDuplicateBatch({ force: true }, ["a.pdf"]);
+  const failedRun = await runDuplicateBatch({ force: true }, ["a.pdf"], { ...canonicalReports, "c.pdf": [canonicalFallback] });
   assert.equal(failedRun.result, 1);
   assert.deepEqual(failedRun.converted.sort(), ["a.pdf", "b.pdf", "c.pdf", "d.pdf"]);
   assert(failedRun.logs.includes("[5/5] Copied the HEP for e.pdf; same content as c.pdf"));
   assert.equal(await readFile(duplicateOutput("e.pdf"), "utf8"), "HEP converted from c.pdf");
   assert.equal(failedRun.summary["Duplicate PDFs (HEP copied)"], "1");
+  assert.equal(failedRun.summary["PDFs attempted"], "5"); assert.equal(failedRun.summary.Successful, "4");
+  assert.equal(failedRun.summary.Failed, "1");
+  assert.equal(failedRun.summary["Original PDFs (successful)"], "43 B");
+  assert.equal(failedRun.summary["Generated HEPs (successful)"], "96 B");
+  assert.equal(failedRun.summary["Successful PDFs using raster fallback"], "2",
+    "the promoted successful canonical conversion and its copy count; the failed original does not");
+
+  // A failed copy is an attempted PDF but contributes no successful output
+  // bytes. Other duplicate copies continue without launching extra workers.
+  await rm(duplicateOutput("c.pdf"));
+  await mkdir(duplicateOutput("c.pdf"));
+  const copyFailureRun = await runDuplicateBatch({ force: true }, [], canonicalReports);
+  assert.equal(copyFailureRun.result, 1);
+  assert.deepEqual(copyFailureRun.converted.sort(), ["a.pdf", "b.pdf", "d.pdf"]);
+  assert.equal(copyFailureRun.summary["PDFs attempted"], "5"); assert.equal(copyFailureRun.summary.Successful, "4");
+  assert.equal(copyFailureRun.summary.Failed, "1"); assert.equal(copyFailureRun.summary.Skipped, "0");
+  assert.equal(copyFailureRun.summary["Duplicate PDFs (HEP copied)"], "1");
+  assert.equal(copyFailureRun.summary["Original PDFs (successful)"], "43 B");
+  assert.equal(copyFailureRun.summary["Generated HEPs (successful)"], "96 B");
+  assert.equal(copyFailureRun.summary["Size change (successful)"], "+53 B (+123.26%)");
+  assert.equal(copyFailureRun.summary["HEPs larger than original PDFs"], "4");
+  assert.equal(copyFailureRun.summary["Successful PDFs using raster fallback"], "2");
+  assert.equal(copyFailureRun.summary.Warnings, "1 across 1 PDF(s)");
+  assert.deepEqual(copyFailureRun.timingRows[2].slice(2), ["failed", "0h 00m 00s", "9 B", "--", "--"],
+    "a failed duplicate copy has no successful HEP size or size change");
+  assert(copyFailureRun.errors.some(line => line.includes("Failed c.pdf")));
+  assert(copyFailureRun.diagnostics.some(line => line.includes(`${path.join(duplicateDirectory, "c.pdf")}: Could not copy`)));
+  assert.equal(await readFile(duplicateOutput("e.pdf"), "utf8"), "HEP converted from a.pdf");
+  await rm(duplicateOutput("c.pdf"), { recursive: true });
+
+  // Outputs created after discovery are runtime skips, never successful
+  // duplicates. Their candidate sizes and fallback reports stay excluded.
+  await writeFile(duplicateOutput("c.pdf"), "existing duplicate output sentinel");
+  const skippedCopies = await runDuplicateBatch({ force: false }, [], canonicalReports);
+  assert.equal(skippedCopies.result, 0);
+  assert.equal(skippedCopies.summary["PDFs attempted"], "5"); assert.equal(skippedCopies.summary.Successful, "3");
+  assert.equal(skippedCopies.summary.Skipped, "2"); assert.equal(skippedCopies.summary.Failed, "0");
+  assert.equal(skippedCopies.summary["Duplicate PDFs (HEP copied)"], "0");
+  assert.equal(skippedCopies.summary["Original PDFs (successful)"], "34 B");
+  assert.equal(skippedCopies.summary["Generated HEPs (successful)"], "72 B");
+  assert.equal(skippedCopies.summary["HEPs larger than original PDFs"], "3");
+  assert.equal(skippedCopies.summary["Successful PDFs using raster fallback"], "1");
+  assert.equal(skippedCopies.summary.Warnings, "1 across 1 PDF(s)");
+  assert.deepEqual(skippedCopies.timingRows[2].slice(2), ["skipped", "0h 00m 00s", "9 B", "--", "--"]);
+  assert.equal(skippedCopies.summary["Conversion time saved by duplicates (est.)"], undefined);
+  assert.equal(await readFile(duplicateOutput("c.pdf"), "utf8"), "existing duplicate output sentinel");
   assert.deepEqual((await readdir(duplicateDirectory)).filter((name) => name.startsWith(".hepr-")), [],
     "duplicate copies must not leave temporary files behind");
 } finally {

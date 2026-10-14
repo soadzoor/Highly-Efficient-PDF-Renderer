@@ -1401,9 +1401,13 @@ durations overlap in parallel and can exceed wall time.
 PDFs with identical content are converted once per batch. Pending PDFs that share
 their exact byte size are compared by SHA-256 before dispatch; each later copy
 receives a copy of the first one's HEP (cloned on copy-on-write filesystems such
-as APFS) and appears as `duplicate` in the table. The metrics table counts these
-separately from attempted conversions, with an estimate of the conversion time they
-saved, and the diagnostics log names the PDF each duplicate matched. If that PDF
+as APFS) and appears as `duplicate` in the table. Successful copies are included
+in attempted and successful counts, original PDF and saved HEP byte totals,
+size comparisons, and raster-fallback counts. The duplicate count is a subset
+of successful outputs. Timing statistics use actual copy time; estimated
+conversion time saved is reported separately. Warning totals count diagnostics
+actually emitted, without repeating the identical PDF's warnings for each copy.
+The diagnostics log names the PDF each duplicate matched. If that PDF
 produces no HEP, its duplicates are converted normally. Only HEPs written by the
 current batch are copied; with `--force --keep-unchanged`, a duplicate's existing
 HEP is kept when it already has the same bytes. HEP files do not record their

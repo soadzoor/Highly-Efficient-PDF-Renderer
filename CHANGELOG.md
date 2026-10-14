@@ -6,6 +6,13 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Fixed
+
+- Include successfully copied duplicate PDFs in CLI attempted/successful counts,
+  original PDF and output HEP size totals, size comparisons, and raster-fallback
+  counts. Timing statistics include actual copy time while estimated conversion
+  time saved remains separate; warnings continue to count emitted diagnostics.
+
 ## [0.1.63] - 2026-10-13
 
 ### Added
