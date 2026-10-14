@@ -5,7 +5,7 @@
  * this registry maps that placeholder to the section the writer stores.
  */
 export interface PreparedRasterSection {
-  readonly storage: "png" | "webp" | "binary" | "mono";
+  readonly storage: "png" | "webp" | "binary" | "mono" | "jpx";
   readonly bytes: Uint8Array;
 }
 

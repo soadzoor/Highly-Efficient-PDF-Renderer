@@ -5,6 +5,7 @@ import type {
   NativeImageCodecResult
 } from "./nativeImage";
 import { PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
+import { registerBundledJpxResolver } from "../sourceJpxRaster";
 
 export interface BundledJpegCodecAsset {
   readonly url: URL;
@@ -155,11 +156,11 @@ export function createBundledImageCodecResolver(
   if (!Number.isSafeInteger(maxAggregateBytes) || maxAggregateBytes <= 0) {
     throw new RangeError("The bundled JPEG aggregate byte limit must be a positive safe integer.");
   }
-  return async (request, signal) => await resolveBundledImageCodecWithLimit(
+  return registerBundledJpxResolver<NativeImageCodecResolver>(async (request, signal) => await resolveBundledImageCodecWithLimit(
     request,
     maxAggregateBytes,
     signal
-  );
+  ));
 }
 
 export const resolveBundledImageCodec: NativeImageCodecResolver =

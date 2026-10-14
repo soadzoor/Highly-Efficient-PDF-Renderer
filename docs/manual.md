@@ -1204,9 +1204,25 @@ filename. Exporting a loaded scene reuses its parsed data, including original
 PDF layer defaults, hidden geometry, and retained fallback resources. The original
 PDF is not required to replay those resources after reopening the HEP file.
 
-By default, `buildHep` uses DEFLATE compression and stores each raster as the
-smaller of WebP or PNG, with raw RGBA as a fallback when encoding is unavailable.
-Set `encodeRasterImages: false` to store raw raster pixels. Set
+By default, `buildHep` uses DEFLATE compression and stores ordinary color rasters
+as the smaller of WebP or PNG, with raw RGBA as a fallback when encoding is
+unavailable. Eligible oversized JPEG 2000 images retain their original JPX
+compression at full resolution. Their pixels undergo no additional lossy
+quantization, avoiding the much larger PNG that can result when an image exceeds
+WebP's 16,383-pixel dimension limit.
+This reduces file size and export encoding work. Full-resolution decoding still
+requires memory for the image pixels and codec workspace.
+
+This retention applies to unsigned eight-bit opaque Gray/RGB images decoded by
+the bundled codec, with original dimensions, unchanged color interpretation,
+absent or identity `Decode`, and no masks or embedded opacity. Images requiring
+other color conversions, precision changes or reduced resolution use ordinary
+encoding. Export checks fingerprints of the canonical pixels and original
+encoded bytes; edited pixels or stale provenance use ordinary encoding too.
+These checks detect accidental changes, not cryptographic tampering.
+
+Set `encodeRasterImages: false` to store decoded raster pixels and disable
+original JPX retention. Set
 `compression: "store"` to write uncompressed container sections without native
 compression stream APIs. Such files can also be loaded without native
 decompression streams. Both options can increase file size.
@@ -1304,11 +1320,16 @@ The builder accepts `signal` and `onProgress`, including LOD building, raster en
 container build progress. Browser and Node exports use the same format but may
 differ in encoded image bytes.
 
-The loader supports HEP containers v1–v4 with scene schemas v9–v13. Scene v13
+The loader supports HEP containers v1–v4 with scene schemas v9–v16. Scene v13
 stores repeated transparency wrappers and matching draw-run metadata compactly,
 preserving the original group boundaries and paint order exactly. Exports use it
-when repeated wrappers can share storage. New exports use v2 when an exact
-stroke-style palette saves space, or v3 when lossless integer encoding shrinks
+when repeated wrappers can share storage. Scene v14 stores compact raster repeat
+grids, v15 shares repeated raster sections, and v16 stores eligible original JPX
+streams in validated `HJP1` envelopes. Only exports using original JPX storage
+need a v16-capable reader; other exports keep the scene version required by their
+stored features, and older v9–v15 files remain supported. New exports use
+container v2 when an exact stroke-style palette saves space, or v3 when lossless
+integer encoding shrinks
 the existing vector LOD bytes. Connected clip outlines use v4 when endpoint
 chaining reduces storage. These files require an updated viewer. Existing
 v1–v3 files remain supported. These encodings preserve every decoded section

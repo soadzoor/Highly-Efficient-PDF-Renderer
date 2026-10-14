@@ -306,7 +306,7 @@ try {
 
   const standaloneTable = sections.encodeRasterLayerTable({ atlases: [], layers: [storedTable.layers[0]] });
   assert.equal(standaloneTable[2], 16 | 4, "original JBIG2 has its own flag and retains opacity");
-  for (const flag of [16 | 1, 16 | 2, 16 | 3, 16 | 8, 16 | 32, 128]) {
+  for (const flag of [16 | 1, 16 | 2, 16 | 3, 16 | 8, 16 | 32, 16 | 128]) {
     const invalid = standaloneTable.slice();
     invalid[2] = flag;
     assert.throws(() => sections.decodeRasterLayerTable(invalid, limits), /flag|storage/i);

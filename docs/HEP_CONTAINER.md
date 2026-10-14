@@ -1,13 +1,15 @@
 # HEP container versions 1–4
 
 The `.hep` file is a binary container with MIME type `application/x-hep`. Container
-versions **1–4** wrap **scene schema versions 9–14**, recorded in
+versions **1–4** wrap **scene schema versions 9–16**, recorded in
 `manifest.json`. These version numbers evolve independently. The page-based v8
 document model is a different thing; it is not this container's scene schema.
-Readers support all four container versions and scene v9–v15; files using older
+Readers support all four container versions and scene v9–v16; files using older
 scene schemas must be regenerated from their original PDF. Writers use scene
-v15 when repeated raster images share one section, v14 for compact raster repeat grids, v13 when repeated paint-group metadata is compacted, v12 for transposed binary
-runs, v10 for plain packed monochrome rasters, otherwise v9. Legacy v11 JBIG2
+v16 for retained original JPEG 2000 images, v15 when repeated raster images share
+one section, v14 for compact raster repeat grids, v13 when repeated paint-group
+metadata is compacted, v12 for transposed binary runs, v10 for plain packed
+monochrome rasters, otherwise v9. Legacy v11 JBIG2
 streams remain readable. Readers need support for
 the scene version used by the file. Container repacking preserves section bytes
 and does not upgrade a scene or restore omitted layers.
@@ -82,9 +84,10 @@ The writer groups entries in insertion order, opening a new chunk when the curre
 group fills. Entry metadata order does not affect decoding.
 
 `manifest.json`, root-level files, `raster/` and `source/` sections, PDF files, and
-PNG/WebP files remain standalone. The manifest uses compact JSON. PNG/WebP payloads
-are stored directly. Other chunks use native zlib-wrapped DEFLATE if the result is
-smaller, otherwise stored bytes. A global `STORE` setting stores every chunk;
+PNG/WebP files remain standalone. The manifest uses compact JSON. PNG/WebP and
+original JPX raster payloads are stored directly. Other chunks use native
+zlib-wrapped DEFLATE if the result is smaller, otherwise stored bytes. A global
+`STORE` setting stores every chunk;
 per-entry `STORE` overrides are grouped separately from compressed entries.
 CRC32 is the IEEE reflected polynomial `0xedb88320`, initialized and finalized
 with XOR `0xffffffff` (the same convention as ZIP and zlib).
@@ -283,7 +286,7 @@ decimal text.
 | `clipPaths` | `{file, count, edgeCount}` | `geometry/clip-paths.d512` |
 | `drawRuns` | `{file, count, encoding?}` | `geometry/draw-runs.varint` |
 | `paintGraph` | `{file, rootCount, encoding?}` | `geometry/paint-graph.varint` |
-| `rasterLayers` (v9–v15) | `{file, count, atlasCount, repeats?}` | `geometry/raster-layers.varint` |
+| `rasterLayers` (v9–v16) | `{file, count, atlasCount, repeats?}` | `geometry/raster-layers.varint` |
 | `rasterLayers.repeats` (v14) | `{file, count, translationCount}` | `geometry/raster-repeats.f64` |
 
 Every integer is an unsigned LEB128 varint unless described as zigzag, which is
@@ -379,7 +382,7 @@ a flags byte (bits 0-1 storage: 0 raw RGBA8, 1 PNG, 2 WebP, 3 atlas cell; bit 2
 opacity present; bit 3 selects packed monochrome in v10+, bit 4 selects original
 JBIG2 in v11+, bit 5 selects transposed binary runs in v12+; an extended storage
 flag requires bits 0-1 and all other storage flags zero; bit 6 marks a shared
-section in v15+; bit 7 zero),
+section in v15+; bit 7 selects original JPEG 2000 in v16+),
 `width`, `height`, and zigzag deltas of
 `paintOrder` and `pageIndex` against the previous layer. A shared layer then
 stores the varint distance back to the earlier layer whose section holds its
@@ -440,9 +443,64 @@ on each side, into an atlas unless lossy WebP, plus about 64 bytes of per-sectio
 cost, needs at most half the bytes of its lossless form, as photographs do.
 Atlases are shelf-packed in layer order, at most 2,048 texels square, and stored
 losslessly, since lossy blocks would bleed between unrelated cells; a single
-candidate stays standalone. Readers accept up to 262,144 layers and 4,096 image
-sections, and count decoded atlases and cropped cells as RGBA toward the memory
-budget.
+candidate stays standalone. Readers validate section sizes, dimensions and safe
+aggregate byte counts before image decoding. Decoded atlases and cropped cells
+use RGBA accounting; packed images use their packed representation. Actual
+allocations remain subject to host memory, codec address ranges and caller limits.
+
+Scene v16 adds `raster/layer-N.jpx`, preserving an original JPEG 2000 stream
+instead of re-encoding its decoded pixels as PNG or WebP. The native PDF path
+currently retains eligible images with a width or height above 16,383, which
+cannot use the ordinary lossy WebP encoder. This avoids a large lossless PNG
+replacement without downsampling or adding another lossy quantization step.
+It reduces file size and export encoding work; loading still decodes the images
+at full resolution and needs memory for their canonical pixels and codec work.
+Only exports containing these sections use v16; other exports keep the version
+needed by their existing features, and scene v9–v15 files remain readable.
+
+Eligibility requires a trusted bundled decode of unsigned eight-bit opaque
+`DeviceGray` or `DeviceRGB` pixels, unchanged dimensions and absent or identity
+`Decode`. Color-space substitutions, other color spaces, masks, color-key
+transparency, matte adjustments, embedded opacity, precision conversion and
+resolution reduction exclude retention. Packed monochrome layers and repeat
+grids use their existing storage. Constant layer opacity and placement remain
+ordinary layer metadata. Export rechecks both canonical RGBA and encoded-byte
+fingerprints; changed pixels or source bytes take the normal encoding path.
+`encodeRasterImages: false` also selects decoded-pixel storage rather than
+retaining original JPX.
+
+Each JPX section has a 32-byte `HJP1` header followed by the original JP2 or raw
+JPEG 2000 codestream. The writer stores the section without another container
+compression pass:
+
+| Offset | Type | Value |
+| --- | --- | --- |
+| 0 | 4 bytes | `HJP1` |
+| 4 | uint8 | Flags: zero |
+| 5 | uint8 | Components: `1` for Gray or `3` for RGB |
+| 6 | 2 bytes | Reserved: zero |
+| 8 | uint32 | Width |
+| 12 | uint32 | Height |
+| 16 | uint32 | Encoded payload byte length |
+| 20 | 2 uint32 | Canonical RGBA mutation fingerprint |
+| 28 | uint32 | Reserved: zero |
+| 32 | encoded byte length bytes | Original JPX payload |
+
+The section length must equal `32 + encodedLength`. Before decoder allocation,
+the reader checks the envelope and mandatory codestream SIZ marker: dimensions
+must match the raster table and header, and component count and unsigned
+eight-bit precision must agree. It then uses the same bundled native JPEG 2000
+decoder as PDF loading, reconstructs opaque RGBA and verifies the canonical
+fingerprint before publishing the layer. Verified original bytes remain
+available for unchanged re-export. Identical placements can use v15's shared
+section reference within a v16 file.
+
+The RGBA fingerprint is the dimensions-bound pair returned by
+`hashSourceJpxRgba` in `src/sourceJpxRaster.ts`; runtime provenance also carries
+an encoded-byte fingerprint from `hashSourceJpxEncoded`. These two-lane
+fingerprints detect accidental edits and stale provenance, and are not
+cryptographic authentication. Container CRCs, structural checks and native
+decoder validation apply separately.
 
 Scene v10 adds `raster/layer-N.mono`: eight palette bytes (straight-alpha RGBA8
 for zero bits, then one bits), followed by exactly `ceil(width / 8) * height`
@@ -455,10 +513,10 @@ canonical pixels; GPU display derivatives are rebuilt when needed. Optional
 decoded JBIG2 symbol caches are omitted. Reloading retains packed rows with lazy
 RGBA access for consumers that require it.
 
-Packed layers count their palette and packed bytes toward the same 1 GiB
-aggregate raster memory limit. Traditional layers retain RGBA accounting;
-per-image texel and dimension limits still apply to both representations.
-Indexed section lengths are checked against dimensions before decompression.
+Packed layers account for their palette and packed bytes; traditional layers
+retain RGBA accounting. Section lengths and dimensions are checked before
+decompression, with caller limits and codec address validation applied where
+relevant.
 For a 2,480 by 3,506 scan this reduces the uncompressed pixel section from
 34,779,520 RGBA bytes to 1,086,868 bytes including the palette. Compressed size
 depends on the scan; packed DEFLATE does not promise the same ratio as the

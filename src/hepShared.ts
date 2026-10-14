@@ -58,6 +58,8 @@ export const PARSED_DATA_GROUP_RUN_FORMAT_VERSION = 13;
 export const PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION = 14;
 /** Repeated larger images reuse one raster section through a layer reference. */
 export const PARSED_DATA_SHARED_RASTER_FORMAT_VERSION = 15;
+/** Eligible unchanged JPEG 2000 images retain their original encoded pixels. */
+export const PARSED_DATA_JPX_FORMAT_VERSION = 16;
 export const TEXT_INDEX_JSON_PATH = "text/text-index.json";
 export const TEXT_CHAR_MAP_PATH = "text/char-map.bin";
 export const TEXT_FALLBACK_PATH = "text/fallback-quads.d512";

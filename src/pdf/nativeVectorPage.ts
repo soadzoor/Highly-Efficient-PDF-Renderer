@@ -14,6 +14,7 @@ import type {
 } from "../pdfVectorExtractor";
 import { HEPR_IMAGE_FORMAT, expandHeprImageToRgba8, heprRawImageBytesPerPixel, heprRawImageByteLength } from "../heprDocumentData";
 import { createMonochromeRasterLayer } from "../monochromeRaster";
+import { hashSourceJpxEncoded, hashSourceJpxRgba, type SourceJpxRaster } from "../sourceJpxRaster";
 import {
   DENSE_PDF_VECTOR_SCENE_EVENT_FILL,
   DENSE_PDF_VECTOR_SCENE_EVENT_STROKE,
@@ -133,6 +134,9 @@ const MAX_TEXT_CUBIC_TO_QUAD_DEPTH = 12;
 const TEXT_INDEX_GAP_EM_FACTOR = 0.25;
 /** Padding for the exceptional legacy clipped-image capture. */
 const VECTOR_RASTER_CROP_PADDING_PX = 2;
+/** Bind once before exposure; later public pixel edits must not become a new original. */
+const sourceJpxFingerprints = new WeakMap<NativePdfImageDescription,
+  Pick<SourceJpxRaster, "rgbaHash" | "encodedHash">>();
 
 /**
  * Build the existing one-page `VectorScene` directly from native parser data.
@@ -1811,6 +1815,7 @@ function buildRasterLayers(
   const uniformCropColors = new Map<ImageTexelRect, Uint8Array | null>();
   const uniformImageColors = new Map<number, Uint8Array | null>();
   const layers: RasterLayer[] = [];
+  const sourceJpxImages = new Map<number, SourceJpxRaster>();
   let compositedImages: Map<number, Uint8Array> | null = null;
   for (const invocation of order) {
     throwIfAborted(signal);
@@ -1932,7 +1937,27 @@ function buildRasterLayers(
       paintOrder: sidecar.imagePaintOrders[invocation],
       pageIndex: 0
     };
-    layers.push(monochrome ? createMonochromeRasterLayer(base, monochrome) : { ...base, data: layerData });
+    let sourceJpx: SourceJpxRaster | undefined;
+    const originalJpx = image.originalJpx;
+    if (!monochrome && originalJpx && layerData === imageData && layerWidth === originalJpx.width &&
+        layerHeight === originalJpx.height && image.softMaskImageIndex < 0) {
+      sourceJpx = sourceJpxImages.get(imageIndex);
+      if (!sourceJpx) {
+        // Worker transfers must never detach the registry's reusable bytes.
+        // One page-owned copy and fingerprint serve all placements of an image.
+        const encoded = originalJpx.encoded.slice();
+        let fingerprints = sourceJpxFingerprints.get(image);
+        if (!fingerprints) {
+          fingerprints = { rgbaHash: hashSourceJpxRgba(layerData, layerWidth, layerHeight, signal),
+            encodedHash: hashSourceJpxEncoded(encoded, signal) };
+          sourceJpxFingerprints.set(image, fingerprints);
+        }
+        sourceJpx = { ...originalJpx, encoded, ...fingerprints };
+        sourceJpxImages.set(imageIndex, sourceJpx);
+      }
+    }
+    layers.push(monochrome ? createMonochromeRasterLayer(base, monochrome)
+      : { ...base, data: layerData, ...(sourceJpx ? { sourceJpx } : {}) });
   }
   return layers;
 }

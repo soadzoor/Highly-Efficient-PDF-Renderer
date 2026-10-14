@@ -50,6 +50,7 @@ import {
   decodeHepJbig2Raster, inspectHepJbig2Raster, HEP_JBIG2_RASTER_HEADER_BYTES,
   HEP_JBIG2_NO_GLOBALS, HEP_JBIG2_MAX_DECODE_BYTES, hepJbig2GlobalsFile
 } from "./hepJbig2Raster";
+import { decodeHepJpxRaster, HEP_JPX_RASTER_HEADER_BYTES } from "./hepJpxRaster";
 import { createMonochromeRasterLayer } from "./monochromeRaster";
 import { decodeHepRasterRepeats, hepRasterRepeatsByteLength, SCENE_RASTER_REPEATS_PATH } from "./hepRasterRepeats";
 import {
@@ -79,6 +80,7 @@ import {
   PARSED_DATA_GROUP_RUN_FORMAT_VERSION,
   PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION,
   PARSED_DATA_SHARED_RASTER_FORMAT_VERSION,
+  PARSED_DATA_JPX_FORMAT_VERSION,
   readTexturePayloadAsFloat32,
   readNonNegativeInt,
   preparedStrokeGeometry,
@@ -482,9 +484,10 @@ async function loadSceneFromHepInternal(
       manifest.formatVersion !== PARSED_DATA_BINARY_FORMAT_VERSION &&
       manifest.formatVersion !== PARSED_DATA_GROUP_RUN_FORMAT_VERSION &&
       manifest.formatVersion !== PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION &&
-      manifest.formatVersion !== PARSED_DATA_SHARED_RASTER_FORMAT_VERSION) {
+      manifest.formatVersion !== PARSED_DATA_SHARED_RASTER_FORMAT_VERSION &&
+      manifest.formatVersion !== PARSED_DATA_JPX_FORMAT_VERSION) {
     throw new Error(
-      `HEP format v${String(manifest.formatVersion)} is not supported; expected v${PARSED_DATA_FORMAT_VERSION}–v${PARSED_DATA_SHARED_RASTER_FORMAT_VERSION}. Re-export the HEP file with the current version.`
+      `HEP format v${String(manifest.formatVersion)} is not supported; expected v${PARSED_DATA_FORMAT_VERSION}–v${PARSED_DATA_JPX_FORMAT_VERSION}. Re-export the HEP file with the current version.`
     );
   }
 
@@ -1326,6 +1329,9 @@ async function readRasterLayersFromParsedData(
   if (formatVersion < PARSED_DATA_SHARED_RASTER_FORMAT_VERSION && table.layers.some(layer => layer.source !== undefined)) {
     throw new Error("Shared raster layer sections require HEP scene format v15.");
   }
+  if (formatVersion < PARSED_DATA_JPX_FORMAT_VERSION && table.layers.some(layer => layer.storage === "jpx")) {
+    throw new Error("Original JPEG 2000 raster layers require HEP scene format v16.");
+  }
   validateRasterLayerPayloads(archive, table);
   const repeats = await readRasterRepeatsFromParsedData(archive, meta.repeats, count, formatVersion, signal);
 
@@ -1399,6 +1405,14 @@ async function readRasterLayersFromParsedData(
       layers.push(createMonochromeRasterLayer(base, monochrome));
       continue;
     }
+    if (record.storage === "jpx") {
+      const bytes = await archive.file(rasterLayerFile(i, "jpx"))!.async("uint8array");
+      signal?.throwIfAborted();
+      const decoded = await decodeHepJpxRaster(bytes, record.width, record.height, signal);
+      signal?.throwIfAborted();
+      layers.push({ ...base, ...decoded });
+      continue;
+    }
     let data: Uint8Array;
     if (record.storage === "atlas") {
       const cell = record.cell!;
@@ -1444,7 +1458,8 @@ function placeSharedRasterLayer(
     pageIndex: record.pageIndex,
     ...(repeat ? { repeat } : {}),
     ...(interpolation !== "-" && interpolation !== undefined ? { interpolate: interpolation === "1" } : {}),
-    ...(record.opacity === undefined ? {} : { opacity: record.opacity })
+    ...(record.opacity === undefined ? {} : { opacity: record.opacity }),
+    ...(owner.sourceJpx ? { sourceJpx: owner.sourceJpx } : {})
   };
   return "monochrome" in pixels ? createMonochromeRasterLayer(base, pixels.monochrome) : { ...base, data: pixels.data };
 }
@@ -1544,8 +1559,8 @@ function validateRasterLayerPayloads(archive: HepArchive, table: RasterLayerTabl
     addTexels(texels, `Raster layer ${index}`, decodedBytes);
     // A shared layer's section was validated for the layer that owns it.
     if (layer.storage !== "atlas" && layer.source === undefined) {
-      const encodedMono = layer.storage === "binary" || layer.storage === "jbig2";
-      const byteLength = addSection(rasterLayerFile(index, layer.storage), encodedMono ? null : decodedBytes, `Raster layer ${index}`);
+      const encoded = layer.storage === "binary" || layer.storage === "jbig2" || layer.storage === "jpx";
+      const byteLength = addSection(rasterLayerFile(index, layer.storage), encoded ? null : decodedBytes, `Raster layer ${index}`);
       if (layer.storage === "binary" && (byteLength < HEP_BINARY_RASTER_HEADER_BYTES + 2 ||
           byteLength > hepBinaryRasterByteLengthLimit(layer.width, layer.height))) {
         throw new Error(`Raster layer ${index} binary section size does not match its dimensions.`);
@@ -1556,6 +1571,10 @@ function validateRasterLayerPayloads(archive: HepArchive, table: RasterLayerTabl
             decodedBytes - 8 + byteLength - HEP_JBIG2_RASTER_HEADER_BYTES > HEP_JBIG2_MAX_DECODE_BYTES) {
           throw new Error(`Raster layer ${index} JBIG2 section exceeds the decode byte budget.`);
         }
+      }
+      if (layer.storage === "jpx" && (byteLength <= HEP_JPX_RASTER_HEADER_BYTES ||
+          !Number.isSafeInteger(decodedBytes + byteLength))) {
+        throw new Error(`Raster layer ${index} JPEG 2000 section size is invalid.`);
       }
     }
   });

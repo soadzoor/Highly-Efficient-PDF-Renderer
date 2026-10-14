@@ -194,8 +194,12 @@ by default. If its installation fails or optional dependencies were omitted,
 install both packages with `npm install @soadzoor/hepr @napi-rs/canvas` and run
 `npx pdf-to-hep` from that project.
 
-HEP uses scene schema **v9 only**. Regenerate older archives from the original
-PDFs. Exports retain hidden content and original layer defaults; temporary layer
+Current HEP readers support scene schemas **v9–v16**. Exports select the version
+required by their stored features. Eligible oversized JPEG 2000 images retain
+their original compression and full-resolution pixels in v16, without another
+lossy encode; only exports using this storage require a v16-capable reader.
+Regenerate archives with scene schemas older than v9 from the original PDFs.
+Exports retain hidden content and original layer defaults; temporary layer
 visibility and primitive colors remain per-view settings.
 
 ## Learn more

@@ -25,7 +25,7 @@ export interface HepEncodingOptions extends HepLodOptions {
   /** Receives export warnings, including a HEP larger than the original PDF. */
   onWarning?: (message: string) => void;
 
-  /** Encode color rasters as WebP/PNG when supported. Monochrome layers always retain packed bits. @default true */
+  /** Encode color rasters as WebP/PNG, retaining eligible oversized source JPX. Monochrome layers always retain packed bits. @default true */
   encodeRasterImages?: boolean;
 
   /** HEP compression algorithm. @default "deflate" */

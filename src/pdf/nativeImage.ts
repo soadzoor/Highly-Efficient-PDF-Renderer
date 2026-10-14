@@ -1,4 +1,5 @@
 import type { MonochromeSymbolScene } from "../compactMonochromeRaster";
+import { isBundledJpxResolver, type SourceJpxRaster } from "../sourceJpxRaster";
 import {
   isPdfDictionary,
   isPdfName,
@@ -134,6 +135,8 @@ export interface NativePdfImageOptions {
 }
 
 export interface NativePdfImageDescription {
+  /** Internal original bytes; vector pages copy these before exposing transferable provenance. */
+  readonly originalJpx?: Omit<SourceJpxRaster, "rgbaHash" | "encodedHash">;
   readonly jbig2Symbols?: MonochromeSymbolScene;
   readonly width: number;
   readonly height: number;
@@ -483,6 +486,7 @@ export class NativePdfImageRegistry {
         )
       : [];
     let jbig2Symbols: MonochromeSymbolScene | undefined;
+    let originalJpx: NativePdfImageDescription["originalJpx"];
     let data: Uint8Array | null = null;
     let format: number | null = null;
     let codecRequest: NativeImageCodecRequest | null = null;
@@ -818,6 +822,26 @@ export class NativePdfImageRegistry {
             data = converted.data;
             format = converted.format;
           }
+          // Oversized images cannot use the ordinary WebP export path. Keep
+          // only source layouts whose bundled decode is canonical Gray/RGB,
+          // without a PDF-side color, mask, precision or resolution change.
+          const colorKind = colorSpaceIndex < 0 ? undefined : this.colors.describe(colorSpaceIndex).kind;
+          if (terminalCodec === "jpeg2000" && this.trustedCodecResolver && isBundledJpxResolver(codecResolver) &&
+              (width > 16383 || height > 16383) && !imageMask && mask.kind === "none" && mask.imageIndex < 0 &&
+              colorKeyMask.length === 0 && mask.matte.length === 0 && embeddedSoftMask.value === 0 &&
+              resolved.width === width && resolved.height === height && resolved.bitsPerComponent === 8 &&
+              ((resolved.components === 1 && colorKind === "DeviceGray" && !colorSpaceResources?.has("DefaultGray") &&
+                format === HEPR_IMAGE_FORMAT.Gray8) ||
+               (resolved.components === 3 && colorKind === "DeviceRGB" && !colorSpaceResources?.has("DefaultRGB") &&
+                format === HEPR_IMAGE_FORMAT.Rgba8)) && await sourceJpxHasIdentityDecode(this.document, dictionary, resolved.components, signal)) {
+            const { readJpxProperties } = await import("./nativeJpxCodec");
+            throwIfAborted(signal);
+            const metadata = readJpxProperties(requestEncoded);
+            if (metadata.unsignedBytes && metadata.components === resolved.components &&
+                metadata.width === width && metadata.height === height) {
+              originalJpx = Object.freeze({ width, height, components: resolved.components as 1 | 3, encoded: requestEncoded });
+            }
+          }
           codecRequest = null;
         } else {
           data = unresolvedPayload!;
@@ -901,6 +925,7 @@ export class NativePdfImageRegistry {
       matte: mask.matte,
       data,
       ...(jbig2Symbols ? { jbig2Symbols } : {}),
+      ...(originalJpx ? { originalJpx } : {}),
       codecRequest
     });
     const index = this.records.length;
@@ -2331,6 +2356,19 @@ async function readImageDecode(
     throw new PdfError("unsupported-image", "An image-mask Decode array must be [0 1] or [1 0].");
   }
   return values;
+}
+
+/** JPX ignores Decode, but keep provenance conservative without rejecting an ignored malformed value. */
+async function sourceJpxHasIdentityDecode(document: NativePdfDocument, dictionary: PdfDictionary,
+  components: number, signal?: AbortSignal): Promise<boolean> {
+  if (!dictionary.has("Decode")) return true;
+  try {
+    const values = await resolveNumberArray(document, dictionary.get("Decode"), signal);
+    return values.length === components * 2 && values.every((value, index) => value === index % 2);
+  } catch {
+    throwIfAborted(signal);
+    return false;
+  }
 }
 
 async function readColorKeyMask(

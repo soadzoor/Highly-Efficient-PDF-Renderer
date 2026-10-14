@@ -5,6 +5,7 @@ import { isRasterAtlasCandidate } from "./hepRasterLayers";
 import { detectMonochromeRaster } from "./monochromeRaster";
 import { preparedRasterPlaceholder, type PreparedRasterSection } from "./preparedRasterSections";
 import { encodeRasterRgbaCandidates, pickBestRasterImage } from "./rasterImageCodec";
+import { prepareSourceJpxRaster } from "./hepJpxPreparation";
 
 /** Encodes one parsed page's larger images before the next page is decoded. */
 export type HepRasterPagePreparer = (scene: VectorScene, signal?: AbortSignal) => Promise<void>;
@@ -12,11 +13,12 @@ export type HepRasterPagePreparer = (scene: VectorScene, signal?: AbortSignal) =
 /**
  * A streaming PDF export keeps every page until the HEP is written, but only
  * needs the encoded form of its larger images. This preparer stores each such
- * image the way the HEP writer would (exact two-color packing, otherwise the
- * smaller of WebP and PNG) as soon as its page is parsed, and releases its
- * pixels. Identical images across the document, matched by a SHA-256 digest
- * of their pixels, share one encoded section. Atlas-sized images keep their
- * pixels so the writer still packs them document-wide.
+ * image the way the HEP writer would (eligible original JPEG 2000, exact
+ * two-color packing, otherwise the smaller of WebP and PNG) as soon as its
+ * page is parsed, and releases its pixels. Identical images across the document,
+ * matched by a SHA-256 digest of their retained stream or pixels, share one
+ * encoded section. Atlas-sized images keep their pixels so the writer still
+ * packs them document-wide.
  */
 export function createHepRasterPagePreparer(): HepRasterPagePreparer {
   const sectionsByDigest = new Map<string, PreparedRasterSection>();
@@ -28,11 +30,16 @@ export function createHepRasterPagePreparer(): HepRasterPagePreparer {
       if (!isPreparableRasterLayer(layer)) continue;
       const { width, height } = layer;
       const rgba = layer.data.subarray(0, width * height * 4);
-      const digest = await pixelDigest(rgba, width, height);
+      const original = await prepareSourceJpxRaster(layer, signal);
+      // Hash the small retained stream instead of copying a potentially
+      // gigabyte-sized RGBA plane through WebCrypto solely to deduplicate it.
+      const digestBytes = original?.bytes ?? rgba;
+      const hash = await pixelDigest(digestBytes, width, height);
+      const digest = hash === undefined ? undefined : `${original ? "jpx" : "rgba"}:${hash}`;
       signal?.throwIfAborted();
       let section = digest === undefined ? undefined : sectionsByDigest.get(digest);
       if (!section) {
-        const encoded = await encodeRasterSection(width, height, rgba, signal);
+        const encoded = original ?? await encodeRasterSection(width, height, rgba, signal);
         // Nothing beats raw pixels; the writer stores them as it always has.
         if (!encoded) continue;
         section = encoded;
@@ -80,7 +87,7 @@ async function encodeRasterSection(
 }
 
 /**
- * Dimensions and SHA-256 of the pixels, or undefined without WebCrypto (for
+ * Dimensions and SHA-256 of the bytes, or undefined without WebCrypto (for
  * example on an insecure origin); identical images are then encoded twice.
  */
 async function pixelDigest(rgba: Uint8Array, width: number, height: number): Promise<string | undefined> {

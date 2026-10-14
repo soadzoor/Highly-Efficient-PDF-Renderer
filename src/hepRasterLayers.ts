@@ -1,5 +1,5 @@
 /**
- * Scene v9–v15 raster layers: one binary record per canonical image layer, with
+ * Scene v9–v16 raster layers: one binary record per canonical image layer, with
  * the pixels of small lossless layers packed into shared atlas images. Since
  * v15 a repeated larger image can reuse an earlier layer's section.
  *
@@ -25,7 +25,7 @@ export const RASTER_ATLAS_MAX_SIZE = 2048;
 export const RASTER_ATLAS_MAX_CELL_TEXELS = 16_384;
 
 /** Index order is the wire format; never reorder, only append. */
-const LAYER_STORAGE = ["rgba", "png", "webp", "atlas", "mono", "jbig2", "binary"] as const;
+const LAYER_STORAGE = ["rgba", "png", "webp", "atlas", "mono", "jbig2", "binary", "jpx"] as const;
 const ATLAS_ENCODINGS = ["rgba", "png"] as const;
 const FLAG_STORAGE_MASK = 3;
 const FLAG_OPACITY = 4;
@@ -34,6 +34,8 @@ const FLAG_JBIG2 = 16;
 const FLAG_BINARY = 32;
 /** Scene v15: the layer reuses the section an earlier layer stores. */
 const FLAG_SHARED = 64;
+/** Scene v16: original JPEG 2000 pixels decoded by the bundled native codec. */
+const FLAG_JPX = 128;
 const MAX_INT32 = 0x7fffffff;
 
 export type RasterLayerStorage = typeof LAYER_STORAGE[number];
@@ -226,7 +228,8 @@ export function copyRasterRect(
  * bit 2 opacity present; bit 3 monochrome packed section with bits 0-1 zero,
  * added in scene v10; bit 4 original JBIG2 section with bits 0-1 and bit 3
  * zero, added in scene v11; bit 5 transposed binary runs with all other storage
- * bits zero, added in scene v12), `varint width`, `varint height`, zigzag deltas of
+ * bits zero, added in scene v12; bit 7 original JPEG 2000 with all other storage
+ * bits zero, added in scene v16), `varint width`, `varint height`, zigzag deltas of
  * paint order and page index against the previous layer, then for a cell
  * `varint atlas` and zigzag `x`, `y` against the previous cell's right edge
  * and row when it is in the same atlas (else against zero), and a float64
@@ -259,7 +262,8 @@ export function encodeRasterLayerTable({ atlases, layers }: RasterLayerTable): U
       fail(`layer ${index} has an invalid opacity`);
     }
     const storageFlag = layer.storage === "mono" ? FLAG_MONOCHROME :
-      layer.storage === "jbig2" ? FLAG_JBIG2 : layer.storage === "binary" ? FLAG_BINARY : storage;
+      layer.storage === "jbig2" ? FLAG_JBIG2 : layer.storage === "binary" ? FLAG_BINARY :
+      layer.storage === "jpx" ? FLAG_JPX : storage;
     const shared = layer.source !== undefined;
     if (shared) requireSharedSource(layers, index, layer.source!, layer);
     writer.writeByte(storageFlag | (hasOpacity ? FLAG_OPACITY : 0) | (shared ? FLAG_SHARED : 0));
@@ -328,14 +332,14 @@ export function decodeRasterLayerTable(bytes: Uint8Array, limits: RasterLayerTab
   let previousCell = { atlas: -1, right: 0, y: 0 };
   for (let index = 0; index < layerCount; index += 1) {
     const flags = cursor.readByte("raster layer flags");
-    if (flags & ~(FLAG_STORAGE_MASK | FLAG_OPACITY | FLAG_MONOCHROME | FLAG_JBIG2 | FLAG_BINARY | FLAG_SHARED)) {
+    if (flags & ~(FLAG_STORAGE_MASK | FLAG_OPACITY | FLAG_MONOCHROME | FLAG_JBIG2 | FLAG_BINARY | FLAG_SHARED | FLAG_JPX)) {
       fail(`layer ${index} has reserved flag bits`);
     }
-    const extendedStorage = flags & (FLAG_MONOCHROME | FLAG_JBIG2 | FLAG_BINARY);
+    const extendedStorage = flags & (FLAG_MONOCHROME | FLAG_JBIG2 | FLAG_BINARY | FLAG_JPX);
     if (extendedStorage && ((flags & FLAG_STORAGE_MASK) || (extendedStorage & (extendedStorage - 1)))) {
       fail(`layer ${index} has conflicting storage flags`);
     }
-    const storage = flags & FLAG_BINARY ? "binary" : flags & FLAG_JBIG2 ? "jbig2" :
+    const storage = flags & FLAG_JPX ? "jpx" : flags & FLAG_BINARY ? "binary" : flags & FLAG_JBIG2 ? "jbig2" :
       flags & FLAG_MONOCHROME ? "mono" : LAYER_STORAGE[flags & FLAG_STORAGE_MASK];
     const width = requireInteger(cursor.readVarUint32(), 1, limits.maxDimension, "layer width");
     const height = requireInteger(cursor.readVarUint32(), 1, limits.maxDimension, "layer height");

@@ -1,4 +1,5 @@
 import { preparedRasterSection } from "./preparedRasterSections";
+import type { SourceJpxRaster } from "./sourceJpxRaster";
 import { PAGE_PRIMITIVE_KINDS, PAGE_PRIMITIVE_RANGE_STRIDE, scenePrimitiveCounts, validatePagePrimitiveRanges } from "./scenePageViews";
 import { appendVectorDrawRun, defaultVectorDrawRuns, validateVectorDrawRuns } from "./vectorDrawOrder";
 import { placeSceneAnnotation, type AnnotationAppearanceMode, type SceneAnnotation, type ScenePdfPage } from "./annotationData";
@@ -39,6 +40,8 @@ export interface Bounds {
 }
 
 export interface RasterLayer {
+  /** Verified original oversized JPEG 2000 bytes, reusable until pixels or source bytes change. */
+  sourceJpx?: SourceJpxRaster;
   /** Reusable raster cell; matrix encloses its grid rather than sampling it once. */
   repeat?: RasterRepeat;
   /** Viewing-only GPU blocks; canonical pixels remain available for export and recovery. */

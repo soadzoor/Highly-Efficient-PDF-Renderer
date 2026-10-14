@@ -4,6 +4,13 @@ ImageMagick 6.9.12 / OpenJPEG 2.5.0, using `convert input.pam -depth 8 -quality 
 alpha `128`. They contain no third-party artwork. The JBIG2 test page and globals
 are assembled from segment and fax bits in `scripts/lib/imageCodecFixtures.mjs`.
 
+`rgb-wide-16400x2.jp2` is a synthetic RGB ramp wider than WebP's dimension
+limit. It was generated from an opaque RGBA ramp `(x % 256, (3*x+40*y) % 256,
+(7*x+50*y) % 256)`, encoded as JPEG at quality 100 with `@napi-rs/canvas`, then
+converted with macOS `sips -s format public.jpeg-2000`. Tests compare the JPX
+decoder's pixels before and after HEP export, without assuming lossless fixture
+generation. It checks full resolution and original-stream reuse through workers.
+
 The `gray*-3x2.jp2` fixtures contain a six-sample ramp from zero to the maximum
 unsigned value (or the corresponding signed range). Precisions are 1, 2, 4,
 signed 8, unsigned/signed 12 and signed 16 bits. Their odd width checks packed

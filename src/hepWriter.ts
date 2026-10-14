@@ -36,6 +36,7 @@ import { encodeHepMonochromeRaster } from "./hepMonochromeRaster";
 import { encodeHepBinaryRaster } from "./hepBinaryRaster";
 import { detectMonochromeRaster } from "./monochromeRaster";
 import { preparedRasterSection, type PreparedRasterSection } from "./preparedRasterSections";
+import { prepareSourceJpxRaster } from "./hepJpxPreparation";
 import { encodeHepRasterRepeats, SCENE_RASTER_REPEATS_PATH } from "./hepRasterRepeats";
 import {
   IdenticalRasterFinder,
@@ -69,6 +70,7 @@ import {
   PARSED_DATA_GROUP_RUN_FORMAT_VERSION,
   PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION,
   PARSED_DATA_SHARED_RASTER_FORMAT_VERSION,
+  PARSED_DATA_JPX_FORMAT_VERSION,
   TEXT_INDEX_JSON_PATH,
   TEXT_CHAR_MAP_PATH,
   TEXT_FALLBACK_PATH,
@@ -252,7 +254,8 @@ export async function buildHepBlobForLayout(
   reportBuildProgress(hepBuildStart, { stage: "hep-build" });
 
   const manifest = {
-    formatVersion: rasterLayersManifest?.shared ? PARSED_DATA_SHARED_RASTER_FORMAT_VERSION :
+    formatVersion: rasterLayersManifest?.jpx ? PARSED_DATA_JPX_FORMAT_VERSION :
+      rasterLayersManifest?.shared ? PARSED_DATA_SHARED_RASTER_FORMAT_VERSION :
       rasterRepeats ? PARSED_DATA_RASTER_REPEAT_FORMAT_VERSION :
       paintGraphExport?.repeatedGroups ? PARSED_DATA_GROUP_RUN_FORMAT_VERSION :
       rasterLayersManifest?.binary ? PARSED_DATA_BINARY_FORMAT_VERSION :
@@ -433,7 +436,7 @@ async function writeHepRasterLayers(
     signal?: AbortSignal;
     onTexelsEncoded: (processed: number) => void;
   }
-): Promise<{ file: string; count: number; atlasCount: number; binary: boolean; mono: boolean; shared: boolean } | undefined> {
+): Promise<{ file: string; count: number; atlasCount: number; binary: boolean; mono: boolean; shared: boolean; jpx: boolean } | undefined> {
   if (layers.length === 0) {
     return undefined;
   }
@@ -448,6 +451,8 @@ async function writeHepRasterLayers(
   let binary = false;
   let mono = false;
   let shared = false;
+  let jpx = false;
+  const originalJpxOwners = new Map<NonNullable<RasterLayer["sourceJpx"]>, number>();
   /** Layers owning a packed section, which identical copies reference. */
   const packedSections: Array<{ storage: "binary" | "mono"; bytes: Uint8Array } | undefined> = [];
   /** The first earlier layer with identical pixels, or -1. */
@@ -503,17 +508,21 @@ async function writeHepRasterLayers(
       }
     };
     // Packed layers expose RGBA only through an expanding getter; never touch it.
-    const prepared = layer.monochrome ? undefined : preparedRasterSection(layer.data);
+    const prepared = layer.monochrome ? undefined : preparedRasterSection(layer.data) ??
+      (options.encodeRasterImages ? await prepareSourceJpxRaster(layer, options.signal) : undefined);
     if (prepared) {
       // Encoded while its page was parsed; identical images share one section.
       record.storage = prepared.storage;
-      const owner = preparedOwners.get(prepared);
+      if (prepared.storage === "jpx") jpx = true;
+      const owner = preparedOwners.get(prepared) ?? (prepared.storage === "jpx" && layer.sourceJpx
+        ? originalJpxOwners.get(layer.sourceJpx) : undefined);
       if (owner !== undefined) {
         record.source = owner;
         shared = true;
       } else {
         preparedOwners.set(prepared, i);
-        if (prepared.storage === "png" || prepared.storage === "webp") {
+        if (prepared.storage === "jpx" && layer.sourceJpx) originalJpxOwners.set(layer.sourceJpx, i);
+        if (prepared.storage === "png" || prepared.storage === "webp" || prepared.storage === "jpx") {
           writeOwnedHepImageSection(archive, rasterLayerFile(i, prepared.storage), prepared.bytes);
         } else {
           archive.file(rasterLayerFile(i, prepared.storage), prepared.bytes);
@@ -646,7 +655,7 @@ async function writeHepRasterLayers(
   }
 
   records.forEach((record, index) => {
-    if (record.storage === "atlas" || record.storage === "mono" || record.storage === "binary" ||
+    if (record.storage === "atlas" || record.storage === "mono" || record.storage === "binary" || record.storage === "jpx" ||
         record.source !== undefined || preparedRasterSection(layers[index].data)) return;
     const image = encoded[index];
     if (image) {
@@ -658,7 +667,7 @@ async function writeHepRasterLayers(
     }
   });
   archive.file(SCENE_RASTER_LAYERS_PATH, encodeRasterLayerTable({ atlases, layers: records }));
-  return { file: SCENE_RASTER_LAYERS_PATH, count: records.length, atlasCount: atlases.length, binary, mono, shared };
+  return { file: SCENE_RASTER_LAYERS_PATH, count: records.length, atlasCount: atlases.length, binary, mono, shared, jpx };
 }
 
 function buildTextIndexExport(scene: VectorScene): TextIndexExportResult | null {
