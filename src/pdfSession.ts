@@ -55,6 +55,10 @@ import {
   type DensePdfTextOperatorContext
 } from "./pdf/nativeContentCompiler";
 import {
+  densePdfGenericPathPaintCount,
+  getDensePdfGenericPathPaint
+} from "./pdf/nativeRetainedResources";
+import {
   scanPreparedResourceReferencesFastOrExact,
   tryScanFastPreparedResourceReferences
 } from "./pdf/nativeFastResourceScanner";
@@ -1832,6 +1836,7 @@ class NativePdfSession implements NativeVectorPdfSession {
     const retainOptionalContent = (options as NativeVectorCompileOptions).retainOptionalContent === true;
     const compileOptions: DensePdfContentInputOptions = {
       onDiagnostic: imageResources.onDiagnostic,
+      compactRetainedResources: output === "display-program",
       ...denseSourcePaintOptions(imageResources),
       retainOptionalContent,
       ...(retainOptionalContent ? { combineOptionalContent: (parent: number, own: number) => this.optionalContent.combineMemberships(parent, own) } : {}),
@@ -4865,6 +4870,7 @@ async function compileNativeFormPrograms(
       enableSegmentMerge: nativeVectorSegmentMergeEnabled(options),
       enableInvisibleCull: nativeVectorInvisibleCullEnabled(options),
       output: "display-program",
+      compactRetainedResources: true,
       totalBytes: definition.content.length,
       signal
     });
@@ -5301,6 +5307,7 @@ async function compileNativeType3Programs(
       enableSegmentMerge: nativeVectorSegmentMergeEnabled(options),
       enableInvisibleCull: nativeVectorInvisibleCullEnabled(options),
       output: "display-program",
+      compactRetainedResources: true,
       type3PaintMode: glyph.charProc.metrics.colored ? "colored" : "uncolored",
       totalBytes: content.length,
       signal
@@ -5385,7 +5392,7 @@ async function compileNativeType3Programs(
       if (kind === DENSE_PDF_PAINT_RUN_PATH) {
         const paintIndex = compiled.paintRuns[offset + 1];
         const count = compiled.paintRuns[offset + 2];
-        const paint = compiled.genericPathPaints[paintIndex];
+        const paint = getDensePdfGenericPathPaint(compiled, paintIndex);
         if (count !== 1 || paintIndex !== genericPathPaintCount || !paint) {
           throw new PdfError("invalid-object", "A Type3 CharProc lost generic path provenance.", {
             pageIndex,
@@ -5412,7 +5419,7 @@ async function compileNativeType3Programs(
     }
     if (
       pathPaintIndex !== compiled.pathPaints.length ||
-      genericPathPaintCount !== compiled.genericPathPaints.length ||
+      genericPathPaintCount !== densePdfGenericPathPaintCount(compiled) ||
       imagePaintIndex !== compiled.imagePaints.length ||
       glyphPaintIndex !== compiled.glyphPaints.length
     ) {
@@ -5574,6 +5581,7 @@ async function compileNativeType3Programs(
       enableSegmentMerge: nativeVectorSegmentMergeEnabled(options),
       enableInvisibleCull: false,
       output: "display-program",
+      compactRetainedResources: true,
       type3PaintMode: "colored",
       totalBytes: content.bytes.length,
       signal
@@ -5880,6 +5888,7 @@ async function compileNativeSoftMaskProgram(
       formXObjects: graph.pageForms,
       retainOptionalContent: (options as NativeVectorCompileOptions).retainOptionalContent === true,
       output: "display-program",
+      compactRetainedResources: true,
       enableSegmentMerge: false,
       enableInvisibleCull: false,
       colorSpaceResolver: resources.colorSpaceResolver,
@@ -5994,7 +6003,7 @@ function inheritedPaintRolesForFormProgram(
           else stroke = true;
         }
       } else if (kind === DENSE_PDF_PAINT_RUN_PATH) {
-        const paint = program.compiled.genericPathPaints[program.compiled.paintRuns[offset + 1]];
+        const paint = getDensePdfGenericPathPaint(program.compiled, program.compiled.paintRuns[offset + 1]);
         fill ||= paint?.fill?.inheritType3Paint === true;
         stroke ||= paint?.stroke?.inheritType3Paint === true;
       } else if (kind === DENSE_PDF_PAINT_RUN_IMAGE) {
@@ -6638,6 +6647,7 @@ async function compileNativePatternPrograms(
       enableSegmentMerge: nativeVectorSegmentMergeEnabled(options),
       enableInvisibleCull: nativeVectorInvisibleCullEnabled(options),
       output: "display-program",
+      compactRetainedResources: true,
       uncoloredPatternPaint: pattern.kind === "uncolored-tiling",
       totalBytes: content.length,
       signal

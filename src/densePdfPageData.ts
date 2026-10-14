@@ -16,6 +16,12 @@ import {
   type DensePdfMatrix
 } from "./pdf/nativeContentCompiler";
 import {
+  densePdfPagePathCount,
+  densePdfGenericPathPaintCount,
+  getDensePdfPagePath,
+  getDensePdfGenericPathPaint
+} from "./pdf/nativeRetainedResources";
+import {
   HEPR_ANNOTATION_MARKED_CONTENT_TAG,
   HEPR_COLOR_SPACE_KIND,
   HEPR_DOCUMENT_DATA_VERSION,
@@ -655,7 +661,9 @@ export function createHeprPageDataFromDense(
     if (existing) return existing;
     const pathIndices: number[] = [];
     const transformIndices: number[] = [];
-    for (const path of source.pagePaths) {
+    for (let index = 0; index < densePdfPagePathCount(source); index += 1) {
+      const path = getDensePdfPagePath(source, index);
+      if (!path) throw new TypeError("Dense PDF exact path metadata is missing a resource.");
       const transformIndex = appendTransform(path.transform);
       transformIndices.push(transformIndex);
       pathIndices.push(appendRawPath(path.data, path.bounds));
@@ -1077,7 +1085,7 @@ export function createHeprPageDataFromDense(
     },
     composite: Readonly<DensePdfCompositeState>
   ): HeprDisplayCommand => {
-    const paint = source.genericPathPaints[paintIndex];
+    const paint = getDensePdfGenericPathPaint(source, paintIndex);
     const resources = compiledPathResources.get(source);
     if (
       !paint || !resources || paint.pathIndex < 0 ||
@@ -1405,7 +1413,7 @@ export function createHeprPageDataFromDense(
                 : kind === DENSE_PDF_PAINT_RUN_PATTERN
                   ? stores.patterns.kinds.length
                   : kind === DENSE_PDF_PAINT_RUN_PATH
-                    ? compiled.genericPathPaints.length
+                    ? densePdfGenericPathPaintCount(compiled)
                     : -1;
     if (limit < 0 || first + count > limit) {
       throw new TypeError(
@@ -1660,7 +1668,7 @@ export function createHeprPageDataFromDense(
   if (patternPaintIndex !== compiled.patternPaints.length) {
     throw new TypeError("Dense PDF pattern paint metadata contains unreferenced entries.");
   }
-  if (genericPathPaintCount !== compiled.genericPathPaints.length) {
+  if (genericPathPaintCount !== densePdfGenericPathPaintCount(compiled)) {
     throw new TypeError("Dense PDF generic path paint metadata contains unreferenced entries.");
   }
 
@@ -1975,7 +1983,7 @@ export function createHeprPageDataFromDense(
       formImagePaintIndex !== formCompiled.imageTransforms.length ||
       formShadingPaintIndex !== formCompiled.shadingPaints.length ||
       formPatternPaintIndex !== formCompiled.patternPaints.length ||
-      formGenericPathPaintCount !== formCompiled.genericPathPaints.length ||
+      formGenericPathPaintCount !== densePdfGenericPathPaintCount(formCompiled) ||
       formInvocationCount !== formCompiled.formPaints.length ||
       program.invocationProgramIndices.length !== formCompiled.formPaints.length
     ) {
@@ -2223,7 +2231,7 @@ export function createHeprPageDataFromDense(
       imagePaintIndex !== charProc.imageTransforms.length ||
       shadingPaintIndex !== charProc.shadingPaints.length ||
       patternPaintIndex !== charProc.patternPaints.length
-      || genericPathPaintCount !== charProc.genericPathPaints.length ||
+      || genericPathPaintCount !== densePdfGenericPathPaintCount(charProc) ||
       glyphPaintIndex !== charProc.glyphPaints.length ||
       formInvocationCount !== charProc.formPaints.length ||
       program.invocationProgramIndices.length !== charProc.formPaints.length
@@ -2444,7 +2452,7 @@ export function createHeprPageDataFromDense(
       imagePaintIndex !== patternCompiled.imageTransforms.length ||
       shadingPaintIndex !== patternCompiled.shadingPaints.length ||
       nestedPatternPaintIndex !== patternCompiled.patternPaints.length
-      || genericPathPaintCount !== patternCompiled.genericPathPaints.length ||
+      || genericPathPaintCount !== densePdfGenericPathPaintCount(patternCompiled) ||
       glyphPaintIndex !== patternCompiled.glyphPaints.length ||
       formInvocationCount !== patternCompiled.formPaints.length ||
       program.invocationProgramIndices.length !== patternCompiled.formPaints.length

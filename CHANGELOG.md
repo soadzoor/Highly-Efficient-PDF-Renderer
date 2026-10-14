@@ -12,10 +12,11 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   content after image boundaries, searching candidate boundaries in bounded
   native byte scans, and recognizing numeric operands without temporary
   strings. Preserve boundary ambiguity checks, caller scan limits and cancellation.
-- Avoid a second copy of captured retained path and paint resources during
-  compiler finalization. Freeze the already-owned snapshots in place, preserving
-  geometry, graphics-state isolation and immutable metadata while reducing
-  peak memory and temporary allocations on drawings with many path paints.
+- Reduce retained PDF rendering memory by capturing exact paths and paints
+  directly in chunked numeric buffers and sharing identical transforms, colors
+  and stroke styles. Preserve coordinate precision, graphics-state isolation,
+  paint order and caller limits. Finalization adopts the owned resources
+  without another complete copy.
 - Reduce PDF-to-HEP peak memory by reusing decoded images and fonts when retrying
   retained rendering, releasing the PDF worker before final image encoding, and
   adopting the bundled JPEG 2000 decoder's owned sample buffers. Upload Node

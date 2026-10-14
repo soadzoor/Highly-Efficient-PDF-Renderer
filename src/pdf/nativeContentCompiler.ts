@@ -8,6 +8,7 @@
  */
 
 import type { PdfDiagnostic } from "./nativeTypes";
+import type { DensePdfRetainedResourceBuilder, DensePdfPackedRetainedResources } from "./nativeRetainedResources";
 
 export type DensePdfMatrix = [number, number, number, number, number, number];
 
@@ -378,6 +379,8 @@ export interface DensePdfContentCompileOptions {
   initialVectorClip?: DensePdfTextClip | null;
   /** Retain transient root paint identities for an internal selective-render retry. @internal */
   capturePaintSourceIdentities?: boolean;
+  /** Capture retained paths and paints directly in shared chunks. @internal */
+  compactRetainedResources?: boolean;
   /** Resource-aware text interpreter sharing this compiler's token stream. */
   textOperatorSink?: DensePdfTextOperatorSink;
   /** Inherited state used when specializing a reusable Form program. */
@@ -476,6 +479,8 @@ export interface DensePdfCompiledPage {
   pagePaths: readonly DensePdfPagePath[];
   /** Paint metadata for generic path triples, in source order. */
   genericPathPaints: readonly DensePdfGenericPathPaint[];
+  /** Internal compact resources; when present, use count/get helpers instead of the empty legacy arrays. */
+  packedRetainedResources?: DensePdfPackedRetainedResources;
   /** Persistent local clipping chain nodes. */
   clipPaths: readonly DensePdfClipPath[];
   /** CTM for image runs, in the order image triples appear in `paintRuns`. */
@@ -1131,7 +1136,14 @@ async function compileContent(
   assertValidBounds(options.pageBounds, "pageBounds");
   options.signal?.throwIfAborted();
 
-  const compiler = new DenseContentCompiler(options, policy);
+  // Keep ordinary standalone compilation independent of retained storage.
+  let packedRetainedResources: DensePdfRetainedResourceBuilder | undefined;
+  if (policy.displayProgram && options.compactRetainedResources) {
+    const { DensePdfRetainedResourceBuilder } = await import("./nativeRetainedResources");
+    options.signal?.throwIfAborted();
+    packedRetainedResources = new DensePdfRetainedResourceBuilder();
+  }
+  const compiler = new DenseContentCompiler(options, policy, packedRetainedResources);
   const lexer = new IncrementalPdfLexer(
     (token) => compiler.consumeToken(token),
     (value) => compiler.consumeNumber(value)
@@ -1551,6 +1563,8 @@ class DenseContentCompiler {
 
   readonly genericPathPaints: DensePdfGenericPathPaint[] = [];
 
+  private readonly packedRetainedResources: DensePdfRetainedResourceBuilder | undefined;
+
   readonly clipPaths: DensePdfClipPath[] = [];
 
   readonly imageTransforms: DensePdfMatrix[] = [];
@@ -1709,9 +1723,14 @@ class DenseContentCompiler {
 
   operatorCount = 0;
 
-  constructor(options: DensePdfContentInputOptions, policy: ContentOutputPolicy) {
+  constructor(
+    options: DensePdfContentInputOptions,
+    policy: ContentOutputPolicy,
+    packedRetainedResources?: DensePdfRetainedResourceBuilder
+  ) {
     this.options = options;
     this.policy = policy;
+    this.packedRetainedResources = packedRetainedResources;
     this.extGStates = normalizeExtGStateDefinitions(options);
     this.alwaysVisibleOptionalContentProperties = new Set(
       options.alwaysVisibleOptionalContentProperties ?? []
@@ -2177,14 +2196,13 @@ class DenseContentCompiler {
       for (const clip of this.clipPaths) {
         textClips.push(Object.freeze({
           parent: textClips[clip.parentIndex] ?? this.options.initialVectorClip ?? null,
-          path: this.pagePaths[clip.pathIndex],
+          path: this.retainedPagePath(clip.pathIndex)!,
           fillRule: clip.fillRule
         }));
       }
     }
-    // Capturing a retained path/paint already copies its mutable graphics
-    // state. This compiler is consumed by finish(), so freeze those owned
-    // snapshots in place instead of allocating another complete object graph.
+    // Legacy capture already owns its snapshots. Freeze them in place; compact
+    // capture instead owns shared immutable state and chunked numeric records.
     for (let index = 0; index < this.pagePaths.length; index++) {
       const path = this.pagePaths[index];
       Object.freeze(path.transform);
@@ -2209,6 +2227,7 @@ class DenseContentCompiler {
       Object.freeze(paint);
       if ((index & 0x1fff) === 0) await checkpoint();
     }
+    const packedRetainedResources = await this.packedRetainedResources?.finish(checkpoint);
     const result: DensePdfCompiledPage = {
       operatorCount: this.operatorCount,
       pathCount: this.pathCount,
@@ -2297,6 +2316,7 @@ class DenseContentCompiler {
       ),
       pagePaths: Object.freeze(this.pagePaths),
       genericPathPaints: Object.freeze(this.genericPathPaints),
+      ...(packedRetainedResources ? { packedRetainedResources } : {}),
       clipPaths: Object.freeze(
         this.clipPaths.map((clip) => Object.freeze({ ...clip }))
       ),
@@ -3212,13 +3232,38 @@ class DenseContentCompiler {
     }
   }
 
+  private get retainedPagePathCount(): number {
+    return this.packedRetainedResources?.pathCount ?? this.pagePaths.length;
+  }
+
+  private retainedPagePath(index: number): DensePdfPagePath | undefined {
+    return this.packedRetainedResources
+      ? this.packedRetainedResources.getPath(index)
+      : this.pagePaths[index];
+  }
+
+  private get retainedGenericPathPaintCount(): number {
+    return this.packedRetainedResources?.paintCount ?? this.genericPathPaints.length;
+  }
+
+  private retainedGenericPathPaint(index: number): DensePdfGenericPathPaint | undefined {
+    return this.packedRetainedResources
+      ? this.packedRetainedResources.getPaint(index)
+      : this.genericPathPaints[index];
+  }
+
+  private appendRetainedGenericPathPaint(paint: DensePdfGenericPathPaint): void {
+    if (this.packedRetainedResources) this.packedRetainedResources.appendPaint(paint);
+    else this.genericPathPaints.push(paint);
+  }
+
   private retainExactPath(
     pathData: Float32Array,
     pathBounds: DensePdfBounds | null,
     painted: boolean,
     operator: string
   ): number {
-    if (this.pagePaths.length >= this.maxPathResources) {
+    if (this.retainedPagePathCount >= this.maxPathResources) {
       throw new DensePdfResourceLimitError(
         `Generic path resources exceed limit ${this.maxPathResources}.`,
         operator
@@ -3238,13 +3283,17 @@ class DenseContentCompiler {
         operator
       );
     }
-    const index = this.pagePaths.length;
+    const index = this.retainedPagePathCount;
     const bounds = pathBounds ?? { minX: 0, minY: 0, maxX: 0, maxY: 0 };
-    this.pagePaths.push({
-      data: pathData.slice(),
-      transform: [...this.state.matrix],
-      bounds: { ...bounds }
-    });
+    if (this.packedRetainedResources) {
+      this.packedRetainedResources.appendPath(pathData, this.state.matrix, bounds);
+    } else {
+      this.pagePaths.push({
+        data: pathData.slice(),
+        transform: [...this.state.matrix],
+        bounds: { ...bounds }
+      });
+    }
     this.retainedPathVerbs = nextVerbCount;
     this.retainedPathCoordinates = nextCoordinateCount;
     if (painted && pathBounds) {
@@ -3355,9 +3404,12 @@ class DenseContentCompiler {
     fillRule: 0 | 1,
     fill: boolean,
     stroke: boolean,
-    operator: string
+    operator: string,
+    capturedBounds: DensePdfBounds | null
   ): void {
-    const pathBounds = this.pagePaths[pathIndex]?.bounds;
+    // The capture already has these exact bounds. Do not materialize a packed
+    // path and typed-array view solely to recover them for each paint.
+    const pathBounds = capturedBounds ?? { minX: 0, minY: 0, maxX: 0, maxY: 0 };
     if (pathBounds) {
       let paintBounds = pathBounds;
       if (stroke && this.state.lineWidth > 0) {
@@ -3386,8 +3438,8 @@ class DenseContentCompiler {
       fillComposite.alpha === 1 && fillComposite.blendMode === "Normal" &&
       fillComposite.softMaskIndex < 0;
     if (combined) {
-      const start = this.genericPathPaints.length;
-      this.genericPathPaints.push({
+      const start = this.retainedGenericPathPaintCount;
+      this.appendRetainedGenericPathPaint({
         pathIndex,
         fillRule,
         fill: this.currentSolidPaint("fill"),
@@ -3405,8 +3457,8 @@ class DenseContentCompiler {
       return;
     }
     if (fill && fillComposite) {
-      const start = this.genericPathPaints.length;
-      this.genericPathPaints.push({
+      const start = this.retainedGenericPathPaintCount;
+      this.appendRetainedGenericPathPaint({
         pathIndex,
         fillRule,
         fill: this.currentSolidPaint("fill"),
@@ -3423,8 +3475,8 @@ class DenseContentCompiler {
       );
     }
     if (stroke && strokeComposite) {
-      const start = this.genericPathPaints.length;
-      this.genericPathPaints.push({
+      const start = this.retainedGenericPathPaintCount;
+      this.appendRetainedGenericPathPaint({
         pathIndex,
         fillRule,
         fill: null,
@@ -3622,7 +3674,7 @@ class DenseContentCompiler {
           operator
         );
       } else if (visibleFill) {
-        this.retainGenericPathPaint(exactPathIndex, exactFillRule, true, false, operator);
+        this.retainGenericPathPaint(exactPathIndex, exactFillRule, true, false, operator, pathBounds);
       }
       if (visiblePatternStroke) {
         this.recordPatternPaint(
@@ -3633,7 +3685,7 @@ class DenseContentCompiler {
           operator
         );
       } else if (visibleStroke) {
-        this.retainGenericPathPaint(exactPathIndex, exactFillRule, false, true, operator);
+        this.retainGenericPathPaint(exactPathIndex, exactFillRule, false, true, operator, pathBounds);
       }
       finishClip();
       this.clearPaintPathState();
@@ -3666,7 +3718,8 @@ class DenseContentCompiler {
         fillRule ?? FILL_RULE_NONZERO,
         visibleFill,
         visibleStroke,
-        operator
+        operator,
+        pathBounds
       );
       finishClip();
       this.clearPaintPathState();
@@ -4510,7 +4563,7 @@ class DenseContentCompiler {
         overlappingPathSpan = this.vectorPrecedingPathsOverlapImage(operator);
         if (overlappingPathSpan && (
           !this.policy.selectiveRaster ||
-          this.genericPathPaints.length !== 0
+          this.retainedGenericPathPaintCount !== 0
         )) {
           throw new DensePdfUnsupportedError(
             "VectorScene output cannot move an image behind overlapping preceding visible path paint.",
@@ -4652,8 +4705,9 @@ class DenseContentCompiler {
       check({ minX: strokeBounds[offset], minY: strokeBounds[offset + 1],
         maxX: strokeBounds[offset + 2], maxY: strokeBounds[offset + 3] });
     }
-    for (const paint of this.genericPathPaints) {
-      const path = this.pagePaths[paint.pathIndex];
+    for (let index = 0; index < this.retainedGenericPathPaintCount; index++) {
+      const paint = this.retainedGenericPathPaint(index)!;
+      const path = this.retainedPagePath(paint.pathIndex);
       if (!path) throw new DensePdfSyntaxError("A path paint references a missing path.");
       let bounds = path.bounds;
       if (paint.strokeStyle && paint.strokeStyle.lineWidth > 0) {
@@ -4759,7 +4813,7 @@ class DenseContentCompiler {
         "Pattern painting requires source-ordered display-program compilation."
       );
     }
-    const sourcePath = this.pagePaths[pathIndex];
+    const sourcePath = this.retainedPagePath(pathIndex);
     if (!sourcePath) {
       throw new DensePdfSyntaxError("A pattern paint references a missing exact path.");
     }

@@ -204,6 +204,8 @@ export const fastTests = [
   "native-image-codecs",
   "native-image-codec-ownership",
   "native-retained-resource-ownership",
+  "native-packed-resources",
+  "native-compact-retained",
   "native-image-color-reuse",
   "native-ccitt",
   "native-ccitt-uncompressed",
