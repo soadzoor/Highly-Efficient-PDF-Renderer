@@ -34,6 +34,12 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   independently, copy matching duplicate PDFs, and report each artifact's
   time, size, dimensions and status. PNG fallback uses a matching filename;
   successful outputs remain available when another requested output fails.
+- Show HEP-only conversions' peak memory in the `pdf-to-hep` time table and
+  diagnostics log. A `Peak RSS` column, next to the conversion time, reports the
+  highest resident memory of the worker process that converted the PDF (its
+  runtime and parser thread included), also for failed conversions. Copied
+  duplicates show `--`. The summary adds `Highest worker peak RSS` with its PDF.
+  Concurrent workers overlap, so batch memory can reach several times this value.
 
 ### Changed
 
@@ -66,6 +72,25 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   direct pixels instead of an encode/decode round trip. Share active PDF parser
   sessions, prioritize viewport work, and preserve appearance controls and
   cancellation when thumbnails become obsolete.
+
+### Fixed
+
+- Speed up PDF-to-HEP conversion of photo-heavy PDFs. Before the regular
+  row-band probe decides whether a large image needs a whole-image PNG
+  encode, a probe one eighth its size now rules PNG out for photographs, whose
+  PNG is typically 5–30 times larger than WebP. Images where PNG could still
+  win continue through the regular probe and the exact size comparison, so
+  generated HEPs are unchanged.
+- Reduce PDF-to-HEP peak memory for large PDFs. The `pdf-to-hep` worker passes
+  a file-backed Blob to the builder, and HEP export hands its single loaded
+  copy of the PDF to the parser worker instead of keeping further copies for
+  the whole conversion. Viewer loading still retains its source bytes for
+  re-parsing.
+- Speed up decoding of 8-bit DeviceGray/DeviceRGB images by writing each opaque
+  pixel as one 32-bit word, and speed up xref repair scans of large damaged
+  PDFs with Node's latin1 Buffer decoding (a windows-1252 `TextDecoder`
+  elsewhere) instead of building strings byte by byte. Decoded pixels and
+  repaired object offsets are unchanged.
 
 ## [0.1.64] - 2026-10-14
 

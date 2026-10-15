@@ -40,14 +40,16 @@ async function buildHepFromPdf(
     onProgress: (payload) => forwardParseProgress(parseProgress, payload)
   }, options.signal, false,
   // Stream larger images: each page is encoded once parsed and its pixels released.
-  options.encodeRasterImages === false ? undefined : createHepRasterPagePreparer());
+  options.encodeRasterImages === false ? undefined : createHepRasterPagePreparer(),
+  // Export never re-parses, so the parser worker owns the only PDF copy.
+  true);
   options.signal?.throwIfAborted();
   const rasterLayers = listSceneRasterLayers(loaded.scene);
   const result = await buildSceneHep(
     loaded.scene,
     normalizeSourceLabel(options.sourceLabel, loaded.sourceLabel),
     rasterLayers,
-    loaded.sourceKind === "pdf" ? { ...options, sourcePdfByteLength: loaded.sourceBytes.byteLength } : options,
+    loaded.sourceKind === "pdf" ? { ...options, sourcePdfByteLength: loaded.scene.sourcePdfByteLength } : options,
     progress.child(0.82, 1, { sourceType: "pdf" })
   );
   progress.complete({ sourceType: "pdf" });

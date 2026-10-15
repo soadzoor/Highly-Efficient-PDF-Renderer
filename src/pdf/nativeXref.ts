@@ -698,7 +698,7 @@ async function repairXref(
     throwIfAborted(signal);
     const length = Math.min(blockSize, reader.byteLength - offset);
     const bytes = await reader.read(offset, length, signal);
-    const text = binaryString(bytes);
+    const text = repairScanText(bytes);
     const objects = /(?:^|[\r\n])[\x00\x09\x0c\x20]*(\d+)[\x00\x09\x0a\x0c\x0d\x20]+(\d+)[\x00\x09\x0a\x0c\x0d\x20]+obj(?:[\x00\x09\x0a\x0c\x0d\x20]|[<\[\/(])/g;
     let objectMatch: RegExpExecArray | null;
     while ((objectMatch = objects.exec(text))) {
@@ -1182,6 +1182,25 @@ function matchesAsciiKeyword(bytes: Uint8Array, position: number, keyword: strin
 
 function isSpace(byte: number): boolean {
   return byte === 0 || byte === 9 || byte === 10 || byte === 12 || byte === 13 || byte === 32;
+}
+
+const NODE_BUFFER = (globalThis as {
+  readonly Buffer?: {
+    from(buffer: ArrayBufferLike, byteOffset: number, length: number): { toString(encoding: "latin1"): string };
+  };
+}).Buffer;
+const REPAIR_SCAN_DECODER = new TextDecoder("latin1");
+
+/**
+ * One character per byte for the repair scan, whose patterns are ASCII-only.
+ * binaryString() costs about 12 ms per MiB, which a whole-file scan of a large
+ * PDF pays for every block. Node's latin1 Buffer decoding is a plain copy into
+ * a one-byte string. WHATWG "latin1" is windows-1252: it keeps every ASCII
+ * byte and differs only in 0x80-0x9F, which no repair pattern matches.
+ */
+function repairScanText(bytes: Uint8Array): string {
+  return NODE_BUFFER?.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("latin1") ??
+    REPAIR_SCAN_DECODER.decode(bytes);
 }
 
 function binaryString(bytes: Uint8Array): string {

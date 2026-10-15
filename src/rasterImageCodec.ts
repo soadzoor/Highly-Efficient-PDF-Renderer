@@ -95,6 +95,16 @@ const PNG_PROBE_MIN_TEXELS = 1 << 16;
 const PNG_PROBE_LARGE_TEXELS = 1 << 20;
 const PNG_PROBE_LARGE_MARGIN = 1.2;
 /**
+ * Those images first sample 8 bands of 8 rows, an eighth of the large probe.
+ * Across photographs, scans and graphics that prediction stayed within
+ * -31%/+71% of the real PNG, so only a PNG predicted at 4x the WebP skips the
+ * large probe. Photographs, whose PNG is typically 5-30x larger, stop there;
+ * every image whose PNG won still reached the large probe.
+ */
+const PNG_PROBE_COARSE_BANDS = 8;
+const PNG_PROBE_COARSE_ROWS = 8;
+const PNG_PROBE_COARSE_MARGIN = 4;
+/**
  * Smaller images sample about an eighth of their rows in 4-32 bands. Blank
  * margins and short bands make that prediction several times less accurate,
  * so only a far larger predicted PNG skips the whole-image encode.
@@ -104,15 +114,23 @@ const PNG_PROBE_MAX_BANDS = 32;
 const PNG_PROBE_MIN_BANDS = 4;
 const PNG_PROBE_ROW_SHARE = 8;
 
+interface PngProbeLayout {
+  bands: number;
+  rows: number;
+  margin: number;
+  /** Whether a coarse probe may rule PNG out first. */
+  coarse: boolean;
+}
+
 /** Evenly spaced row bands to sample, or null when the image is too short. */
-function pngProbeLayout(width: number, height: number): { bands: number; rows: number; margin: number } | null {
+function pngProbeLayout(width: number, height: number): PngProbeLayout | null {
   if (width * height < PNG_PROBE_MIN_TEXELS) return null;
   if (width * height >= PNG_PROBE_LARGE_TEXELS && height >= PNG_PROBE_MAX_BANDS * 16 * 2) {
-    return { bands: PNG_PROBE_MAX_BANDS, rows: 16, margin: PNG_PROBE_LARGE_MARGIN };
+    return { bands: PNG_PROBE_MAX_BANDS, rows: 16, margin: PNG_PROBE_LARGE_MARGIN, coarse: true };
   }
   for (const rows of [16, 8]) {
     const bands = Math.min(PNG_PROBE_MAX_BANDS, Math.floor(height / (rows * PNG_PROBE_ROW_SHARE)));
-    if (bands >= PNG_PROBE_MIN_BANDS) return { bands, rows, margin: PNG_PROBE_SMALL_MARGIN };
+    if (bands >= PNG_PROBE_MIN_BANDS) return { bands, rows, margin: PNG_PROBE_SMALL_MARGIN, coarse: false };
   }
   return null;
 }
@@ -132,7 +150,22 @@ async function pngMayBeatWebp(
 ): Promise<boolean> {
   const layout = pngProbeLayout(width, height);
   if (!layout) return true;
-  const { bands, rows, margin } = layout;
+  if (layout.coarse) {
+    const coarse = await predictPngBytes(width, height, rgba, PNG_PROBE_COARSE_BANDS, PNG_PROBE_COARSE_ROWS);
+    if (coarse !== null && coarse >= webpBytes * PNG_PROBE_COARSE_MARGIN) return false;
+  }
+  const predicted = await predictPngBytes(width, height, rgba, layout.bands, layout.rows);
+  return predicted === null || predicted < webpBytes * layout.margin;
+}
+
+/** Whole-image PNG bytes predicted from row bands, or null if they could not be encoded. */
+async function predictPngBytes(
+  width: number,
+  height: number,
+  rgba: Uint8Array<ArrayBufferLike>,
+  bands: number,
+  rows: number
+): Promise<number | null> {
   const sampleRows = bands * rows, rowBytes = width * 4;
   const sample = new Uint8Array(rowBytes * sampleRows);
   for (let band = 0; band < bands; band += 1) {
@@ -140,7 +173,7 @@ async function pngMayBeatWebp(
     sample.set(rgba.subarray(top * rowBytes, (top + rows) * rowBytes), band * rows * rowBytes);
   }
   const { png } = await encodeRasterRgbaImages(width, sampleRows, sample, ["png"]);
-  return !png || png.byteLength * (height / sampleRows) < webpBytes * margin;
+  return png ? png.byteLength * (height / sampleRows) : null;
 }
 
 /** The smaller candidate, or null when neither beats raw RGBA storage. */

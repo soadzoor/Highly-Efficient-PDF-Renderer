@@ -688,8 +688,10 @@ try {
       console.warn("%s warning", "loader");
       return {
         HepArchive,
-        async buildHep(bytes, options) {
-          assert.equal(bytes.byteLength, 14);
+        async buildHep(pdfFile, options) {
+          // The worker passes a file-backed Blob so the builder owns the only PDF copy.
+          assert.ok(pdfFile instanceof Blob);
+          assert.equal(pdfFile.size, 14);
           console.warn("[HEP] synthetic size warning");
           for (const diagnostic of reportingDiagnostics) options.onDiagnostic(diagnostic);
           return new Blob([await encodeTestHep(reportingGeneratedAt)]);
@@ -710,6 +712,11 @@ try {
       { type: "pdf-to-hep-sizes", sourceBytes: 14 },
       { type: "pdf-to-hep-sizes", outputBytes: generatedReportBytes.byteLength }
     ]);
+    const memoryReports = reports.filter((event) => event.type === "pdf-to-hep-memory");
+    assert.equal(memoryReports.length, 1, "each conversion attempt reports one peak");
+    assert(Number.isSafeInteger(memoryReports[0].peakRssBytes) && memoryReports[0].peakRssBytes >= 1024 * 1024);
+    assert(reports.indexOf(memoryReports[0]) > reports.findIndex((event) => event.outputBytes !== undefined),
+      "the peak is measured after the HEP is written");
     assert.deepEqual(reports.filter((event) => event.type === "pdf-to-hep-warning").map((event) => event.message), [
       "loader warning",
       "[HEP] synthetic size warning",
@@ -774,6 +781,7 @@ try {
     assert(reports.some(event => event.type === "pdf-to-hep-raster-fallback"),
       "a fallback observed before failure is reported, allowing the parent to classify it by final status");
     assert(!reports.some((event) => event.outputBytes !== undefined), "failed builds do not report generated sizes");
+    assert(reports.some((event) => event.type === "pdf-to-hep-memory"), "failed builds still report their peak RSS");
     assert.equal(console.warn, reportConsoleWarn, "warning capture is restored after a failed build");
 
     reports.length = 0;
@@ -856,7 +864,9 @@ process.exitCode = await runPdfToHep(process.argv.slice(2), {
   const appendedContents = await readFile(ipcLogPath, "utf8");
   assert(appendedContents.includes(ipcLogContents), "reusing an explicit log path appends rather than truncates");
   assert(appendedContents.includes("second batch marker"));
-  assert.deepEqual(ipcWorker.report, {
+  const { peakRssBytes: ipcPeakRssBytes, ...ipcReport } = ipcWorker.report;
+  assert(Number.isSafeInteger(ipcPeakRssBytes) && ipcPeakRssBytes > 0, "the worker reports its process peak RSS over IPC");
+  assert.deepEqual(ipcReport, {
     warnings: [
       { message: "synthetic IPC warning", count: 2 },
       { message: "report.pdf page 3: [page-raster-fallback] synthetic IPC raster fallback", count: 2 }
@@ -1021,7 +1031,8 @@ process.exitCode = await runPdfToHep(process.argv.slice(2), {
   const canonicalFallback = { type: "pdf-to-hep-raster-fallback", code: "page-raster-fallback", pageIndex: 2,
     message: "Canonical output used raster fallback.", reason: "unsupported paint" };
   const canonicalReports = { "a.pdf": [
-    { type: "pdf-to-hep-warning", message: "canonical conversion warning" }, canonicalFallback
+    { type: "pdf-to-hep-warning", message: "canonical conversion warning" }, canonicalFallback,
+    { type: "pdf-to-hep-memory", peakRssBytes: 3 * 1024 * 1024 }
   ] };
   const duplicateRun = await runDuplicateBatch({ force: false }, [], canonicalReports);
   assert.equal(duplicateRun.result, 0);
@@ -1035,7 +1046,10 @@ process.exitCode = await runPdfToHep(process.argv.slice(2), {
     "[5/5] Copied the HEP for e.pdf; same content as a.pdf",
     "Finished: 3 generated, 2 copied for duplicates, 0 skipped, 0 failed."
   ]) assert(duplicateRun.logs.includes(line), `batch output includes: ${line}`);
-  assert.deepEqual(duplicateRun.timingRows[2], ["3/5", "c.pdf", "duplicate", "0h 00m 00s", "9 B", "24 B", "+166.67%"]);
+  assert.deepEqual(duplicateRun.timingRows[2], ["3/5", "c.pdf", "duplicate", "0h 00m 00s", "--", "9 B", "24 B", "+166.67%"],
+    "a copy runs no conversion worker, so it has no peak RSS of its own");
+  assert.equal(duplicateRun.timingRows[0][4], "3.00 MiB", "the converted canonical PDF shows its worker peak");
+  assert.equal(duplicateRun.summary["Highest worker peak RSS"], "3.00 MiB (a.pdf)");
   assert.equal(duplicateRun.summary["PDFs attempted"], "5", "each converted or copied PDF is processed once");
   assert.equal(duplicateRun.summary.Successful, "5", "copied duplicate HEPs are successful outputs");
   assert.equal(duplicateRun.summary["Duplicate PDFs (HEP copied)"], "2");
@@ -1110,7 +1124,7 @@ process.exitCode = await runPdfToHep(process.argv.slice(2), {
   assert.equal(copyFailureRun.summary["HEPs larger than original PDFs"], "4");
   assert.equal(copyFailureRun.summary["Successful PDFs using raster fallback"], "2");
   assert.equal(copyFailureRun.summary.Warnings, "1 across 1 PDF(s)");
-  assert.deepEqual(copyFailureRun.timingRows[2].slice(2), ["failed", "0h 00m 00s", "9 B", "--", "--"],
+  assert.deepEqual(copyFailureRun.timingRows[2].slice(2), ["failed", "0h 00m 00s", "--", "9 B", "--", "--"],
     "a failed duplicate copy has no successful HEP size or size change");
   assert(copyFailureRun.errors.some(line => line.includes("Failed c.pdf")));
   assert(copyFailureRun.diagnostics.some(line => line.includes(`${path.join(duplicateDirectory, "c.pdf")}: Could not copy`)));
@@ -1130,7 +1144,7 @@ process.exitCode = await runPdfToHep(process.argv.slice(2), {
   assert.equal(skippedCopies.summary["HEPs larger than original PDFs"], "3");
   assert.equal(skippedCopies.summary["Successful PDFs using raster fallback"], "1");
   assert.equal(skippedCopies.summary.Warnings, "1 across 1 PDF(s)");
-  assert.deepEqual(skippedCopies.timingRows[2].slice(2), ["skipped", "0h 00m 00s", "9 B", "--", "--"]);
+  assert.deepEqual(skippedCopies.timingRows[2].slice(2), ["skipped", "0h 00m 00s", "--", "9 B", "--", "--"]);
   assert.equal(skippedCopies.summary["Conversion time saved by duplicates (est.)"], undefined);
   assert.equal(await readFile(duplicateOutput("c.pdf"), "utf8"), "existing duplicate output sentinel");
   assert.deepEqual((await readdir(duplicateDirectory)).filter((name) => name.startsWith(".hepr-")), [],

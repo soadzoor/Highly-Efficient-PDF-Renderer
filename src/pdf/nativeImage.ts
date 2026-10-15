@@ -1769,6 +1769,8 @@ function convertDeviceGraySamplesToSrgb8(
   };
 }
 
+const LITTLE_ENDIAN = new Uint32Array(Uint8Array.of(1, 0, 0, 0).buffer)[0] === 1;
+
 /** Validated device-image samples need no per-pixel graph traversal or allocation. */
 function convertDeviceSamplesToSrgb8(
   samples: ImageSamples,
@@ -1779,6 +1781,10 @@ function convertDeviceSamplesToSrgb8(
   signal?: AbortSignal,
   detectUniform = false
 ): number {
+  if ((componentCount === 1 || componentCount === 3) && colorKeyMask.length === 0 &&
+      samples instanceof Uint8Array && LITTLE_ENDIAN && (output.byteOffset & 3) === 0) {
+    return convertOpaqueDeviceSamplesToSrgb8Words(samples, output, componentCount, decode, signal, detectUniform);
+  }
   // Preserve the general converter's Decode interpolation and rounding exactly.
   // A byte has only 256 possible values, so Decode is evaluated once per value.
   const decoded = new Float64Array(componentCount * 256);
@@ -1826,6 +1832,53 @@ function convertDeviceSamplesToSrgb8(
       output[offset], output[offset + 1], output[offset + 2], output[offset + 3]);
   }
   return uniform;
+}
+
+/**
+ * Opaque gray/RGB fast path of convertDeviceSamplesToSrgb8 with the same
+ * Decode rounding. Each table entry is a component already shifted into its
+ * little-endian RGBA8 word, so a pixel is one 32-bit store instead of four
+ * byte stores and float roundings; scanned pages spend most decode time here.
+ */
+function convertOpaqueDeviceSamplesToSrgb8Words(
+  samples: Uint8Array,
+  output: Uint8Array,
+  componentCount: 1 | 3,
+  decode: readonly number[],
+  signal: AbortSignal | undefined,
+  detectUniform: boolean
+): number {
+  const table = new Uint32Array(componentCount * 256);
+  for (let component = 0; component < componentCount; component += 1) {
+    for (let sample = 0; sample < 256; sample += 1) {
+      const value = Math.round(clamp01(interpolate(
+        sample / 255, 0, 1, decode[component * 2], decode[component * 2 + 1]
+      )) * 255);
+      table[component * 256 + sample] = componentCount === 1 ? value * 0x010101 : value << (component * 8);
+    }
+  }
+  const pixelCount = output.length >>> 2;
+  const words = new Uint32Array(output.buffer, output.byteOffset, pixelCount);
+  if (componentCount === 3) {
+    const red = table.subarray(0, 256), green = table.subarray(256, 512), blue = table.subarray(512, 768);
+    for (let pixel = 0, sample = 0; pixel < pixelCount; pixel += 1, sample += 3) {
+      if ((pixel & 0xffff) === 0) throwIfAborted(signal);
+      words[pixel] = (red[samples[sample]] | green[samples[sample + 1]] | blue[samples[sample + 2]] | 0xff000000) >>> 0;
+    }
+  } else {
+    for (let pixel = 0; pixel < pixelCount; pixel += 1) {
+      if ((pixel & 0xffff) === 0) throwIfAborted(signal);
+      words[pixel] = (table[samples[pixel]] | 0xff000000) >>> 0;
+    }
+  }
+  // Only an all-black or all-white opaque image packs to one bit per pixel.
+  if (!detectUniform || pixelCount === 0) return -1;
+  const first = words[0];
+  if (first !== 0xff000000 && first !== 0xffffffff) return -1;
+  for (let pixel = 1; pixel < pixelCount; pixel += 1) {
+    if (words[pixel] !== first) return -1;
+  }
+  return first & 0xff;
 }
 
 async function resolveFilters(

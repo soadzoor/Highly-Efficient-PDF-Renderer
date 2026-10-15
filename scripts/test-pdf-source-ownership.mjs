@@ -57,6 +57,22 @@ try {
   assert(padded.subarray(0, 5).every(value => value === 0xa5));
   assert(padded.subarray(5 + pdf.length).every(value => value === 0xa5), "subarray loading preserves its backing-buffer margins");
 
+  // HEP export releases its source: the parser owns the loader's only copy.
+  const releasedBlob = new RecordingBlob([pdf], { type: "application/pdf" });
+  for (const source of [pdf.slice(), subarray, pdf.slice().buffer, releasedBlob]) {
+    const before = transfers.length;
+    const released = await loadPdfSceneFromSource(source, { segmentMerge: false, invisibleCull: false },
+      undefined, false, undefined, true);
+    assert.equal(released.scene.segmentCount, 1);
+    assert.equal(released.sourceBytes.byteLength, 0, "a released source retains no PDF copy beside the parser's");
+    assert.equal(released.scene.sourcePdfByteLength, pdf.byteLength, "the scene keeps the PDF size");
+    assert.equal(transfers.length - before, 1, "the loaded copy itself is transferred");
+    if (source instanceof Uint8Array) assert.deepEqual(source, pdf, "caller-owned typed bytes stay attached");
+    else if (source instanceof ArrayBuffer) assert.deepEqual(new Uint8Array(source), pdf, "caller ArrayBuffers stay attached");
+    else assert.equal(releasedBlob.lastRead.byteLength, 0, "a fresh Blob arrayBuffer moves to the parser without a copy");
+  }
+  assert(padded.subarray(5 + pdf.length).every(value => value === 0xa5), "released subarray loading keeps its margins");
+
   const callerBuffer = pdf.slice().buffer;
   const beforeDefault = transfers.length;
   const pages = await extractPdfPageScenes(callerBuffer, { enableSegmentMerge: false, enableInvisibleCull: false });
