@@ -6,6 +6,8 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+## [0.1.65] - 2026-10-15
+
 ### Added
 
 - Add `renderPdfThumbnail()` for single-page PDF/HEP overviews with requested
@@ -527,7 +529,7 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   shadings, and physical press calibration are tracked in the
   [follow-up checklist](docs/development.md#font-local-postscript-follow-ups).
 
-[Unreleased]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.64...HEAD
+[Unreleased]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.65...HEAD
 [0.1.57]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.56...v0.1.57
 [0.1.58]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.57...v0.1.58
 [0.1.59]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.58...v0.1.59
@@ -536,3 +538,4 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 [0.1.62]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.61...v0.1.62
 [0.1.63]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.62...v0.1.63
 [0.1.64]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.63...v0.1.64
+[0.1.65]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.64...v0.1.65
