@@ -1,0 +1,1 @@
+function e(e,t,n,r){let i=t,a=n,o=-1,s=-1;for(let c=0;c<n;c+=1){r?.throwIfAborted();let n=c*t*4+3,l=0;for(;l<t&&e[n+l*4]===0;)l+=1;if(l===t)continue;let u=t-1;for(;u>l&&e[n+u*4]===0;)--u;i=Math.min(i,l),o=Math.max(o,u),a=Math.min(a,c),s=c}return o<0?null:{x:i,y:a,width:o-i+1,height:s-a+1}}export{e as t};

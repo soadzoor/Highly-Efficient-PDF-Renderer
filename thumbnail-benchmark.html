@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HEPR thumbnail benchmark</title>
+    <style>:root{color:#172033;background:#f4f6f8;font-family:system-ui,sans-serif}body{max-width:1500px;margin:0 auto;padding:24px}h1{margin-top:0;font-size:24px}p{max-width:1000px;line-height:1.5}form,.results{background:#fff;border:1px solid #d8dee8;border-radius:8px;margin:20px 0;padding:16px}form{flex-wrap:wrap;align-items:end;gap:16px;display:flex}label{gap:6px;font-size:14px;display:grid}button,select,input{font:inherit;padding:7px}input[type=number]{width:64px}button{cursor:pointer}button:disabled{cursor:default}.results{overflow:auto}table{border-collapse:collapse;font-variant-numeric:tabular-nums;width:100%;font-size:13px}th,td{text-align:right;white-space:nowrap;border-bottom:1px solid #e2e7ee;padding:8px}th:first-child,td:first-child{text-align:left}#preview{align-items:start;gap:16px;min-height:100px;display:flex}#preview img{background:repeating-conic-gradient(#dde2e8 0% 25%,#fff 0% 50%) 0 0/16px 16px;border:1px solid #aeb8c6;max-width:400px;max-height:400px}#status{white-space:pre-wrap}code{background:#e9edf3;padding:2px 4px}</style>
+    <script type="module" crossorigin src="./assets/thumbnailBenchmark-DKUv_vVD.js"></script>
+    <link rel="modulepreload" crossorigin href="./assets/loadCancellation-B_fcKR7q.js">
+    <link rel="modulepreload" crossorigin href="./assets/optionalContentData-CFyj-zla.js">
+    <link rel="modulepreload" crossorigin href="./assets/annotationLayers-CsdPppGk.js">
+    <link rel="modulepreload" crossorigin href="./assets/optionalContent-B2TrsKvv.js">
+    <link rel="modulepreload" crossorigin href="./assets/retainedRasterBounds-CTuCWKTg.js">
+    <link rel="modulepreload" crossorigin href="./assets/scenePaintQuery-qB8GKFGQ.js">
+    <link rel="modulepreload" crossorigin href="./assets/rasterRepeat-2nX8zjEJ.js">
+    <link rel="modulepreload" crossorigin href="./assets/scenePaintGraph-Bq99RSsx.js">
+    <link rel="modulepreload" crossorigin href="./assets/nativeWebGlMixedVectorShaders-oEv9dGMx.js">
+    <link rel="modulepreload" crossorigin href="./assets/pdfVectorExtractor-CJodm4fs.js">
+    <link rel="modulepreload" crossorigin href="./assets/hepReader-CK3x2P19.js">
+    <link rel="modulepreload" crossorigin href="./assets/pdfObjectGenerator-CVXD4mDA.js">
+    <link rel="modulepreload" crossorigin href="./assets/textRasterAtlas-Bhl20IWY.js">
+    <link rel="modulepreload" crossorigin href="./assets/vectorFillBandShaders-CRyg2aoB.js">
+    <link rel="modulepreload" crossorigin href="./assets/searchHighlights-Dqz7hYMK.js">
+    <link rel="modulepreload" crossorigin href="./assets/webGlFloorplanRenderer-BbzY_Wcj.js">
+    <link rel="modulepreload" crossorigin href="./assets/thumbnailOptions-D7yWgzoP.js">
+    <link rel="modulepreload" crossorigin href="./assets/documentSession-B2OSBsD1.js">
+    <link rel="modulepreload" crossorigin href="./assets/thumbnailEncoder-Dz8duVFr.js">
+    <link rel="modulepreload" crossorigin href="./assets/thumbnailTypes-BFtRgOR8.js">
+  </head>
+  <body>
+    <h1>HEPR thumbnail benchmark</h1>
+    <p>Select local PDFs and keep this tab visible. The matrix compares Canvas2D and WebGL, PNG and lossless WebP, 160 px and 400 px, fresh sessions and reused sessions. White-background runs also include an interactive full-preparation baseline. Files stay in this browser. Each row reports median / p95 milliseconds across five measured runs; reused sessions receive one unmeasured warmup.</p>
+    <form id="controls">
+      <label>Local PDFs <input id="files" type="file" accept="application/pdf,.pdf" multiple required /></label>
+      <label>Page <input id="page" type="number" min="1" value="1" required /></label>
+      <label>Background <select id="background"><option value="#ffffff">White</option><option value="transparent">Transparent</option></select></label>
+      <button id="run" type="submit">Run matrix</button>
+      <button id="cancel" type="button" disabled>Cancel</button>
+      <button id="download" type="button" disabled>Download JSON</button>
+    </form>
+    <p id="status" role="status">Ready.</p>
+    <div id="preview" aria-label="Latest rendered thumbnail"></div>
+    <div class="results">
+      <table>
+        <thead><tr><th>Document / size / backend / session / format</th><th>Runs</th><th>Source open</th><th>Prepare</th><th>Factory</th><th>Upload</th><th>Draw submit</th><th>Readback</th><th>Encode</th><th>Decode</th><th>Presentation estimate</th><th>Result</th><th>Visible estimate</th><th>Bytes</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <p>Draw measures CPU submission. Readback includes GPU waiting and conversion to returned pixels. Preparation + rendering is also stored as an overlapping aggregate in JSON; do not add it to its child stages. A missing stage is shown as “—”, including factory work already completed during warmup.</p>
+    <p>“Presentation estimate” ends after a requestAnimationFrame callback and the following task. It provides a paint opportunity, not an exact visible-paint measurement. Record a browser Performance trace with screenshots to inspect actual first visible paint. Host markers <code>hepr-thumbnail:&lt;job&gt;:start</code>, <code>blob</code>, <code>decoded</code>, and <code>presentation-estimate</code> identify each measured job.</p>
+    <p>The interactive baseline fully parses the selected page, creates the existing WebGL renderer with its default LOD and glyph-atlas preparation, draws at the same output dimensions, and uses the same pixel encoder. Reused baseline runs retain that scene, renderer, and encoder. It is not an exact reproduction of the old Reader. Its native canvas has an opaque backdrop, so this baseline is omitted from transparent-background comparisons.</p>
+    <p>Fresh-session measurements retain the browser's HTTP and module caches. The JSON includes warmup and session-opening costs separately. Reload the page between comparison builds, keep hardware and browser settings matched, and inspect the displayed overviews alongside timings.</p>
+  </body>
+</html>
