@@ -10,8 +10,17 @@
 import type { PdfDiagnostic } from "./nativeTypes";
 import type { DensePdfRetainedResourceBuilder, DensePdfPackedRetainedResources } from "./nativeRetainedResources";
 import type { ThumbnailStrokeScanResult } from "./nativeThumbnailStrokeScanner";
+import type { ThumbnailStrokePixelSize } from "../thumbnailTypes";
 
 let scanThumbnailStrokeBlock: typeof import("./nativeThumbnailStrokeScanner").scanThumbnailStrokeBlock | undefined;
+
+/** Packed stroke ABI: style = 2 * flags + alpha; flags 1/2/4 are hairline/round/clip. @internal */
+export function thumbnailStrokeUsesPixelCoverage(halfWidth: number, primitiveType: number,
+  style: number, penScale: number): boolean {
+  const flags = Math.max(0, Math.trunc(style / 2 + 1e-6));
+  return primitiveType < .5 && (flags & ~7) === 0 && (flags & 2) !== 0 && style - flags * 2 === 1 &&
+    Number.isFinite(penScale) && penScale > 0 && ((flags & 1) !== 0 || halfWidth * 2 * penScale <= 1);
+}
 
 export type DensePdfMatrix = [number, number, number, number, number, number];
 
@@ -392,8 +401,10 @@ export interface DensePdfContentCompileOptions {
   thumbnail?: boolean;
   /** Known root-page output scale; nested programs and masks omit it. @internal */
   thumbnailScale?: number;
-  /** Binary Canvas overview dimensions; root programs only. @internal */
-  thumbnailPixelSize?: Readonly<{ width: number; height: number }>;
+  /** Canvas overview dimensions and coverage endpoint grid; root programs only. @internal */
+  thumbnailPixelSize?: ThumbnailStrokePixelSize;
+  /** Retain all primitives while keeping target-aware span boundaries. @internal */
+  thumbnailPixelCulling?: boolean;
   /** Resource-aware text interpreter sharing this compiler's token stream. */
   textOperatorSink?: DensePdfTextOperatorSink;
   /** Inherited state used when specializing a reusable Form program. */
@@ -1486,6 +1497,8 @@ class DenseContentCompiler {
   private thumbnailPointCells: Uint8Array | undefined;
   private thumbnailLineCells: Set<number> | undefined;
   private thumbnailPointRun = -1;
+  private thumbnailPointEpoch = 0;
+  private readonly thumbnailPixelPenScale: number;
   private diagnosedThumbnailPointCulling = false;
   readonly options: DensePdfContentInputOptions;
 
@@ -1765,6 +1778,9 @@ class DenseContentCompiler {
     packedRetainedResources?: DensePdfRetainedResourceBuilder
   ) {
     this.options = options;
+    this.thumbnailPixelPenScale = options.thumbnailPixelSize
+      ? Math.sqrt(options.thumbnailPixelSize.width / (options.pageBounds.maxX - options.pageBounds.minX) *
+          (options.thumbnailPixelSize.height / (options.pageBounds.maxY - options.pageBounds.minY))) : 0;
     this.policy = policy;
     this.packedRetainedResources = packedRetainedResources;
     this.extGStates = normalizeExtGStateDefinitions(options);
@@ -4083,6 +4099,9 @@ class DenseContentCompiler {
       this.assertSupportedStrokeState("S", previewStroke);
     }
     strokes.sourceSegmentCount += 1;
+    // Packed native strokes can share this paint run but flush the renderer's
+    // coverage batch. Later AA edges must retain their separate paint.
+    if (this.options.thumbnailPixelSize && (!previewStroke || !roundCap)) this.thumbnailPointRun = -1;
     if (previewStroke && roundCap && this.cullThumbnailStroke(x0, y0, x1, y1)) {
       this.path.clear();
       return;
@@ -4122,11 +4141,11 @@ class DenseContentCompiler {
     this.path.clear();
   }
 
-  /** Equal pixel endpoint pairs have identical coverage in the binary overview. */
+  /** Equal quantized endpoint pairs have identical smooth overview coverage. */
   private cullThumbnailStroke(x0: number, y0: number, x1: number, y1: number, paintRun?: number): boolean {
     const size = this.options.thumbnailPixelSize;
     const state = this.state;
-    if (!size || !this.policy.displayProgram || !this.options.thumbnail || this.options.thumbnailScale === undefined ||
+    if (!size || this.options.thumbnailPixelCulling === false || !this.policy.displayProgram || !this.options.thumbnail || this.options.thumbnailScale === undefined ||
         this.options.capturePaintSourceIdentities === true ||
         state.strokeAlpha !== 1 || state.blendMode !== "Normal" || state.softMaskIndex >= 0 ||
         state.strokeOverprint || state.alphaIsShape) return false;
@@ -4135,29 +4154,44 @@ class DenseContentCompiler {
     // Packed geometry rounds the transformed endpoints before the renderer
     // projects them. Use exactly that rounding and the actual output size.
     const penWidth = Math.fround(state.lineWidth * state.matrixScale * .5) * 2;
-    if (penWidth > 0 && penWidth * Math.sqrt(sx * sy) > 1) return false;
-    const px = Math.floor((Math.fround(x0) - bounds.minX) * sx);
-    const py = Math.floor(size.height - (Math.fround(y0) - bounds.minY) * sy);
-    const qx = Math.floor((Math.fround(x1) - bounds.minX) * sx);
-    const qy = Math.floor(size.height - (Math.fround(y1) - bounds.minY) * sy);
-    if (!(px >= 0 && px < size.width && py >= 0 && py < size.height &&
-          qx >= 0 && qx < size.width && qy >= 0 && qy < size.height)) return false;
-    const pixelCount = size.width * size.height;
+    if (penWidth > 0 && penWidth * this.thumbnailPixelPenScale > 1) {
+      this.thumbnailPointRun = -1;
+      return false;
+    }
+    const dx0 = (Math.fround(x0) - bounds.minX) * sx;
+    const dy0 = size.height - (Math.fround(y0) - bounds.minY) * sy;
+    const dx1 = (Math.fround(x1) - bounds.minX) * sx;
+    const dy1 = size.height - (Math.fround(y1) - bounds.minY) * sy;
+    // Include points on the page edge, whose antialiased caps can still paint.
+    // Outside endpoints remain conservative even if rounding lands on an edge.
+    if (!(dx0 >= 0 && dx0 <= size.width && dy0 >= 0 && dy0 <= size.height &&
+          dx1 >= 0 && dx1 <= size.width && dy1 >= 0 && dy1 <= size.height)) return false;
+    const subpixels = size.subpixels;
+    if (!Number.isSafeInteger(subpixels) || subpixels < 1) return false;
+    const gridWidth = size.width * subpixels + 1;
+    const gridHeight = size.height * subpixels + 1;
+    const pixelCount = gridWidth * gridHeight;
+    if (!Number.isSafeInteger(pixelCount)) return false;
+    const px = Math.round(dx0 * subpixels), py = Math.round(dy0 * subpixels);
+    const qx = Math.round(dx1 * subpixels), qy = Math.round(dy1 * subpixels);
     const point = px === qx && py === qy;
     // A numeric pair key must remain exact. Large requested outputs simply
     // retain their non-point segments instead of restricting output size.
     if (!point && pixelCount * pixelCount > Number.MAX_SAFE_INTEGER) return false;
-    const run = paintRun ?? (this.canExtendThumbnailStrokeRun(this.strokes.primitiveCount)
+    const run = paintRun ?? (this.canExtendThumbnailStrokeRun(this.strokes.primitiveCount, true)
       ? this.paintRuns.length - 3 : this.paintRuns.length);
     const cells = this.thumbnailPointCells ??= new Uint8Array(pixelCount);
     if (run !== this.thumbnailPointRun) {
-      cells.fill(0); this.thumbnailLineCells?.clear(); this.thumbnailPointRun = run;
+      if (++this.thumbnailPointEpoch > 255) {
+        cells.fill(0); this.thumbnailPointEpoch = 1;
+      }
+      this.thumbnailLineCells?.clear(); this.thumbnailPointRun = run;
     }
-    const cell = py * size.width + px;
+    const cell = py * gridWidth + px;
     if (point) {
-      if (cells[cell] === 0) { cells[cell] = 1; return false; }
+      if (cells[cell] !== this.thumbnailPointEpoch) { cells[cell] = this.thumbnailPointEpoch; return false; }
     } else {
-      const other = qy * size.width + qx;
+      const other = qy * gridWidth + qx;
       const key = cell < other ? cell * pixelCount + other : other * pixelCount + cell;
       const lines = this.thumbnailLineCells ??= new Set<number>();
       if (!lines.has(key)) { lines.add(key); return false; }
@@ -4165,7 +4199,7 @@ class DenseContentCompiler {
     if (!this.diagnosedThumbnailPointCulling) {
       this.diagnosedThumbnailPointCulling = true;
       this.options.onDiagnostic?.({ code: "thumbnail.stroke-pixel-culling", severity: "info",
-        message: "Repeated opaque stroke segments with identical output-pixel coverage are consolidated for the thumbnail." });
+        message: "Repeated opaque stroke segments with identical quarter-pixel endpoint pairs are consolidated for the thumbnail." });
     }
     return true;
   }
@@ -4185,11 +4219,13 @@ class DenseContentCompiler {
     this.pathCount += 1;
     const strokes = this.strokes;
     const first = strokes.primitiveCount;
-    const paintRun = this.options.thumbnailPixelSize
-      ? (this.canExtendThumbnailStrokeRun(first) ? this.paintRuns.length - 3 : this.paintRuns.length) : undefined;
     const halfWidth = this.state.lineWidth * this.state.matrixScale * .5;
-    const penHalfWidth = Math.max(halfWidth, .5 / this.options.thumbnailScale!);
     const flags = STROKE_STYLE_FLAG_ROUND_CAP | (this.state.lineWidth <= 0 ? DENSE_PDF_STROKE_STYLE_FLAG_HAIRLINE : 0);
+    const coverageEligible = thumbnailStrokeUsesPixelCoverage(Math.fround(halfWidth), 0,
+      flags * STROKE_STYLE_FLAG_OFFSET + 1, this.thumbnailPixelPenScale);
+    const paintRun = this.options.thumbnailPixelSize
+      ? (this.canExtendThumbnailStrokeRun(first, coverageEligible) ? this.paintRuns.length - 3 : this.paintRuns.length) : undefined;
+    const penHalfWidth = Math.max(halfWidth, .5 / this.options.thumbnailScale!);
     strokes.recordPathHalfWidth(halfWidth);
     strokes.paintContext = this.strokePaintContext();
     const m = this.state.matrix;
@@ -4575,12 +4611,18 @@ class DenseContentCompiler {
   }
 
   /** Reuse only a root preview span with exactly the same visible paint scope. */
-  private canExtendThumbnailStrokeRun(start: number): boolean {
+  private canExtendThumbnailStrokeRun(start: number, coverageEligible?: boolean): boolean {
     if (!(this.options.thumbnail && this.options.thumbnailScale !== undefined &&
         this.options.capturePaintSourceIdentities !== true &&
         this.state.strokeAlpha === 1 && this.state.blendMode === "Normal" && this.state.softMaskIndex < 0 &&
         this.paintRuns.length >= 3)) return false;
     const offset = this.paintRuns.length - 3;
+    if (this.paintRuns[offset] !== DENSE_PDF_PAINT_RUN_STROKE ||
+        this.paintRuns[offset + 1] + this.paintRuns[offset + 2] !== start) return false;
+    // A later incompatible primitive must not make an already culled AA span
+    // fall back to native strokes when the renderer preflights the command.
+    if (this.options.thumbnailPixelSize && this.thumbnailCoveragePrimitive(start - 1) !==
+        (coverageEligible ?? this.thumbnailCoveragePrimitive(start))) return false;
     const run = offset / 3;
     const previous = this.paintRunCompositeStates[run];
     const paint = this.pathPaints.at(-1);
@@ -4594,6 +4636,12 @@ class DenseContentCompiler {
           paint.sourceColorSpaceIndex === this.state.strokeColorSpace.colorSpaceIndex &&
           (paint.inheritType3Paint === true) === this.state.strokePaintInherited &&
           paint.color[0] === this.state.strokeR && paint.color[1] === this.state.strokeG && paint.color[2] === this.state.strokeB);
+  }
+
+  private thumbnailCoveragePrimitive(index: number): boolean {
+    const offset = index * 4, meta = this.strokes.primitiveMeta.values();
+    return thumbnailStrokeUsesPixelCoverage(this.strokes.styles.values()[offset], meta[offset + 2],
+      meta[offset + 3], this.thumbnailPixelPenScale);
   }
 
   /** `validated`: this paint's composite state was just checked for VectorScene output. */

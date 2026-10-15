@@ -10,6 +10,7 @@ import {
   DensePdfResourceLimitError,
   DensePdfUnsupportedError,
   getDensePdfPaintSourceIdentity,
+  thumbnailStrokeUsesPixelCoverage,
   type DensePdfBounds,
   type DensePdfCompositeState,
   type DensePdfCompiledPage,
@@ -56,6 +57,7 @@ import {
 import type { NativePageTextResources } from "./pdf/nativePageText";
 import { paintNativeGlyphCommands } from "./pdf/nativeGlyphPaint";
 import { throwIfAborted } from "./pdf/nativeTypes";
+import type { ThumbnailStrokePixelSize } from "./thumbnailTypes";
 
 const commandPaintSourceIdentities = new WeakMap<
   HeprDisplayCommand,
@@ -73,6 +75,8 @@ export interface DensePdfPageDataOptions {
   readonly signal?: AbortSignal;
   /** Disposable overview stores may share state and bake pure translations. @internal */
   readonly thumbnail?: boolean;
+  /** Preserve root coverage/native stroke boundaries after early preview culling. @internal */
+  readonly thumbnailPixelSize?: ThumbnailStrokePixelSize;
   /** Complete native glyph/text resources. Required when content contains text shows. */
   readonly text?: NativePageTextResources;
   /** Optional non-glyph text index, such as geometry-backed annotation text. */
@@ -1477,7 +1481,8 @@ export function createHeprPageDataFromDense(
             previous.strokePaintIndex === command.strokePaintIndex && previous.strokeStyleIndex === command.strokeStyleIndex &&
             previous.fillRule === command.fillRule && previous.fillPaintInherited === command.fillPaintInherited &&
             previous.strokePaintInherited === command.strokePaintInherited) ||
-           (previous.source === "stroke-segments" && command.source === "stroke-segments" && previous.paintIndex === command.paintIndex))) {
+           (previous.source === "stroke-segments" && command.source === "stroke-segments" && previous.paintIndex === command.paintIndex &&
+            (target !== commands || sameThumbnailStrokeCoverage(previous.first + previous.count - 1, command.first))))) {
         // A range still paints each item in order. Only command dispatch is
         // shared; fill/stroke and translucent overlap boundaries stay intact.
         previous.count += command.count;
@@ -1523,6 +1528,15 @@ export function createHeprPageDataFromDense(
     });
   };
 
+  const thumbnailPixelPenScale = options.thumbnailPixelSize
+    ? Math.sqrt(options.thumbnailPixelSize.width / pageInfo.width * (options.thumbnailPixelSize.height / pageInfo.height)) : 0;
+  const sameThumbnailStrokeCoverage = (left: number, right: number): boolean => {
+    if (!options.thumbnailPixelSize) return true;
+    const styles = stores.strokes.styles, meta = stores.strokes.primitiveMeta;
+    const a = left * 4, b = right * 4;
+    return thumbnailStrokeUsesPixelCoverage(styles[a], meta[a + 2], meta[a + 3], thumbnailPixelPenScale) ===
+      thumbnailStrokeUsesPixelCoverage(styles[b], meta[b + 2], meta[b + 3], thumbnailPixelPenScale);
+  };
   const commands: HeprDisplayCommand[] = [];
   for (let offset = 0; offset < compiled.paintRuns.length; offset += 3) {
     const paintRunIndex = offset / 3;
@@ -1566,7 +1580,8 @@ export function createHeprPageDataFromDense(
           previous.first + previous.count === first && previous.transformIndex === commandState.transformIndex &&
           previous.clipIndex === commandState.clipIndex && previous.optionalContentIndex === commandState.optionalContentIndex &&
           previous.markedContentIndex === commandState.markedContentIndex && previous.sourceOffset === commandState.sourceOffset &&
-          previous.sourceLength === commandState.sourceLength && previous.paintIndex === solidPaint(paint.color, composite)) {
+          previous.sourceLength === commandState.sourceLength && previous.paintIndex === solidPaint(paint.color, composite) &&
+          sameThumbnailStrokeCoverage(previous.first + previous.count - 1, first)) {
         // Scope validation above still runs for every source paint. Coalesce
         // before creating the otherwise immediately discarded base/draw objects.
         previous.count += count;

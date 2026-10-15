@@ -3,6 +3,16 @@ import type { VectorScene } from "./pdfVectorExtractor";
 import type { HeprPageData } from "./heprDocumentData";
 import type { PdfResourceLimits } from "./pdf/nativeTypes";
 
+/** Shared endpoint quantization for smooth one-pixel thumbnail strokes. */
+export const THUMBNAIL_STROKE_SUBPIXELS = 4;
+
+/** Internal output-space grid used only by disposable Canvas thumbnail preparation. */
+export interface ThumbnailStrokePixelSize {
+  readonly width: number;
+  readonly height: number;
+  readonly subpixels: number;
+}
+
 /** Internal, clone-safe options shared by preparation and snapshot rendering. */
 export interface ThumbnailRenderOptions {
   readonly maxDimension: number;

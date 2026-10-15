@@ -1,6 +1,6 @@
 import { HEPR_PATH_VERB, type HeprPathStore, type PdfMatrix } from "./heprDocumentData";
 
-const CURVE_ERROR_SQUARED = 0.5 * 0.5;
+const CURVE_ERROR_SQUARED = 0.25 * 0.25;
 const LINE_ERROR_SQUARED = 1e-12;
 
 /** Operation-owned preview geometry. Canonical paths remain untouched. */

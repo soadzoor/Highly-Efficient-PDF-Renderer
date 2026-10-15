@@ -15,6 +15,7 @@ try {
   const { loadSceneFromHep } = await import("../src/hepReader.ts");
   const { collectPdfTransferables } = await import("../src/pdf/workerProtocol.ts");
   const { renderThumbnailPageCanvas2d } = await import("../src/thumbnailCanvas2d.ts");
+  const { THUMBNAIL_STROKE_SUBPIXELS } = await import("../src/thumbnailTypes.ts");
   const bytes = createOcrPdfFixture({ pageCount: 2, glyphless: false, scan: false, imageWidth: 2, imageHeight: 2,
     extGState: "/Half << /ca .5 /CA .5 >>",
     content: "q 10 5 180 90 re W n 0 0 1 rg 20 20 50 35 re f " +
@@ -187,16 +188,25 @@ try {
     for (const maxDecodedStreamBytes of [Number.MAX_SAFE_INTEGER, 1024]) {
       const value = await openPdf({ kind: "bytes", bytes: strokeBytes }, { limits: { maxDecodedStreamBytes } });
       sessions.push(value);
-      const compile = value.compilePageUnlocked, culling = [];
+      const compile = value.compilePageUnlocked, culling = [], grids = [];
       value.compilePageUnlocked = async function (page, compileOptions, ...rest) {
-        if (compileOptions.thumbnailScale !== undefined) culling.push(compileOptions.thumbnailPixelSize !== undefined);
+        if (compileOptions.thumbnailScale !== undefined) {
+          culling.push(compileOptions.thumbnailPixelSize !== undefined);
+          grids.push(compileOptions.thumbnailPixelSize && { ...compileOptions.thumbnailPixelSize });
+        }
         return compile.call(this, page, compileOptions, ...rest);
       };
       const initial = await value.renderThumbnailPage(0, options);
       const opaquePage = value.thumbnailPage.page, opaqueSnapshot = structuredClone(opaquePage);
       const bounded = maxDecodedStreamBytes !== Number.MAX_SAFE_INTEGER;
       assert.deepEqual(culling, [!bounded], "explicit working ceilings disable preparation-time pixel culling");
+      assert.deepEqual(grids, [bounded ? undefined : { width: 100, height: 100, subpixels: THUMBNAIL_STROKE_SUBPIXELS }],
+        "native preparation uses exactly the renderer's endpoint grid");
+      assert(value.thumbnailPage.key.endsWith(`:${bounded ? 0 : THUMBNAIL_STROKE_SUBPIXELS}`),
+        "the prepared-page key records effective endpoint quantization");
       assert.equal(opaquePage.stores.strokes.endpoints.length / 4, bounded ? 12 : 2);
+      if (!bounded) assert(initial.rgba.some((byte, index) => index % 4 === 3 && byte > 0 && byte < 255),
+        "the retained opaque overview has genuine antialiased partial coverage");
       await value.renderThumbnailPage(0, { ...options, vectorOverride: [.2, .4, .6, 1] });
       assert.deepEqual(culling, [!bounded], "opaque vector recoloring preserves the same preparation policy");
 
@@ -205,21 +215,33 @@ try {
       assert.deepEqual(culling, bounded ? [false] : [true, false],
         "translucent vector overrides use full source geometry and a distinct preparation when needed");
       const translucentPage = value.thumbnailPage.page;
+      assert(value.thumbnailPage.key.endsWith(":0"), "translucent vector paint never reuses culled endpoint geometry");
       assert.equal(translucentPage.stores.strokes.endpoints.length / 4, 12);
       const referencePage = await value.compilePage(0, { thumbnailScale: 1, thumbnailOmitMetadata: true,
         optimization: "none", enableSegmentMerge: false, enableInvisibleCull: false });
       const reference = await renderThumbnailPageCanvas2d(referencePage, translucentOptions, undefined,
         { maxImagePixels: Number.MAX_SAFE_INTEGER, maxDecodedStreamBytes });
       assertPixels(translucent, reference, "translucent overrides preserve all repeated opacity applications");
+      assertPixels(initial, await renderThumbnailPageCanvas2d(referencePage, options, undefined,
+        { maxImagePixels: Number.MAX_SAFE_INTEGER, maxDecodedStreamBytes }),
+        "quarter-grid preparation matches unculled antialiased thumbnail coverage");
       assert(Math.max(...translucent.rgba.filter((_value, index) => index % 4 === 3)) > 200,
         "the repeated line's visible alpha cannot come from a single half-opacity primitive");
       // Exclude the explicit reference compile from cache-preparation counts.
-      culling.pop();
+      culling.pop(); grids.pop();
       await value.renderThumbnailPage(0, { ...options, vectorOverride: [.6, .4, .2, .4] });
       assert.strictEqual(value.thumbnailPage.page, translucentPage, "another translucent override reuses unculled geometry");
       assert.deepEqual(opaquePage, opaqueSnapshot, "changing culling policy cannot mutate the earlier prepared page");
       assertPixels(await value.renderThumbnailPage(0, options), initial, "switching back to opaque restores the original overview");
       assert.deepEqual(culling, bounded ? [false] : [true, false, true], "the cache key includes effective culling eligibility");
+      if (!bounded) {
+        const beforeGridChange = culling.length;
+        value.thumbnailPage = { ...value.thumbnailPage, key: value.thumbnailPage.key.replace(/:\d+$/, ":1") };
+        assertPixels(await value.renderThumbnailPage(0, options), initial,
+          "a cached representation prepared for a coarser endpoint grid cannot affect smooth output");
+        assert.equal(culling.length, beforeGridChange + 1, "endpoint-grid changes force a new preparation");
+        assert(value.thumbnailPage.key.endsWith(`:${THUMBNAIL_STROKE_SUBPIXELS}`));
+      }
       await value.close();
     }
   }

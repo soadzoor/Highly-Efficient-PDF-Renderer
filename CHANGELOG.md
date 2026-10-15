@@ -46,11 +46,13 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   text transform, and avoid temporary packed resource wrappers during adaptation.
   Recognize complete line and polyline scopes in one byte scan with direct packed
   line coordinates, and share solid-text rendering state. Consolidate opaque root
-  strokes with identical pixel endpoint pairs within each Canvas2D paint scope,
+  strokes with identical quarter-pixel endpoint pairs within compatible Canvas2D
+  paint spans,
   preserving logical source counts, clipping and order; translucent overrides and
   explicit scratch budgets retain their compatibility geometry. Eligible opaque
-  Canvas2D lines use coarse pixel coverage without
-  stroke antialiasing, with a diagnostic. Subpixel square caps may be rounded;
+  Canvas2D lines use four-sample antialiased coverage for smoother curves and
+  diagonals without a larger rendering bitmap, with quarter-pixel curve detail
+  and a diagnostic. Subpixel square caps may be rounded;
   thumbnail approximations remain separate from canonical HEP output. Reuse the
   last successful session thumbnail for identical requests, preserving
   cancellation and reporting only actual total timing on cache hits. Retain one

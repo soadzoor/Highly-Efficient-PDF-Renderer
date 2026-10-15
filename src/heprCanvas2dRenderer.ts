@@ -1193,7 +1193,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
         this.diagnosedThumbnailPixels = true;
         this.options.onDiagnostic?.({ code: "thumbnail.pixel-stroke-approximation", severity: "info",
           pageIndex: this.page.pageInfo.sourcePageIndex,
-          message: "Opaque one-pixel overview lines use coarse pixel coverage without stroke antialiasing." });
+          message: "Opaque one-pixel overview lines use four-sample antialiased pixel coverage." });
       }
     } else {
       context.beginPath();
@@ -1214,12 +1214,14 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     this.options.signal?.throwIfAborted();
     const context = this.thumbnailContext!;
     if (this.thumbnailStroke.coverage) {
-      context.beginPath();
-      this.thumbnailCoverage!.appendRectangles(context, this.options.signal);
-      this.options.signal?.throwIfAborted();
-      context.globalAlpha = 1;
       context.fillStyle = this.thumbnailStroke.paint.css;
-      context.fill();
+      for (let samples = 1; samples <= 4; samples++) {
+        this.options.signal?.throwIfAborted();
+        context.beginPath();
+        const visible = this.thumbnailCoverage!.appendRectangles(context, samples, this.options.signal);
+        this.options.signal?.throwIfAborted();
+        if (visible) { context.globalAlpha = samples / 4; context.fill(); }
+      }
     } else context.stroke();
     this.thumbnailStroke = null;
   }

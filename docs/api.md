@@ -83,13 +83,14 @@ unreadable ordinary glyphs may use inexpensive ink marks. These approximations
 prioritize layout, orientation, dominant shapes and colors over tiny labels or
 exact fine detail. Thin overview strokes use a one-pixel minimum pen for more
 recognizable linework. Canvas2D batches compatible opaque paths, reuses clip
-state and flattens overview curves in output pixels; complex paints keep their
-compatibility rendering. Thin, opaque, solid root-page polylines use a compact
+state and flattens overview curves within a quarter output pixel; complex paints
+keep their compatibility rendering. Thin, opaque, solid root-page polylines use a compact
 one-pixel pen with rounded caps and joins. Eligible opaque Canvas2D line spans
-use coarse pixel coverage without stroke antialiasing, reported as
-`thumbnail.pixel-stroke-approximation`; edges may look heavier or jagged.
-Canvas2D preparation also consolidates opaque root strokes with identical pixel
-endpoint pairs within the same paint scope, reported as
+use four-sample antialiased coverage, reported as
+`thumbnail.pixel-stroke-approximation`. This smooths curves and diagonals while
+retaining the stronger overview pen, without rendering a larger bitmap.
+Canvas2D preparation also consolidates opaque root strokes with identical
+quarter-pixel endpoint pairs within the same compatible paint span, reported as
 `thumbnail.stroke-pixel-culling`. Source counts, clipping and paint order remain
 intact; the full-quality representation is prepared independently.
 Translucent vector overrides and explicit working-memory limits retain all source

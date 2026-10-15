@@ -12,6 +12,7 @@ try {
   const { createHeprPageDataFromDense } = await import("../src/densePdfPageData.ts");
   const { validateHeprPageData } = await import("../src/heprDocumentDataValidation.ts");
   const { renderHeprPageToCanvas2d } = await import("../src/heprCanvas2dRenderer.ts");
+  const { THUMBNAIL_STROKE_SUBPIXELS } = await import("../src/thumbnailTypes.ts");
   const encoder = new TextEncoder();
   const pen = "2 J 0 j .05 w ";
   const dot = (x = 20.2, y = 30.2) => `${x} ${y} m ${x + .1} ${y + .1} l S `;
@@ -42,11 +43,52 @@ try {
     ["reversed horizontal pair", "10.2 60.2 m 90.2 60.2 l S 90.2 60.2 m 10.2 60.2 l S"],
     ["reversed diagonal ties", "10.2 20.2 m 12.2 21.2 l S 12.2 21.2 m 10.2 20.2 l S"],
     ["opposite diagonal ties", "10.2 21.2 m 12.2 20.2 l S 12.2 20.2 m 10.2 21.2 l S"],
-    ["same cells with different source direction", "10.8 20.2 m 10.2 22.8 l S 10.2 20.8 m 10.8 22.2 l S"]
+    ["quarter-pixel diagonal ties", "10.125 20.125 m 12.125 21.125 l S 12.125 21.125 m 10.125 20.125 l S"]
   ]) {
     const pair = await parity(label, pen + lines);
-    assert.equal(pair.reduced.segmentCount, 1, `${label}: binary coverage is independent of source direction`);
+    assert.equal(pair.reduced.segmentCount, 1, `${label}: smooth coverage is independent of source direction`);
   }
+  for (const [label, source] of [
+    ["distinct quarter-pixel positions in one pixel", dot(20.2, 30.2) + dot(20.7, 30.2)],
+    ["same old endpoint cells with different directions", "10.8 20.2 m 10.2 22.8 l S 10.2 20.8 m 10.8 22.2 l S"]
+  ]) {
+    const pair = await parity(label, pen + source);
+    assert.equal(pair.reduced.segmentCount, 2, `${label}: distinct antialiased endpoint pairs remain separate`);
+  }
+  const repeatedQuarter = await parity("Float32 endpoint rounding precedes quarter-pixel rounding", pen +
+    "20.1249999 30.1249999 m 20.1249999 30.1249999 l S " +
+    "20.1250001 30.1250001 m 20.1250001 30.1250001 l S");
+  assert.equal(repeatedQuarter.reduced.segmentCount, 1, "source coordinates sharing packed Float32 endpoints share coverage");
+  const separateQuarter = await parity("quarter-pixel boundaries preserve nearby distinct coverage", pen +
+    "20.1249 30.2 m 20.1249 30.2 l S 20.1251 30.2 m 20.1251 30.2 l S");
+  assert.equal(separateQuarter.reduced.segmentCount, 2);
+
+  for (const [label, source] of [
+    ["right edge", "100 30 m 100 60 l S 100 60 m 100 30 l S"],
+    ["bottom edge", "20 0 m 60 0 l S 60 0 m 20 0 l S"],
+    ["top edge", "20 100 m 60 100 l S 60 100 m 20 100 l S"],
+    ["bottom right corner", "100 0 m 100 0 l S 100 0 m 100 0 l S"]
+  ]) {
+    const pair = await parity(label, "1 J .05 w " + source);
+    assert.equal(pair.reduced.segmentCount, 1, "edge grid positions are representable without aliasing rows");
+  }
+  const outside = await parity("outside positions that round onto the page edge", "1 J .05 w " +
+    "-.05 30 m -.05 30 l S -.05 30 m -.05 30 l S");
+  assert.equal(outside.reduced.segmentCount, 2, "outside endpoints retain conservative source geometry");
+  for (const [label, middle] of [
+    ["thick packed pen", "3 w 70 70 m 90 70 l S .05 w "],
+    ["butt packed cap", "0 J 70 70 m 90 70 l S 1 J "]
+  ]) {
+    const pair = await parity(`coverage batch interrupted by ${label}`, "1 J .05 w " +
+      "20.2 30.2 m 20.2 30.2 l S " + middle + "20.2 30.2 m 20.2 30.2 l S");
+    assert.equal(pair.reduced.segmentCount, 3, "a native-stroke batch boundary preserves later partial-alpha paint");
+  }
+  const roundPolyline = await parity("polylines retain their emitted round-cap coverage class", "1 J .05 w " +
+    "20.2 30.2 m 20.2 30.2 l S 0 J 50 50 m 80 50 l 80 80 l S 1 J " +
+    "20.2 30.2 m 20.2 30.2 l S");
+  assert.equal(roundPolyline.reduced.segmentCount, 3);
+  assert.equal(roundPolyline.reduced.paintRuns.length / 3, 1,
+    "forced-round preview polylines share the same AA batch despite their source cap");
 
   for (const [label, source] of [
     ["intervening fill", pen + dots(4) + "1 g 19 29 3 3 re f " + dots(4)],
@@ -79,7 +121,37 @@ try {
   });
   assert.equal(roundedWide.reduced.segmentCount, roundedWide.baseline.segmentCount,
     "actual rounded output scale excludes pens wider than one pixel from binary culling");
+  const routing = {};
+  const roundedMixed = await parity("rounded non-square mixed native/AA packed styles", "1 J .05 w " +
+    "20.2 30.2 m 20.2 30.2 l S ".repeat(2) + "3 w 100 70 m 140 70 l S .05 w " +
+    "20.2 30.2 m 20.2 30.2 l S", {
+      pageWidth: 201, pageHeight: 103, pixelSize: { width: 400, height: 205 }, calls: routing
+    });
+  assert.equal(roundedMixed.reduced.segmentCount, 3);
+  assert.equal(roundedMixed.reduced.paintRuns.length / 3, 3,
+    "coverage-eligible spans cannot merge across a native packed stroke");
+  assert(routing.rect > 0 && routing.lineTo > 0, "thin AA and affine thick native strokes retain their intended draw routes");
+  const roundedBoundary = await parity("actual rounded scale changes packed coverage eligibility", "1 J .05 w " +
+    "20.2 30.2 m 20.2 30.2 l S ".repeat(2) + ".5025 w 100 70 m 140 70 l S .05 w " +
+    "20.2 30.2 m 20.2 30.2 l S", {
+      pageWidth: 201, pageHeight: 103, pixelSize: { width: 400, height: 205 }
+    });
+  assert.equal(roundedBoundary.reduced.segmentCount, 3);
+  assert.equal(roundedBoundary.reduced.paintRuns.length / 3, 3,
+    "the nominally one-pixel source pen splits spans when rounded output makes it wider");
   await parity("rotated source CTM", pen + dots(), { pageMatrix: [0, 1, -1, 0, 100, 0] });
+  const epochs = await parity("coverage epoch wrap", pen + Array.from({ length: 260 }, (_, index) =>
+    `${index % 2} G ${dots(2)}`).join(""));
+  assert.equal(epochs.reduced.segmentCount, 260, "reused coverage storage resets after byte epochs wrap");
+
+  for (const [label, pixelSize, source] of [
+    ["unsafe numeric pair key", { width: 4000, height: 4000 }, "10 10 m 90 90 l S ".repeat(2)],
+    ["unsafe grid cell count", { width: 2 ** 28, height: 2 ** 28 }, "20.2 30.2 m 20.2 30.2 l S ".repeat(2)]
+  ]) {
+    const baseline = await compile("1 J 0 w " + source, false, { pixelSize });
+    const reduced = await compile("1 J 0 w " + source, true, { pixelSize });
+    assert.deepEqual(reduced, baseline, `${label}: exact-key fallback preserves geometry without allocating an unsafe grid`);
+  }
 
   const layers = { retainOptionalContent: true,
     markedContentProperties: new Map([["First", { resourceName: "First", optionalContentIndex: 0, defaultVisible: true, mcid: -1 }],
@@ -127,7 +199,7 @@ try {
     const before = new AbortController(); before.abort(reason);
     await assert.rejects(compile(pen + dots(), culling, { signal: before.signal }), error => error === reason);
   }
-  console.log("Thumbnail same-cell stroke culling passed: fewer primitives, logical counts, pixel parity, source order, colors, clips, layers, Float32/output rounding, exclusions, limits and cancellation.");
+  console.log("Thumbnail stroke culling passed: quarter-pixel endpoint parity, fewer primitives, logical counts, AA/order/color/clip/layer parity, Float32/output rounding, edge grids, epochs, exact-key fallbacks, limits and cancellation.");
 
   async function compile(source, culling, options = {}) {
     const { pageWidth = 100, pageHeight = 100, pixelSize = { width: 100, height: 100 }, ...overrides } = options;
@@ -135,7 +207,7 @@ try {
       pageMatrix: [1, 0, 0, 1, 0, 0], pageBounds: { minX: 0, minY: 0, maxX: pageWidth, maxY: pageHeight },
       compactRetainedResources: true, thumbnail: true,
       thumbnailScale: Math.min(pixelSize.width / pageWidth, pixelSize.height / pageHeight),
-      thumbnailPixelSize: culling ? pixelSize : undefined,
+      thumbnailPixelSize: { ...pixelSize, subpixels: THUMBNAIL_STROKE_SUBPIXELS }, thumbnailPixelCulling: culling,
       textOperatorSink: { externalGraphicsState: { save() {}, restore() {} }, applyOperator() { return []; } },
       capturePaintSourceIdentities: false, enableInvisibleCull: false, enableSegmentMerge: false, ...overrides });
   }
@@ -153,6 +225,7 @@ try {
       mediaBox: [0, 0, pageWidth, pageHeight], cropBox: [0, 0, pageWidth, pageHeight],
       bleedBox: null, trimBox: null, artBox: null, rotation: 0, userUnit: 1 };
     const page = createHeprPageDataFromDense(pageInfo, compiled, { thumbnail: true,
+      thumbnailPixelSize: { ...pixelSize, subpixels: THUMBNAIL_STROKE_SUBPIXELS },
       retainOptionalContent: options.retainOptionalContent,
       optionalContent: { names: ["First", "Second"], defaultVisible: Uint8Array.of(1, 1) } });
     validateHeprPageData(page);
@@ -160,7 +233,14 @@ try {
       scale: Math.min(pixelSize.width / pageWidth, pixelSize.height / pageHeight), background: [0, 0, 0, 0],
       surfaceFactory(width, height) {
         const canvas = createCanvas(width, height); surfaces.push(canvas);
-        return { canvas, context: canvas.getContext("2d") };
+        const context = canvas.getContext("2d");
+        return { canvas, context: options.calls ? new Proxy(context, { get(target, key) {
+          const value = Reflect.get(target, key, target);
+          return typeof value === "function" ? (...args) => {
+            options.calls[key] = (options.calls[key] ?? 0) + 1;
+            return value.apply(target, args);
+          } : value;
+        }, set(target, key, value) { return Reflect.set(target, key, value, target); } }) : context };
       }
     }, { thumbnail: true, thumbnailPixelStrokes: true, outputSize: pixelSize });
     return Uint8Array.from(result.surface.context.getImageData(0, 0, result.width, result.height).data);
