@@ -2,7 +2,7 @@
 
 import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
-import { createReadStream } from "node:fs";
+import { createReadStream, openAsBlob } from "node:fs";
 import {
   constants,
   copyFile,
@@ -92,10 +92,13 @@ beside their PDFs, unless --output-dir is supplied. Output name collisions are
 rejected.
 HEP files larger than their source PDFs are written with a warning; selected
 LOD caches are retained.
-Each run ends with a filename, status, time and size table, including percentage
-changes (green for smaller HEPs, red for larger HEPs in color terminals).
+Each run ends with a filename, status, time, peak memory and size table,
+including percentage changes (green for smaller HEPs, red for larger HEPs in
+color terminals). Peak RSS is the converting worker process's highest resident
+memory, including its runtime and parser thread; copied duplicates have none.
 A final summary table shows conversion counts, size totals, average and median
-attempt times, summed conversion time and elapsed batch wall time.
+attempt times, the highest worker peak RSS, summed conversion time and elapsed
+batch wall time.
 Detailed warnings, failures and raster-fallback pages/reasons are saved in the
 diagnostics log; ordinary embedded PDF images are not counted as fallback.
 
@@ -835,13 +838,14 @@ export function formatPdfToHepTimingSummary(timings, { color = false } = {}) {
       path.basename(timing.pdfPath).replace(/[\u0000-\u001f\u007f]/g, " "),
       timing.status,
       formatPdfToHepDuration(timing.durationMs),
+      timing.peakRssBytes === undefined ? "--" : formatBytes(timing.peakRssBytes),
       timing.sourceBytes === undefined ? "--" : formatBytes(timing.sourceBytes),
       outputBytes === undefined ? "--" : formatBytes(outputBytes),
       formatPdfToHepSizeChange(timing.sourceBytes, outputBytes, color)
     ];
   });
   return "Conversion time summary:\n" + formatPdfToHepTable(
-    ["#", "Filename", "Status", "Time", "PDF", "HEP", "Change"], rows, [0, 3, 4, 5, 6]
+    ["#", "Filename", "Status", "Time", "Peak RSS", "PDF", "HEP", "Change"], rows, [0, 3, 4, 5, 6, 7]
   );
 }
 
@@ -933,6 +937,12 @@ export function formatPdfToHepSummary(
     ["Fastest attempted PDF time", durationValue(durations[0])],
     ["Slowest attempted PDF time", durationValue(durations.at(-1))]
   );
+  // Workers overlap, so this bounds one conversion rather than the batch total.
+  const highestPeak = timings.reduce((highest, timing) =>
+    timing.peakRssBytes > (highest?.peakRssBytes ?? 0) ? timing : highest, undefined);
+  rows.push(["Highest worker peak RSS", highestPeak
+    ? `${formatBytes(highestPeak.peakRssBytes)} (${path.basename(highestPeak.pdfPath ?? "")})`
+    : "--"]);
   if (duplicates.length > 0) {
     // Each copy saves about as long as its identical PDF took to convert.
     const savedMs = duplicates.reduce((total, timing) => total + (Number(timing.savedDurationMs) || 0), 0);
@@ -1157,6 +1167,10 @@ export function startPdfToHepWorker(
     } else if (message?.type === "pdf-to-hep-sizes") {
       for (const key of ["sourceBytes", "outputBytes"]) {
         if (Number.isSafeInteger(message[key]) && message[key] >= 0) report[key] = message[key];
+      }
+    } else if (message?.type === "pdf-to-hep-memory") {
+      if (Number.isSafeInteger(message.peakRssBytes) && message.peakRssBytes > 0) {
+        report.peakRssBytes = message.peakRssBytes;
       }
     }
   });
@@ -1591,6 +1605,17 @@ export async function runPdfToHep(args = process.argv.slice(2), dependencies = {
   }
 }
 
+/** Highest resident memory of this process so far, or undefined if unavailable. */
+function processPeakRssBytes() {
+  try {
+    // Node reports maxRSS in KiB on every platform.
+    const kibibytes = process.resourceUsage().maxRSS;
+    return Number.isSafeInteger(kibibytes) && kibibytes > 0 ? kibibytes * 1024 : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function reportPdfToHepWorkerEvent(event) {
   if (!process.connected || typeof process.send !== "function") return;
   // Reporting must not turn a usable conversion into a failure if the parent
@@ -1638,10 +1663,12 @@ async function convertPdfToHep(pending, options, password, skippedCount, depende
       console.log(`[${itemNumber}/${itemCount}] Reading ${pdfPath}`);
 
       try {
-        const pdfBytes = await readFile(pdfPath, { signal: abortController.signal });
-        report({ type: "pdf-to-hep-sizes", sourceBytes: pdfBytes.byteLength });
+        // A file-backed Blob is read once by the builder, which hands that only
+        // copy to its parser worker instead of this process keeping another.
+        const pdfFile = await openAsBlob(pdfPath);
+        report({ type: "pdf-to-hep-sizes", sourceBytes: pdfFile.size });
         abortController.signal.throwIfAborted();
-        const hepBlob = await builder.buildHep(pdfBytes, {
+        const hepBlob = await builder.buildHep(pdfFile, {
           sourceLabel,
           withVectorLod: options.withVectorLod,
           withTextLod: options.withTextLod,
@@ -1704,6 +1731,10 @@ async function convertPdfToHep(pending, options, password, skippedCount, depende
         if (isPasswordError(error)) {
           console.error(`Pass --password=<password> or set ${PDF_PASSWORD_ENV} to convert password-protected PDFs.`);
         }
+      } finally {
+        // Each worker converts one PDF, so its process peak is that conversion's.
+        const peakRssBytes = processPeakRssBytes();
+        if (peakRssBytes !== undefined) report({ type: "pdf-to-hep-memory", peakRssBytes });
       }
     }
   } catch (error) {

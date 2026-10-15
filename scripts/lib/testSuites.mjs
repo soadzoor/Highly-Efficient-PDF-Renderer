@@ -207,6 +207,7 @@ export const fastTests = [
   "native-packed-resources",
   "native-compact-retained",
   "native-image-color-reuse",
+  "native-device-image-conversion",
   "native-ccitt",
   "native-ccitt-uncompressed",
   "native-monochrome-images",

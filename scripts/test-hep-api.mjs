@@ -168,7 +168,11 @@ async function testPdfSizeBudgetForwarding() {
     const context = vm.createContext({
       createLoadProgressReporter,
       createHepRasterPagePreparer: () => async () => {},
-      loadPdfSceneFromSource: async () => ({ scene: {}, sourceKind: "pdf", sourceLabel: "source.pdf", sourceBytes: new Uint8Array(4096) }),
+      loadPdfSceneFromSource: async (_source, _options, _signal, _demandLoading, _preparePage, releaseSourceBytes) => {
+        assert.equal(releaseSourceBytes, true, "PDF exports hand their only PDF copy to the parser");
+        // A released source keeps its size on the scene instead of its bytes.
+        return { scene: { sourcePdfByteLength: 4096 }, sourceKind: "pdf", sourceLabel: "source.pdf", sourceBytes: new Uint8Array(0) };
+      },
       listSceneRasterLayers: () => [],
       normalizeSourceLabel: (_value, fallback) => fallback,
       buildSceneHep: async (_scene, _label, _raster, options) => {

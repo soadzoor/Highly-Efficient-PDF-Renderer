@@ -210,10 +210,16 @@ export async function loadPdfSceneFromSource(
   /** @internal Only the Three viewer factory requests a partial viewing scene. */
   demandLoading = false,
   /** @internal HEP export: encode each parsed page's larger images before keeping it. */
-  preparePage?: (scene: VectorScene, signal?: AbortSignal) => Promise<void>
+  preparePage?: (scene: VectorScene, signal?: AbortSignal) => Promise<void>,
+  /**
+   * @internal HEP export: hand the loaded PDF copy to the parser instead of
+   * retaining a second one for re-parsing. The result's `sourceBytes` is then
+   * empty; `scene.sourcePdfByteLength` keeps the PDF size.
+   */
+  releaseSourceBytes = false
 ): Promise<LoadedPdfScene> {
   signal?.throwIfAborted();
-  const pending = loadPdfSceneFromSourceInternal(source, options, signal, demandLoading, preparePage);
+  const pending = loadPdfSceneFromSourceInternal(source, options, signal, demandLoading, preparePage, releaseSourceBytes);
   try { return await waitForLoad(pending, signal); }
   catch (error) {
     // A metadata session can finish just after its caller cancels. Drain and close that unclaimed worker.
@@ -227,11 +233,12 @@ async function loadPdfSceneFromSourceInternal(
   options: PdfObjectGeneratorOptions,
   signal?: AbortSignal,
   demandLoading = false,
-  preparePage?: (scene: VectorScene, signal?: AbortSignal) => Promise<void>
+  preparePage?: (scene: VectorScene, signal?: AbortSignal) => Promise<void>,
+  releaseSourceBytes = false
 ): Promise<LoadedPdfScene> {
   signal?.throwIfAborted();
   const progress = createLoadProgressReporter(options.onProgress);
-  const sourceBytes = await readPdfObjectSourceBytes(
+  let sourceBytes = await readPdfObjectSourceBytes(
     source,
     progress.child(0, 0.16),
     signal
@@ -283,8 +290,13 @@ async function loadPdfSceneFromSourceInternal(
         return { scene, sourceLabel, sourceKind, sourceBytes, sourceOptions: options };
       } catch (error) { await loader.close(); throw error; }
     }
+    const sourceByteLength = sourceBytes.byteLength;
+    // readPdfObjectSourceBytes() always returns a fresh copy, so a released
+    // source transfers that buffer to the worker instead of a second copy.
+    const parseBuffer = releaseSourceBytes ? ownedParseBuffer(sourceBytes) : createParseBuffer(sourceBytes);
+    if (releaseSourceBytes) sourceBytes = new Uint8Array(0);
     const pageScenes = await extractPdfPageScenes(
-      createParseBuffer(sourceBytes),
+      parseBuffer,
       extractOptions,
       signal,
       "transfer",
@@ -293,7 +305,7 @@ async function loadPdfSceneFromSourceInternal(
     signal?.throwIfAborted();
     const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, pageScenes.length);
     const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(pageScenes, pagesPerRow, options.onDiagnostic));
-    scene.sourcePdfByteLength = sourceBytes.byteLength;
+    scene.sourcePdfByteLength = sourceByteLength;
     signal?.throwIfAborted();
     progress.report(0.93, { stage: "compile", sourceType: "pdf" });
     signal?.throwIfAborted();
@@ -628,6 +640,12 @@ function normalizePagesPerRow(value: number | undefined, pageCount: number): num
 
 function createParseBuffer(bytes: Uint8Array): ArrayBuffer {
   return new Uint8Array(bytes).buffer;
+}
+
+/** The exact buffer of bytes this loader owns, or a copy when they are a view. */
+function ownedParseBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer instanceof ArrayBuffer && bytes.byteOffset === 0 &&
+    bytes.byteLength === bytes.buffer.byteLength ? bytes.buffer : createParseBuffer(bytes);
 }
 
 function looksLikeRawBase64Source(value: string): boolean {

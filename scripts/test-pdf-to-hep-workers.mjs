@@ -203,17 +203,22 @@ await withBatch({
       { type: "pdf-to-hep-sizes", sourceBytes: 1024 },
       { type: "pdf-to-hep-warning", message: "[HEP] larger output" },
       { type: "pdf-to-hep-warning", message: "[HEP] larger output" },
-      { type: "pdf-to-hep-sizes", outputBytes: 2048 }
+      { type: "pdf-to-hep-sizes", outputBytes: 2048 },
+      { type: "pdf-to-hep-memory", peakRssBytes: 512 * 1024 * 1024 }
     ],
     2: [
       { type: "pdf-to-hep-sizes", sourceBytes: 8192, outputBytes: 4096 },
       { type: "pdf-to-hep-sizes", sourceBytes: -1, outputBytes: "invalid" },
-      { type: "pdf-to-hep-warning", message: "page 2: [icc-fallback] approximate colors" }
+      { type: "pdf-to-hep-warning", message: "page 2: [icc-fallback] approximate colors" },
+      { type: "pdf-to-hep-memory", peakRssBytes: 1.25 * GiB },
+      ...[-1, 0, 1.5, "4096", Number.MAX_SAFE_INTEGER + 1].map(peakRssBytes =>
+        ({ type: "pdf-to-hep-memory", peakRssBytes }))
     ],
     3: [
       { type: "pdf-to-hep-sizes", sourceBytes: 1_000_000, outputBytes: 2_000_000 },
       { type: "pdf-to-hep-error", message: "synthetic encoding failure" },
-      { type: "pdf-to-hep-warning", message: "repaired malformed content" }
+      { type: "pdf-to-hep-warning", message: "repaired malformed content" },
+      { type: "pdf-to-hep-memory", peakRssBytes: 2 * GiB }
     ],
     4: [{ type: "pdf-to-hep-sizes", sourceBytes: 1_000_000, outputBytes: 2_000_000 }]
   }
@@ -243,7 +248,12 @@ await withBatch({
   assert.match(diagnostics, /page 2: \[icc-fallback\] approximate colors/);
   assert(diagnostics.indexOf("worker-1.pdf:") < diagnostics.indexOf("worker-2.pdf:"), "warnings stay in input order");
   const timingSummary = batch.logs.find((line) => line.startsWith("Conversion time summary:"));
-  assert.deepEqual(tableRows(timingSummary)[1], ["1/4", "worker-1.pdf", "generated", "0h 00m 00s", "1.00 KiB", "2.00 KiB", "+100.00%"]);
+  const timingRows = tableRows(timingSummary);
+  assert.deepEqual(timingRows[1], ["1/4", "worker-1.pdf", "generated", "0h 00m 00s", "512.00 MiB", "1.00 KiB", "2.00 KiB", "+100.00%"]);
+  assert.equal(timingRows[2][4], "1.25 GiB", "invalid later memory reports keep the last valid worker peak");
+  assert.equal(timingRows[3][4], "2.00 GiB", "a failed conversion keeps its measured worker peak");
+  assert.equal(timingRows[4][4], "--", "a worker without a memory report shows no peak");
+  assert.equal(totals["Highest worker peak RSS"], "2.00 GiB (worker-3.pdf)");
   assert(!timingSummary.includes("1.91 MiB"), "failed and skipped candidates are excluded from output sizes");
 });
 
@@ -315,7 +325,7 @@ const timingCases = [
   { pdfPath: path.resolve("private/nested/smaller.pdf"), fileNumber: 1, fileCount: 5,
     status: "generated", durationMs: 100, sourceBytes: 1024, outputBytes: 512 },
   { pdfPath: path.resolve("private/nested/larger.pdf"), fileNumber: 2, fileCount: 5,
-    status: "generated", durationMs: 600, sourceBytes: 1024, outputBytes: 2048 },
+    status: "generated", durationMs: 600, sourceBytes: 1024, outputBytes: 2048, peakRssBytes: 1.5 * GiB },
   { pdfPath: path.resolve("private/nested/failed.pdf"), fileNumber: 3, fileCount: 5,
     status: "failed", durationMs: 2500, sourceBytes: 1024, outputBytes: 4096 },
   { pdfPath: path.resolve("private/nested/skipped.pdf"), fileNumber: 4, fileCount: 5,
@@ -331,9 +341,11 @@ assert.match(coloredTimingTable, /\x1b\[32m-50\.00%\x1b\[0m/);
 assert.match(coloredTimingTable, /\x1b\[31m\+100\.00%\x1b\[0m/);
 assert(!timingTable.includes("\x1b["), "plain output is suitable for redirected terminals");
 const fileRows = tableRows(timingTable).slice(1);
-assert.deepEqual(fileRows[2].slice(4), ["1.00 KiB", "--", "--"], "failed output candidates have no comparable HEP size");
-assert.deepEqual(fileRows[3].slice(4), ["1.00 KiB", "--", "--"], "skipped output candidates have no comparable HEP size");
-assert.deepEqual(fileRows[4].slice(4), ["0 B", "0 B", "--"], "empty sources have no percentage denominator");
+assert.deepEqual(fileRows[2].slice(5), ["1.00 KiB", "--", "--"], "failed output candidates have no comparable HEP size");
+assert.deepEqual(fileRows[3].slice(5), ["1.00 KiB", "--", "--"], "skipped output candidates have no comparable HEP size");
+assert.deepEqual(fileRows[4].slice(5), ["0 B", "0 B", "--"], "empty sources have no percentage denominator");
+assert.deepEqual(fileRows.map((row) => row[4]), ["--", "1.50 GiB", "--", "--", "--"], "peak RSS follows the time column");
+assert.equal(metrics(formatPdfToHepSummary(timingCases, 0))["Highest worker peak RSS"], "1.50 GiB (larger.pdf)");
 assert.equal(new Set(timingTable.split("\n").slice(1).map((line) => line.length)).size, 1,
   "the ASCII borders and rows remain aligned");
 
@@ -355,6 +367,7 @@ const emptyTimes = metrics(formatPdfToHepSummary([], 2));
 assert.equal(emptyTimes["Average attempted PDF time"], "--");
 assert.equal(emptyTimes["Median attempted PDF time"], "--");
 assert.equal(emptyTimes.Skipped, "2");
+assert.equal(emptyTimes["Highest worker peak RSS"], "--");
 assert(!formatPdfToHepSummary([], 0).includes("NaN"));
 assert.match(formatPdfToHepDiagnosticsSummary([{ pdfPath: "failed.pdf", status: "failed", errorMessage: "broken" }]),
   /Failed PDFs:\n  failed.pdf: broken/);
