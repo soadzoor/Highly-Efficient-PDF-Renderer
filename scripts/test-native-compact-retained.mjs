@@ -81,6 +81,175 @@ try {
     "path CTMs retain Float64 precision, rather than rounding to the final GPU format early");
   await comparePages(varied.legacy, varied.compact);
 
+  const previewSource = "2 J [3 1] .5 d 10 10 m 30 10 l S 10 20 m 30 20 l S " +
+    "q 2 .25 .5 .75 5 6 cm 10 30 m 30 30 l S Q 10 40 m 30 40 l S";
+  const preview = await pair(previewSource, { thumbnail: true });
+  const ordinary = await compileDensePdfContent(encoder.encode(previewSource), {
+    ...defaults, compactRetainedResources: true
+  });
+  assert.equal(ordinary.packedRetainedResources.matrices.length, 2,
+    "canonical capture continues globally interning equal CTMs");
+  assert.equal(preview.compact.packedRetainedResources.matrices.length, 3,
+    "thumbnail compiler forwards its disposable-capture policy");
+  assert.deepEqual(materialize(preview.compact), materialize(ordinary),
+    "thumbnail capture changes neither anisotropic/sheared stroke geometry nor exact clip and paint state");
+  await comparePages(ordinary, preview.compact);
+  const previewVaried = await pair(variedSource, { ...variedOptions, thumbnail: true });
+  await comparePages(varied.legacy, previewVaried.compact);
+
+  const translatedSource = "2 J .75 w [3 1] .5 d " +
+    ["10 20", "30 40", "50 60"].map(translation =>
+      `q 1 0 0 1 ${translation} cm 1 1 m 4 1 l S Q`).join(" ");
+  const translated = await pair(translatedSource, { pageMatrix: [1, 0, 0, 1, 0, 0], thumbnail: true });
+  const translatedCanonical = createHeprPageDataFromDense(pageInfo, translated.compact);
+  const translatedThumbnail = createHeprPageDataFromDense(pageInfo, translated.compact, { thumbnail: true });
+  validateHeprPageData(translatedThumbnail);
+  assert.equal(translatedCanonical.stores.transforms.values.length / 6, 4);
+  assert.equal(translatedThumbnail.stores.transforms.values.length / 6, 1,
+    "translated thumbnail paths share the identity transform");
+  assert.equal(translatedCanonical.stores.strokes.lineWidths.length, 3);
+  assert.equal(translatedThumbnail.stores.strokes.lineWidths.length, 1,
+    "identical packed stroke styles share one thumbnail style record");
+  assert.deepEqual([...translatedThumbnail.stores.strokes.dashValues], [3, 1]);
+  assert.deepEqual([...translatedThumbnail.stores.paths.coordinates], [11, 21, 14, 21, 31, 41, 34, 41, 51, 61, 54, 61]);
+  assert.equal(translatedThumbnail.displayProgram.groups[0].commands.length, 1);
+  assert.equal(translatedThumbnail.displayProgram.groups[0].commands[0].count, 3,
+    "contiguous paths with identical execution state share command dispatch");
+  await compareLoweredGeometry(translatedCanonical, translatedThumbnail);
+  assert.deepEqual(createHeprPageDataFromDense(pageInfo, translated.compact), translatedCanonical,
+    "thumbnail adaptation cannot mutate the compiled source or subsequent canonical output");
+
+  const clippedTranslated = await pair("2 J q 1 0 0 1 20 30 cm 0 0 10 10 re W n " +
+    "-5 5 m 15 5 l S 2 2 m 8 8 l S Q", { pageMatrix: [1, 0, 0, 1, 0, 0], thumbnail: true });
+  const clippedCanonical = createHeprPageDataFromDense(pageInfo, clippedTranslated.compact);
+  const clippedThumbnail = createHeprPageDataFromDense(pageInfo, clippedTranslated.compact, { thumbnail: true });
+  validateHeprPageData(clippedThumbnail);
+  assert.deepEqual([...clippedThumbnail.stores.clips.transformIndices], [0],
+    "translated persistent clips use their baked path with the shared identity transform");
+  await compareLoweredGeometry(clippedCanonical, clippedThumbnail);
+
+  const rotated = await pair(translatedSource, { pageMatrix: [0, 1, -1, 0, 100, 0], thumbnail: true });
+  const rotatedCanonical = createHeprPageDataFromDense(pageInfo, rotated.compact);
+  const rotatedThumbnail = createHeprPageDataFromDense(pageInfo, rotated.compact, { thumbnail: true });
+  assert.deepEqual(rotatedThumbnail.stores.paths.coordinates, rotatedCanonical.stores.paths.coordinates,
+    "rotated CTMs retain their original path coordinates");
+  await compareLoweredGeometry(rotatedCanonical, rotatedThumbnail);
+
+  const formRoot = { compact: await compileDensePdfContent(encoder.encode("/Form Do"), { ...defaults,
+    pageMatrix: [1, 0, 0, 1, 0, 0], formXObjects: new Map([["Form", 0]]), compactRetainedResources: true }) };
+  const formOptions = { forms: {
+    rootInvocationProgramIndices: Uint32Array.of(0), annotations: [],
+    programs: [{ compiled: translated.compact, glyphOffset: 0, invocationProgramIndices: new Uint32Array(),
+      matrix: [0, 1, -1, 0, 100, 0], bounds: [0, 0, 100, 100], resourceName: "Form" }]
+  } };
+  const formCanonical = createHeprPageDataFromDense(pageInfo, formRoot.compact, formOptions);
+  const formThumbnail = createHeprPageDataFromDense(pageInfo, formRoot.compact, { ...formOptions, thumbnail: true });
+  validateHeprPageData(formThumbnail);
+  assert.equal(formThumbnail.displayProgram.programs[0].commands.length, 1,
+    "thumbnail state sharing also applies inside reusable Forms");
+  await compareLoweredGeometry(formCanonical, formThumbnail);
+
+  const alpha = await pair("2 J /Alpha gs " + translatedSource, { pageMatrix: [1, 0, 0, 1, 0, 0],
+    extGStates: [{ resourceName: "Alpha", strokeAlpha: .5 }], thumbnail: true });
+  const alphaThumbnail = createHeprPageDataFromDense(pageInfo, alpha.compact, { thumbnail: true });
+  assert.equal(alphaThumbnail.displayProgram.groups.length, 4);
+  assert(alphaThumbnail.displayProgram.groups.slice(1).every(group => group.alpha === .5 && group.commands[0].count === 1),
+    "translucent strokes retain independent compositing boundaries when paths overlap");
+
+  const overflow = materialize(translated.legacy);
+  overflow.pagePaths[0] = { ...overflow.pagePaths[0], transform: [1, 0, 0, 1, 3e38, 0],
+    data: Float32Array.of(0, 3e38, 1, 1, 3e38, 2) };
+  const overflowThumbnail = createHeprPageDataFromDense(pageInfo, overflow, { thumbnail: true });
+  assert.equal(overflowThumbnail.stores.paths.pathVerbOffsets.length - 1, 3,
+    "translation overflow rolls back the temporary path before keeping the original CTM");
+  assert.equal(overflowThumbnail.stores.paths.coordinates[0], Math.fround(3e38));
+  assert.equal(overflowThumbnail.stores.transforms.values[10], Math.fround(3e38));
+
+  const thinLines = "2 J .25 w 1 0 0 RG " + ["10 20", "30 40", "50 60"].map(translation =>
+    `q 1 0 0 1 ${translation} cm 1 1 m 4 1 l S Q`).join(" ");
+  const thin = await compileDensePdfContent(encoder.encode(thinLines), { ...defaults,
+    pageMatrix: [1, 0, 0, 1, 0, 0], compactRetainedResources: true, thumbnail: true, thumbnailScale: .1 });
+  assert.equal(thin.segmentCount, 3);
+  assert.equal(densePdfPagePathCount(thin), 0, "thin isolated preview lines can stay in the dense stroke store");
+  const thinUnmerged = createHeprPageDataFromDense(pageInfo, thin);
+  const thinMerged = createHeprPageDataFromDense(pageInfo, thin, { thumbnail: true });
+  validateHeprPageData(thinMerged);
+  assert.equal(thinUnmerged.displayProgram.groups[0].commands.length, 3);
+  assert.deepEqual(thinMerged.displayProgram.groups[0].commands.map(command => [command.source, command.first, command.count]),
+    [["stroke-segments", 0, 3]], "contiguous same-state packed strokes share thumbnail command dispatch");
+  assert.deepEqual(thinMerged.stores, thinUnmerged.stores,
+    "merging packed commands retains every primitive's geometry, width, alpha, and clipping flags");
+  await compareLoweredGeometry(thinUnmerged, thinMerged);
+  const coalescedThin = await compileDensePdfContent(encoder.encode(thinLines), { ...defaults,
+    pageMatrix: [1, 0, 0, 1, 0, 0], compactRetainedResources: true, thumbnail: true, thumbnailScale: .1,
+    capturePaintSourceIdentities: false });
+  assert.equal(coalescedThin.pathPaints.length, 1,
+    "root previews without provenance do not allocate duplicate same-color packed paint records");
+  assert.deepEqual([...coalescedThin.paintRuns], [thin.paintRuns[0], 0, 3]);
+  const coalescedThinPage = createHeprPageDataFromDense(pageInfo, coalescedThin, { thumbnail: true });
+  assert.deepEqual(coalescedThinPage.stores, thinMerged.stores);
+  await compareLoweredGeometry(thinUnmerged, coalescedThinPage);
+  const differentScopes = await compileDensePdfContent(encoder.encode("2 J .25 w " +
+    "q 0 0 100 100 re W n 10 10 m 20 10 l S Q 10 20 m 20 20 l S"), { ...defaults,
+    pageMatrix: [1, 0, 0, 1, 0, 0], compactRetainedResources: true, thumbnail: true, thumbnailScale: .1,
+    capturePaintSourceIdentities: false });
+  assert.equal(differentScopes.pathPaints.length, 2, "root preview coalescing preserves different persistent clip scopes");
+
+  const colorSeparated = await compileDensePdfContent(encoder.encode(thinLines +
+    " 0 0 1 RG 5 5 m 8 5 l S 1 0 0 RG 6 6 m 9 6 l S"), { ...defaults,
+    pageMatrix: [1, 0, 0, 1, 0, 0], compactRetainedResources: true, thumbnail: true, thumbnailScale: .1,
+    capturePaintSourceIdentities: false });
+  const colorPage = createHeprPageDataFromDense(pageInfo, colorSeparated, { thumbnail: true });
+  assert.deepEqual(colorPage.displayProgram.groups[0].commands.map(command => [command.first, command.count]), [[0, 3], [3, 1], [4, 1]],
+    "packed stroke command merging cannot cross intervening paint colors or reorder earlier strokes");
+  const thinAlpha = await compileDensePdfContent(encoder.encode("/Alpha gs " + thinLines), { ...defaults,
+    pageMatrix: [1, 0, 0, 1, 0, 0], compactRetainedResources: true, thumbnail: true, thumbnailScale: .1,
+    capturePaintSourceIdentities: false, extGStates: [{ resourceName: "Alpha", strokeAlpha: .5 }] });
+  const thinAlphaPage = createHeprPageDataFromDense(pageInfo, thinAlpha, { thumbnail: true });
+  assert.equal(thinAlphaPage.displayProgram.groups.length, 4,
+    "packed translucent strokes retain independent compositing groups");
+
+  const previewLine = (source, options = {}) => compileDensePdfContent(encoder.encode(source), { ...defaults,
+    pageMatrix: [1, 0, 0, 1, 0, 0], compactRetainedResources: true, thumbnail: true, thumbnailScale: 1,
+    capturePaintSourceIdentities: false, ...options });
+  const approximations = [];
+  const isolated = await previewLine("2 J 2 j 3 M /Adjust gs .5 w 10 10 m 20 10 l S 10 20 m 20 20 l S", {
+    extGStates: [{ resourceName: "Adjust", strokeAdjustment: true }],
+    onDiagnostic: diagnostic => approximations.push(diagnostic)
+  });
+  assert.equal(isolated.segmentCount, 2);
+  assert.equal(densePdfPagePathCount(isolated), 0,
+    "subpixel isolated strokes can ignore nonparticipating joins and retain approximate square-cap/adjusted pens compactly");
+  assert.equal(isolated.pathPaints.length, 1);
+  assert((Math.trunc(isolated.primitiveMeta[3] / 2 + 1e-6) & (1 << 1)) !== 0,
+    "the preview square-cap approximation stores an explicit round-cap flag");
+  assert.equal(approximations.filter(diagnostic => diagnostic.code === "thumbnail.stroke-approximation").length, 1,
+    "square-cap and stroke-adjustment approximations are diagnosed once per compilation");
+  const canonicalIsolated = await previewLine("2 J 2 j 3 M .5 w 10 10 m 20 10 l S", {
+    thumbnail: false, thumbnailScale: undefined
+  });
+  assert.equal(canonicalIsolated.segmentCount, 0);
+  assert.equal(densePdfPagePathCount(canonicalIsolated), 1, "full-quality canonical square caps remain generic exact paths");
+  const nestedIsolated = await previewLine("2 J .5 w 10 10 m 20 10 l S", { thumbnailScale: undefined });
+  assert.equal(nestedIsolated.segmentCount, 0,
+    "thumbnail state sharing alone does not enable root-only pen approximation in nested Forms or soft masks");
+  for (const [label, source, options] of [
+    ["thick", "2 J 2 w 10 10 m 20 10 l S", {}],
+    ["dashed", "2 J .5 w [2 1] .25 d 10 10 m 20 10 l S", {}],
+    ["anisotropic", "2 J .25 w 10 10 m 20 10 l S", { pageMatrix: [2, 0, 0, 1, 0, 0] }]
+  ]) {
+    const retained = await previewLine(source, options);
+    assert.equal(retained.segmentCount, 0, `${label} strokes stay on their exact generic path`);
+    assert.equal(densePdfPagePathCount(retained), 1);
+  }
+  const nearClip = await previewLine("0 0 10 10 re W n 2 J .1 w -.25 2 m -.25 8 l S");
+  assert.equal(nearClip.segmentCount, 1,
+    "a widened subpixel pen can remain visible when its centerline lies just outside the clip");
+  assert.equal(nearClip.clipPaths.length, 1);
+  assert.equal(nearClip.paintRunClipIndices[0], 0, "compact preview strokes retain their exact persistent clip reference");
+  assert((Math.trunc(nearClip.primitiveMeta[3] / 2 + 1e-6) & (1 << 2)) !== 0,
+    "the packed stroke preserves its clipping flag and bounds");
+
   const hugeIndex = 0x1_0000_0000 + 19;
   const indexed = await pair("/Huge cs .2 .4 .6 sc /Huge CS .6 .4 .2 SC 1 1 20 20 re B", {
     colorSpaceResolver: name => name === "Huge" ? { resourceName: name, colorSpaceIndex: hugeIndex,
@@ -175,3 +344,17 @@ try {
   }
   console.log("Compact retained compiler checks passed: exact paths/CTMs/styles, paint roles, clips, patterns, inherited Type3 paint, large color indexes, logical limits, streaming, cancellation and direct-output compatibility.");
 } finally { hooks.deregister(); }
+
+async function compareLoweredGeometry(before, after) {
+  const { lowerRetainedPageToVectorScene } = await import("../src/retainedVectorPage.ts");
+  const canonical = await lowerRetainedPageToVectorScene(before, { signal: new AbortController().signal });
+  const thumbnail = await lowerRetainedPageToVectorScene(after, { signal: new AbortController().signal });
+  for (const field of ["endpoints", "primitiveMeta", "primitiveBounds", "styles", "fillSegmentsA", "fillSegmentsB",
+    "fillPathMetaA", "fillPathMetaB", "fillPathMetaC", "clipPaths"]) {
+    assert.deepEqual(thumbnail[field], canonical[field], `thumbnail adapter preserves ${field}`);
+  }
+  const orderedPrimitives = scene => scene.drawRuns.flatMap(({ first, count, ...state }) =>
+    Array.from({ length: count }, (_, offset) => ({ ...state, index: first + offset })));
+  assert.deepEqual(orderedPrimitives(thumbnail), orderedPrimitives(canonical),
+    "thumbnail adapter preserves per-primitive paint order and execution state across equivalent run ranges");
+}

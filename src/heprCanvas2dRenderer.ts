@@ -44,6 +44,7 @@ import { findRgbaAlphaBounds } from "./rgbaBounds";
 import type { NativeGlyphPathCommand } from "./pdf/nativeFont";
 import { paintNativeGlyphCommands } from "./pdf/nativeGlyphPaint";
 import { buildNativeGlyphHairline } from "./pdf/nativeGlyphHairline";
+import { ThumbnailCanvasPath } from "./thumbnailCanvasPath";
 
 export const HEPR_CANVAS_2D_ERROR_CODES = Object.freeze({
   InvalidOptions: "canvas2d.invalid-options",
@@ -180,6 +181,10 @@ export interface HeprCanvas2dTimings {
 
 /** @internal Kept separate from the rendering/public parser options. */
 export interface HeprCanvas2dRenderInternals {
+  /** Overview-only device-space paths and opaque stroke batching. */
+  readonly thumbnail?: boolean;
+  /** Operation-owned input already validated by its caller. Never inferred from thumbnail mode. */
+  readonly trustedPage?: boolean;
   /** Snapshot-only rounded backing dimensions, independent of canonical page geometry. */
   readonly outputSize?: { readonly width: number; readonly height: number };
   readonly vectorOverride?: readonly [number, number, number, number];
@@ -380,6 +385,7 @@ interface PatternRuntime {
 }
 
 interface InternalCanvasBackendOptions {
+  readonly thumbnail?: boolean;
   readonly vectorOverride?: readonly [number, number, number, number];
   readonly deviceMatrix: PdfMatrix;
   readonly width: number;
@@ -465,12 +471,14 @@ export async function renderHeprPageToCanvas2d(
     timings: internal.timings,
     vectorOverride: internal.vectorOverride,
     imageSurfaces: internal.imageSurfaces,
-    boundSoftMasks: internal.boundSoftMasks
+    boundSoftMasks: internal.boundSoftMasks,
+    thumbnail: internal.thumbnail
   });
   try {
     const stats = await executeHeprDisplayProgram(page, backend, {
       signal: resolved.signal,
-      limits: options.executionLimits
+      limits: options.executionLimits,
+      trustedPage: internal.trustedPage
     });
     return Object.freeze({ surface, ...size, stats });
   } finally {
@@ -502,6 +510,15 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
   private readonly vectorOverride?: readonly [number, number, number, number];
   private readonly sharedImages: HeprCanvas2dImageSurfaceCache | undefined;
   private readonly boundSoftMasks: boolean;
+  private readonly thumbnail: boolean;
+  private readonly thumbnailPaths: ThumbnailCanvasPath | undefined;
+  private thumbnailContext: CanvasRenderingContext2D | null = null;
+  private thumbnailClips: HeprExecutionClipScope | null = null;
+  private thumbnailStroke: { readonly paint: SolidPaint; readonly width: number;
+    readonly cap: CanvasLineCap; readonly join: CanvasLineJoin; readonly miter: number } | null = null;
+  private thumbnailFill: SolidPaint | null = null;
+  private readonly thumbnailPaints = new Map<number, ResolvedPaint>();
+  private diagnosedThumbnail = false;
   private functionEvaluator: HeprFunctionEvaluator | null = null;
   private colorEvaluator: HeprColorEvaluator | null = null;
   private liveWorkingPixels = 0;
@@ -520,6 +537,8 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     this.timings = internal?.timings;
     this.vectorOverride = internal?.vectorOverride;
     this.boundSoftMasks = internal?.boundSoftMasks === true;
+    this.thumbnail = internal?.thumbnail === true;
+    this.thumbnailPaths = this.thumbnail ? new ThumbnailCanvasPath(page.stores.paths, options.signal) : undefined;
     this.options = isResolvedOptions(options) ? options : resolveOptions(options);
     this.sharedImages = internal?.imageSurfaces;
     this.sharedImages?.assertCompatible(page, this.options);
@@ -545,6 +564,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
   }
 
   beginCompositeGroup(execution: HeprCompositeGroupExecution): void {
+    this.resetThumbnailState();
     this.assertUsable();
     this.options.signal?.throwIfAborted();
     if (execution.role === "root") {
@@ -590,6 +610,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
   }
 
   beginProgram(execution: HeprProgramExecution): void {
+    this.resetThumbnailState();
     this.assertUsable();
     this.options.signal?.throwIfAborted();
     if (this.currentFrame().discard) return;
@@ -606,6 +627,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     execution: HeprCompositeGroupExecution,
     outcome: HeprExecutionOutcome
   ): Promise<void> {
+    this.resetThumbnailState(outcome.status === "complete");
     const frame = this.frames.pop();
     if (!frame || frame.execution.executionId !== execution.executionId) {
       throw canvasError(
@@ -652,27 +674,30 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     }
   }
 
-  async drawRun(execution: HeprDrawRunExecution): Promise<void> {
+  endProgram(_execution: HeprProgramExecution, outcome: HeprExecutionOutcome): void {
+    this.resetThumbnailState(outcome.status === "complete");
+  }
+
+  drawRun(execution: HeprDrawRunExecution): void | Promise<void> {
     this.assertUsable();
     this.options.signal?.throwIfAborted();
     const frame = this.currentFrame();
     if (frame.discard || execution.command.count === 0) return;
+    if (this.thumbnail && !this.frames.some(frame => frame.execution.role === "soft-mask") &&
+        (this.drawThumbnailPaths(frame.surface.context, execution) ||
+          this.drawThumbnailDenseStrokes(frame.surface.context, execution))) return;
+    this.resetThumbnailState();
     switch (execution.command.source) {
       case "paths":
-        await this.drawGenericPaths(frame.surface.context, execution);
-        return;
+        return this.drawGenericPaths(frame.surface.context, execution);
       case "fill-paths":
-        await this.drawDenseFills(frame.surface.context, execution);
-        return;
+        return this.drawDenseFills(frame.surface.context, execution);
       case "stroke-segments":
-        await this.drawDenseStrokes(frame.surface.context, execution);
-        return;
+        return this.drawDenseStrokes(frame.surface.context, execution);
       case "glyphs":
-        await this.drawGlyphs(frame.surface.context, execution);
-        return;
+        return this.drawGlyphs(frame.surface.context, execution);
       case "images":
-        await this.drawImages(frame.surface.context, execution);
-        return;
+        return this.drawImages(frame.surface.context, execution);
       case "meshes":
         this.drawMeshes(frame.surface.context, execution);
         return;
@@ -690,6 +715,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
 
   dispose(): void {
     if (this.disposed) return;
+    this.resetThumbnailState(false);
     this.disposed = true;
     for (const frame of this.frames) if (!frame.direct) this.releaseSurface(frame);
     for (const mask of this.masks.values()) this.releaseSurface(mask);
@@ -698,6 +724,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     this.imageCache.clear();
     this.gradientStopCache.clear();
     this.localImageSurfaces.clear();
+    this.thumbnailPaints.clear();
     this.sharedImages?.endRender();
     if (this.ownsPatternRuntime) {
       this.patternRuntime.active.clear();
@@ -881,6 +908,204 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     if (this.timings) {
       this.timings.softMaskMs += performance.now() - startedAt;
       this.timings.softMaskPixels += bounds.width * bounds.height;
+    }
+  }
+
+  /** Pixel-space overview path. Opaque adjacent strokes share one native draw;
+   * fills and translucent strokes retain their original paint boundaries. */
+  private drawThumbnailPaths(context: CanvasRenderingContext2D, execution: HeprDrawRunExecution): boolean {
+    const command = execution.command;
+    if (command.source !== "paths") return false;
+    const fill = this.readOptionalPaint(command.fillPaintIndex, command.fillPaintInherited === true, execution, "fillPaintIndex");
+    const stroke = this.readOptionalPaint(command.strokePaintIndex, command.strokePaintInherited === true, execution, "strokePaintIndex");
+    if ((fill?.visible && fill.kind !== "solid") || (stroke?.visible && stroke.kind !== "solid")) return false;
+    if (!fill?.visible && !stroke?.visible) return true;
+    const matrix = multiplyHeprMatrices(this.deviceMatrix, execution.state.transform);
+    if (!matrix.every(Number.isFinite)) return false;
+    const scale = Math.hypot(matrix[0], matrix[1]);
+    const otherScale = Math.hypot(matrix[2], matrix[3]);
+    const determinant = matrix[0] * matrix[3] - matrix[1] * matrix[2];
+    if (!(scale > 0) || !(otherScale > 0) || determinant === 0) return false;
+    const styles = this.page.stores.strokes, style = command.strokeStyleIndex;
+    const solidStroke = stroke?.visible ? stroke as SolidPaint : null;
+    const solidFill = fill?.visible ? fill as SolidPaint : null;
+    let width = 0, cap: CanvasLineCap = "butt", join: CanvasLineJoin = "miter", miter = 10;
+    if (solidStroke) {
+      // Dash phase/length and strongly affine pens stay on the exact backend.
+      if (styles.dashOffsets[style] !== styles.dashOffsets[style + 1] ||
+          (styles.flags[style] & HEPR_STROKE_FLAG.StrokeAdjust) !== 0) return false;
+      const localWidth = styles.lineWidths[style];
+      const hairline = localWidth === 0 || (styles.flags[style] & HEPR_STROKE_FLAG.Hairline) !== 0;
+      if (!isSimilarityTransform(matrix) && !hairline && localWidth * Math.max(scale, otherScale) > 1) return false;
+      width = hairline ? 1 : Math.max(1, localWidth * Math.sqrt(Math.abs(determinant)));
+      cap = lineCap(styles.lineCaps[style]);
+      join = lineJoin(styles.lineJoins[style]);
+      miter = styles.miterLimits[style];
+    }
+    this.diagnoseThumbnailApproximation();
+    this.ensureThumbnailContext(context, execution.state.clips);
+    // Native generic bounds already include their source CTM. Only cull when
+    // the adapter has baked that CTM into coordinates and uses identity here.
+    const transformOffset = command.transformIndex * 6, transforms = this.page.stores.transforms.values;
+    const localIdentity = transforms[transformOffset] === 1 && transforms[transformOffset + 1] === 0 &&
+      transforms[transformOffset + 2] === 0 && transforms[transformOffset + 3] === 1 &&
+      transforms[transformOffset + 4] === 0 && transforms[transformOffset + 5] === 0;
+    const batchable = solidStroke && !solidFill && solidStroke.alpha === 1;
+    if (batchable) this.beginThumbnailStroke(solidStroke, width, cap, join, miter);
+    else this.flushThumbnailStroke();
+    for (let index = command.first; index < command.first + command.count; index++) {
+      this.options.signal?.throwIfAborted();
+      // Page bounds are conservative after affine transformation. Include the
+      // entire possible cap/miter extent before discarding an offscreen path.
+      if (localIdentity && !thumbnailPathIntersects(this.page, index, matrix, this.width, this.height,
+        solidStroke ? width * Math.max(1, miter) : 0)) continue;
+      if (!batchable) context.beginPath();
+      this.thumbnailPaths!.append(context, index, matrix);
+      if (solidFill) {
+        if (this.thumbnailFill !== solidFill) {
+          context.globalAlpha = solidFill.alpha;
+          context.fillStyle = solidFill.css;
+          this.thumbnailFill = solidFill;
+        }
+        context.fill(command.fillRule === 1 ? "evenodd" : "nonzero");
+      }
+      if (solidStroke && !batchable) {
+        context.globalAlpha = solidStroke.alpha;
+        context.strokeStyle = solidStroke.css;
+        context.lineWidth = width;
+        context.lineCap = cap;
+        context.lineJoin = join;
+        context.miterLimit = miter;
+        context.setLineDash([]);
+        context.stroke();
+        this.thumbnailFill = null;
+      }
+    }
+    return true;
+  }
+
+  /** Dense overview lines keep their compact storage and share the same opaque
+   * device-space batching as generic paths. Curves and affine thick pens retain
+   * the reference path, and primitive alpha always keeps its paint boundary. */
+  private drawThumbnailDenseStrokes(context: CanvasRenderingContext2D, execution: HeprDrawRunExecution): boolean {
+    const command = execution.command;
+    if (command.source !== "stroke-segments") return false;
+    if (!this.paintPaints(command.paintIndex >= 0 ? command.paintIndex : execution.state.type3PaintIndex)) return true;
+    const paint = this.readRequiredPaint(command.paintIndex, execution, "paintIndex");
+    if (!paint.visible) return true;
+    if (paint.kind !== "solid") return false;
+    const matrix = multiplyHeprMatrices(this.deviceMatrix, execution.state.transform);
+    if (!matrix.every(Number.isFinite)) return false;
+    const scale = Math.hypot(matrix[0], matrix[1]);
+    const otherScale = Math.hypot(matrix[2], matrix[3]);
+    const determinant = matrix[0] * matrix[3] - matrix[1] * matrix[2];
+    if (!(scale > 0) || !(otherScale > 0) || !Number.isFinite(determinant) || determinant === 0) return false;
+    const penScale = Math.sqrt(Math.abs(determinant));
+    const similarity = isSimilarityTransform(matrix);
+    const strokes = this.page.stores.strokes;
+    const last = command.first + command.count;
+    // Decide before appending any geometry: falling back after part of a run
+    // would apply its paint twice. This scan allocates no per-segment objects.
+    for (let index = command.first; index < last; index++) {
+      this.options.signal?.throwIfAborted();
+      const offset = index * 4;
+      const styleFlags = Math.max(0, Math.trunc(strokes.primitiveMeta[offset + 3] / DENSE_STYLE_FLAG_OFFSET + 1e-6));
+      if (strokes.primitiveMeta[offset + 2] >= 0.5 || (styleFlags & ~(
+        DENSE_STYLE_FLAG_HAIRLINE | DENSE_STYLE_FLAG_ROUND_CAP | DENSE_STYLE_FLAG_CLIPPED
+      )) !== 0) return false;
+      const localWidth = strokes.styles[offset] * 2;
+      const hairline = localWidth === 0 || (styleFlags & DENSE_STYLE_FLAG_HAIRLINE) !== 0;
+      if (!similarity && !hairline && localWidth * Math.max(scale, otherScale) > 1) return false;
+    }
+    this.diagnoseThumbnailApproximation();
+    this.ensureThumbnailContext(context, execution.state.clips);
+    for (let index = command.first; index < last; index++) {
+      this.options.signal?.throwIfAborted();
+      const offset = index * 4;
+      const packed = strokes.primitiveMeta[offset + 3];
+      const styleFlags = Math.max(0, Math.trunc(packed / DENSE_STYLE_FLAG_OFFSET + 1e-6));
+      const primitiveAlpha = clamp01(packed - styleFlags * DENSE_STYLE_FLAG_OFFSET);
+      if (primitiveAlpha === 0) continue;
+      const hairline = strokes.styles[offset] === 0 || (styleFlags & DENSE_STYLE_FLAG_HAIRLINE) !== 0;
+      const width = hairline ? 1 : Math.max(1, strokes.styles[offset] * 2 * penScale);
+      const cap = (styleFlags & DENSE_STYLE_FLAG_ROUND_CAP) !== 0 ? "round" : "butt";
+      const alpha = paint.alpha * primitiveAlpha;
+      if (alpha === 1) this.beginThumbnailStroke(paint, width, cap, "miter", 10);
+      else {
+        this.flushThumbnailStroke();
+        context.beginPath();
+        context.globalAlpha = alpha;
+        context.strokeStyle = paint.css;
+        context.lineWidth = width;
+        context.lineCap = cap;
+        context.lineJoin = "miter";
+        context.miterLimit = 10;
+        context.setLineDash([]);
+        this.thumbnailFill = null;
+      }
+      const x0 = strokes.endpoints[offset], y0 = strokes.endpoints[offset + 1];
+      const x1 = strokes.primitiveMeta[offset], y1 = strokes.primitiveMeta[offset + 1];
+      context.moveTo(matrix[0] * x0 + matrix[2] * y0 + matrix[4], matrix[1] * x0 + matrix[3] * y0 + matrix[5]);
+      context.lineTo(matrix[0] * x1 + matrix[2] * y1 + matrix[4], matrix[1] * x1 + matrix[3] * y1 + matrix[5]);
+      if (alpha !== 1) context.stroke();
+    }
+    return true;
+  }
+
+  private diagnoseThumbnailApproximation(): void {
+    if (this.diagnosedThumbnail) return;
+    this.diagnosedThumbnail = true;
+    this.options.onDiagnostic?.({ code: "thumbnail.vector-approximation", severity: "info",
+      pageIndex: this.page.pageInfo.sourcePageIndex,
+      message: "Overview curves use pixel-space detail and thin strokes use a one-pixel pen." });
+  }
+
+  private beginThumbnailStroke(paint: SolidPaint, width: number, cap: CanvasLineCap, join: CanvasLineJoin, miter: number): void {
+    const previous = this.thumbnailStroke;
+    // Source style indices can differ for every object; compare visible values.
+    if (previous && previous.paint === paint && previous.width === width && previous.cap === cap &&
+        previous.join === join && previous.miter === miter) return;
+    this.flushThumbnailStroke();
+    const context = this.thumbnailContext!;
+    context.beginPath();
+    context.globalAlpha = 1;
+    context.strokeStyle = paint.css;
+    context.lineWidth = width;
+    context.lineCap = cap;
+    context.lineJoin = join;
+    context.miterLimit = miter;
+    context.setLineDash([]);
+    this.thumbnailFill = null;
+    this.thumbnailStroke = { paint, width, cap, join, miter };
+  }
+
+  private flushThumbnailStroke(): void {
+    if (!this.thumbnailStroke) return;
+    this.options.signal?.throwIfAborted();
+    this.thumbnailContext!.stroke();
+    this.thumbnailStroke = null;
+  }
+
+  private ensureThumbnailContext(context: CanvasRenderingContext2D, clips: HeprExecutionClipScope | null): void {
+    if (this.thumbnailContext === context && equalThumbnailClips(this.thumbnailClips, clips)) return;
+    this.resetThumbnailState();
+    context.save();
+    try {
+      this.applyClips(context, clips);
+      setCanvasTransform(context, IDENTITY);
+      this.thumbnailContext = context;
+      this.thumbnailClips = clips;
+    } catch (error) { context.restore(); throw error; }
+  }
+
+  private resetThumbnailState(paint = true): void {
+    try { if (paint) this.flushThumbnailStroke(); }
+    finally {
+      this.thumbnailStroke = null;
+      this.thumbnailFill = null;
+      if (this.thumbnailContext) this.thumbnailContext.restore();
+      this.thumbnailContext = null;
+      this.thumbnailClips = null;
     }
   }
 
@@ -1150,9 +1375,12 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
       if (primitiveAlpha === 0) continue;
       const halfWidth = strokes.styles[offset];
       const hairline = (styleFlags & DENSE_STYLE_FLAG_HAIRLINE) !== 0 || halfWidth === 0;
-      const lineWidth = hairline
+      let lineWidth = hairline
         ? hairlineWidth(matrix, `${execution.commandPath}.first`)
         : halfWidth * 2;
+      if (this.thumbnail && !this.frames.some(frame => frame.execution.role === "soft-mask")) {
+        lineWidth = Math.max(lineWidth, thumbnailMinimumWidth(matrix));
+      }
       context.save();
       try {
         this.applyClips(context, execution.state.clips);
@@ -2760,6 +2988,15 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
   }
 
   private readPaint(index: number, path: string): ResolvedPaint {
+    if (!this.thumbnail || this.frames.some(frame => frame.execution.role === "soft-mask")) return this.resolvePaint(index, path);
+    const cached = this.thumbnailPaints.get(index);
+    if (cached) return cached;
+    const paint = this.resolvePaint(index, path);
+    this.thumbnailPaints.set(index, paint);
+    return paint;
+  }
+
+  private resolvePaint(index: number, path: string): ResolvedPaint {
     const paints = this.page.stores.paints;
     const alpha = clamp01(paints.alphas[index]);
     const kind = paints.kinds[index];
@@ -2897,6 +3134,9 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     context.lineWidth = hairline
       ? hairlineWidth(canvasTransform, `${path}.strokeStyleIndex`)
       : strokes.lineWidths[index];
+    if (this.thumbnail && !this.frames.some(frame => frame.execution.role === "soft-mask")) {
+      context.lineWidth = Math.max(context.lineWidth, thumbnailMinimumWidth(canvasTransform));
+    }
     context.miterLimit = strokes.miterLimits[index];
     context.lineCap = lineCap(strokes.lineCaps[index]);
     context.lineJoin = lineJoin(strokes.lineJoins[index]);
@@ -3450,6 +3690,43 @@ function clearSurface(surface: HeprCanvas2dSurface): void {
   } finally {
     context.restore();
   }
+}
+
+function thumbnailMinimumWidth(m: PdfMatrix): number {
+  // The smallest stretch controls the thinnest possible device-space pen.
+  const determinant = Math.abs(m[0] * m[3] - m[1] * m[2]);
+  if (determinant === 0) return 0;
+  const trace = m[0] * m[0] + m[1] * m[1] + m[2] * m[2] + m[3] * m[3];
+  const maximum = Math.sqrt((trace + Math.sqrt(Math.max(0, trace * trace - 4 * determinant * determinant))) / 2);
+  return maximum / determinant;
+}
+
+function equalThumbnailClips(a: HeprExecutionClipScope | null, b: HeprExecutionClipScope | null): boolean {
+  while (a !== b) {
+    if (!a || !b || a.kind !== b.kind) return false;
+    if (a.kind === "resource") {
+      if (b.kind !== "resource" || a.clipIndex !== b.clipIndex) return false;
+    } else {
+      if (b.kind !== "program-bounds") return false;
+      for (let index = 0; index < 4; index++) if (a.bounds[index] !== b.bounds[index]) return false;
+    }
+    for (let index = 0; index < 6; index++) if (a.outerTransform[index] !== b.outerTransform[index]) return false;
+    a = a.parent;
+    b = b.parent;
+  }
+  return true;
+}
+
+function thumbnailPathIntersects(page: HeprPageData, index: number, m: PdfMatrix,
+  width: number, height: number, margin: number): boolean {
+  const bounds = page.stores.paths.bounds, offset = index * 4;
+  const x0 = bounds[offset], y0 = bounds[offset + 1], x1 = bounds[offset + 2], y1 = bounds[offset + 3];
+  const ax = m[0] * x0 + m[2] * y0 + m[4], ay = m[1] * x0 + m[3] * y0 + m[5];
+  const bx = m[0] * x1 + m[2] * y0 + m[4], by = m[1] * x1 + m[3] * y0 + m[5];
+  const cx = m[0] * x0 + m[2] * y1 + m[4], cy = m[1] * x0 + m[3] * y1 + m[5];
+  const dx = m[0] * x1 + m[2] * y1 + m[4], dy = m[1] * x1 + m[3] * y1 + m[5];
+  return Math.max(ax, bx, cx, dx) >= -margin && Math.max(ay, by, cy, dy) >= -margin &&
+    Math.min(ax, bx, cx, dx) <= width + margin && Math.min(ay, by, cy, dy) <= height + margin;
 }
 
 function appendStoredPath(

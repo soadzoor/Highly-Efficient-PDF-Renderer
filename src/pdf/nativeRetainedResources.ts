@@ -149,8 +149,80 @@ export function getDensePdfGenericPathPaint(page: RetainedPage, index: number): 
   return page.packedRetainedResources ? paintAt(page.packedRetainedResources, index) : page.genericPathPaints[index];
 }
 
+/** Reusable, caller-owned view of a retained path. No geometry view or wrapper
+ * is allocated while reading packed records. Consume it before the next read.
+ * @internal */
+export interface DensePdfPathReadTarget extends DensePdfBounds {
+  data: Float32Array;
+  dataOffset: number;
+  dataLength: number;
+  transform: DensePdfMatrix;
+}
+
+/** @internal */
+export function readDensePdfPagePathInto(page: RetainedPage, index: number, target: DensePdfPathReadTarget): boolean {
+  const resources = page.packedRetainedResources;
+  if (!resources) {
+    const path = page.pagePaths[index];
+    if (!path) return false;
+    target.data = path.data;
+    target.dataOffset = 0;
+    target.dataLength = path.data.length;
+    target.transform = path.transform;
+    target.minX = path.bounds.minX;
+    target.minY = path.bounds.minY;
+    target.maxX = path.bounds.maxX;
+    target.maxY = path.bounds.maxY;
+    return true;
+  }
+  if (!Number.isInteger(index) || index < 0 || index >= resources.pathCount) return false;
+  const chunk = resources.pathChunks[recordChunkIndex(index)];
+  const record = (index - chunk.start) * PATH_RECORD_SIZE;
+  const values = chunk.records;
+  target.data = resources.geometryChunks[values[record]];
+  target.dataOffset = values[record + 1];
+  target.dataLength = values[record + 2];
+  target.transform = resources.matrices[values[record + 3]];
+  target.minX = values[record + 4];
+  target.minY = values[record + 5];
+  target.maxX = values[record + 6];
+  target.maxY = values[record + 7];
+  return true;
+}
+
+/** @internal */
+export type DensePdfPaintReadTarget = { -readonly [Key in keyof DensePdfGenericPathPaint]: DensePdfGenericPathPaint[Key] };
+
+/** Reuses the supplied record without materializing a frozen paint wrapper.
+ * Referenced paints and styles remain the original immutable resources.
+ * @internal */
+export function readDensePdfGenericPathPaintInto(page: RetainedPage, index: number, target: DensePdfPaintReadTarget): boolean {
+  const resources = page.packedRetainedResources;
+  if (!resources) {
+    const paint = page.genericPathPaints[index];
+    if (!paint) return false;
+    target.pathIndex = paint.pathIndex;
+    target.fillRule = paint.fillRule;
+    target.fill = paint.fill;
+    target.stroke = paint.stroke;
+    target.strokeStyle = paint.strokeStyle;
+    return true;
+  }
+  if (!Number.isInteger(index) || index < 0 || index >= resources.paintCount) return false;
+  const chunk = resources.paintChunks[recordChunkIndex(index)];
+  const record = (index - chunk.start) * PAINT_RECORD_SIZE;
+  const values = chunk.records;
+  target.pathIndex = values[record];
+  target.fillRule = values[record + 1] as 0 | 1;
+  target.fill = values[record + 2] < 0 ? null : resources.solidPaints[values[record + 2]];
+  target.stroke = values[record + 3] < 0 ? null : resources.solidPaints[values[record + 3]];
+  target.strokeStyle = values[record + 4] < 0 ? null : resources.strokeStyles[values[record + 4]];
+  return true;
+}
+
 /** Capture owns geometry ranges immediately; finalization never rebuilds the resource graph. */
 export class DensePdfRetainedResourceBuilder {
+  private readonly thumbnail: boolean;
   private readonly pathChunks: CapturedResourceChunk[] = [];
   private readonly paintChunks: CapturedResourceChunk[] = [];
   private readonly geometryChunks: Float32Array[] = [];
@@ -170,6 +242,10 @@ export class DensePdfRetainedResourceBuilder {
   private paints = 0;
   private finished = false;
 
+  constructor(thumbnail = false) {
+    this.thumbnail = thumbnail;
+  }
+
   get pathCount(): number { return this.paths; }
   get paintCount(): number { return this.paints; }
 
@@ -181,14 +257,17 @@ export class DensePdfRetainedResourceBuilder {
     if (this.lastMatrixIndex >= 0 && equalNumbers(this.matrices[this.lastMatrixIndex], transform)) {
       return this.lastMatrixIndex;
     }
-    const key = numbersKey(transform);
-    let index = this.matrixIndices.get(key);
+    // Thumbnail page adaptation appends each path's CTM again. Avoid global
+    // string-key interning here while retaining the common consecutive-CTM
+    // fast path and every original Float64 value.
+    const key = this.thumbnail ? undefined : numbersKey(transform);
+    let index = key === undefined ? undefined : this.matrixIndices.get(key);
     if (index === undefined) {
       index = this.matrices.length;
       const matrix: DensePdfMatrix = [transform[0], transform[1], transform[2], transform[3], transform[4], transform[5]];
       Object.freeze(matrix);
       this.matrices.push(matrix);
-      this.matrixIndices.set(key, index);
+      if (key !== undefined) this.matrixIndices.set(key, index);
     }
     this.lastMatrixIndex = index;
     return index;

@@ -83,6 +83,41 @@ try {
   assert.equal(renderer.scene.textGlyphMetaB[0], 3, "compacted glyph metadata belongs to the referenced outline");
   assert.equal(documentGlyphs.textInstanceB[2], 2, "remapping never rewrites shared document text instances");
   assert.equal(documentGlyphs.textGlyphCount, 3);
+
+  const linework = buildStrokeScene([
+    { points: [[0, 10], [100, 10]], width: 0 },
+    { points: [[0, 20], [100, 20]], width: .02 },
+    { points: [[0, 30], [100, 30]], width: 40 }
+  ]);
+  linework.pageBounds = { minX: 0, minY: 0, maxX: 101, maxY: 53 };
+  linework.pageRects = Float32Array.of(0, 0, 101, 53);
+  linework.gradientCount = 1;
+  linework.gradientMetaA = Float32Array.of(0, 0, 0, 0);
+  linework.gradientMetaB = Float32Array.of(1, 0, 0, 1);
+  linework.gradientMetaC = Float32Array.of(0, 0, 0, 0);
+  linework.gradientMetaD = Float32Array.of(100, 0, 0, 0);
+  linework.gradientMetaE = Float32Array.of(0, 0, 0, 0);
+  linework.gradientLut = new Uint8Array(1024 * 4).fill(255);
+  linework.gradientStrokeRunCount = 1; linework.gradientStrokeSegmentCount = 3;
+  linework.gradientStrokeRunMetaA = Float32Array.of(0, 3, 0, -1);
+  linework.gradientStrokeRunMetaB = Float32Array.of(0, 0, 0, 0);
+  linework.gradientStrokeEndpoints = linework.endpoints.slice();
+  linework.gradientStrokePrimitiveMeta = linework.primitiveMeta.slice();
+  linework.gradientStrokePrimitiveBounds = linework.primitiveBounds.slice();
+  linework.gradientStrokeStyles = linework.styles.slice();
+  const lineworkBefore = structuredClone(linework);
+  const lineworkPixels = await service.render(linework, { ...options, maxDimension: 10 });
+  assert.deepEqual([lineworkPixels.width, lineworkPixels.height], [10, 5]);
+  const minimumHalfWidth = .5 / Math.min(10 / 101, 5 / 53), localLinework = renderer.scene;
+  for (const key of ["styles", "gradientStrokeStyles"]) {
+    assert.notEqual(localLinework[key], linework[key], "overview style arrays are privately owned before setScene uploads them");
+    assert.equal(localLinework[key][0], 0, "native device hairlines retain zero half-width");
+    assert(Math.abs(localLinework[key][4] - minimumHalfWidth) < 1e-6, "thin positive half-widths use the actual rounded viewport scale");
+    assert.equal(localLinework[key][8], 20, "larger source widths remain unchanged");
+    assert.deepEqual([...localLinework[key]].filter((_, index) => index % 4), [...linework[key]].filter((_, index) => index % 4),
+      "overview widening preserves all style color channels");
+  }
+  assert.deepEqual(linework, lineworkBefore, "stronger overview linework never changes canonical geometry, styles, clips or width metadata");
   const cancelled = new AbortController(); cancelled.abort(new Error("removed PDF"));
   await assert.rejects(async () => service.render(scene, options, cancelled.signal), /removed PDF/);
   const queuedCancellation = new AbortController();
@@ -113,7 +148,7 @@ try {
   assert(thumbnailCanvas.calls.filter(call => call[0] === "createBuffer").length < interactiveCanvas.calls.filter(call => call[0] === "createBuffer").length,
     "snapshot construction omits interactive buffers");
   interactive.dispose(); thumbnail.dispose();
-  console.log("Thumbnail renderer: sizing, offset bounds, alpha/readback, immutable scenes, local visibility, warm reuse, no LOD/atlas/RAF, fallback, cancellation and disposal passed.");
+  console.log("Thumbnail renderer: sizing, offset bounds, alpha/readback, immutable scenes, overview stroke widths, local visibility, warm reuse, no LOD/atlas/RAF, fallback, cancellation and disposal passed.");
 } finally {
   for (const [name, descriptor] of original) {
     if (descriptor) Object.defineProperty(globalThis, name, descriptor);

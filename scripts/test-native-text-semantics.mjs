@@ -15,6 +15,7 @@ const {
   multiplyPdfTextMatrices
 } = await import("../src/pdf/nativeText.ts");
 const { buildNativePageTextResources } = await import("../src/pdf/nativePageText.ts");
+const { compileDensePdfContent } = await import("../src/pdf/nativeContentCompiler.ts");
 const { HEPR_GLYPH_FLAG, HEPR_PATH_VERB } = await import("../src/heprDocumentData.ts");
 const { PdfError, DEFAULT_PDF_RESOURCE_LIMITS } = await import("../src/pdf/nativeTypes.ts");
 
@@ -31,6 +32,7 @@ testVerticalMetricsAndAdjustments();
 testRenderingModesAndInvisibleGeometry();
 testOutlineStoresAndLimits();
 testCancellationMalformedValuesAndResourceLimits();
+await testExternalGraphicsTransformParity();
 
 console.log("native text semantics tests passed");
 hooks.deregister();
@@ -291,6 +293,80 @@ function testGraphicsStateCtmAndTransformDeduplication() {
   const depth = compilerFor([], { maxGraphicsStateDepth: 1 });
   depth.saveGraphicsState();
   expectPdfError(() => depth.saveGraphicsState(), "resource-limit");
+}
+
+async function testExternalGraphicsTransformParity() {
+  const content = `
+    /F1 10 Tf 1 Tc 2 Tw 80 Tz 12 TL 3 Ts
+    q 1 0 0 1 7 11 cm q 0 1 -1 0 0 0 cm Q Q
+    /Span << /ActualText (label) >> BDC
+    q 2 0 0 3 4 5 cm /Inherited gs
+      BT 1 0 0 1 6 8 Tm (A) Tj
+        q 1 0 0 1 9 12 cm /F1 20 Tf 4 Tc 70 Tz (B) Tj Q
+        (C) Tj
+      ET
+    Q EMC
+    BT 1 0 0 1 2 3 Tm [(A) -300 (B)] TJ ET
+    4 Tr BT q 1 0 0 1 5 6 cm (A) Tj Q ET 0 Tr
+    q /Inherited gs Q
+    BT (C) Tj ET
+    /Span << /ActualText (recovered) >> BDC BT (A) Tj ET
+  `;
+  const inheritedFont = { font: fontA, fontIndex: 0 };
+  async function interpret(source, thumbnail, overrides = {}) {
+    const runs = [], diagnostics = [], emittedRuns = [];
+    const text = compilerFor([["F1", fontA]], {
+      initialTransform: [0, 1, -1, 0, 20, 40],
+      onRun: run => { runs.push(run); emittedRuns.push(run); },
+      onDiagnostic: diagnostic => diagnostics.push(diagnostic),
+      ...overrides
+    });
+    if (thumbnail) {
+      text.concatTransform = () => { throw new Error("The graphics CTM must not be multiplied twice."); };
+    }
+    await compileDensePdfContent(new TextEncoder().encode(source), {
+      output: "display-program", thumbnail,
+      pageMatrix: [0, 1, -1, 0, 20, 40],
+      pageBounds: { minX: -1000, minY: -1000, maxX: 1000, maxY: 1000 },
+      extGStates: [{ resourceName: "Inherited", font: { fontIndex: 0, size: 13 } }],
+      textOperatorSink: {
+        getFontSelection: () => text.getFontSelection(),
+        applyOperator(operator, operands, context) {
+          assert.equal(context.graphicsTransform !== undefined, thumbnail);
+          emittedRuns.length = 0;
+          text.setOutputEnabled(context.outputEnabled);
+          if (context.font) text.setFontResource(inheritedFont, context.font.size);
+          text.applyOperator(operator, operands, context.graphicsTransform);
+          return emittedRuns;
+        }
+      }
+    });
+    return { compilation: text.build(), runs, diagnostics };
+  }
+  const expected = await interpret(content, false);
+  const actual = await interpret(content, true);
+  assert.deepEqual(actual, expected, "borrowed CTMs preserve text, glyph placement, q/Q parameters, ActualText and callbacks");
+  assert.equal(actual.compilation.actualTextEndPositions.size, 2);
+  assert.deepEqual(actual.diagnostics.map(diagnostic => diagnostic.details.operator), ["q", "cm", "Q"]);
+
+  const huge = "1" + "0".repeat(308);
+  for (const source of ["q q", "Q", "1 0 0 1 cm", "1 0 0 1 /Bad 0 cm", `${huge} 0 0 ${huge} 0 0 cm ${huge} 0 0 ${huge} 0 0 cm`]) {
+    for (const thumbnail of [false, true]) {
+      await assert.rejects(interpret(source, thumbnail, { maxGraphicsStateDepth: 1 }), undefined,
+        "borrowed CTMs retain graphics nesting, operand and finite-result checks");
+    }
+  }
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(interpret("q Q", true, { signal: controller.signal }), error => error.code === "aborted");
+  for (const thumbnail of [false, true]) {
+    await assert.rejects(interpret("BT (A) Tj ET", thumbnail), error => error.code === "unsupported-font");
+    await assert.rejects(interpret("/F1 10 Tf BT (AA) Tj ET", thumbnail, { maxGlyphs: 1 }), error => error.code === "resource-limit");
+    await assert.rejects(interpret("/F1 10 Tf BT [(A) -10 (B)] TJ ET", thumbnail, { maxTextArrayItems: 2 }), error => error.code === "resource-limit");
+    const interrupted = new AbortController();
+    await assert.rejects(interpret("BT 1 0 0 1 0 0 cm ET", thumbnail, {
+      signal: interrupted.signal, onDiagnostic: () => interrupted.abort()
+    }), error => error.code === "aborted");
+  }
 }
 
 function testWordSpacingCodeSemantics() {

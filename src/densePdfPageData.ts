@@ -19,7 +19,11 @@ import {
   densePdfPagePathCount,
   densePdfGenericPathPaintCount,
   getDensePdfPagePath,
-  getDensePdfGenericPathPaint
+  getDensePdfGenericPathPaint,
+  readDensePdfPagePathInto,
+  readDensePdfGenericPathPaintInto,
+  type DensePdfPathReadTarget,
+  type DensePdfPaintReadTarget
 } from "./pdf/nativeRetainedResources";
 import {
   HEPR_ANNOTATION_MARKED_CONTENT_TAG,
@@ -67,6 +71,8 @@ export function getHeprCommandPaintSourceIdentity(
 
 export interface DensePdfPageDataOptions {
   readonly signal?: AbortSignal;
+  /** Disposable overview stores may share state and bake pure translations. @internal */
+  readonly thumbnail?: boolean;
   /** Complete native glyph/text resources. Required when content contains text shows. */
   readonly text?: NativePageTextResources;
   /** Optional non-glyph text index, such as geometry-backed annotation text. */
@@ -490,9 +496,25 @@ export function createHeprPageDataFromDense(
     }
   }
   const extraTransforms: number[] = [];
+  const thumbnailTransformIndices = options.thumbnail ? new WeakMap<object, number>() : undefined;
+  let lastThumbnailTransform: DensePdfMatrix | undefined;
+  let lastThumbnailTransformIndex = -1;
   const appendTransform = (matrix: DensePdfMatrix): number => {
+    if (thumbnailTransformIndices) {
+      const existing = thumbnailTransformIndices.get(matrix);
+      if (existing !== undefined) return existing;
+      if (lastThumbnailTransform && matrix.every((value, index) => Object.is(value, lastThumbnailTransform![index]))) {
+        thumbnailTransformIndices.set(matrix, lastThumbnailTransformIndex);
+        return lastThumbnailTransformIndex;
+      }
+    }
     const index = stores.transforms.values.length / 6 + extraTransforms.length / 6;
     extraTransforms.push(...matrix);
+    if (thumbnailTransformIndices) {
+      thumbnailTransformIndices.set(matrix, index);
+      lastThumbnailTransform = matrix;
+      lastThumbnailTransformIndex = index;
+    }
     return index;
   };
   let identityTransformIndex = -1;
@@ -544,14 +566,25 @@ export function createHeprPageDataFromDense(
   const coveredClipGlyphs = new Uint8Array(stores.glyphs.glyphIds.length);
   const appendRawPath = (
     data: Float32Array,
-    bounds: Readonly<DensePdfBounds>
+    bounds: Readonly<DensePdfBounds>,
+    translationX?: number,
+    translationY = 0,
+    dataOffset = 0,
+    dataLength = data.length
   ): number => {
+    const dataEnd = dataOffset + dataLength;
+    if (!Number.isSafeInteger(dataOffset) || dataOffset < 0 ||
+        !Number.isSafeInteger(dataLength) || dataLength < 0 || dataEnd > data.length) {
+      throw new TypeError("Dense PDF generic path has an invalid geometry span.");
+    }
     const pathIndex = pathVerbOffsets.length - 1;
     if (pathIndex >= resourceLimits.maxPathResources) {
       throw pageDataResourceLimit("paths", resourceLimits.maxPathResources);
     }
+    const firstVerb = pathVerbs.length, firstCoordinate = pathCoordinates.length;
+    const firstCoordinateOffset = pathCoordinateOffsets.length;
     let closed = false;
-    for (let offset = 0; offset < data.length;) {
+    for (let offset = dataOffset; offset < dataEnd;) {
       const sourceVerb = data[offset++];
       let targetVerb: number;
       let coordinateCount: number;
@@ -571,7 +604,7 @@ export function createHeprPageDataFromDense(
       } else {
         throw new TypeError(`Dense PDF generic path contains invalid verb ${sourceVerb}.`);
       }
-      if (offset + coordinateCount > data.length) {
+      if (offset + coordinateCount > dataEnd) {
         throw new TypeError("Dense PDF generic path ends inside a verb's coordinates.");
       }
       if (pathVerbs.length >= resourceLimits.maxPathVerbs) {
@@ -584,12 +617,31 @@ export function createHeprPageDataFromDense(
         );
       }
       pathVerbs.push(targetVerb);
-      for (let index = 0; index < coordinateCount; index += 1) {
-        const coordinate = data[offset++];
-        if (!Number.isFinite(coordinate)) {
-          throw new TypeError("Dense PDF generic path contains a non-finite coordinate.");
+      if (translationX === undefined) {
+        for (let index = 0; index < coordinateCount; index += 1) {
+          const coordinate = data[offset++];
+          if (!Number.isFinite(coordinate)) {
+            throw new TypeError("Dense PDF generic path contains a non-finite coordinate.");
+          }
+          pathCoordinates.push(coordinate);
         }
-        pathCoordinates.push(coordinate);
+      } else {
+        for (let index = 0; index < coordinateCount; index += 1) {
+          const coordinate = data[offset++];
+          if (!Number.isFinite(coordinate)) {
+            throw new TypeError("Dense PDF generic path contains a non-finite coordinate.");
+          }
+          const translated = Math.fround(coordinate + (index % 2 === 0 ? translationX : translationY));
+          if (!Number.isFinite(translated)) {
+            // Keep the original separate CTM when baking would overflow the
+            // Float32 store. No partial path or resource index escapes.
+            pathVerbs.length = firstVerb;
+            pathCoordinates.length = firstCoordinate;
+            pathCoordinateOffsets.length = firstCoordinateOffset;
+            return -1;
+          }
+          pathCoordinates.push(translated);
+        }
       }
       pathCoordinateOffsets.push(pathCoordinates.length);
     }
@@ -661,12 +713,30 @@ export function createHeprPageDataFromDense(
     if (existing) return existing;
     const pathIndices: number[] = [];
     const transformIndices: number[] = [];
+    const pathTarget: DensePdfPathReadTarget | undefined = options.thumbnail ? {
+      data: stores.paths.coordinates, dataOffset: 0, dataLength: 0,
+      transform: [1, 0, 0, 1, 0, 0], minX: 0, minY: 0, maxX: 0, maxY: 0
+    } : undefined;
     for (let index = 0; index < densePdfPagePathCount(source); index += 1) {
-      const path = getDensePdfPagePath(source, index);
+      const path = pathTarget
+        ? readDensePdfPagePathInto(source, index, pathTarget) ? pathTarget : undefined
+        : getDensePdfPagePath(source, index);
       if (!path) throw new TypeError("Dense PDF exact path metadata is missing a resource.");
-      const transformIndex = appendTransform(path.transform);
-      transformIndices.push(transformIndex);
-      pathIndices.push(appendRawPath(path.data, path.bounds));
+      const matrix = path.transform;
+      const bounds = pathTarget ?? (path as NonNullable<ReturnType<typeof getDensePdfPagePath>>).bounds;
+      const dataOffset = pathTarget?.dataOffset ?? 0, dataLength = pathTarget?.dataLength ?? path.data.length;
+      const translationOnly = options.thumbnail && matrix[0] === 1 && matrix[1] === 0 &&
+        matrix[2] === 0 && matrix[3] === 1 && Number.isFinite(matrix[4]) && Number.isFinite(matrix[5]);
+      const translatedPath = translationOnly
+        ? appendRawPath(path.data, bounds, matrix[4] === 0 && matrix[5] === 0 ? undefined : matrix[4], matrix[5], dataOffset, dataLength)
+        : -1;
+      if (translatedPath >= 0) {
+        transformIndices.push(identityTransformIndex);
+        pathIndices.push(translatedPath);
+      } else {
+        transformIndices.push(appendTransform(matrix));
+        pathIndices.push(appendRawPath(path.data, bounds, undefined, 0, dataOffset, dataLength));
+      }
     }
     const clipIndices: number[] = [];
     for (let localIndex = 0; localIndex < source.clipPaths.length; localIndex += 1) {
@@ -797,11 +867,19 @@ export function createHeprPageDataFromDense(
   let patternPaintIndex = 0;
   let genericPathPaintCount = 0;
   let rootFormPaintCount = 0;
+  let lastSolidPaintIndex = -1;
+  let lastSolidR = 0, lastSolidG = 0, lastSolidB = 0, lastSolidAlpha = 0;
+  let lastSolidOverprint = 0, lastSolidOverprintMode = 0;
 
   const solidPaint = (
     rgba: readonly [number, number, number, number],
     composite?: Readonly<DensePdfCompositeState>
   ): number => {
+    const overprint = composite?.overprint === true ? 1 : 0;
+    const overprintMode = composite?.overprintMode ?? 0;
+    if (options.thumbnail && lastSolidPaintIndex >= 0 &&
+        rgba[0] === lastSolidR && rgba[1] === lastSolidG && rgba[2] === lastSolidB && rgba[3] === lastSolidAlpha &&
+        overprint === lastSolidOverprint && overprintMode === lastSolidOverprintMode) return lastSolidPaintIndex;
     const colorKey = `${rgba[0]},${rgba[1]},${rgba[2]}`;
     let colorIndex = colorKeys.get(colorKey);
     if (colorIndex === undefined) {
@@ -810,20 +888,24 @@ export function createHeprPageDataFromDense(
       colorParameters.push(rgba[0], rgba[1], rgba[2]);
       colorParameterOffsets.push(colorParameters.length);
     }
-    const overprint = composite?.overprint === true ? 1 : 0;
-    const overprintMode = composite?.overprintMode ?? 0;
     const paintKey = `solid:${colorIndex}:${rgba[3]}:${overprint}:${overprintMode}`;
     const existing = paintKeys.get(paintKey);
-    if (existing !== undefined) return existing;
-    const paintIndex = paintKeys.size;
-    paintKeys.set(paintKey, paintIndex);
-    paintKinds.push(HEPR_PAINT_KIND.SolidColor);
-    paintResourceIndices.push(colorIndex);
-    paintAlphas.push(rgba[3]);
-    paintOverprint.push(overprint);
-    paintOverprintModes.push(overprintMode);
-    paintPatternTransformIndices.push(-1);
-    paintPatternBasePaintIndices.push(-1);
+    const paintIndex = existing ?? paintKeys.size;
+    if (existing === undefined) {
+      paintKeys.set(paintKey, paintIndex);
+      paintKinds.push(HEPR_PAINT_KIND.SolidColor);
+      paintResourceIndices.push(colorIndex);
+      paintAlphas.push(rgba[3]);
+      paintOverprint.push(overprint);
+      paintOverprintModes.push(overprintMode);
+      paintPatternTransformIndices.push(-1);
+      paintPatternBasePaintIndices.push(-1);
+    }
+    if (options.thumbnail) {
+      lastSolidPaintIndex = paintIndex;
+      lastSolidR = rgba[0]; lastSolidG = rgba[1]; lastSolidB = rgba[2]; lastSolidAlpha = rgba[3];
+      lastSolidOverprint = overprint; lastSolidOverprintMode = overprintMode;
+    }
     return paintIndex;
   };
   const patternPaint = (
@@ -861,9 +943,26 @@ export function createHeprPageDataFromDense(
     paintPatternBasePaintIndices.push(basePaintIndex);
     return paintIndex;
   };
+  type GenericStrokeStyle = NonNullable<DensePdfCompiledPage["genericPathPaints"][number]["strokeStyle"]>;
+  const thumbnailStyleIndices = options.thumbnail ? new WeakMap<GenericStrokeStyle, number>() : undefined;
+  let lastThumbnailStyle: GenericStrokeStyle | undefined;
+  let lastThumbnailStyleIndex = -1;
   const appendGenericStrokeStyle = (
-    style: NonNullable<DensePdfCompiledPage["genericPathPaints"][number]["strokeStyle"]>
+    style: GenericStrokeStyle
   ): number => {
+    if (thumbnailStyleIndices) {
+      const existing = thumbnailStyleIndices.get(style);
+      if (existing !== undefined) return existing;
+      const previous = lastThumbnailStyle;
+      if (previous && Object.is(style.lineWidth, previous.lineWidth) && Object.is(style.miterLimit, previous.miterLimit) &&
+          style.lineCap === previous.lineCap && style.lineJoin === previous.lineJoin &&
+          style.hairline === previous.hairline && style.strokeAdjust === previous.strokeAdjust &&
+          Object.is(style.dashPhase, previous.dashPhase) && style.dash.length === previous.dash.length &&
+          style.dash.every((value, index) => Object.is(value, previous.dash[index]))) {
+        thumbnailStyleIndices.set(style, lastThumbnailStyleIndex);
+        return lastThumbnailStyleIndex;
+      }
+    }
     if (
       !Number.isFinite(style.lineWidth) || style.lineWidth < 0 ||
       !Number.isFinite(style.miterLimit) || style.miterLimit < 1 ||
@@ -887,6 +986,11 @@ export function createHeprPageDataFromDense(
     strokeDashValues.push(...style.dash);
     strokeDashOffsets.push(strokeDashValues.length);
     strokeDashPhases.push(style.dashPhase);
+    if (thumbnailStyleIndices) {
+      thumbnailStyleIndices.set(style, index);
+      lastThumbnailStyle = style;
+      lastThumbnailStyleIndex = index;
+    }
     return index;
   };
   const appendTextStrokeStyle = (
@@ -1072,6 +1176,8 @@ export function createHeprPageDataFromDense(
         : resources.wrapperComposite, true);
     return true;
   };
+  const thumbnailPaintTarget: DensePdfPaintReadTarget | undefined = options.thumbnail
+    ? { pathIndex: 0, fillRule: 0, fill: null, stroke: null, strokeStyle: null } : undefined;
   const genericPathCommand = (
     source: DensePdfCompiledPage,
     paintIndex: number,
@@ -1085,7 +1191,9 @@ export function createHeprPageDataFromDense(
     },
     composite: Readonly<DensePdfCompositeState>
   ): HeprDisplayCommand => {
-    const paint = getDensePdfGenericPathPaint(source, paintIndex);
+    const paint = thumbnailPaintTarget
+      ? readDensePdfGenericPathPaintInto(source, paintIndex, thumbnailPaintTarget) ? thumbnailPaintTarget : undefined
+      : getDensePdfGenericPathPaint(source, paintIndex);
     const resources = compiledPathResources.get(source);
     if (
       !paint || !resources || paint.pathIndex < 0 ||
@@ -1224,6 +1332,10 @@ export function createHeprPageDataFromDense(
     });
   }
 
+  // Every command adopts scalar scope fields immediately. A thumbnail can
+  // reuse this transient record rather than allocate one per source paint.
+  const thumbnailScope = options.thumbnail ? { transformIndex: 0, clipIndex: -1,
+    optionalContentIndex: -1, markedContentIndex: -1, sourceOffset: -1, sourceLength: -1 } : undefined;
   const commandScope = (
     source: DensePdfCompiledPage,
     paintRunIndex: number,
@@ -1256,6 +1368,12 @@ export function createHeprPageDataFromDense(
       localClipIndex >= pathResources.clipIndices.length
     ) {
       throw new TypeError("Dense PDF paint run references invalid persistent clip metadata.");
+    }
+    if (thumbnailScope) {
+      thumbnailScope.clipIndex = localClipIndex < 0 ? -1 : pathResources.clipIndices[localClipIndex];
+      thumbnailScope.optionalContentIndex = optionalContentIndex;
+      thumbnailScope.markedContentIndex = localMarkedContentIndex < 0 ? -1 : markedContentOffset + localMarkedContentIndex;
+      return thumbnailScope;
     }
     return {
       transformIndex: 0,
@@ -1349,6 +1467,22 @@ export function createHeprPageDataFromDense(
       composite.alpha === 1 && composite.blendMode === "Normal" &&
       softMaskGroupIndex < 0
     ) {
+      const previous = options.thumbnail ? target.at(-1) : undefined;
+      if (previous?.kind === "draw" && command.kind === "draw" &&
+          previous.first + previous.count === command.first && previous.transformIndex === command.transformIndex &&
+          previous.clipIndex === command.clipIndex && previous.optionalContentIndex === command.optionalContentIndex &&
+          previous.markedContentIndex === command.markedContentIndex && previous.sourceOffset === command.sourceOffset &&
+          previous.sourceLength === command.sourceLength &&
+          ((previous.source === "paths" && command.source === "paths" && previous.fillPaintIndex === command.fillPaintIndex &&
+            previous.strokePaintIndex === command.strokePaintIndex && previous.strokeStyleIndex === command.strokeStyleIndex &&
+            previous.fillRule === command.fillRule && previous.fillPaintInherited === command.fillPaintInherited &&
+            previous.strokePaintInherited === command.strokePaintInherited) ||
+           (previous.source === "stroke-segments" && command.source === "stroke-segments" && previous.paintIndex === command.paintIndex))) {
+        // A range still paints each item in order. Only command dispatch is
+        // shared; fill/stroke and translucent overlap boundaries stay intact.
+        previous.count += command.count;
+        return;
+      }
       target.push(command);
       return;
     }
@@ -1423,6 +1557,23 @@ export function createHeprPageDataFromDense(
     const commandState = commandScope(compiled, paintRunIndex, rootMarkedContentOffset);
     const composite = compiled.paintRunCompositeStates[paintRunIndex];
     if (!composite) throw new TypeError("Dense PDF paint run has no composite state.");
+    if (options.thumbnail && kind === DENSE_PDF_PAINT_RUN_STROKE &&
+        composite.alpha === 1 && composite.blendMode === "Normal" && composite.softMaskIndex < 0) {
+      const paint = compiled.pathPaints[pathPaintIndex];
+      if (!paint) throw new TypeError("Dense PDF path paint metadata is inconsistent.");
+      const previous = commands.at(-1);
+      if (previous?.kind === "draw" && previous.source === "stroke-segments" &&
+          previous.first + previous.count === first && previous.transformIndex === commandState.transformIndex &&
+          previous.clipIndex === commandState.clipIndex && previous.optionalContentIndex === commandState.optionalContentIndex &&
+          previous.markedContentIndex === commandState.markedContentIndex && previous.sourceOffset === commandState.sourceOffset &&
+          previous.sourceLength === commandState.sourceLength && previous.paintIndex === solidPaint(paint.color, composite)) {
+        // Scope validation above still runs for every source paint. Coalesce
+        // before creating the otherwise immediately discarded base/draw objects.
+        previous.count += count;
+        pathPaintIndex++;
+        continue;
+      }
+    }
     const base = { kind: "draw" as const, first, count, ...commandState };
     if (kind === DENSE_PDF_PAINT_RUN_GLYPH) {
       const textRun = textRuns.get(`${first}:${count}`);

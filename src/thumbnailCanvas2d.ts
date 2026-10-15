@@ -6,7 +6,7 @@ import { thumbnailSize, type ThumbnailCanvas2dLimits, type ThumbnailPixels, type
 /** Retained snapshot fallback shared by parser workers and DOM-only browser hosts. */
 export async function renderThumbnailPageCanvas2d(page: HeprPageData, options: ThumbnailRenderOptions,
   signal?: AbortSignal, limits?: ThumbnailCanvas2dLimits,
-  onDiagnostic?: (diagnostic: PdfDiagnostic) => void): Promise<ThumbnailPixels> {
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void, trustedPage = false): Promise<ThumbnailPixels> {
   signal?.throwIfAborted();
   const size = thumbnailSize(page.pageInfo.width, page.pageInfo.height, options.maxDimension);
   const factoryStarted = performance.now();
@@ -28,7 +28,7 @@ export async function renderThumbnailPageCanvas2d(page: HeprPageData, options: T
       signal, surfaceFactory: measuredFactory, maxCanvasPixels: limits?.maxImagePixels,
       maxWorkingPixels: limits === undefined ? undefined : Math.floor(limits.maxDecodedStreamBytes / 4),
       onDiagnostic }, renderHeprPageToCanvas2d,
-    { timings, vectorOverride: options.vectorOverride, outputSize: size });
+    { timings, vectorOverride: options.vectorOverride, outputSize: size, thumbnail: true, trustedPage });
     signal?.throwIfAborted();
     // Native Canvas backends can return external, non-transferable buffers.
     return { width: pixels.width, height: pixels.height, rgba: Uint8Array.from(pixels.rgba),

@@ -199,7 +199,7 @@ export class NativeTextCompiler {
     this.transformIndexes.set(hashTransformWords(this.transformTupleWords), 0);
   }
 
-  saveGraphicsState(): void {
+  saveGraphicsState(shareTransform = false): void {
     this.reportGraphicsInsideTextObject("q");
     this.checkCancellation();
     if (this.graphicsStack.length >= this.maxGraphicsStateDepth) {
@@ -207,16 +207,16 @@ export class NativeTextCompiler {
         details: { maxGraphicsStateDepth: this.maxGraphicsStateDepth }
       });
     }
-    this.graphicsStack.push({ ctm: [...this.ctm], textState: { ...this.state } });
+    this.graphicsStack.push({ ctm: shareTransform ? this.ctm : [...this.ctm], textState: { ...this.state } });
   }
 
-  restoreGraphicsState(): void {
+  restoreGraphicsState(shareTransform = false): void {
     this.reportGraphicsInsideTextObject("Q");
     this.checkCancellation();
     const snapshot = this.graphicsStack.pop();
     if (!snapshot) throw invalidText("PDF text graphics-state stack underflow.");
-    this.ctm = [...snapshot.ctm];
-    this.state = { ...snapshot.textState };
+    this.ctm = shareTransform ? snapshot.ctm : [...snapshot.ctm];
+    this.state = shareTransform ? snapshot.textState : { ...snapshot.textState };
   }
 
   /** Concatenate a page-space transform after the current CTM. */
@@ -475,16 +475,28 @@ export class NativeTextCompiler {
     if (separator === "\n" || this.pendingSeparator === null) this.pendingSeparator = separator;
   }
 
-  /** Route standard text operators from any allocation-conscious content lexer. */
-  applyOperator(operator: string, operands: readonly unknown[]): void {
+  /**
+   * Route standard text operators from any allocation-conscious content lexer.
+   * The optional transform is borrowed from a graphics compiler that replaces
+   * rather than mutates its matrices and validates every cm result. Supplying
+   * it on every operator avoids interpreting the same graphics CTM twice.
+   */
+  applyOperator(operator: string, operands: readonly unknown[], graphicsTransform?: PdfMatrix): void {
     this.checkCancellation();
+    if (graphicsTransform !== undefined) this.ctm = graphicsTransform as Matrix;
     switch (operator) {
       case "BMC": this.requireOperandCount(operator, operands, 1); this.beginMarkedText(); return;
       case "BDC": this.requireOperandCount(operator, operands, 2); this.beginMarkedText(operands[1] as Uint8Array | null); return;
       case "EMC": this.requireOperandCount(operator, operands, 0); this.endMarkedText(); return;
-      case "q": this.requireOperandCount(operator, operands, 0); this.saveGraphicsState(); return;
-      case "Q": this.requireOperandCount(operator, operands, 0); this.restoreGraphicsState(); return;
-      case "cm": this.requireOperandCount(operator, operands, 6); this.concatTransform(numberMatrix(operands)); return;
+      case "q": this.requireOperandCount(operator, operands, 0); this.saveGraphicsState(graphicsTransform !== undefined); return;
+      case "Q": this.requireOperandCount(operator, operands, 0); this.restoreGraphicsState(graphicsTransform !== undefined); return;
+      case "cm":
+        this.requireOperandCount(operator, operands, 6);
+        if (graphicsTransform !== undefined) {
+          this.reportGraphicsInsideTextObject(operator);
+          this.checkCancellation();
+        } else this.concatTransform(numberMatrix(operands));
+        return;
       case "BT": this.requireOperandCount(operator, operands, 0); this.beginText(); return;
       case "ET": this.requireOperandCount(operator, operands, 0); this.endText(); return;
       case "Tf":

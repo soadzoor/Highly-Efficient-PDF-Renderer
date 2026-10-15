@@ -464,6 +464,7 @@ class NativePdfSession implements NativeVectorPdfSession {
   private readonly document: NativePdfDocument;
   private readonly fontPrograms = new NativePdfFontProgramCache();
   private thumbnailRenderer: import("./thumbnailRenderer").ThumbnailSceneRenderer | null = null;
+  private thumbnailPage: { readonly key: string; readonly page: HeprPageData } | undefined;
   private readonly formRegistry: NativePdfFormAppearanceRegistry;
   private readonly annotationMetadata: NativePdfAnnotationMetadataRegistry;
   private readonly structure: NativePdfStructureTree;
@@ -664,7 +665,21 @@ class NativePdfSession implements NativeVectorPdfSession {
           throw error;
         }
       }
-      let page = await this.compilePageUnlocked(sourcePageIndex, compileOptions, signal);
+      // Like a parsed native page, this disposable preview can be repainted
+      // for another background/format without interpreting its PDF again.
+      // Resolution and retained layers affect preparation; paint options do not.
+      const preparationKey = `${sourcePageIndex}:${options.maxDimension}:${options.optionalContent !== undefined}`;
+      const preparedPage = this.thumbnailPage?.key === preparationKey ? this.thumbnailPage.page
+        : await this.compilePageUnlocked(sourcePageIndex, compileOptions, signal);
+      const complete = <T extends ThumbnailPageResult>(result: T): T => {
+        signal.throwIfAborted();
+        if ("rgba" in result) this.thumbnailPage = { key: preparationKey, page: preparedPage };
+        // Capability fallbacks expose transferable page/scene storage to the
+        // owning host. Do not retain buffers the worker may detach on return.
+        else if (this.thumbnailPage?.page === preparedPage) this.thumbnailPage = undefined;
+        return result;
+      };
+      let page = preparedPage;
       const canvasLimits = { maxImagePixels: this.document.limits.maxImagePixels,
         maxDecodedStreamBytes: this.document.limits.maxDecodedStreamBytes };
       if (options.optionalContent) {
@@ -701,13 +716,13 @@ class NativePdfSession implements NativeVectorPdfSession {
           const { ThumbnailSceneRenderer } = await import("./thumbnailRenderer");
           this.thumbnailRenderer ??= new ThumbnailSceneRenderer();
           const result = await this.thumbnailRenderer.render(scene, options, signal);
-          return { ...result, timings: [{ stage: "prepare", durationMs: prepareMs }, ...(result.timings ?? [])] };
+          return complete({ ...result, timings: [{ stage: "prepare", durationMs: prepareMs }, ...(result.timings ?? [])] });
         } catch (error) {
           signal.throwIfAborted();
           const nodeRuntime = typeof (globalThis as { process?: { versions?: { node?: string } } }).process?.versions?.node === "string";
           if (!nodeRuntime && preparedScene && (error as { code?: string })?.code === "thumbnail.webgl-unavailable") {
-            return { scene: preparedScene, ...(options.backend === "auto" ? { page, limits: canvasLimits } : {}),
-              timings: [{ stage: "prepare", durationMs: prepareMs }] };
+            return complete({ scene: preparedScene, ...(options.backend === "auto" ? { page, limits: canvasLimits } : {}),
+              timings: [{ stage: "prepare", durationMs: prepareMs }] });
           }
           if (options.backend === "webgl") throw error;
           this.appendDiagnostics([{ code: "thumbnail.canvas2d-fallback", severity: "info", pageIndex: sourcePageIndex,
@@ -719,14 +734,14 @@ class NativePdfSession implements NativeVectorPdfSession {
       try {
         const { renderThumbnailPageCanvas2d } = await import("./thumbnailCanvas2d");
         const pixels = await renderThumbnailPageCanvas2d(page, options, signal, canvasLimits,
-          diagnostic => this.appendDiagnostics([diagnostic]));
-        return { ...pixels, timings: [{ stage: "prepare", durationMs: prepareMs }, ...(pixels.timings ?? [])] };
+          diagnostic => this.appendDiagnostics([diagnostic]), true);
+        return complete({ ...pixels, timings: [{ stage: "prepare", durationMs: prepareMs }, ...(pixels.timings ?? [])] });
       } catch (error) {
         signal.throwIfAborted();
         const nodeRuntime = typeof (globalThis as { process?: { versions?: { node?: string } } }).process?.versions?.node === "string";
         if (!nodeRuntime && typeof document === "undefined" && error instanceof PdfError &&
             error.details?.reason === "selective-composite-surface") {
-          return { page, limits: canvasLimits, timings: [{ stage: "prepare", durationMs: prepareMs }] };
+          return complete({ page, limits: canvasLimits, timings: [{ stage: "prepare", durationMs: prepareMs }] });
         }
         throw error;
       }
@@ -898,6 +913,7 @@ class NativePdfSession implements NativeVectorPdfSession {
     this.closed = true;
     this.lifetime.abort(new PdfError("closed", "The PDF session is closed."));
     this.thumbnailRenderer?.close(); this.thumbnailRenderer = null;
+    this.thumbnailPage = undefined;
     this.fontPrograms.clear();
     this.closePromise = this.document.close();
     return this.closePromise;
@@ -1048,6 +1064,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       bindNativeSourceJpxStore(imageStore, imageResources.registry, signal);
       const densePageData = createHeprPageDataFromDense(pageInfo, compiled, {
         signal,
+        thumbnail: (options as NativeVectorCompileOptions).thumbnailScale !== undefined,
         retainOptionalContent: (options as NativeVectorCompileOptions).retainOptionalContent === true,
         text,
         forms: compositingPrograms.forms,
@@ -1713,9 +1730,10 @@ class NativePdfSession implements NativeVectorPdfSession {
     signal.throwIfAborted();
     // A later compilation of the same page streams its content again and
     // reuses the resources the first one loaded.
+    const streamThumbnail = (options as NativeVectorCompileOptions).thumbnailScale !== undefined;
     const streamed = reuse?.prepared?.streamed
       ? reuse.prepared
-      : output === "vector-scene" && !reuse?.prepared
+      : (output === "vector-scene" || streamThumbnail) && !reuse?.prepared
         ? await this.prepareStreamedPageResources(sourcePageIndex, options, signal)
         : null;
     if (streamed) {
@@ -1944,7 +1962,7 @@ class NativePdfSession implements NativeVectorPdfSession {
         if (context.font) {
           textCompiler.setFontResource(fontRegistry.resources[context.font.fontIndex], context.font.size);
         }
-        textCompiler.applyOperator(operator, operands);
+        textCompiler.applyOperator(operator, operands, context.graphicsTransform);
         return emittedTextRuns;
       }
     };
@@ -1960,6 +1978,8 @@ class NativePdfSession implements NativeVectorPdfSession {
     const compileOptions: DensePdfContentInputOptions = {
       onDiagnostic: imageResources.onDiagnostic,
       compactRetainedResources: output === "display-program",
+      thumbnail: (options as NativeVectorCompileOptions).thumbnailScale !== undefined,
+      thumbnailScale: (options as NativeVectorCompileOptions).thumbnailScale,
       ...denseSourcePaintOptions(imageResources),
       retainOptionalContent,
       ...(retainOptionalContent ? { combineOptionalContent: (parent: number, own: number) => this.optionalContent.combineMemberships(parent, own) } : {}),
@@ -3212,7 +3232,7 @@ async function flattenNativeVectorFormOccurrences(
         if (context.font) {
           textCompiler.setFontResource(fontRegistry.resources[context.font.fontIndex], context.font.size);
         }
-        textCompiler.applyOperator(operator, operands);
+        textCompiler.applyOperator(operator, operands, context.graphicsTransform);
         return emittedTextRuns;
       }
     };
@@ -4939,7 +4959,7 @@ async function compileNativeFormPrograms(
         if (context.font) {
           textCompiler.setFontResource(fontRegistry.resources[context.font.fontIndex], context.font.size);
         }
-        textCompiler.applyOperator(operator, operands);
+        textCompiler.applyOperator(operator, operands, context.graphicsTransform);
         return emittedTextRuns;
       }
     };
@@ -4994,6 +5014,7 @@ async function compileNativeFormPrograms(
       enableInvisibleCull: nativeVectorInvisibleCullEnabled(options),
       output: "display-program",
       compactRetainedResources: true,
+      thumbnail: (options as NativeVectorCompileOptions).thumbnailScale !== undefined,
       totalBytes: definition.content.length,
       signal
     });
@@ -5286,7 +5307,7 @@ async function compileNativeType3Programs(
         if (context.font) {
           textCompiler.setFontResource(fontRegistry.resources[context.font.fontIndex], context.font.size);
         }
-        textCompiler.applyOperator(operator, operands);
+        textCompiler.applyOperator(operator, operands, context.graphicsTransform);
         return emittedTextRuns;
       }
     };
@@ -5431,6 +5452,7 @@ async function compileNativeType3Programs(
       enableInvisibleCull: nativeVectorInvisibleCullEnabled(options),
       output: "display-program",
       compactRetainedResources: true,
+      thumbnail: (options as NativeVectorCompileOptions).thumbnailScale !== undefined,
       type3PaintMode: glyph.charProc.metrics.colored ? "colored" : "uncolored",
       totalBytes: content.length,
       signal
@@ -5706,6 +5728,7 @@ async function compileNativeType3Programs(
       enableInvisibleCull: false,
       output: "display-program",
       compactRetainedResources: true,
+      thumbnail: (options as NativeVectorCompileOptions).thumbnailScale !== undefined,
       type3PaintMode: "colored",
       totalBytes: content.bytes.length,
       signal
@@ -6013,6 +6036,7 @@ async function compileNativeSoftMaskProgram(
       retainOptionalContent: (options as NativeVectorCompileOptions).retainOptionalContent === true,
       output: "display-program",
       compactRetainedResources: true,
+      thumbnail: (options as NativeVectorCompileOptions).thumbnailScale !== undefined,
       enableSegmentMerge: false,
       enableInvisibleCull: false,
       colorSpaceResolver: resources.colorSpaceResolver,
@@ -6651,7 +6675,7 @@ async function compileNativePatternPrograms(
         if (context.font) {
           textCompiler.setFontResource(fontRegistry.resources[context.font.fontIndex], context.font.size);
         }
-        textCompiler.applyOperator(operator, operands);
+        textCompiler.applyOperator(operator, operands, context.graphicsTransform);
         return emittedTextRuns;
       }
     };
@@ -6772,6 +6796,7 @@ async function compileNativePatternPrograms(
       enableInvisibleCull: nativeVectorInvisibleCullEnabled(options),
       output: "display-program",
       compactRetainedResources: true,
+      thumbnail: (options as NativeVectorCompileOptions).thumbnailScale !== undefined,
       uncoloredPatternPaint: pattern.kind === "uncolored-tiling",
       totalBytes: content.length,
       signal

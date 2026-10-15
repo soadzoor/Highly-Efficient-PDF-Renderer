@@ -119,6 +119,8 @@ export interface DensePdfTextOperatorSink {
 export interface DensePdfTextOperatorContext {
   /** Present only when gs selects a font dictionary and text-space size. */
   readonly font?: Readonly<DensePdfFontSelection>;
+  /** Thumbnail-only, immutable-by-replacement graphics CTM before this operator. */
+  readonly graphicsTransform?: Readonly<DensePdfMatrix>;
   readonly outputEnabled: boolean;
   readonly optionalContentIndex: number;
   readonly markedContentIndex: number;
@@ -381,6 +383,10 @@ export interface DensePdfContentCompileOptions {
   capturePaintSourceIdentities?: boolean;
   /** Capture retained paths and paints directly in shared chunks. @internal */
   compactRetainedResources?: boolean;
+  /** Skip global retained CTM interning for disposable thumbnails. @internal */
+  thumbnail?: boolean;
+  /** Known root-page output scale; nested programs and masks omit it. @internal */
+  thumbnailScale?: number;
   /** Resource-aware text interpreter sharing this compiler's token stream. */
   textOperatorSink?: DensePdfTextOperatorSink;
   /** Inherited state used when specializing a reusable Form program. */
@@ -1141,7 +1147,7 @@ async function compileContent(
   if (policy.displayProgram && options.compactRetainedResources) {
     const { DensePdfRetainedResourceBuilder } = await import("./nativeRetainedResources");
     options.signal?.throwIfAborted();
-    packedRetainedResources = new DensePdfRetainedResourceBuilder();
+    packedRetainedResources = new DensePdfRetainedResourceBuilder(options.thumbnail === true);
   }
   const compiler = new DenseContentCompiler(options, policy, packedRetainedResources);
   const lexer = new IncrementalPdfLexer(
@@ -1622,6 +1628,7 @@ class DenseContentCompiler {
   readonly vectorPathPaintRanges: number[] = [];
 
   private readonly strokePaintContexts = new Map<number, number>();
+  private diagnosedThumbnailStroke = false;
 
   private lastContextClipIndex = -2;
 
@@ -2134,7 +2141,8 @@ class DenseContentCompiler {
         this.textSink?.applyOperator("EMC", [], {
           outputEnabled: this.contentVisible,
           optionalContentIndex: this.activeOptionalContentIndex,
-          markedContentIndex: this.activeMarkedContentIndex
+          markedContentIndex: this.activeMarkedContentIndex,
+          ...(this.options.thumbnail === true ? { graphicsTransform: this.state.matrix } : {})
         });
         if ((this.markedContentStack.length & 0x1fff) === 0) await checkpoint();
       }
@@ -2454,7 +2462,8 @@ class DenseContentCompiler {
         {
           outputEnabled: this.contentVisible,
           optionalContentIndex: this.activeOptionalContentIndex,
-          markedContentIndex: this.activeMarkedContentIndex
+          markedContentIndex: this.activeMarkedContentIndex,
+          ...(this.options.thumbnail === true ? { graphicsTransform: this.state.matrix } : {})
         }
       );
       if (glyphRuns) {
@@ -2550,7 +2559,7 @@ class DenseContentCompiler {
       case "q":
         this.requireArgs(operator, args, 0);
         // The current path is not part of the saved graphics state.
-        this.stateStack.push(cloneState(this.state));
+        this.stateStack.push(cloneState(this.state, this.options.thumbnail === true));
         return;
       case "Q": {
         this.requireArgs(operator, args, 0);
@@ -2565,6 +2574,11 @@ class DenseContentCompiler {
       case "cm": {
         this.requireArgs(operator, args, 6);
         const matrix = multiplyMatrices(this.state.matrix, matrixFromArgs(args));
+        // The thumbnail text sink borrows this CTM instead of multiplying it
+        // independently. Preserve its finite-result check even without glyphs.
+        if (this.options.thumbnail === true && this.textSink && matrix.some((value) => !Number.isFinite(value))) {
+          throw new DensePdfSyntaxError("A PDF graphics transform has a non-finite result.");
+        }
         this.rebaseCurrentPath(matrix, operator);
         this.state.matrix = matrix;
         this.state.matrixScale = matrixScale(this.state.matrix);
@@ -2650,6 +2664,7 @@ class DenseContentCompiler {
             outputEnabled: this.contentVisible,
             optionalContentIndex: this.activeOptionalContentIndex,
             markedContentIndex: this.activeMarkedContentIndex,
+            ...(this.options.thumbnail === true ? { graphicsTransform: this.state.matrix } : {}),
             font: definition.font
           });
         }
@@ -3079,7 +3094,8 @@ class DenseContentCompiler {
         this.textSink?.applyOperator(operator, [tag], {
           outputEnabled: this.contentVisible,
           optionalContentIndex: this.activeOptionalContentIndex,
-          markedContentIndex: this.activeMarkedContentIndex
+          markedContentIndex: this.activeMarkedContentIndex,
+          ...(this.options.thumbnail === true ? { graphicsTransform: this.state.matrix } : {})
         });
         return;
       }
@@ -3145,7 +3161,8 @@ class DenseContentCompiler {
         this.textSink?.applyOperator(operator, [tag, actualText], {
           outputEnabled: this.contentVisible,
           optionalContentIndex: this.activeOptionalContentIndex,
-          markedContentIndex: this.activeMarkedContentIndex
+          markedContentIndex: this.activeMarkedContentIndex,
+          ...(this.options.thumbnail === true ? { graphicsTransform: this.state.matrix } : {})
         });
         return;
       }
@@ -3162,7 +3179,8 @@ class DenseContentCompiler {
         this.textSink?.applyOperator(operator, [], {
           outputEnabled: this.contentVisible,
           optionalContentIndex: this.activeOptionalContentIndex,
-          markedContentIndex: this.activeMarkedContentIndex
+          markedContentIndex: this.activeMarkedContentIndex,
+          ...(this.options.thumbnail === true ? { graphicsTransform: this.state.matrix } : {})
         });
         return;
       case "MP":
@@ -3501,6 +3519,9 @@ class DenseContentCompiler {
       this.assertCurrentPathLimits(operator);
     }
 
+    const previewStroke = this.options.thumbnail === true &&
+      this.options.thumbnailScale !== undefined && this.options.thumbnailScale > 0 &&
+      this.state.lineWidth * this.state.matrixScale * this.options.thumbnailScale <= 1;
     if (
       this.contentVisible &&
       operator === "S" &&
@@ -3509,17 +3530,16 @@ class DenseContentCompiler {
       this.pendingClipRule === null &&
       // Ordered output records each paint's exact clip path; like the general
       // path, the stroke store itself only culls against the clip's bounds.
-      (this.state.clipIndex < 0 || this.policy.orderedPaint) &&
+      (this.state.clipIndex < 0 || this.policy.orderedPaint || (this.policy.displayProgram && previewStroke)) &&
       this.state.lineDash.length === 0 &&
-      this.state.lineCap !== 2 &&
+      (this.state.lineCap !== 2 || previewStroke) &&
       this.path.isSingleLine() &&
       // A single segment has no joins, stroke adjustment is not applied, and
       // the general path packs this line exactly the same way. Only display
       // programs, which otherwise retain the exact style, need the defaults.
       (!this.policy.displayProgram || (
-        this.state.lineJoin === 0 &&
-        Math.abs(this.state.miterLimit - 10) <= 1e-6 &&
-        !this.state.strokeAdjustment &&
+        (previewStroke || (this.state.lineJoin === 0 &&
+          Math.abs(this.state.miterLimit - 10) <= 1e-6 && !this.state.strokeAdjustment)) &&
         isPackedStrokeTransformCompatible(
           this.state.matrix,
           this.state.lineWidth,
@@ -3527,9 +3547,26 @@ class DenseContentCompiler {
         )
       ))
     ) {
-      this.paintSimpleStrokeLine();
+      if (previewStroke && !this.diagnosedThumbnailStroke && (this.state.lineCap === 2 || this.state.strokeAdjustment)) {
+        this.diagnosedThumbnailStroke = true;
+        this.options.onDiagnostic?.({ code: "thumbnail.stroke-approximation", severity: "info",
+          message: "Subpixel isolated strokes use a preview pen; square caps may be rounded and stroke adjustment is approximate." });
+      }
+      this.paintSimpleStrokeLine(previewStroke);
       return;
     }
+
+    // At overview scale, opaque solid polylines need only a one-pixel pen.
+    // Keep their centerlines in the packed stroke store instead of capturing
+    // paths, CTMs, styles and draw objects only to lower them again for Canvas.
+    if (previewStroke && this.policy.displayProgram && this.contentVisible &&
+        (operator === "S" || operator === "s") && this.currentColorPaints("stroke") &&
+        this.state.strokePatternColorSpace === null && this.pendingClipRule === null &&
+        this.state.lineDash.length === 0 && this.state.strokeAlpha === 1 &&
+        this.state.blendMode === "Normal" && this.state.softMaskIndex < 0 &&
+        !this.state.strokeOverprint && !this.state.alphaIsShape &&
+        isPackedStrokeTransformCompatible(this.state.matrix, this.state.lineWidth, false) &&
+        this.paintThumbnailPolyline()) return;
 
     const pathData = this.path.view();
     const pathBounds = pathData.length > 0
@@ -3818,7 +3855,7 @@ class DenseContentCompiler {
     this.clearPaintPathState();
   }
 
-  private paintSimpleStrokeLine(): void {
+  private paintSimpleStrokeLine(previewStroke = false): void {
     const strokes = this.strokes;
     const data = this.path.rawData();
     const matrix = this.state.matrix;
@@ -3835,10 +3872,13 @@ class DenseContentCompiler {
     const halfWidth = hairline
       ? 0
       : this.state.lineWidth * this.state.matrixScale * 0.5;
+    const cullingHalfWidth = previewStroke
+      ? Math.max(halfWidth, 0.5 / this.options.thumbnailScale!) : halfWidth;
+    const roundCap = this.state.lineCap === 1 || (previewStroke && this.state.lineCap === 2);
     if (
       !clip ||
-      geometryMaxX + halfWidth < clip.minX || geometryMinX - halfWidth > clip.maxX ||
-      geometryMaxY + halfWidth < clip.minY || geometryMinY - halfWidth > clip.maxY
+      geometryMaxX + cullingHalfWidth < clip.minX || geometryMinX - cullingHalfWidth > clip.maxX ||
+      geometryMaxY + cullingHalfWidth < clip.minY || geometryMinY - cullingHalfWidth > clip.maxY
     ) {
       this.path.clear();
       return;
@@ -3848,24 +3888,24 @@ class DenseContentCompiler {
     const dx = x1 - x0;
     const dy = y1 - y0;
     const zeroLength = dx * dx + dy * dy < 1e-10;
-    if (zeroLength && this.state.lineCap !== 1) {
+    if (zeroLength && !roundCap) {
       this.path.clear();
       return;
     }
     const validated = this.state.strokeAlpha > ALPHA_INVISIBLE_EPSILON && this.policy.vectorScene === true;
     if (this.state.strokeAlpha > ALPHA_INVISIBLE_EPSILON) {
       if (validated) this.noteVectorOrdinaryPaint("stroke", "S");
-      this.assertSupportedStrokeState("S");
+      this.assertSupportedStrokeState("S", previewStroke);
     }
     strokes.sourceSegmentCount += 1;
     strokes.paintContext = this.strokePaintContext();
     const strokeStart = strokes.primitiveCount;
     let flags = hairline ? DENSE_PDF_STROKE_STYLE_FLAG_HAIRLINE : 0;
-    if (this.state.lineCap === 1) flags |= STROKE_STYLE_FLAG_ROUND_CAP;
-    const paintMinX = geometryMinX - halfWidth;
-    const paintMinY = geometryMinY - halfWidth;
-    const paintMaxX = geometryMaxX + halfWidth;
-    const paintMaxY = geometryMaxY + halfWidth;
+    if (roundCap) flags |= STROKE_STYLE_FLAG_ROUND_CAP;
+    const paintMinX = geometryMinX - cullingHalfWidth;
+    const paintMinY = geometryMinY - cullingHalfWidth;
+    const paintMaxX = geometryMaxX + cullingHalfWidth;
+    const paintMaxY = geometryMaxY + cullingHalfWidth;
     const visibleMinX = Math.max(clip.minX, paintMinX);
     const visibleMinY = Math.max(clip.minY, paintMinY);
     const visibleMaxX = Math.min(clip.maxX, paintMaxX);
@@ -3893,24 +3933,90 @@ class DenseContentCompiler {
     this.path.clear();
   }
 
-  private assertSupportedStrokeState(operator: string): void {
+  /** Approximate only thin, opaque root-page polylines; curves use the exact path. */
+  private paintThumbnailPolyline(): boolean {
+    const data = this.path.rawData();
+    const length = this.path.length;
+    for (let offset = 0; offset < length;) {
+      if ((offset & 0x1fff) === 0) this.options.signal?.throwIfAborted();
+      const verb = data[offset++];
+      if (verb === DRAW_MOVE_TO || verb === DRAW_LINE_TO) offset += 2;
+      else if (verb !== DRAW_CLOSE) return false;
+    }
+    const clip = this.state.clipBounds;
+    if (!clip || length === 0) { this.path.clear(); return true; }
+    this.pathCount += 1;
+    const strokes = this.strokes;
+    const first = strokes.primitiveCount;
+    const halfWidth = this.state.lineWidth * this.state.matrixScale * .5;
+    const penHalfWidth = Math.max(halfWidth, .5 / this.options.thumbnailScale!);
+    const flags = STROKE_STYLE_FLAG_ROUND_CAP | (this.state.lineWidth <= 0 ? DENSE_PDF_STROKE_STYLE_FLAG_HAIRLINE : 0);
+    strokes.recordPathHalfWidth(halfWidth);
+    strokes.paintContext = this.strokePaintContext();
+    const m = this.state.matrix;
+    let x = 0, y = 0, startX = 0, startY = 0;
+    for (let offset = 0; offset < length;) {
+      if ((offset & 0x1fff) === 0) this.options.signal?.throwIfAborted();
+      const verb = data[offset++];
+      if (verb === DRAW_MOVE_TO) {
+        const px = data[offset++], py = data[offset++];
+        x = startX = m[0] * px + m[2] * py + m[4];
+        y = startY = m[1] * px + m[3] * py + m[5];
+        continue;
+      }
+      let nx = startX, ny = startY;
+      if (verb === DRAW_LINE_TO) {
+        const px = data[offset++], py = data[offset++];
+        nx = m[0] * px + m[2] * py + m[4];
+        ny = m[1] * px + m[3] * py + m[5];
+      }
+      if (nx === x && ny === y && this.state.lineCap !== 1) continue;
+      strokes.sourceSegmentCount += 1;
+      const minX = Math.min(x, nx), minY = Math.min(y, ny);
+      const maxX = Math.max(x, nx), maxY = Math.max(y, ny);
+      if (minX - penHalfWidth <= clip.maxX && maxX + penHalfWidth >= clip.minX &&
+          minY - penHalfWidth <= clip.maxY && maxY + penHalfWidth >= clip.minY) {
+        const clipped = minX - penHalfWidth < clip.minX || maxX + penHalfWidth > clip.maxX ||
+          minY - penHalfWidth < clip.minY || maxY + penHalfWidth > clip.maxY;
+        strokes.emitPrimitive(x, y, nx, ny, nx, ny, STROKE_PRIMITIVE_LINE, halfWidth,
+          this.state.strokeR, this.state.strokeG, this.state.strokeB, 1,
+          flags | (clipped ? DENSE_PDF_STROKE_STYLE_FLAG_CLIPPED : 0),
+          clipped ? clip.minX : minX, clipped ? clip.minY : minY,
+          clipped ? clip.maxX : maxX, clipped ? clip.maxY : maxY);
+      }
+      x = nx; y = ny;
+    }
+    const count = strokes.primitiveCount - first;
+    if (count > 0) {
+      if (!this.diagnosedThumbnailStroke) {
+        this.diagnosedThumbnailStroke = true;
+        this.options.onDiagnostic?.({ code: "thumbnail.stroke-approximation", severity: "info",
+          message: "Thin overview polylines use a one-pixel preview pen with rounded caps and joins." });
+      }
+      this.recordPaintRun(DENSE_PDF_PAINT_RUN_STROKE, first, count);
+    }
+    this.path.clear();
+    return true;
+  }
+
+  private assertSupportedStrokeState(operator: string, previewStroke = false): void {
     // The compact unordered representation retains its established
     // approximation behavior. Source-ordered compilation must fail instead
     // of discarding visible stroke semantics.
     if (!this.policy.displayProgram) return;
-    if (this.state.lineCap === 2) {
+    if (this.state.lineCap === 2 && !previewStroke) {
       throw new DensePdfUnsupportedError(
         "Projecting-square line caps require the native stroke-style expansion.",
         operator
       );
     }
-    if (this.state.lineJoin !== 0 || Math.abs(this.state.miterLimit - 10) > 1e-6) {
+    if (!previewStroke && (this.state.lineJoin !== 0 || Math.abs(this.state.miterLimit - 10) > 1e-6)) {
       throw new DensePdfUnsupportedError(
         "The active line join or miter limit is not representable by the stroke store.",
         operator
       );
     }
-    if (this.state.strokeAdjustment) {
+    if (this.state.strokeAdjustment && !previewStroke) {
       throw new DensePdfUnsupportedError(
         "Stroke adjustment requires device-pixel-aware path placement.",
         operator
@@ -4263,6 +4369,31 @@ class DenseContentCompiler {
       }
     }
     if (!this.policy.displayProgram) return;
+    // Disposable root previews need neither per-operator provenance nor
+    // duplicate opaque paint metadata. Keep contiguous packed strokes in one
+    // run only while every visible scope and composite value stays identical.
+    if (this.options.thumbnail && this.options.thumbnailScale !== undefined &&
+        this.options.capturePaintSourceIdentities !== true && kind === DENSE_PDF_PAINT_RUN_STROKE &&
+        this.state.strokeAlpha === 1 && this.state.blendMode === "Normal" && this.state.softMaskIndex < 0 &&
+        this.paintRuns.length >= 3) {
+      const offset = this.paintRuns.length - 3;
+      const run = offset / 3;
+      const previous = this.paintRunCompositeStates[run];
+      const paint = this.pathPaints.at(-1);
+      if (this.paintRuns[offset] === kind && this.paintRuns[offset + 1] + this.paintRuns[offset + 2] === start &&
+          this.paintRunClipIndices[run] === this.state.clipIndex &&
+          this.paintRunOptionalContentIndices[run] === this.activeOptionalContentIndex &&
+          this.paintRunMarkedContentIndices[run] === this.activeMarkedContentIndex &&
+          previous.alpha === 1 && previous.blendMode === "Normal" && previous.softMaskIndex < 0 &&
+          previous.alphaIsShape === this.state.alphaIsShape && previous.overprint === this.state.strokeOverprint &&
+          previous.overprintMode === this.state.overprintMode && paint &&
+          paint.sourceColorSpaceIndex === this.state.strokeColorSpace.colorSpaceIndex &&
+          (paint.inheritType3Paint === true) === this.state.strokePaintInherited &&
+          paint.color[0] === this.state.strokeR && paint.color[1] === this.state.strokeG && paint.color[2] === this.state.strokeB) {
+        this.paintRuns[offset + 2] += count;
+        return;
+      }
+    }
     // A run is scoped to exactly one source painting operator. Even adjacent
     // compatible stores may be separated by a clip, group, marked-content, or
     // backdrop-sensitive state transition that has no geometry of its own.
@@ -7736,7 +7867,11 @@ function validateTextArray(values: PdfValue[]): void {
   }
 }
 
-function cloneState(state: GraphicsState): GraphicsState {
+function cloneState(state: GraphicsState, shareValues = false): GraphicsState {
+  // Thumbnail snapshots own their scalar state but share immutable values:
+  // cm, d/gs and clipping replace matrices, dashes, bounds and masks rather
+  // than mutating them. Keep that invariant when adding graphics operators.
+  if (shareValues) return { ...state };
   return {
     ...state,
     matrix: [...state.matrix],

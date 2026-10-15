@@ -114,6 +114,34 @@ try {
     await assert.rejects(compile(fixture([prefix + inline + " Q"]), false, { signal: controller.signal },
       () => controller.abort()), error => error.code === "aborted");
   }
+  // Thumbnail retained programs use the same lazy resource loader. Compare
+  // pixels against prepared input when first-use resources and inline images
+  // suspend/resume the shared token stream, including a chunk boundary.
+  for (const streams of [
+    [prefix + " ".repeat(256 * 1024 - prefix.length - 1) + inline + " Q", "2 J 0.2 w 10 30 m 90 30 l S"],
+    ["/Sh sh /Pattern cs /Gradient scn 0 0 50 100 re f"],
+    ["/Pattern cs /Gradient scn 0 0 50 100 re f q 50 0 50 100 re W n /Sh sh Q"],
+    ["/Pattern cs /P scn 10 10 30 30 re f q 10 10 10 10 re W n /Sh sh Q"]
+  ]) {
+    const bytes = fixture(streams, true), pixels = [];
+    for (const prepared of [true, false]) {
+      const session = await openPdf({ kind: "bytes", bytes }, {
+        missingFontResolver() { return { identifier: "thumbnail-stream", sfntBytes: buildTinySfnt() }; },
+        imageCodecResolver() {
+          return { samples: Uint8Array.of(100, 120, 140), width: 1, height: 1, components: 3, bitsPerComponent: 8 };
+        }
+      });
+      if (prepared) session.prepareStreamedPageResources = async () => null;
+      try {
+        const thumbnail = await session.renderThumbnailPage(0, {
+          maxDimension: 80, backend: "canvas2d", background: [1, 1, 1, 1]
+        });
+        assert.deepEqual([thumbnail.width, thumbnail.height], [80, 80]);
+        pixels.push(thumbnail.rgba);
+      } finally { await session.close(); }
+    }
+    assert.deepEqual(pixels[1], pixels[0], "streamed thumbnail resources preserve prepared thumbnail pixels");
+  }
   console.log("Streamed inline boundaries, resource loading, limits, cancellation, and second-pass reuse passed.");
 
   async function compile(bytes, prepared, options = {}, onCodec) {

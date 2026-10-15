@@ -16,6 +16,12 @@ interface ProcessingSessionEncoder {
   close(): void | Promise<void>;
 }
 
+interface CompletedThumbnail {
+  readonly key: string;
+  readonly result: Readonly<PdfThumbnailResult>;
+  readonly diagnostics: readonly PdfDiagnostic[];
+}
+
 /** Platform-specific resources stay owned by the same reusable session. */
 export interface ProcessingSessionServices {
   readonly canvas2dOnly?: boolean;
@@ -77,6 +83,9 @@ export class ProcessingSession implements DocumentSession {
   private renderer: ThumbnailSceneRenderer | undefined;
   private encoder: ProcessingSessionEncoder | undefined;
   private partition: ScenePageViews | undefined;
+  // Retain only the last encoded overview. The parser separately reuses its
+  // last prepared page; temporary pixels are released after encoding.
+  private completedThumbnail: CompletedThumbnail | undefined;
   private canvas2dOnly = false;
   private readonly sourceByteLength: number;
   private readonly label: string;
@@ -110,8 +119,25 @@ export class ProcessingSession implements DocumentSession {
     const page = (options.page ?? 1) - 1;
     if (page >= this.info.pageCount) throw new RangeError("page is outside this document.");
     const started = performance.now();
+    let completedThumbnail: CompletedThumbnail | undefined;
     return this.run(options.signal, async signal => {
+      // Include every normalized rendering field and the requested backend,
+      // even when Node's auto routing resolves to the same Canvas2D backend.
+      const key = JSON.stringify({ page, format: options.format ?? "webp", ...renderOptions, backend: normalized.backend });
+      const cached = this.completedThumbnail;
+      if (cached?.key === key) {
+        if (options.onDiagnostic !== this.openOptions.onDiagnostic) {
+          for (const diagnostic of cached.diagnostics) { signal.throwIfAborted(); options.onDiagnostic?.(copyThumbnailDiagnostic(diagnostic)); }
+        }
+        signal.throwIfAborted();
+        // No preparation, drawing or encoding ran. Report actual return time
+        // without replaying old durations or inventing zero-cost stage work.
+        options.onTiming?.({ stage: "total", durationMs: performance.now() - started });
+        signal.throwIfAborted();
+        return { ...cached.result };
+      }
       const diagnosticStart = this.diagnostics.length;
+      let completed: PdfThumbnailResult | undefined;
       try {
         const prepareStart = performance.now();
         let pixels;
@@ -179,13 +205,21 @@ export class ProcessingSession implements DocumentSession {
         options.onTiming?.({ stage: "encode", durationMs: performance.now() - encodeStart });
         options.onTiming?.({ stage: "total", durationMs: performance.now() - started });
         signal.throwIfAborted();
-        return { blob, width: pixels.width, height: pixels.height };
+        completed = { blob, width: pixels.width, height: pixels.height };
+        return { ...completed };
       } finally {
+        const diagnostics = completed ? this.diagnostics.slice(diagnosticStart).map(copyThumbnailDiagnostic) : undefined;
         if (options.onDiagnostic !== this.openOptions.onDiagnostic) {
           for (const diagnostic of this.diagnostics.slice(diagnosticStart)) options.onDiagnostic?.(diagnostic);
         }
+        signal.throwIfAborted();
+        if (completed) {
+          completedThumbnail = Object.freeze({ key, result: Object.freeze(completed),
+            diagnostics: Object.freeze(diagnostics!.map(diagnostic => Object.freeze({ ...diagnostic,
+              ...(diagnostic.details ? { details: Object.freeze({ ...diagnostic.details }) } : {}) }))) });
+        }
       }
-    });
+    }, () => { if (completedThumbnail) this.completedThumbnail = completedThumbnail; });
   }
 
   buildHep(options: DocumentSessionHepOptions = {}): Promise<Blob> {
@@ -236,6 +270,7 @@ export class ProcessingSession implements DocumentSession {
 
   private async closeInternal(): Promise<void> {
     this.lifetime.abort(new DOMException("Document session closed.", "AbortError"));
+    this.completedThumbnail = undefined;
     const encoder = this.encoder;
     try {
       await Promise.all([
@@ -259,7 +294,8 @@ export class ProcessingSession implements DocumentSession {
     }
   }
 
-  private run<T>(signal: AbortSignal | undefined, operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  private run<T>(signal: AbortSignal | undefined, operation: (signal: AbortSignal) => Promise<T>,
+    onSuccess?: (value: T) => void): Promise<T> {
     if (this.lifetime.signal.aborted) return Promise.reject(new PdfError("closed", "The document session is closed."));
     const combined = signal ? AbortSignal.any([this.lifetime.signal, signal]) : this.lifetime.signal;
     const result = this.tail.then(async () => {
@@ -267,7 +303,18 @@ export class ProcessingSession implements DocumentSession {
       try { const value = await operation(combined); combined.throwIfAborted(); return value; }
       catch (error) { combined.throwIfAborted(); throw error; }
     });
-    this.tail = result.then(() => {}, () => {});
-    return waitForLoad(result, combined);
+    const completed = waitForLoad(result, combined).then(value => {
+      combined.throwIfAborted();
+      onSuccess?.(value);
+      return value;
+    });
+    // Early cancellation still drains the underlying operation. Publication
+    // commits only an accepted result, before the next queued request enters.
+    this.tail = result.then(() => completed, () => completed).then(() => {}, () => {});
+    return completed;
   }
+}
+
+function copyThumbnailDiagnostic(diagnostic: PdfDiagnostic): PdfDiagnostic {
+  return { ...diagnostic, ...(diagnostic.details ? { details: { ...diagnostic.details } } : {}) };
 }

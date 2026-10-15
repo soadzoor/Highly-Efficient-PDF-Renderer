@@ -37,6 +37,20 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Changed
 
+- Speed up thumbnail preparation with streamed resource loading, shared preview
+  transforms/styles, and compact isolated strokes. Batch compatible opaque
+  drawing, reuse clipping and paint state, and use output-pixel curve detail
+  with stronger one-pixel overview strokes. Keep thin opaque root polylines in
+  compact stroke storage with rounded caps and joins, share unchanged graphics
+  state, reuse the interpreter's text transform, and avoid temporary packed
+  resource wrappers during adaptation. Subpixel square caps may be rounded;
+  thumbnail approximations remain separate from canonical HEP output. Reuse the
+  last successful session thumbnail for identical requests, preserving
+  cancellation and reporting only actual total timing on cache hits. Retain one
+  prepared thumbnail page for repainting with different colors or formats;
+  changing page, resolution or layer-retention policy prepares a new preview.
+  Worker fallbacks release storage transferred to the owning host, and session
+  close clears both caches.
 - Use the shared thumbnail pipeline in native and Three Reader sidebars, with
   direct pixels instead of an encode/decode round trip. Share active PDF parser
   sessions, prioritize viewport work, and preserve appearance controls and

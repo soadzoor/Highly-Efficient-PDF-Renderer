@@ -44,7 +44,8 @@ export class ThumbnailSceneRenderer {
     const bounds = scene.pageBounds;
     const size = thumbnailSize(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY, options.maxDimension);
     if (!Number.isSafeInteger(size.width * size.height * 4)) throw new RangeError("Thumbnail pixel dimensions exceed safe integer limits.");
-    const local = copyScene(scene);
+    const pixelsPerPageUnit = Math.min(size.width / (bounds.maxX - bounds.minX), size.height / (bounds.maxY - bounds.minY));
+    const local = copyScene(scene, .5 / pixelsPerPageUnit);
     const visibility = thumbnailVisibility(local, options.optionalContent);
     const background = validateColor(options.background);
     const vector = validateColor(options.vectorOverride ?? [0, 0, 0, 0]);
@@ -133,7 +134,7 @@ export async function renderThumbnailScene(scene: VectorScene, options: Thumbnai
   finally { renderer.close(); }
 }
 
-function copyScene(scene: VectorScene): VectorScene {
+function copyScene(scene: VectorScene, minHalfWidth: number): VectorScene {
   const descriptors = Object.getOwnPropertyDescriptors(scene);
   descriptors.drawRuns = { enumerable: true, configurable: true, writable: true,
     value: scene.drawRuns ?? defaultVectorDrawRuns(scene) };
@@ -141,6 +142,20 @@ function copyScene(scene: VectorScene): VectorScene {
   // Static thumbnails draw the available content without that animation.
   descriptors.pendingPagePreviews = { enumerable: true, configurable: true, writable: true, value: undefined };
   const local = Object.defineProperties({}, descriptors) as VectorScene;
+  // Keep positive linework legible at overview resolution. The GPU scheduler
+  // and clip elision also read these local styles, so their overlap bounds
+  // include the wider strokes. Zero-width device hairlines stay shader-owned.
+  for (const key of ["styles", "gradientStrokeStyles"] as const) {
+    const styles = local[key]?.slice();
+    if (!styles) continue;
+    local[key] = styles;
+    for (let offset = 0; offset < styles.length; offset += 4) {
+      if (styles[offset] > 0 && styles[offset] < minHalfWidth) {
+        styles[offset] = minHalfWidth;
+        if (key === "styles") local.maxHalfWidth = Math.max(local.maxHalfWidth, styles[offset]);
+      }
+    }
+  }
   compactGlyphs(local);
   return local;
 }

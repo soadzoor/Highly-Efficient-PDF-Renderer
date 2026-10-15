@@ -81,7 +81,13 @@ to the one-shot call. The requested resolution reaches preparation before render
 images, curves, clipping and compatibility surfaces use thumbnail detail, and
 unreadable ordinary glyphs may use inexpensive ink marks. These approximations
 prioritize layout, orientation, dominant shapes and colors over tiny labels or
-exact fine detail. Public thumbnails retain scanned-page appearance.
+exact fine detail. Thin overview strokes use a one-pixel minimum pen for more
+recognizable linework. Canvas2D batches compatible opaque paths, reuses clip
+state and flattens overview curves in output pixels; complex paints keep their
+compatibility rendering. Thin, opaque, solid root-page polylines use a compact
+one-pixel pen with rounded caps and joins. Dashed, thick, translucent, masked
+and nested-program paths retain their compatibility geometry. Public thumbnails
+retain scanned-page appearance.
 
 The parser and snapshot renderer run in a module worker when supported; browser
 capabilities determine fallback. The lossless WebP codec is a lazy package-local
@@ -131,6 +137,21 @@ changing them requires another session. Each operation accepts its own cancellat
 signal. Cancelling one thumbnail leaves the session usable. Operations are serialized;
 thumbnail derivatives never replace canonical HEP resources. HEP sessions re-encode
 their existing canonical scene without recovering detail absent from that HEP.
+
+A session retains its last completed thumbnail. Repeating the same normalized
+page, size, background, format and backend returns the immutable image Blob
+without preparing, drawing or encoding again. A different request replaces that
+entry only after success; failed or cancelled requests leave the prior result
+available. Cache hits still check cancellation and report only their actual
+`total` timing. Closing the session releases the cached result.
+
+The parser also retains one prepared thumbnail page after native rendering.
+Changing only paint or encoding options, such as background, vector color or
+format, redraws that page without interpreting the PDF again. Resolution,
+page or layer-retention changes require preparation. Layer visibility is
+applied to a separate view of the cached page. Worker capability fallbacks
+that transfer a prepared page or scene to the host do not retain that storage.
+Closing the session releases this prepared representation too.
 
 For local browser timing and visual checks, open `thumbnail-benchmark.html` on the
 manually started development or production-preview server. Select a local document;

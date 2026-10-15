@@ -158,6 +158,31 @@ try {
     "interning also reuses non-adjacent equal matrices");
   assert.notEqual(variants.getPath(0).transform, variants.getPath(1).transform);
 
+  const preview = new DensePdfRetainedResourceBuilder(true);
+  const previewMatrix = [1.0000000000000002, -0, .25, .75, 2 ** 40 + .5, -3.0000000000000004];
+  const expectedPreviewMatrix = previewMatrix.slice();
+  const otherPreviewMatrix = [2, .5, -.25, 1, -7, 11];
+  for (const transform of [previewMatrix, [...previewMatrix], otherPreviewMatrix, [...previewMatrix]]) {
+    preview.appendPath(normal, transform, zeroBounds);
+  }
+  previewMatrix.fill(99); otherPreviewMatrix.fill(99);
+  assert.equal(preview.getPath(0).transform, preview.getPath(1).transform,
+    "thumbnail capture still reuses consecutive equal CTMs");
+  assert.notEqual(preview.getPath(0).transform, preview.getPath(3).transform,
+    "thumbnail capture avoids global interning of nonadjacent CTMs");
+  assert.deepEqual(preview.getPath(0).transform, expectedPreviewMatrix,
+    "thumbnail matrices remain owned, exact and immutable after caller mutation");
+  assert.deepEqual(preview.getPath(3).transform, expectedPreviewMatrix);
+  assert(Object.is(preview.getPath(0).transform[1], -0));
+  assert(Object.isFrozen(preview.getPath(0).transform));
+  const previewPacked = await preview.finish(async () => {});
+  assert.equal(previewPacked.matrices.length, 3);
+  const clonedPreview = { ...legacy, packedRetainedResources: structuredClone(previewPacked) };
+  for (let index = 0; index < preview.pathCount; index++) {
+    assert.deepEqual(getDensePdfPagePath(clonedPreview, index), preview.getPath(index),
+      "thumbnail captures remain exact across the parser worker boundary");
+  }
+
   const empty = await new DensePdfRetainedResourceBuilder().finish(async () => {});
   assert.equal(densePdfPagePathCount({ ...legacy, packedRetainedResources: empty }), 0);
   assert.equal(densePdfGenericPathPaintCount({ ...legacy, packedRetainedResources: empty }), 0);
