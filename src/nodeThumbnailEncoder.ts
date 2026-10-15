@@ -25,6 +25,7 @@ interface WorkerHandle {
   readonly onMessage: (response: ThumbnailEncodeResponse) => void;
   readonly onError: (error: Error) => void;
   readonly onExit: (code: number) => void;
+  readonly warmed: Set<ThumbnailEncodingFormat>;
   terminating?: Promise<void>;
 }
 interface EncodeJob {
@@ -56,6 +57,14 @@ export class NodeThumbnailEncoder {
   private closing?: Promise<void>;
 
   constructor(options: NodeThumbnailEncoderOptions = {}) { this.options = options; }
+
+  /** Start this session's thread and codec while its PDF worker prepares pixels. */
+  async warm(format: ThumbnailEncodingFormat, signal?: AbortSignal): Promise<void> {
+    throwIfThumbnailEncodingCancelled(signal);
+    if (this.closed) throw new Error("The thumbnail encoder is closed.");
+    if (this.worker?.warmed.has(format)) return;
+    await this.encode({ width: 1, height: 1, rgba: new Uint8Array(4) }, format, signal);
+  }
 
   encode(pixels: ThumbnailPixels, format: ThumbnailEncodingFormat, signal?: AbortSignal,
     onDiagnostic?: (diagnostic: PdfDiagnostic) => void): Promise<Blob> {
@@ -122,6 +131,7 @@ export class NodeThumbnailEncoder {
         });
         const handle: WorkerHandle = {
           worker,
+          warmed: new Set(),
           onMessage: response => this.receive(handle, response),
           onError: error => this.fail(handle, error),
           onExit: code => this.fail(handle, new Error(`The thumbnail encoder worker exited (${code}).`))
@@ -149,6 +159,7 @@ export class NodeThumbnailEncoder {
     if (!job || job.worker !== handle || response.id !== job.id) return;
     this.active = undefined;
     try {
+      if (response.blob) handle.warmed.add(job.format);
       for (const diagnostic of response.diagnostics ?? []) job.onDiagnostic?.(diagnostic);
       this.settle(job, response.blob, response.error ? new Error(response.error) : undefined);
     } catch (error) { this.settle(job, undefined, error); }

@@ -28,7 +28,7 @@ export async function renderThumbnailPageCanvas2d(page: HeprPageData, options: T
       signal, surfaceFactory: measuredFactory, maxCanvasPixels: limits?.maxImagePixels,
       maxWorkingPixels: limits === undefined ? undefined : Math.floor(limits.maxDecodedStreamBytes / 4),
       onDiagnostic }, renderHeprPageToCanvas2d,
-    { timings, vectorOverride: options.vectorOverride, outputSize: size, thumbnail: true, trustedPage });
+    { timings, vectorOverride: options.vectorOverride, outputSize: size, thumbnail: true, thumbnailPixelStrokes: true, trustedPage });
     signal?.throwIfAborted();
     // Native Canvas backends can return external, non-transferable buffers.
     return { width: pixels.width, height: pixels.height, rgba: Uint8Array.from(pixels.rgba),

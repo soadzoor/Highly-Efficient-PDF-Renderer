@@ -45,6 +45,7 @@ import type { NativeGlyphPathCommand } from "./pdf/nativeFont";
 import { paintNativeGlyphCommands } from "./pdf/nativeGlyphPaint";
 import { buildNativeGlyphHairline } from "./pdf/nativeGlyphHairline";
 import { ThumbnailCanvasPath } from "./thumbnailCanvasPath";
+import { ThumbnailLineCoverage } from "./thumbnailLineCoverage";
 
 export const HEPR_CANVAS_2D_ERROR_CODES = Object.freeze({
   InvalidOptions: "canvas2d.invalid-options",
@@ -183,6 +184,8 @@ export interface HeprCanvas2dTimings {
 export interface HeprCanvas2dRenderInternals {
   /** Overview-only device-space paths and opaque stroke batching. */
   readonly thumbnail?: boolean;
+  /** Binary pixel coverage for compact, opaque one-pixel overview line spans. */
+  readonly thumbnailPixelStrokes?: boolean;
   /** Operation-owned input already validated by its caller. Never inferred from thumbnail mode. */
   readonly trustedPage?: boolean;
   /** Snapshot-only rounded backing dimensions, independent of canonical page geometry. */
@@ -386,6 +389,7 @@ interface PatternRuntime {
 
 interface InternalCanvasBackendOptions {
   readonly thumbnail?: boolean;
+  readonly thumbnailPixelStrokes?: boolean;
   readonly vectorOverride?: readonly [number, number, number, number];
   readonly deviceMatrix: PdfMatrix;
   readonly width: number;
@@ -472,7 +476,8 @@ export async function renderHeprPageToCanvas2d(
     vectorOverride: internal.vectorOverride,
     imageSurfaces: internal.imageSurfaces,
     boundSoftMasks: internal.boundSoftMasks,
-    thumbnail: internal.thumbnail
+    thumbnail: internal.thumbnail,
+    thumbnailPixelStrokes: internal.thumbnailPixelStrokes
   });
   try {
     const stats = await executeHeprDisplayProgram(page, backend, {
@@ -511,14 +516,19 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
   private readonly sharedImages: HeprCanvas2dImageSurfaceCache | undefined;
   private readonly boundSoftMasks: boolean;
   private readonly thumbnail: boolean;
+  private readonly thumbnailPixelStrokes: boolean;
   private readonly thumbnailPaths: ThumbnailCanvasPath | undefined;
+  private thumbnailCoverage: ThumbnailLineCoverage | undefined;
+  private thumbnailCoveragePixels = 0;
   private thumbnailContext: CanvasRenderingContext2D | null = null;
   private thumbnailClips: HeprExecutionClipScope | null = null;
   private thumbnailStroke: { readonly paint: SolidPaint; readonly width: number;
-    readonly cap: CanvasLineCap; readonly join: CanvasLineJoin; readonly miter: number } | null = null;
+    readonly cap: CanvasLineCap; readonly join: CanvasLineJoin; readonly miter: number; readonly coverage: boolean } | null = null;
   private thumbnailFill: SolidPaint | null = null;
   private readonly thumbnailPaints = new Map<number, ResolvedPaint>();
+  private thumbnailGlyphRecords: Map<number, Map<number, number>> | undefined;
   private diagnosedThumbnail = false;
+  private diagnosedThumbnailPixels = false;
   private functionEvaluator: HeprFunctionEvaluator | null = null;
   private colorEvaluator: HeprColorEvaluator | null = null;
   private liveWorkingPixels = 0;
@@ -538,6 +548,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     this.vectorOverride = internal?.vectorOverride;
     this.boundSoftMasks = internal?.boundSoftMasks === true;
     this.thumbnail = internal?.thumbnail === true;
+    this.thumbnailPixelStrokes = this.thumbnail && internal?.thumbnailPixelStrokes === true;
     this.thumbnailPaths = this.thumbnail ? new ThumbnailCanvasPath(page.stores.paths, options.signal) : undefined;
     this.options = isResolvedOptions(options) ? options : resolveOptions(options);
     this.sharedImages = internal?.imageSurfaces;
@@ -685,7 +696,8 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     if (frame.discard || execution.command.count === 0) return;
     if (this.thumbnail && !this.frames.some(frame => frame.execution.role === "soft-mask") &&
         (this.drawThumbnailPaths(frame.surface.context, execution) ||
-          this.drawThumbnailDenseStrokes(frame.surface.context, execution))) return;
+          this.drawThumbnailDenseStrokes(frame.surface.context, execution) ||
+          this.drawThumbnailGlyphs(frame.surface.context, execution))) return;
     this.resetThumbnailState();
     switch (execution.command.source) {
       case "paths":
@@ -725,6 +737,9 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     this.gradientStopCache.clear();
     this.localImageSurfaces.clear();
     this.thumbnailPaints.clear();
+    this.thumbnailGlyphRecords?.clear();
+    this.thumbnailCoverage = undefined;
+    this.thumbnailCoveragePixels = 0;
     this.sharedImages?.endRender();
     if (this.ownsPatternRuntime) {
       this.patternRuntime.active.clear();
@@ -1002,8 +1017,11 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     if (!(scale > 0) || !(otherScale > 0) || !Number.isFinite(determinant) || determinant === 0) return false;
     const penScale = Math.sqrt(Math.abs(determinant));
     const similarity = isSimilarityTransform(matrix);
+    const pixelStrokes = this.thumbnailPixelStrokes && this.page.stores.paints.overprint[paint.index] === 0 && !this.frames.some(frame =>
+      frame.execution.alpha !== 1 || frame.execution.blendMode !== "Normal" || frame.execution.softMaskGroupIndex >= 0);
     const strokes = this.page.stores.strokes;
     const last = command.first + command.count;
+    let wholeCoverage = pixelStrokes && paint.alpha === 1;
     // Decide before appending any geometry: falling back after part of a run
     // would apply its paint twice. This scan allocates no per-segment objects.
     for (let index = command.first; index < last; index++) {
@@ -1016,9 +1034,36 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
       const localWidth = strokes.styles[offset] * 2;
       const hairline = localWidth === 0 || (styleFlags & DENSE_STYLE_FLAG_HAIRLINE) !== 0;
       if (!similarity && !hairline && localWidth * Math.max(scale, otherScale) > 1) return false;
+      if (wholeCoverage && ((styleFlags & DENSE_STYLE_FLAG_ROUND_CAP) === 0 ||
+          clamp01(strokes.primitiveMeta[offset + 3] - styleFlags * DENSE_STYLE_FLAG_OFFSET) !== 1 ||
+          (!hairline && localWidth * penScale > 1))) wholeCoverage = false;
     }
     this.diagnoseThumbnailApproximation();
     this.ensureThumbnailContext(context, execution.state.clips);
+    if (wholeCoverage && this.canUseThumbnailCoverage()) {
+      // One preflight certifies the entire common CAD span. Avoid decoding its
+      // paint/style and reopening the same coverage batch for every segment.
+      this.beginThumbnailStroke(paint, 1, "round", "miter", 10, true);
+      const coverage = this.thumbnailCoverage!, endpoints = strokes.endpoints, meta = strokes.primitiveMeta;
+      const [a, b, c, d, e, f] = matrix, end = last * 4, signal = this.options.signal;
+      signal?.throwIfAborted();
+      if (b === 0 && c === 0) {
+        for (let offset = command.first * 4; offset < end; offset += 4) {
+          if ((offset & 0xfff) === 0) signal?.throwIfAborted();
+          coverage.appendLine(a * endpoints[offset] + e, d * endpoints[offset + 1] + f,
+            a * meta[offset] + e, d * meta[offset + 1] + f);
+        }
+      } else {
+        for (let offset = command.first * 4; offset < end; offset += 4) {
+          if ((offset & 0xfff) === 0) signal?.throwIfAborted();
+          const x0 = endpoints[offset], y0 = endpoints[offset + 1], x1 = meta[offset], y1 = meta[offset + 1];
+          coverage.appendLine(a * x0 + c * y0 + e, b * x0 + d * y0 + f,
+            a * x1 + c * y1 + e, b * x1 + d * y1 + f);
+        }
+      }
+      signal?.throwIfAborted();
+      return true;
+    }
     for (let index = command.first; index < last; index++) {
       this.options.signal?.throwIfAborted();
       const offset = index * 4;
@@ -1030,7 +1075,8 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
       const width = hairline ? 1 : Math.max(1, strokes.styles[offset] * 2 * penScale);
       const cap = (styleFlags & DENSE_STYLE_FLAG_ROUND_CAP) !== 0 ? "round" : "butt";
       const alpha = paint.alpha * primitiveAlpha;
-      if (alpha === 1) this.beginThumbnailStroke(paint, width, cap, "miter", 10);
+      const coverage = pixelStrokes && alpha === 1 && width === 1 && cap === "round" && this.canUseThumbnailCoverage();
+      if (alpha === 1) this.beginThumbnailStroke(paint, width, cap, "miter", 10, coverage);
       else {
         this.flushThumbnailStroke();
         context.beginPath();
@@ -1045,10 +1091,72 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
       }
       const x0 = strokes.endpoints[offset], y0 = strokes.endpoints[offset + 1];
       const x1 = strokes.primitiveMeta[offset], y1 = strokes.primitiveMeta[offset + 1];
-      context.moveTo(matrix[0] * x0 + matrix[2] * y0 + matrix[4], matrix[1] * x0 + matrix[3] * y0 + matrix[5]);
-      context.lineTo(matrix[0] * x1 + matrix[2] * y1 + matrix[4], matrix[1] * x1 + matrix[3] * y1 + matrix[5]);
+      const deviceX0 = matrix[0] * x0 + matrix[2] * y0 + matrix[4], deviceY0 = matrix[1] * x0 + matrix[3] * y0 + matrix[5];
+      const deviceX1 = matrix[0] * x1 + matrix[2] * y1 + matrix[4], deviceY1 = matrix[1] * x1 + matrix[3] * y1 + matrix[5];
+      if (coverage) this.thumbnailCoverage!.appendLine(deviceX0, deviceY0, deviceX1, deviceY1);
+      else {
+        context.moveTo(deviceX0, deviceY0);
+        context.lineTo(deviceX1, deviceY1);
+      }
       if (alpha !== 1) context.stroke();
     }
+    return true;
+  }
+
+  /** Solid filled text preserves one paint boundary per glyph. Only transient
+   * clip/color state and outline lookups are shared; glyph geometry stays exact. */
+  private drawThumbnailGlyphs(context: CanvasRenderingContext2D, execution: HeprDrawRunExecution): boolean {
+    const command = execution.command;
+    if (command.source !== "glyphs" || command.renderingMode !== 0) return false;
+    const fill = this.readOptionalPaint(command.fillPaintIndex, false, execution, "fillPaintIndex");
+    if (!fill?.visible) return true;
+    if (fill.kind !== "solid") return false;
+    const glyphs = this.page.stores.glyphs, last = command.first + command.count;
+    for (let index = command.first; index < last; index++) {
+      if ((glyphs.flags[index] & HEPR_GLYPH_FLAG.Type3) !== 0 &&
+          (glyphs.flags[index] & HEPR_GLYPH_FLAG.Invisible) === 0) return false;
+    }
+    this.flushThumbnailStroke();
+    this.ensureThumbnailContext(context, execution.state.clips);
+    if (this.thumbnailFill !== fill) {
+      context.globalAlpha = fill.alpha;
+      context.fillStyle = fill.css;
+      this.thumbnailFill = fill;
+    }
+    const records = this.thumbnailGlyphRecords ??= new Map<number, Map<number, number>>();
+    const transforms = this.page.stores.transforms.values, fonts = this.page.stores.fonts;
+    const owner = execution.state.transform, device = this.deviceMatrix;
+    for (let index = command.first; index < last; index++) {
+      this.options.signal?.throwIfAborted();
+      if ((glyphs.flags[index] & HEPR_GLYPH_FLAG.Invisible) !== 0) continue;
+      const font = glyphs.fontIndices[index], glyph = glyphs.glyphIds[index];
+      let fontRecords = records.get(font);
+      if (!fontRecords) { fontRecords = new Map<number, number>(); records.set(font, fontRecords); }
+      let record = fontRecords.get(glyph);
+      if (record === undefined) { record = findGlyphRecord(this.page, font, glyph); fontRecords.set(glyph, record); }
+      if (record < 0) {
+        throw canvasError(HEPR_CANVAS_2D_ERROR_CODES.UnsupportedPaint,
+          `Visible glyph ${index} has no derived outline.`, `${execution.commandPath}.first`);
+      }
+      const count = fonts.outlinePathCounts[record];
+      if (count === 0) continue;
+      const offset = glyphs.transformIndices[index] * 6;
+      const ga = transforms[offset], gb = transforms[offset + 1], gc = transforms[offset + 2];
+      const gd = transforms[offset + 3], ge = transforms[offset + 4], gf = transforms[offset + 5];
+      // Retain the reference multiplication order (owner * glyph, then device)
+      // without allocating three six-element matrices for every glyph.
+      const a = owner[0] * ga + owner[2] * gb, b = owner[1] * ga + owner[3] * gb;
+      const c = owner[0] * gc + owner[2] * gd, d = owner[1] * gc + owner[3] * gd;
+      const e = owner[0] * ge + owner[2] * gf + owner[4], f = owner[1] * ge + owner[3] * gf + owner[5];
+      context.setTransform(device[0] * a + device[2] * b, device[1] * a + device[3] * b,
+        device[0] * c + device[2] * d, device[1] * c + device[3] * d,
+        device[0] * e + device[2] * f + device[4], device[1] * e + device[3] * f + device[5]);
+      context.beginPath();
+      const first = fonts.outlinePathStarts[record];
+      for (let path = first; path < first + count; path++) appendStoredPath(context, this.page, path);
+      context.fill("nonzero");
+    }
+    setCanvasTransform(context, IDENTITY);
     return true;
   }
 
@@ -1060,29 +1168,59 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
       message: "Overview curves use pixel-space detail and thin strokes use a one-pixel pen." });
   }
 
-  private beginThumbnailStroke(paint: SolidPaint, width: number, cap: CanvasLineCap, join: CanvasLineJoin, miter: number): void {
+  private canUseThumbnailCoverage(): boolean {
+    if (!this.thumbnailPixelStrokes) return false;
+    if (this.thumbnailCoverage) return true;
+    // One coverage byte per output pixel plus two Int32 bounds per row. Keep
+    // the existing native path when the caller's scratch budget has no room.
+    const pixels = Math.ceil((this.width * this.height + this.height * 8) / 4);
+    if (pixels > this.options.maxWorkingPixels - this.liveWorkingPixels - (this.sharedImages?.pixelCount ?? 0)) return false;
+    this.thumbnailCoverage = new ThumbnailLineCoverage(this.width, this.height);
+    this.thumbnailCoveragePixels = pixels;
+    this.liveWorkingPixels += pixels;
+    return true;
+  }
+
+  private beginThumbnailStroke(paint: SolidPaint, width: number, cap: CanvasLineCap, join: CanvasLineJoin, miter: number, coverage = false): void {
     const previous = this.thumbnailStroke;
     // Source style indices can differ for every object; compare visible values.
     if (previous && previous.paint === paint && previous.width === width && previous.cap === cap &&
-        previous.join === join && previous.miter === miter) return;
+        previous.join === join && previous.miter === miter && previous.coverage === coverage) return;
     this.flushThumbnailStroke();
     const context = this.thumbnailContext!;
-    context.beginPath();
-    context.globalAlpha = 1;
-    context.strokeStyle = paint.css;
-    context.lineWidth = width;
-    context.lineCap = cap;
-    context.lineJoin = join;
-    context.miterLimit = miter;
-    context.setLineDash([]);
+    if (coverage) {
+      if (!this.diagnosedThumbnailPixels) {
+        this.diagnosedThumbnailPixels = true;
+        this.options.onDiagnostic?.({ code: "thumbnail.pixel-stroke-approximation", severity: "info",
+          pageIndex: this.page.pageInfo.sourcePageIndex,
+          message: "Opaque one-pixel overview lines use coarse pixel coverage without stroke antialiasing." });
+      }
+    } else {
+      context.beginPath();
+      context.globalAlpha = 1;
+      context.strokeStyle = paint.css;
+      context.lineWidth = width;
+      context.lineCap = cap;
+      context.lineJoin = join;
+      context.miterLimit = miter;
+      context.setLineDash([]);
+    }
     this.thumbnailFill = null;
-    this.thumbnailStroke = { paint, width, cap, join, miter };
+    this.thumbnailStroke = { paint, width, cap, join, miter, coverage };
   }
 
   private flushThumbnailStroke(): void {
     if (!this.thumbnailStroke) return;
     this.options.signal?.throwIfAborted();
-    this.thumbnailContext!.stroke();
+    const context = this.thumbnailContext!;
+    if (this.thumbnailStroke.coverage) {
+      context.beginPath();
+      this.thumbnailCoverage!.appendRectangles(context, this.options.signal);
+      this.options.signal?.throwIfAborted();
+      context.globalAlpha = 1;
+      context.fillStyle = this.thumbnailStroke.paint.css;
+      context.fill();
+    } else context.stroke();
     this.thumbnailStroke = null;
   }
 
@@ -1102,6 +1240,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     try { if (paint) this.flushThumbnailStroke(); }
     finally {
       this.thumbnailStroke = null;
+      this.thumbnailCoverage?.clear();
       this.thumbnailFill = null;
       if (this.thumbnailContext) this.thumbnailContext.restore();
       this.thumbnailContext = null;
@@ -3480,6 +3619,14 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
       this.localImageSurfaces.delete(key);
       this.imageCache.delete(key);
       this.releasePixels(image.accountedPixels);
+    }
+    if (this.thumbnailCoverage && !this.thumbnailStroke?.coverage &&
+        pixels > this.options.maxWorkingPixels - this.liveWorkingPixels - (this.sharedImages?.pixelCount ?? 0)) {
+      // Completed overview coverage is a disposable optimization. Release it
+      // before refusing a required image/group surface under the caller's cap.
+      this.thumbnailCoverage = undefined;
+      this.releasePixels(this.thumbnailCoveragePixels);
+      this.thumbnailCoveragePixels = 0;
     }
     if (pixels > this.options.maxWorkingPixels - this.liveWorkingPixels -
         (this.sharedImages?.pixelCount ?? 0)) {

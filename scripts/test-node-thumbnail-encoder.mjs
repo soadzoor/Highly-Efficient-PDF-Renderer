@@ -16,6 +16,10 @@ try {
   const fixture = { width: 2, height: 2, rgba: Uint8Array.of(20, 100, 200, 0, 70, 30, 210, 1, 250, 255, 190, 128, 25, 150, 40, 255) };
   const before = fixture.rgba.slice(), encoder = createEncoder();
   assert.equal(resolveNodeThumbnailEncoderWorkerUrl().protocol, "data:", "direct source use boots the local TypeScript worker with an extension resolver");
+  await encoder.warm("webp");
+  const warmedWorker = encoder.worker.worker, afterWarmId = encoder.nextId;
+  await encoder.warm("webp");
+  assert.equal(encoder.nextId, afterWarmId, "an already warmed codec does no extra pixel encoding");
   for (const format of ["webp", "png"]) {
     const result = await encoder.encode(fixture, format);
     assert.equal(result.type, `image/${format}`);
@@ -24,6 +28,7 @@ try {
       "the Node worker uses the same exact pixel encoder as browser workers");
   }
   assert.deepEqual(fixture.rgba, before, "caller pixels remain attached and unchanged");
+  assert.equal(encoder.worker.worker, warmedWorker, "real output reuses the prewarmed thread and compiled codec");
   const reusedWorker = encoder.worker.worker;
   const pooled = { width: 1, height: 1, rgba: Buffer.from([1, 10, 100, 255]) }, pooledBefore = Buffer.from(pooled.rgba);
   await encoder.encode(pooled, "webp");
@@ -47,6 +52,7 @@ try {
   const invalid = createEncoder(), preAborted = new AbortController(); preAborted.abort(startupReason);
   await assert.rejects(invalid.encode(fixture, "webp", preAborted.signal), error => error === startupReason);
   await assert.rejects(invalid.encode({ ...fixture, rgba: new Uint8Array(1) }, "png"), RangeError);
+  await assert.rejects(invalid.warm("webp", preAborted.signal), error => error === startupReason);
   assert.equal(invalid.worker, undefined, "invalid and pre-aborted calls never create a thread");
 
   const workerEntry = new URL("../src/nodeThumbnailEncodeWorker.ts", import.meta.url).href;
@@ -67,6 +73,22 @@ await import(${JSON.stringify(workerEntry)});
 `;
   const workerUrl = pathToFileURL(join(scratch, "instrumented-worker.mjs"));
   await writeFile(workerUrl, bootstrap);
+  const warming = createEncoder({ workerUrl }), warmAbort = new AbortController();
+  const warmRejected = assert.rejects(warming.warm("webp", warmAbort.signal), error => error === startupReason);
+  // Cancellation during a codec's native entry must also discard the warm
+  // worker, even though no application pixels have reached it yet.
+  await new Promise(resolve => {
+    const inspect = () => {
+      if (!warming.worker) { setImmediate(inspect); return; }
+      warming.worker.worker.on("message", message => {
+        if (message.encodingStarted) { warmAbort.abort(startupReason); resolve(); }
+      });
+    };
+    inspect();
+  });
+  await warmRejected;
+  assert.equal((await warming.encode(fixture, "webp")).type, "image/webp", "cancelled warm work recreates an independent encoder thread");
+  await warming.close();
   const cancellable = createEncoder({ workerUrl });
   await cancellable.encode(fixture, "webp");
   const firstWorker = cancellable.worker.worker;

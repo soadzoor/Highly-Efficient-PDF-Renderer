@@ -238,6 +238,7 @@ export interface NativeVectorPdfSession extends PdfSession {
 export interface NativeVectorCompileOptions extends PdfCompileOptions {
   /** Internal, operation-local snapshot preparation. Never used for HEP compilation. */
   readonly thumbnailScale?: number;
+  readonly thumbnailPixelSize?: Readonly<{ width: number; height: number }>;
   readonly thumbnailMaxDimension?: number;
   readonly thumbnailOmitMetadata?: boolean;
   /** Viewing approximation: draw stored text with substitute fonts and skip image decoding. */
@@ -646,7 +647,14 @@ class NativePdfSession implements NativeVectorPdfSession {
       const size = thumbnailSize(this.info.pages[sourcePageIndex].width, this.info.pages[sourcePageIndex].height, options.maxDimension);
       const compileOptions: NativeVectorCompileOptions = { signal, optimization: "none", enableSegmentMerge: false,
         enableInvisibleCull: false, thumbnailScale: size.scale, thumbnailMaxDimension: options.maxDimension,
-        thumbnailOmitMetadata: true, retainOptionalContent: options.optionalContent !== undefined };
+        thumbnailOmitMetadata: true, retainOptionalContent: options.optionalContent !== undefined,
+        // With a caller-specified scratch budget, binary coverage may yield
+        // to the native stroke fallback. Preserve all source segments then.
+        ...(options.backend === "canvas2d" && (!options.vectorOverride || options.vectorOverride[3] === 1) &&
+            this.document.limits.maxDecodedStreamBytes === Number.MAX_SAFE_INTEGER &&
+            size.width * size.height <= this.document.limits.maxImagePixels &&
+            size.width * size.height <= this.document.limits.maxDecodedStreamBytes
+          ? { thumbnailPixelSize: { width: size.width, height: size.height } } : {}) };
       if (options.ocrTextOnly) {
         const { compileNativeOcrTextPage } = await import("./pdf/nativeOcrText");
         const scene = await compileNativeOcrTextPage(this.document, sourcePageIndex, compileOptions, signal,
@@ -668,7 +676,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       // Like a parsed native page, this disposable preview can be repainted
       // for another background/format without interpreting its PDF again.
       // Resolution and retained layers affect preparation; paint options do not.
-      const preparationKey = `${sourcePageIndex}:${options.maxDimension}:${options.optionalContent !== undefined}`;
+      const preparationKey = `${sourcePageIndex}:${options.maxDimension}:${options.optionalContent !== undefined}:${compileOptions.thumbnailPixelSize !== undefined}`;
       const preparedPage = this.thumbnailPage?.key === preparationKey ? this.thumbnailPage.page
         : await this.compilePageUnlocked(sourcePageIndex, compileOptions, signal);
       const complete = <T extends ThumbnailPageResult>(result: T): T => {
@@ -1952,6 +1960,10 @@ class NativePdfSession implements NativeVectorPdfSession {
     });
     const textOperatorSink = {
       getFontSelection: () => textCompiler.getFontSelection(),
+      externalGraphicsState: {
+        save: () => textCompiler.saveGraphicsState(true),
+        restore: () => textCompiler.restoreGraphicsState(true)
+      },
       applyOperator(
         operator: string,
         operands: readonly unknown[],
@@ -1980,6 +1992,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       compactRetainedResources: output === "display-program",
       thumbnail: (options as NativeVectorCompileOptions).thumbnailScale !== undefined,
       thumbnailScale: (options as NativeVectorCompileOptions).thumbnailScale,
+      thumbnailPixelSize: (options as NativeVectorCompileOptions).thumbnailPixelSize,
       ...denseSourcePaintOptions(imageResources),
       retainOptionalContent,
       ...(retainOptionalContent ? { combineOptionalContent: (parent: number, own: number) => this.optionalContent.combineMemberships(parent, own) } : {}),
@@ -3222,6 +3235,10 @@ async function flattenNativeVectorFormOccurrences(
     });
     const textOperatorSink = {
       getFontSelection: () => textCompiler.getFontSelection(),
+      externalGraphicsState: {
+        save: () => textCompiler.saveGraphicsState(true),
+        restore: () => textCompiler.restoreGraphicsState(true)
+      },
       applyOperator(
         operator: string,
         operands: readonly unknown[],
@@ -4949,6 +4966,10 @@ async function compileNativeFormPrograms(
     });
     const textOperatorSink = {
       getFontSelection: () => textCompiler.getFontSelection(),
+      externalGraphicsState: {
+        save: () => textCompiler.saveGraphicsState(true),
+        restore: () => textCompiler.restoreGraphicsState(true)
+      },
       applyOperator(
         operator: string,
         operands: readonly unknown[],
@@ -5297,6 +5318,10 @@ async function compileNativeType3Programs(
     });
     const textOperatorSink = {
       getFontSelection: () => textCompiler.getFontSelection(),
+      externalGraphicsState: {
+        save: () => textCompiler.saveGraphicsState(true),
+        restore: () => textCompiler.restoreGraphicsState(true)
+      },
       applyOperator(
         operator: string,
         operands: readonly unknown[],
@@ -6665,6 +6690,10 @@ async function compileNativePatternPrograms(
     });
     const textOperatorSink = {
       getFontSelection: () => textCompiler.getFontSelection(),
+      externalGraphicsState: {
+        save: () => textCompiler.saveGraphicsState(true),
+        restore: () => textCompiler.restoreGraphicsState(true)
+      },
       applyOperator(
         operator: string,
         operands: readonly unknown[],

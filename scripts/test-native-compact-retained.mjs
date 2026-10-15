@@ -97,6 +97,39 @@ try {
   const previewVaried = await pair(variedSource, { ...variedOptions, thumbnail: true });
   await comparePages(varied.legacy, previewVaried.compact);
 
+  // Thumbnail saves share styles until a write, while keeping every saved CTM
+  // independent. Exercise each mutation as the first write in a nested scope.
+  const styleChanges = [
+    "3 w", "1 J", "2 j", "3 M", "/RelativeColorimetric ri", "25 i", "[7 2] .75 d", "/Split gs",
+    "3 w 1 J 2 j q .25 G 7 w 2 J 1 j 3 3 5 5 re B Q",
+    ".25 G 3 w 1 J 2 j q 7 w 2 J 1 j .75 G 3 3 5 5 re B Q",
+    ".25 G", ".75 g", ".2 .4 .6 RG", ".6 .4 .2 rg", ".1 .2 .3 .4 K", ".4 .3 .2 .1 k",
+    "/DeviceRGB CS", "/DeviceRGB cs", ".25 SC", ".75 sc", ".25 SCN", ".75 scn",
+    "0 0 30 30 re W n", "0 0 30 30 re 5 5 20 20 re W* n"
+  ];
+  for (const change of styleChanges) {
+    const source = `2 J [3 1] .5 d q 1 0 0 1 10 20 cm q 0 1 -1 0 5 6 cm ${change}
+      1 1 8 8 re B /Form Do Q 2 2 8 8 re B /Form Do Q 3 3 8 8 re B /Form Do`;
+    const options = { ...defaults, ...variedOptions, formXObjects: new Map([["Form", 0]]) };
+    const canonical = await compileDensePdfContent(encoder.encode(source), options);
+    const preview = await compileDensePdfContent(encoder.encode(source), {
+      ...options, compactRetainedResources: true, thumbnail: true
+    });
+    const values = compiled => ({ ...materialize(compiled), formPaints: compiled.formPaints.map(paint => ({
+      ...paint, initialGraphicsState: { ...paint.initialGraphicsState,
+        strokeColorSpace: { ...paint.initialGraphicsState.strokeColorSpace, convertToSrgb: undefined },
+        fillColorSpace: { ...paint.initialGraphicsState.fillColorSpace, convertToSrgb: undefined }
+      }
+    })) });
+    assert.deepEqual(values(preview), values(canonical),
+      `thumbnail state sharing preserves nested ${change}, restored styles, clipping, and inherited Form state`);
+  }
+  const rebasedSource = "2 J q 1 0 0 1 10 20 cm 1 1 m q 0 1 -1 0 5 6 cm 2 2 l Q 3 3 l Q 4 4 l S";
+  const rebased = await pair(rebasedSource, { thumbnail: true });
+  const rebasedCanonical = await compileDensePdfContent(encoder.encode(rebasedSource), defaults);
+  assert.deepEqual(materialize(rebased.compact), materialize(rebasedCanonical),
+    "restoring shared states rebases unfinished paths against the saved CTM rather than a later cm");
+
   const translatedSource = "2 J .75 w [3 1] .5 d " +
     ["10 20", "30 40", "50 60"].map(translation =>
       `q 1 0 0 1 ${translation} cm 1 1 m 4 1 l S Q`).join(" ");

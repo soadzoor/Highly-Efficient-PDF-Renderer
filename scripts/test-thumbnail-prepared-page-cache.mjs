@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import { createOcrPdfFixture } from "./lib/ocrPdfFixture.mjs";
 import { sceneFingerprint } from "./lib/sceneFingerprint.mjs";
+import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
 
 const hooks = registerHooks({ resolve(specifier, context, next) {
   return next(context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+(?:[?#]|$)/i.test(specifier)
@@ -44,12 +45,11 @@ try {
     { ...base, background: [0, 0, 0, 0] },
     { ...base, background: [.2, .4, .6, 1] },
     { ...base, vectorOverride: [1, .1, .2, 1] },
-    { ...base, background: [0, 0, 0, 0], vectorOverride: [.8, .2, .6, .5] },
     base
   ]) {
     const actual = await session.renderThumbnailPage(0, options);
     assertPixels(actual, await fresh(0, options), "repaint options match fresh native output");
-    assert.equal(preparations, 1, "background, alpha and vector color changes do not reinterpret PDF content");
+    assert.equal(preparations, 1, "background alpha and opaque vector color changes do not reinterpret PDF content");
     assert.strictEqual(session.thumbnailPage.page, firstPage);
     assert.deepEqual(firstPage, firstSnapshot, "repainting preserves the unfiltered prepared stores");
   }
@@ -120,7 +120,8 @@ try {
     let fallbackPreparations = 0;
     const originalCompile = fallbackSession.compilePageUnlocked;
     fallbackSession.compilePageUnlocked = async function (...args) { fallbackPreparations++; return originalCompile.apply(this, args); };
-    const seed = await fallbackSession.renderThumbnailPage(0, base);
+    const seedOptions = { ...base, backend: backend === "canvas2d" ? "canvas2d" : "auto" };
+    const seed = await fallbackSession.renderThumbnailPage(0, seedOptions);
     const cachedPage = fallbackSession.thumbnailPage.page;
     const result = await withoutNativeSurfaces(() => fallbackSession.renderThumbnailPage(0, { ...base, backend }));
     assert(!("rgba" in result));
@@ -135,7 +136,7 @@ try {
       assertPixels(await renderThumbnailPageCanvas2d(received.page, base, undefined, received.limits, undefined, true), seed,
         "transferred fallback data remains usable by its owning host");
     } else assert(received.scene.rasterLayers.some(layer => layer.data?.byteLength > 0));
-    assertPixels(await fallbackSession.renderThumbnailPage(0, base), seed, "retry after transferring a fallback reparses intact resources");
+    assertPixels(await fallbackSession.renderThumbnailPage(0, seedOptions), seed, "retry after transferring a fallback reparses intact resources");
     assert.equal(fallbackPreparations, 2, "the sender never reuses a detached fallback page");
     await fallbackSession.close();
   }
@@ -166,12 +167,62 @@ try {
   const exported = await loadSceneFromHep(await (await buildHep(exactScene, exportOptions)).arrayBuffer());
   const referenceExport = await loadSceneFromHep(await (await buildHep(referenceScene, exportOptions)).arrayBuffer());
   assert.equal(sceneFingerprint(exported), sceneFingerprint(referenceExport), "subsequent full-quality HEP output matches a fresh native session");
+  await testStrokeCullingPreparationKeys();
   await session.close();
   assert.equal(session.thumbnailPage, undefined, "close drops the prepared page owner");
   await assert.rejects(session.renderThumbnailPage(0, base), error => error.code === "closed");
   console.log("Prepared thumbnail pages: native pixel parity across backgrounds/vector/alpha/layers, compile reuse and key isolation, failed/aborted render isolation, canonical/HEP parity and close cleanup passed.");
 
   async function opened() { const value = await openPdf({ kind: "bytes", bytes }); sessions.push(value); return value; }
+  async function testStrokeCullingPreparationKeys() {
+    const content = "1 J .05 w " + "20.2 30.2 m 20.3 30.3 l S ".repeat(6) +
+      "40.2 50.2 m 80.2 50.2 l S ".repeat(6);
+    const strokeBytes = writeTinyPdf({ objects: [
+      { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+      { number: 2, body: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>" },
+      { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 4 0 R >>" },
+      { number: 4, body: tinyPdfStream("", content) }
+    ] });
+    const options = { maxDimension: 100, backend: "canvas2d", background: [0, 0, 0, 0] };
+    for (const maxDecodedStreamBytes of [Number.MAX_SAFE_INTEGER, 1024]) {
+      const value = await openPdf({ kind: "bytes", bytes: strokeBytes }, { limits: { maxDecodedStreamBytes } });
+      sessions.push(value);
+      const compile = value.compilePageUnlocked, culling = [];
+      value.compilePageUnlocked = async function (page, compileOptions, ...rest) {
+        if (compileOptions.thumbnailScale !== undefined) culling.push(compileOptions.thumbnailPixelSize !== undefined);
+        return compile.call(this, page, compileOptions, ...rest);
+      };
+      const initial = await value.renderThumbnailPage(0, options);
+      const opaquePage = value.thumbnailPage.page, opaqueSnapshot = structuredClone(opaquePage);
+      const bounded = maxDecodedStreamBytes !== Number.MAX_SAFE_INTEGER;
+      assert.deepEqual(culling, [!bounded], "explicit working ceilings disable preparation-time pixel culling");
+      assert.equal(opaquePage.stores.strokes.endpoints.length / 4, bounded ? 12 : 2);
+      await value.renderThumbnailPage(0, { ...options, vectorOverride: [.2, .4, .6, 1] });
+      assert.deepEqual(culling, [!bounded], "opaque vector recoloring preserves the same preparation policy");
+
+      const translucentOptions = { ...options, vectorOverride: [.2, .4, .6, .5] };
+      const translucent = await value.renderThumbnailPage(0, translucentOptions);
+      assert.deepEqual(culling, bounded ? [false] : [true, false],
+        "translucent vector overrides use full source geometry and a distinct preparation when needed");
+      const translucentPage = value.thumbnailPage.page;
+      assert.equal(translucentPage.stores.strokes.endpoints.length / 4, 12);
+      const referencePage = await value.compilePage(0, { thumbnailScale: 1, thumbnailOmitMetadata: true,
+        optimization: "none", enableSegmentMerge: false, enableInvisibleCull: false });
+      const reference = await renderThumbnailPageCanvas2d(referencePage, translucentOptions, undefined,
+        { maxImagePixels: Number.MAX_SAFE_INTEGER, maxDecodedStreamBytes });
+      assertPixels(translucent, reference, "translucent overrides preserve all repeated opacity applications");
+      assert(Math.max(...translucent.rgba.filter((_value, index) => index % 4 === 3)) > 200,
+        "the repeated line's visible alpha cannot come from a single half-opacity primitive");
+      // Exclude the explicit reference compile from cache-preparation counts.
+      culling.pop();
+      await value.renderThumbnailPage(0, { ...options, vectorOverride: [.6, .4, .2, .4] });
+      assert.strictEqual(value.thumbnailPage.page, translucentPage, "another translucent override reuses unculled geometry");
+      assert.deepEqual(opaquePage, opaqueSnapshot, "changing culling policy cannot mutate the earlier prepared page");
+      assertPixels(await value.renderThumbnailPage(0, options), initial, "switching back to opaque restores the original overview");
+      assert.deepEqual(culling, bounded ? [false] : [true, false, true], "the cache key includes effective culling eligibility");
+      await value.close();
+    }
+  }
   async function fresh(page, options) {
     const value = await opened();
     try { return await value.renderThumbnailPage(page, options); } finally { await value.close(); }

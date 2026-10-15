@@ -85,9 +85,23 @@ exact fine detail. Thin overview strokes use a one-pixel minimum pen for more
 recognizable linework. Canvas2D batches compatible opaque paths, reuses clip
 state and flattens overview curves in output pixels; complex paints keep their
 compatibility rendering. Thin, opaque, solid root-page polylines use a compact
-one-pixel pen with rounded caps and joins. Dashed, thick, translucent, masked
-and nested-program paths retain their compatibility geometry. Public thumbnails
-retain scanned-page appearance.
+one-pixel pen with rounded caps and joins. Eligible opaque Canvas2D line spans
+use coarse pixel coverage without stroke antialiasing, reported as
+`thumbnail.pixel-stroke-approximation`; edges may look heavier or jagged.
+Canvas2D preparation also consolidates opaque root strokes with identical pixel
+endpoint pairs within the same paint scope, reported as
+`thumbnail.stroke-pixel-culling`. Source counts, clipping and paint order remain
+intact; the full-quality representation is prepared independently.
+Translucent vector overrides and explicit working-memory limits retain all source
+segments so compatibility rendering can preserve their appearance.
+Dashed, thick, translucent, masked and nested-program paths retain their
+compatibility geometry. Public thumbnails retain scanned-page appearance.
+
+Thumbnail preparation shares saved graphics and text settings until they change,
+reuses the graphics interpreter's text transform, and recognizes complete line
+and polyline scopes in one byte scan. Solid filled text shares rendering state
+while preserving glyph placement and per-glyph alpha. These shortcuts preserve
+caller limits and cancellation, and remain separate from canonical HEP conversion.
 
 The parser and snapshot renderer run in a module worker when supported; browser
 capabilities determine fallback. The lossless WebP codec is a lazy package-local
@@ -203,6 +217,9 @@ package dependency, but is required to render these server thumbnails. The
 API does not install `Worker`, `document` or `OffscreenCanvas` globals.
 Lossless WebP remains the default, with the same diagnostic PNG fallback and
 independent full-quality HEP conversion policy as the browser API.
+Node codec startup overlaps PDF preparation and is cancelled with the request.
+The isolated PDF worker skips native Canvas system-font discovery because PDF
+text uses resolved font outlines; the host environment is unchanged.
 
 `NodeDocumentSessionOpenOptions` also accepts `NodePdfWorkerOpenOptions`:
 `workerUrl` and `workerName` configure the parser worker, while

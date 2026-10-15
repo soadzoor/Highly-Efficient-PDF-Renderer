@@ -207,7 +207,10 @@ export class NativeTextCompiler {
         details: { maxGraphicsStateDepth: this.maxGraphicsStateDepth }
       });
     }
-    this.graphicsStack.push({ ctm: shareTransform ? this.ctm : [...this.ctm], textState: { ...this.state } });
+    this.graphicsStack.push({
+      ctm: shareTransform ? this.ctm : [...this.ctm],
+      textState: shareTransform ? this.state : { ...this.state }
+    });
   }
 
   restoreGraphicsState(shareTransform = false): void {
@@ -252,6 +255,7 @@ export class NativeTextCompiler {
     if (!this.fonts.has(resourceName)) {
       throw new PdfError("unsupported-font", `Page font resource /${resourceName} is missing.`);
     }
+    this.ensureMutableTextState();
     this.state.fontResourceName = resourceName;
     this.state.directFontResource = null;
     this.state.fontSize = finite(size, "font size");
@@ -263,6 +267,7 @@ export class NativeTextCompiler {
     if (!resource || !Number.isSafeInteger(resource.fontIndex) || resource.fontIndex < 0) {
       throw new PdfError("unsupported-font", "An extended graphics state references an unprepared font.");
     }
+    this.ensureMutableTextState();
     this.state.fontResourceName = null;
     this.state.directFontResource = resource;
     this.state.fontSize = finite(size, "font size");
@@ -275,26 +280,31 @@ export class NativeTextCompiler {
 
   setCharacterSpacing(value: number): void {
     this.checkCancellation();
+    this.ensureMutableTextState();
     this.state.characterSpacing = finite(value, "character spacing");
   }
 
   setWordSpacing(value: number): void {
     this.checkCancellation();
+    this.ensureMutableTextState();
     this.state.wordSpacing = finite(value, "word spacing");
   }
 
   setHorizontalScale(percent: number): void {
     this.checkCancellation();
+    this.ensureMutableTextState();
     this.state.horizontalScale = finite(percent, "horizontal text scale") / 100;
   }
 
   setLeading(value: number): void {
     this.checkCancellation();
+    this.ensureMutableTextState();
     this.state.leading = finite(value, "text leading");
   }
 
   setRise(value: number): void {
     this.checkCancellation();
+    this.ensureMutableTextState();
     this.state.rise = finite(value, "text rise");
   }
 
@@ -309,6 +319,7 @@ export class NativeTextCompiler {
       );
     }
     if (this.inTextObject && mode >= 4) this.lockedClippingMode = mode;
+    this.ensureMutableTextState();
     this.state.renderingMode = mode;
   }
 
@@ -376,7 +387,10 @@ export class NativeTextCompiler {
     this.checkCancellation();
     tx = finite(tx, "text x translation");
     ty = finite(ty, "text y translation");
-    if (setLeading) this.state.leading = -ty;
+    if (setLeading) {
+      this.ensureMutableTextState();
+      this.state.leading = -ty;
+    }
     this.lineMatrix = multiply(this.lineMatrix, [1, 0, 0, 1, tx, ty]);
     this.textMatrix = [...this.lineMatrix];
     if (ty !== 0) {
@@ -884,6 +898,13 @@ export class NativeTextCompiler {
     };
     this.diagnostics.push(diagnostic);
     this.onDiagnostic?.(diagnostic);
+  }
+
+  private ensureMutableTextState(): void {
+    if (this.graphicsStack.length > 0 &&
+        this.graphicsStack[this.graphicsStack.length - 1].textState === this.state) {
+      this.state = { ...this.state };
+    }
   }
 
   private currentFont(): NativeTextFontResource {

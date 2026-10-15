@@ -27,6 +27,7 @@ export async function openNodeDocumentSessionRuntime(source: NodeDocumentSource,
     options.signal?.throwIfAborted();
     return new ProcessingSession("pdf", pdf.info.byteLength, label, options, diagnostics, pdf, undefined, {
       canvas2dOnly: true,
+      prewarmEncoder: true,
       createEncoder: async () => {
         const { NodeThumbnailEncoder } = await import("./nodeThumbnailEncoder");
         return new NodeThumbnailEncoder({ workerUrl: options.encoderWorkerUrl });

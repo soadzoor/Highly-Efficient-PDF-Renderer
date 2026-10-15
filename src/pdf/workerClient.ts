@@ -123,6 +123,7 @@ export async function openPdfInNodeWorker(
     readonly process?: {
       readonly versions?: { readonly node?: string };
       readonly execArgv?: readonly string[];
+      readonly env?: Readonly<Record<string, string | undefined>>;
     };
   }).process;
   if (!nodeProcess?.versions?.node) {
@@ -134,13 +135,17 @@ export async function openPdfInNodeWorker(
     const module = await import(/* @vite-ignore */ moduleName) as unknown as {
       Worker: new (
         filename: string | URL,
-        options: { readonly name?: string; readonly execArgv?: readonly string[] }
+        options: { readonly name?: string; readonly execArgv?: readonly string[];
+          readonly env?: Readonly<Record<string, string | undefined>> }
       ) => NodeWorkerLike;
     };
     const workerUrl = options.workerUrl ?? defaultNodePdfWorkerUrl();
     worker = new module.Worker(workerUrl, {
       name: options.workerName ?? "hepr-pdf",
-      execArgv: sanitizeNodePdfWorkerExecArgv(nodeProcess.execArgv ?? [])
+      execArgv: sanitizeNodePdfWorkerExecArgv(nodeProcess.execArgv ?? []),
+      // PDF text is rendered from resolved outlines. Native Canvas needs no
+      // system-font scan in this isolated worker; keep the host env untouched.
+      env: { ...nodeProcess.env, DISABLE_SYSTEM_FONTS_LOAD: "1" }
     });
   } catch (cause) {
     throw workerCrash("Unable to create the HEPR Node PDF worker.", cause);

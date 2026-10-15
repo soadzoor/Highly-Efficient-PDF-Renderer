@@ -1,16 +1,17 @@
-import { readPdfObjectSourceBytes, resolveSourceKind, resolveSourceLabel, type PdfObjectSource } from "./pdfObjectGenerator";
+import type { PdfObjectSource } from "./pdfObjectGenerator";
 import type { DocumentSession, DocumentSessionOpenOptions, DocumentSessionHepOptions, DocumentSessionInfo } from "./documentSession";
 import type { PdfThumbnailOptions, PdfThumbnailResult } from "./pdfThumbnail";
 import { normalizeThumbnailOptions } from "./thumbnailOptions";
-import { nativeVectorMissingFontResolver, resolvePdfPageNumbers, composeVectorScenesInGrid, type VectorScene } from "./pdfVectorExtractor";
+import type { VectorScene } from "./pdfVectorExtractor";
 import type { NativeVectorPdfSession } from "./pdfSession";
-import { ScenePageViews } from "./scenePageViews";
+import type { ScenePageViews } from "./scenePageViews";
 import { PdfError, type PdfDiagnostic } from "./pdf/nativeTypes";
 import { waitForLoad } from "./loadCancellation";
 import type { ThumbnailSceneRenderer } from "./thumbnailRenderer";
 import type { ThumbnailPixels } from "./thumbnailTypes";
 
 interface ProcessingSessionEncoder {
+  warm?(format: "webp" | "png", signal?: AbortSignal): Promise<void>;
   encode(pixels: ThumbnailPixels, format: "webp" | "png", signal?: AbortSignal,
     onDiagnostic?: (diagnostic: PdfDiagnostic) => void): Promise<Blob>;
   close(): void | Promise<void>;
@@ -25,10 +26,12 @@ interface CompletedThumbnail {
 /** Platform-specific resources stay owned by the same reusable session. */
 export interface ProcessingSessionServices {
   readonly canvas2dOnly?: boolean;
+  readonly prewarmEncoder?: boolean;
   readonly createEncoder?: () => Promise<ProcessingSessionEncoder>;
 }
 
 export async function openDocumentSessionRuntime(source: PdfObjectSource, options: DocumentSessionOpenOptions): Promise<DocumentSession> {
+  const { readPdfObjectSourceBytes, resolveSourceKind, resolveSourceLabel } = await import("./pdfObjectGenerator");
   let bytes = await readPdfObjectSourceBytes(source, undefined, options.signal);
   options.signal?.throwIfAborted();
   const kind = resolveSourceKind(source, bytes, options.sourceKind);
@@ -41,7 +44,7 @@ export async function openDocumentSessionRuntime(source: PdfObjectSource, option
   try {
     if (kind === "pdf") {
       const openOptions = { ...options, repair: options.repair ?? "safe", onDiagnostic,
-        missingFontResolver: options.missingFontResolver ?? await nativeVectorMissingFontResolver() };
+        missingFontResolver: options.missingFontResolver ?? await (await import("./pdfVectorExtractor")).nativeVectorMissingFontResolver() };
       options.signal?.throwIfAborted();
       if (typeof Worker === "function") {
         const { openPdfInBrowserWorker } = await import("./pdf/workerClient");
@@ -82,6 +85,7 @@ export class ProcessingSession implements DocumentSession {
   private closing: Promise<void> | undefined;
   private renderer: ThumbnailSceneRenderer | undefined;
   private encoder: ProcessingSessionEncoder | undefined;
+  private encoderPending: Promise<ProcessingSessionEncoder> | undefined;
   private partition: ScenePageViews | undefined;
   // Retain only the last encoded overview. The parser separately reuses its
   // last prepared page; temporary pixels are released after encoding.
@@ -138,6 +142,16 @@ export class ProcessingSession implements DocumentSession {
       }
       const diagnosticStart = this.diagnostics.length;
       let completed: PdfThumbnailResult | undefined;
+      // Node codec startup runs in its own thread while the PDF worker prepares
+      // pixels. A failed or cancelled render owns and cancels this pending work.
+      const warming = this.services.prewarmEncoder ? new AbortController() : undefined;
+      const warmSignal = warming ? AbortSignal.any([signal, warming.signal]) : undefined;
+      // Warming is opportunistic. The real encode reports codec errors and
+      // fallback diagnostics through the normal request path.
+      const warm = warmSignal ? this.getEncoder().then(encoder => {
+        warmSignal.throwIfAborted();
+        return encoder.warm?.(options.format ?? "webp", warmSignal);
+      }).catch(() => {}) : undefined;
       try {
         const prepareStart = performance.now();
         let pixels;
@@ -178,7 +192,9 @@ export class ProcessingSession implements DocumentSession {
           } else pixels = result;
         }
         else {
-          const { ThumbnailSceneRenderer } = await import("./thumbnailRenderer");
+          const [{ ThumbnailSceneRenderer }, { ScenePageViews }] = await Promise.all([
+            import("./thumbnailRenderer"), import("./scenePageViews")
+          ]);
           signal.throwIfAborted();
           this.renderer ??= new ThumbnailSceneRenderer();
           this.partition ??= new ScenePageViews(this.scene!);
@@ -189,16 +205,12 @@ export class ProcessingSession implements DocumentSession {
         signal.throwIfAborted();
         options.onTiming?.({ stage: "prepare-render", durationMs: performance.now() - prepareStart });
         signal.throwIfAborted();
-        if (!this.encoder) {
-          if (this.services.createEncoder) this.encoder = await this.services.createEncoder();
-          else {
-            const { ThumbnailEncoder } = await import("./thumbnailEncoder");
-            this.encoder = new ThumbnailEncoder();
-          }
-        }
-        signal.throwIfAborted();
         const encodeStart = performance.now();
-        const blob = await this.encoder.encode(pixels, options.format ?? "webp", signal, diagnostic => {
+        if (warm) await warm;
+        signal.throwIfAborted();
+        const encoder = await this.getEncoder();
+        signal.throwIfAborted();
+        const blob = await encoder.encode(pixels, options.format ?? "webp", signal, diagnostic => {
           this.diagnostics.push(diagnostic); this.openOptions.onDiagnostic?.(diagnostic);
         });
         signal.throwIfAborted();
@@ -208,6 +220,9 @@ export class ProcessingSession implements DocumentSession {
         completed = { blob, width: pixels.width, height: pixels.height };
         return { ...completed };
       } finally {
+        warming?.abort(new DOMException("Thumbnail preparation finished.", "AbortError"));
+        // Drain lazy creation too, so close cannot leave a late encoder owner.
+        if (warm) await warm;
         const diagnostics = completed ? this.diagnostics.slice(diagnosticStart).map(copyThumbnailDiagnostic) : undefined;
         if (options.onDiagnostic !== this.openOptions.onDiagnostic) {
           for (const diagnostic of this.diagnostics.slice(diagnosticStart)) options.onDiagnostic?.(diagnostic);
@@ -233,6 +248,8 @@ export class ProcessingSession implements DocumentSession {
       const { buildHep } = await import("./hepBuilder");
       signal.throwIfAborted();
       if (!this.pdf) return buildHep(this.scene!, { ...options, signal, sourceLabel: options.sourceLabel ?? this.label });
+      const { resolvePdfPageNumbers, composeVectorScenesInGrid } = await import("./pdfVectorExtractor");
+      signal.throwIfAborted();
       const indexes = resolvePdfPageNumbers(this.info.pageCount, options.pages).map(page => page - 1);
       const prepare = options.encodeRasterImages === false ? undefined : (await import("./hepRasterPreparation")).createHepRasterPagePreparer();
       const pages: VectorScene[] = [];
@@ -266,6 +283,21 @@ export class ProcessingSession implements DocumentSession {
 
   close(): Promise<void> {
     return this.closing ??= this.closeInternal();
+  }
+
+  private getEncoder(): Promise<ProcessingSessionEncoder> {
+    if (this.encoder) return Promise.resolve(this.encoder);
+    if (this.encoderPending) return this.encoderPending;
+    const pending = Promise.resolve().then(async () => {
+      const encoder = this.services.createEncoder ? await this.services.createEncoder()
+        : new (await import("./thumbnailEncoder")).ThumbnailEncoder();
+      this.encoder = encoder;
+      return encoder;
+    });
+    this.encoderPending = pending;
+    const finished = (): void => { if (this.encoderPending === pending) this.encoderPending = undefined; };
+    void pending.then(finished, finished);
+    return pending;
   }
 
   private async closeInternal(): Promise<void> {

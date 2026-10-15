@@ -311,7 +311,8 @@ async function testExternalGraphicsTransformParity() {
     q /Inherited gs Q
     BT (C) Tj ET
     /Span << /ActualText (recovered) >> BDC BT (A) Tj ET
-  `;
+  ` + ["/F1 20 Tf", "7 Tc", "9 Tw", "45 Tz", "25 TL", "10 Ts", "7 Tr", "0 -25 TD", "/Inherited gs"]
+    .map(change => `q BT ${change} (A ) Tj ET Q BT (B) Tj T* (C) Tj ET`).join(" ");
   const inheritedFont = { font: fontA, fontIndex: 0 };
   async function interpret(source, thumbnail, overrides = {}) {
     const runs = [], diagnostics = [], emittedRuns = [];
@@ -324,14 +325,20 @@ async function testExternalGraphicsTransformParity() {
     if (thumbnail) {
       text.concatTransform = () => { throw new Error("The graphics CTM must not be multiplied twice."); };
     }
-    await compileDensePdfContent(new TextEncoder().encode(source), {
+    const dispatched = [];
+    const compiled = await compileDensePdfContent(new TextEncoder().encode(source), {
       output: "display-program", thumbnail,
       pageMatrix: [0, 1, -1, 0, 20, 40],
       pageBounds: { minX: -1000, minY: -1000, maxX: 1000, maxY: 1000 },
       extGStates: [{ resourceName: "Inherited", font: { fontIndex: 0, size: 13 } }],
       textOperatorSink: {
         getFontSelection: () => text.getFontSelection(),
+        externalGraphicsState: {
+          save: () => text.saveGraphicsState(true),
+          restore: () => text.restoreGraphicsState(true)
+        },
         applyOperator(operator, operands, context) {
+          dispatched.push(operator);
           assert.equal(context.graphicsTransform !== undefined, thumbnail);
           emittedRuns.length = 0;
           text.setOutputEnabled(context.outputEnabled);
@@ -341,7 +348,13 @@ async function testExternalGraphicsTransformParity() {
         }
       }
     });
-    return { compilation: text.build(), runs, diagnostics };
+    if (thumbnail) {
+      assert(!dispatched.includes("q") && !dispatched.includes("Q"), "graphics saves use the direct text hooks");
+      if (source === content) assert.equal(dispatched.filter(operator => operator === "cm").length, 2,
+        "only cm inside BT needs text dispatch for diagnostics");
+    }
+    return { compilation: text.build(), runs, diagnostics, clipPaths: compiled.clipPaths,
+      paintRunClipIndices: compiled.paintRunClipIndices };
   }
   const expected = await interpret(content, false);
   const actual = await interpret(content, true);

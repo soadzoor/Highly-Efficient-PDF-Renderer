@@ -42,15 +42,24 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   drawing, reuse clipping and paint state, and use output-pixel curve detail
   with stronger one-pixel overview strokes. Keep thin opaque root polylines in
   compact stroke storage with rounded caps and joins, share unchanged graphics
-  state, reuse the interpreter's text transform, and avoid temporary packed
-  resource wrappers during adaptation. Subpixel square caps may be rounded;
+  and text state, save common pen settings separately, reuse the interpreter's
+  text transform, and avoid temporary packed resource wrappers during adaptation.
+  Recognize complete line and polyline scopes in one byte scan with direct packed
+  line coordinates, and share solid-text rendering state. Consolidate opaque root
+  strokes with identical pixel endpoint pairs within each Canvas2D paint scope,
+  preserving logical source counts, clipping and order; translucent overrides and
+  explicit scratch budgets retain their compatibility geometry. Eligible opaque
+  Canvas2D lines use coarse pixel coverage without
+  stroke antialiasing, with a diagnostic. Subpixel square caps may be rounded;
   thumbnail approximations remain separate from canonical HEP output. Reuse the
   last successful session thumbnail for identical requests, preserving
   cancellation and reporting only actual total timing on cache hits. Retain one
   prepared thumbnail page for repainting with different colors or formats;
-  changing page, resolution or layer-retention policy prepares a new preview.
+  changing page, resolution, pixel-culling mode or layer-retention policy prepares a new preview.
   Worker fallbacks release storage transferred to the owning host, and session
-  close clears both caches.
+  close clears both caches. Node parser workers skip native Canvas system-font
+  discovery, and lazy encoder startup overlaps PDF preparation with shared
+  ownership and cancellation; the host environment remains unchanged.
 - Use the shared thumbnail pipeline in native and Three Reader sidebars, with
   direct pixels instead of an encode/decode round trip. Share active PDF parser
   sessions, prioritize viewport work, and preserve appearance controls and
