@@ -24,6 +24,6 @@ const zipBytes = new Uint8Array(await zipBlob.arrayBuffer());
 assert.deepEqual(Array.from(zipBytes.subarray(0, 4)), [0x48, 0x45, 0x50, 0]);
 
 const declarations = await readFile(declarationPath, "utf8");
-assert.match(declarations, /export \{ buildHep \} from "\.\/hepBuilder";/);
+assert.match(declarations, /export \{ buildHep, buildHepWithScene \} from "\.\/hepBuilder";/);
 
 console.log("Built-package HEP smoke test passed");

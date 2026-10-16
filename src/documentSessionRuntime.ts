@@ -3,6 +3,7 @@ import type { DocumentSession, DocumentSessionOpenOptions, DocumentSessionHepOpt
 import type { PdfThumbnailOptions, PdfThumbnailResult } from "./pdfThumbnail";
 import { normalizeThumbnailOptions } from "./thumbnailOptions";
 import type { VectorScene } from "./pdfVectorExtractor";
+import type { HepBuildResult } from "./hepBuilder";
 import type { NativeVectorPdfSession } from "./pdfSession";
 import type { ScenePageViews } from "./scenePageViews";
 import { PdfError, type PdfDiagnostic } from "./pdf/nativeTypes";
@@ -238,6 +239,16 @@ export class ProcessingSession implements DocumentSession {
   }
 
   buildHep(options: DocumentSessionHepOptions = {}): Promise<Blob> {
+    return this.buildHepOperation(options, false);
+  }
+
+  buildHepWithScene(options: DocumentSessionHepOptions = {}): Promise<HepBuildResult> {
+    return this.buildHepOperation(options, true);
+  }
+
+  private buildHepOperation(options: DocumentSessionHepOptions, retainScene: false): Promise<Blob>;
+  private buildHepOperation(options: DocumentSessionHepOptions, retainScene: true): Promise<HepBuildResult>;
+  private buildHepOperation(options: DocumentSessionHepOptions, retainScene: boolean): Promise<Blob | HepBuildResult> {
     for (const key of ["password", "imageCodecResolver", "iccTransformResolver", "iccEngine", "embeddedFontPaint"]) {
       if (key in options) return Promise.reject(new TypeError(`${key} is fixed when opening the document session.`));
     }
@@ -245,13 +256,14 @@ export class ProcessingSession implements DocumentSession {
       return Promise.reject(new RangeError("maxPagesPerRow must be a positive integer."));
     }
     return this.run(options.signal, async signal => {
-      const { buildHep } = await import("./hepBuilder");
+      const builder = await import("./hepBuilder");
+      const buildHep = retainScene ? builder.buildHepWithScene : builder.buildHep;
       signal.throwIfAborted();
       if (!this.pdf) return buildHep(this.scene!, { ...options, signal, sourceLabel: options.sourceLabel ?? this.label });
       const { resolvePdfPageNumbers, composeVectorScenesInGrid } = await import("./pdfVectorExtractor");
       signal.throwIfAborted();
       const indexes = resolvePdfPageNumbers(this.info.pageCount, options.pages).map(page => page - 1);
-      const prepare = options.encodeRasterImages === false ? undefined : (await import("./hepRasterPreparation")).createHepRasterPagePreparer();
+      const prepare = retainScene || options.encodeRasterImages === false ? undefined : (await import("./hepRasterPreparation")).createHepRasterPagePreparer();
       const pages: VectorScene[] = [];
       const diagnosticStart = this.diagnostics.length;
       for (let index = 0; index < indexes.length; index++) {
@@ -269,6 +281,7 @@ export class ProcessingSession implements DocumentSession {
           unit: "pages", processed: index + 1, total: indexes.length, sourcePageIndex: indexes[index] });
       }
       const combined = composeVectorScenesInGrid(pages, options.maxPagesPerRow ?? Math.max(1, Math.ceil(Math.sqrt(pages.length))), options.onDiagnostic);
+      if (retainScene) combined.sourcePdfByteLength = options.sourcePdfByteLength ?? this.sourceByteLength;
       if (options.onDiagnostic !== this.openOptions.onDiagnostic) {
         for (const diagnostic of this.diagnostics.slice(diagnosticStart)) options.onDiagnostic?.(diagnostic);
       }

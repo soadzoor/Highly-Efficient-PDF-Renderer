@@ -81,9 +81,14 @@ try {
       assert.deepEqual(reused[key], fresh[key], `thumbnail reuse preserves full-quality HEP ${key}`);
     }
   } finally { await freshSession.close(); }
+  const withScene = await activeSession.buildHepWithScene({ ...exportOptions, pages: "1" });
+  assert.equal(withScene.scene.pageCount, 1, "Node sessions return a reusable complete scene");
+  assert.equal(withScene.blob.type, "application/x-hep");
   await activeSession.close(); await activeSession.close();
+  assert(withScene.scene.fillSegmentCount > 0, "returned Node scenes remain valid after worker termination");
   await assert.rejects(activeSession.renderThumbnail(), error => error.code === "closed");
   await assert.rejects(activeSession.buildHep(), error => error.code === "closed");
+  await assert.rejects(activeSession.buildHepWithScene(), error => error.code === "closed");
   activeSession = undefined;
 
   // Pause an actual image decode, then cancel that operation. The host callback

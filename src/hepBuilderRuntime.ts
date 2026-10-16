@@ -5,23 +5,39 @@ import { listSceneRasterLayers } from "./hepShared";
 import type { SceneTextureStats } from "./hepTypes";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { createLoadProgressReporter, type PDFLoadProgress } from "./loadProgress";
-import type { BuildHepFromPdfOptions, BuildHepFromSceneOptions, HepEncodingOptions } from "./hepBuilder";
+import type { BuildHepFromPdfOptions, BuildHepFromSceneOptions, HepEncodingOptions, HepBuildResult } from "./hepBuilder";
 
 export async function buildHepRuntime(
   input: PdfObjectSource | VectorScene,
   options: BuildHepFromPdfOptions | BuildHepFromSceneOptions = {}
 ): Promise<Blob> {
+  return (await buildHepResultRuntime(input, options)).blob;
+}
+
+export function buildHepWithSceneRuntime(
+  input: PdfObjectSource | VectorScene,
+  options: BuildHepFromPdfOptions | BuildHepFromSceneOptions = {}
+): Promise<HepBuildResult> {
+  return buildHepResultRuntime(input, options, true);
+}
+
+async function buildHepResultRuntime(
+  input: PdfObjectSource | VectorScene,
+  options: BuildHepFromPdfOptions | BuildHepFromSceneOptions,
+  retainScene = false
+): Promise<HepBuildResult> {
   options.signal?.throwIfAborted();
   if (isVectorScene(input)) {
-    return buildHepFromScene(input, options as BuildHepFromSceneOptions);
+    return buildHepFromScene(input, options as BuildHepFromSceneOptions, retainScene);
   }
-  return buildHepFromPdf(input, options as BuildHepFromPdfOptions);
+  return buildHepFromPdf(input, options as BuildHepFromPdfOptions, retainScene);
 }
 
 async function buildHepFromPdf(
   source: PdfObjectSource,
-  options: BuildHepFromPdfOptions
-): Promise<Blob> {
+  options: BuildHepFromPdfOptions,
+  retainScene = false
+): Promise<HepBuildResult> {
   const progress = createLoadProgressReporter(options.onProgress);
   const parseProgress = progress.child(0, 0.82, { sourceType: "pdf" });
   const loaded = await loadPdfSceneFromSource(source, {
@@ -39,8 +55,9 @@ async function buildHepFromPdf(
     sourceKind: "pdf",
     onProgress: (payload) => forwardParseProgress(parseProgress, payload)
   }, options.signal, false,
-  // Stream larger images: each page is encoded once parsed and its pixels released.
-  options.encodeRasterImages === false ? undefined : createHepRasterPagePreparer(),
+  // Blob-only exports release larger image pixels as each page is encoded.
+  // A reusable viewer scene must keep those pixels.
+  retainScene || options.encodeRasterImages === false ? undefined : createHepRasterPagePreparer(),
   // Export never re-parses, so the parser worker owns the only PDF copy.
   true);
   options.signal?.throwIfAborted();
@@ -50,7 +67,8 @@ async function buildHepFromPdf(
     normalizeSourceLabel(options.sourceLabel, loaded.sourceLabel),
     rasterLayers,
     loaded.sourceKind === "pdf" ? { ...options, sourcePdfByteLength: loaded.scene.sourcePdfByteLength } : options,
-    progress.child(0.82, 1, { sourceType: "pdf" })
+    progress.child(0.82, 1, { sourceType: "pdf" }),
+    retainScene
   );
   progress.complete({ sourceType: "pdf" });
   options.signal?.throwIfAborted();
@@ -59,8 +77,9 @@ async function buildHepFromPdf(
 
 async function buildHepFromScene(
   scene: VectorScene,
-  options: BuildHepFromSceneOptions
-): Promise<Blob> {
+  options: BuildHepFromSceneOptions,
+  retainScene = false
+): Promise<HepBuildResult> {
   const progress = createLoadProgressReporter(options.onProgress);
   options.signal?.throwIfAborted();
   const rasterLayers = listSceneRasterLayers(scene);
@@ -70,7 +89,8 @@ async function buildHepFromScene(
     normalizeSourceLabel(options.sourceLabel, "document.pdf"),
     rasterLayers,
     options,
-    progress.child(0, 1)
+    progress.child(0, 1),
+    retainScene
   );
   progress.complete();
   options.signal?.throwIfAborted();
@@ -82,8 +102,9 @@ async function buildSceneHep(
   sourceLabel: string,
   rasterLayers: ReturnType<typeof listSceneRasterLayers>,
   options: HepEncodingOptions,
-  progress: ReturnType<typeof createLoadProgressReporter>
-): Promise<Blob> {
+  progress: ReturnType<typeof createLoadProgressReporter>,
+  retainScene = false
+): Promise<HepBuildResult> {
   assertCurrentVectorScene(scene);
   const result = await buildHepBlobForLayout(
     scene,
@@ -96,6 +117,7 @@ async function buildSceneHep(
       vectorLodPrecision: options.vectorLodPrecision,
       withTextLod: options.withTextLod,
       encodeRasterImages: options.encodeRasterImages ?? true,
+      retainScene,
       sourcePdfByteLength: options.sourcePdfByteLength,
       onWarning: options.onWarning,
       compression: options.compression === "store" ? "STORE" : "DEFLATE",
@@ -110,7 +132,7 @@ async function buildSceneHep(
       }
     }
   );
-  return result.blob;
+  return { blob: result.blob, scene: result.scene };
 }
 
 function assertCurrentVectorScene(scene: VectorScene): void {

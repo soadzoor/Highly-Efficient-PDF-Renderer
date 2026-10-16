@@ -33,6 +33,7 @@ try {
   const declarations = await readFile(resolve(installed, manifest.exports["./node"].types), "utf8");
   assert.match(declarations, /renderPdfThumbnail/);
   assert.match(declarations, /openDocumentSession/);
+  assert.match(declarations, /HepBuildResult/);
   await assert.rejects(access(resolve(installed, "src")), error => error.code === "ENOENT", "published Node APIs require no TypeScript sources");
   const pdfPath = resolve(scratch, "drawing with spaces.pdf");
   await writeFile(pdfPath, writeTinyPdf({ objects: [
@@ -81,6 +82,7 @@ async function exercise(library, pdfPath) {
   assert.equal(new TextDecoder().decode(new Uint8Array(await output.blob.arrayBuffer()).subarray(12, 16)), "VP8L");
   assert(!diagnostics.some(diagnostic => /worker-unavailable|webp-png-fallback/.test(diagnostic.code)), "published defaults must render through the actual workers and lossless encoder");
   const session = await library.openDocumentSession(pathToFileURL(pdfPath));
+  let withScene;
   try {
     // Large preview text forces the package's lazy standard-font loader;
     // tiny preview ink marks alone would miss an SSR asset-resolution bug.
@@ -90,5 +92,9 @@ async function exercise(library, pdfPath) {
     const hep = await session.buildHep({ withVectorLod: false, withTextLod: false, encodeRasterImages: false, compression: "store" });
     assert.equal(hep.type, "application/x-hep");
     assert.deepEqual([...new Uint8Array(await hep.arrayBuffer()).subarray(0, 4)], [72,69,80,0]);
+    withScene = await session.buildHepWithScene({ compression: "store" });
+    assert.equal(withScene.blob.type, "application/x-hep");
+    assert.equal(withScene.scene.pageCount, 1);
   } finally { await session.close(); await session.close(); }
+  assert(withScene.scene.textInstanceCount > 0, "packed and SSR sessions retain full-quality text after close");
 }

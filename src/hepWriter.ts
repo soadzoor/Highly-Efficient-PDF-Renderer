@@ -376,6 +376,7 @@ export async function buildHepBlobForLayout(
 
   return {
     blob: hepBlob,
+    scene,
     byteLength: hepBlob.size,
     textureCount: textureEntries.length + (gradientLutByteLength > 0 ? 1 : 0),
     rasterLayerCount: rasterLayers.length,

@@ -190,6 +190,12 @@ const hepBlob = await buildHep("/document.pdf");
 // Save or upload the Blob with a .hep filename.
 ```
 
+For conversion followed by immediate display, use `buildHepWithScene()` (also
+available on document sessions) to receive `{ blob, scene }`. Pass that scene to
+`createThreePdfObject()` without decoding the generated HEP; applicable LOD
+caches are reused. The scene remains usable after the session closes and retains
+full-resolution image pixels, which can use more memory than a blob-only export.
+
 HEP skips PDF extraction. `buildHep` includes applicable vector and text LOD caches
 by default to skip expensive simplification on load. Set `withVectorLod: false`
 and/or `withTextLod: false` to omit them. Shared vector records reduce file size;

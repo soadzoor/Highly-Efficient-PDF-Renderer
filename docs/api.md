@@ -144,6 +144,7 @@ try {
 | `info` | Read-only source kind, page count and page dimensions. |
 | `renderThumbnail(options?)` | Same thumbnail options and result as above. |
 | `buildHep(options?)` | Canonical HEP conversion with existing page selection, compression and LOD options. Default vector/text LOD export stays enabled. |
+| `buildHepWithScene(options?)` | Same conversion options, returning `HepBuildResult`: `{ blob, scene }`. Reuse the complete scene for display without decoding the generated HEP. |
 | `getDiagnostics()` | Copy of accumulated diagnostics. |
 | `close()` | Idempotently cancel pending work and release parser, renderer, encoder and scene resources. |
 
@@ -152,6 +153,15 @@ changing them requires another session. Each operation accepts its own cancellat
 signal. Cancelling one thumbnail leaves the session usable. Operations are serialized;
 thumbnail derivatives never replace canonical HEP resources. HEP sessions re-encode
 their existing canonical scene without recovering detail absent from that HEP.
+
+Use `buildHepWithScene()` when generating a HEP for upload and immediately
+displaying the document. Its returned scene remains usable after `close()`;
+the caller owns that reference. Pass the same scene object to
+`createThreePdfObject(scene, { sourceLabel })` to reuse
+applicable vector and text LOD data. Treat the scene and its arrays as read-only.
+The operation retains full-resolution raster pixels instead of releasing them
+as pages are encoded, so it can use more memory than `buildHep()`. Renderer
+resources, camera controls and shaders still need preparation.
 
 A session retains its last completed thumbnail. Repeating the same normalized
 page, size, background, format and backend returns the immutable image Blob
@@ -1281,6 +1291,26 @@ recolor that correction; layer-dependent backdrop changes are replayed.
 Returns `Promise<Blob>` with MIME type `application/x-hep`. Save it with a `.hep`
 extension. Import it from `@soadzoor/hepr/bundler` in a bundled browser app,
 or `@soadzoor/hepr` in Node.
+
+For conversion followed by display, `buildHepWithScene(input, options?)` accepts
+the same inputs and options and returns `Promise<HepBuildResult>`:
+
+```js
+import { buildHepWithScene, createThreePdfObject } from "@soadzoor/hepr/bundler";
+
+const { blob, scene } = await buildHepWithScene(file, { signal });
+// Save or upload blob as the HEP file.
+const pdf = await createThreePdfObject(scene, { sourceLabel: file.name, signal });
+```
+
+The scene contains the complete selected pages, including raster pixels and
+applicable LOD caches prepared during generation. No generated HEP decode is
+needed. Keep the returned scene object intact to preserve those caches; each
+viewer still creates its own rendering resources. This API retains renderable
+pixels and vector LOD indexes, using more memory than a blob-only export.
+`buildHep()` continues returning only a Blob and streams large raster encodes.
+Both browser and Node document sessions also expose `buildHepWithScene()`;
+closing a session does not invalidate a successful returned scene.
 
 | Input | Options |
 | --- | --- |

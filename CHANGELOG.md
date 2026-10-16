@@ -6,6 +6,15 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Added
+
+- Add `buildHepWithScene()` and the matching browser/Node document-session
+  method, returning both the HEP Blob and a reusable complete scene for immediate
+  viewing without decoding the generated HEP. Preserve applicable prepared LOD
+  data and keep successful scenes usable after session close. This opt-in path
+  retains full-resolution image pixels and viewer LOD indexes; `buildHep()` keeps
+  its existing blob-only, streaming export behavior.
+
 ## [0.1.65] - 2026-10-15
 
 ### Added

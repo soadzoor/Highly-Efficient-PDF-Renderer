@@ -80,6 +80,13 @@ export interface BuildHepFromPdfOptions extends HepEncodingOptions, PdfIccOption
 /** Options when building parsed data from an existing HEPR scene. */
 export type BuildHepFromSceneOptions = HepEncodingOptions;
 
+/** A generated HEP and its complete, reusable rendering scene. */
+export interface HepBuildResult {
+  readonly blob: Blob;
+  /** Treat as read-only; remains usable after its document session closes. */
+  readonly scene: VectorScene;
+}
+
 /**
  * Build a HEP parsed-data file from a PDF source.
  *
@@ -106,6 +113,33 @@ export async function buildHep(
   const { buildHepRuntime } = await waitForLoad(import("./hepBuilderRuntime"), options.signal);
   options.signal?.throwIfAborted();
   return buildHepRuntime(input, resolveHepLodOptions(options));
+}
+
+/**
+ * Build a HEP and retain its full-quality scene without decoding the generated HEP.
+ * Keeps renderable raster pixels and applicable LOD caches, using more memory
+ * than blob-only buildHep(). Pass the returned scene directly to createThreePdfObject().
+ */
+export function buildHepWithScene(
+  source: PdfObjectSource,
+  options?: BuildHepFromPdfOptions
+): Promise<HepBuildResult>;
+
+/** Build from an existing scene, retaining applicable prepared LOD data. */
+export function buildHepWithScene(
+  scene: VectorScene,
+  options?: BuildHepFromSceneOptions
+): Promise<HepBuildResult>;
+
+export async function buildHepWithScene(
+  input: PdfObjectSource | VectorScene,
+  options: BuildHepFromPdfOptions | BuildHepFromSceneOptions = {}
+): Promise<HepBuildResult> {
+  validateEncodingOptions(options);
+  options.signal?.throwIfAborted();
+  const { buildHepWithSceneRuntime } = await waitForLoad(import("./hepBuilderRuntime"), options.signal);
+  options.signal?.throwIfAborted();
+  return buildHepWithSceneRuntime(input, resolveHepLodOptions(options));
 }
 
 function validateEncodingOptions(options: HepEncodingOptions): void {

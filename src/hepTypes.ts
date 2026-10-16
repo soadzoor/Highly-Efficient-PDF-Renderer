@@ -1,5 +1,6 @@
 import type { HepLodOptions } from "./hepLod";
 import type { LoadProgressCallback } from "./loadProgress";
+import type { VectorScene } from "./pdfVectorExtractor";
 
 export interface ExportTextureEntry {
   name: string;
@@ -51,6 +52,8 @@ export type TextureComponentType =
   | "uint16-range-delta-columns";
 
 export interface BuildHepBlobOptions extends HepLodOptions {
+  /** Prepare reusable viewer LOD indexes alongside export geometry. @internal */
+  retainScene?: boolean;
   sourcePdfByteLength?: number;
   onWarning?: (message: string) => void;
   encodeRasterImages?: boolean;
@@ -152,6 +155,7 @@ export interface ParsedDataGradientLutEntry {
 
 export interface HepBlobResult {
   blob: Blob;
+  scene: VectorScene;
   byteLength: number;
   textureCount: number;
   rasterLayerCount: number;

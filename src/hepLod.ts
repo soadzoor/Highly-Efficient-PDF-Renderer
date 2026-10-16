@@ -2,7 +2,7 @@ import { prepareVectorLodForStorage, packVectorLod, packVectorLodWithPointRecipe
 import { HepArchive } from "./hepContainer";
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import {
-  getStoredVectorStrokeLod, buildVectorStrokeLodForStorage, storeVectorStrokeLod, rebuildStoredVectorStrokeLodIndexes,
+  getStoredVectorStrokeLod, hasStoredVectorStrokeLod, buildVectorStrokeLodForStorage, storeVectorStrokeLod, rebuildStoredVectorStrokeLodIndexes,
   VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS, type StoredVectorStrokeLod
 } from "./vectorStrokeLodCore";
 import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
@@ -26,7 +26,7 @@ interface LodDescriptor { version: number; file: string; precision?: "lossless" 
 export interface HepLodManifest { vector?: LodDescriptor; text?: LodDescriptor }
 
 export async function writeHepLod(archive: HepArchive, scene: VectorScene,
-  options: HepLodOptions & { signal?: AbortSignal; onProgress?: (value: number, kind: "vector-lod" | "text-lod") => void } = {}
+  options: HepLodOptions & { retainScene?: boolean; signal?: AbortSignal; onProgress?: (value: number, kind: "vector-lod" | "text-lod") => void } = {}
 ): Promise<HepLodManifest | undefined> {
   options = resolveHepLodOptions(options);
   const result: HepLodManifest = {};
@@ -36,6 +36,7 @@ export async function writeHepLod(archive: HepArchive, scene: VectorScene,
   if (vector) {
     options.onProgress?.(0, "vector-lod");
     let data = getStoredVectorStrokeLod(scene);
+    const retainVectorLod = options.retainScene && !hasStoredVectorStrokeLod(scene);
     if (!data) {
       data = await buildVectorStrokeLodForStorage(scene, {
         signal: options.signal,
@@ -48,6 +49,13 @@ export async function writeHepLod(archive: HepArchive, scene: VectorScene,
       const packed = await packVectorLodWithPointRecipes(scene, packVectorLod(scene, data), options.signal);
       result.vector = { ...writeData(archive, "lod-vector", packed.pointRecipes ? 5 : 4, packed),
         precision: data.positionQuantum || data.positionQuanta ? "compact" : "lossless" };
+      if (retainVectorLod) {
+        // Export geometry omits spatial indexes. Build them once for direct
+        // viewer adoption, without decoding or simplifying the scene again.
+        const indexed = await rebuildStoredVectorStrokeLodIndexes(scene, data, options.signal);
+        options.signal?.throwIfAborted();
+        storeVectorStrokeLod(scene, indexed);
+      }
     }
     options.onProgress?.(1 / steps, "vector-lod");
   }

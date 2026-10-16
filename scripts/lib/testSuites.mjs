@@ -10,6 +10,7 @@ export const fastTests = [
   "changelog",
   "document-loading",
   "pdf-thumbnail",
+  "hep-with-scene",
   "node-pdf-thumbnail",
   "node-canvas-worker-environment",
   "node-thumbnail-encoder",

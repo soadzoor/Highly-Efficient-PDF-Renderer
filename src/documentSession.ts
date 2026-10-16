@@ -1,6 +1,6 @@
 import type { PdfObjectSource, PdfObjectSourceKind } from "./pdfObjectGenerator";
 import type { OpenPdfOptions } from "./pdfSession";
-import type { BuildHepFromPdfOptions } from "./hepBuilder";
+import type { BuildHepFromPdfOptions, HepBuildResult } from "./hepBuilder";
 import type { PdfThumbnailOptions, PdfThumbnailResult } from "./pdfThumbnail";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import { waitForLoad } from "./loadCancellation";
@@ -24,6 +24,8 @@ export interface DocumentSession {
   renderThumbnail(options?: PdfThumbnailOptions): Promise<PdfThumbnailResult>;
   /** Canonical conversion; thumbnail approximations never enter HEP output. */
   buildHep(options?: DocumentSessionHepOptions): Promise<Blob>;
+  /** Canonical HEP plus a reusable scene that remains usable after close(). */
+  buildHepWithScene(options?: DocumentSessionHepOptions): Promise<HepBuildResult>;
   getDiagnostics(): readonly PdfDiagnostic[];
   close(): Promise<void>;
 }

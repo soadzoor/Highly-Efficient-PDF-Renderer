@@ -67,6 +67,10 @@ assert.ok(entry.exports.includes("createThreePdfObject"));
 assert.ok(entry.exports.includes("detectRooms"), "the root package must retain its room detection API");
 assert.ok(entry.exports.includes("renderPdfThumbnail"), "the root package must retain its thumbnail API");
 assert.ok(entry.exports.includes("openDocumentSession"), "the root package must retain its reusable document API");
+assert.ok(entry.exports.includes("buildHepWithScene"), "the root package must export reusable HEP generation results");
+const declarations = await readFile(new URL("../dist/types/hepBuilder.d.ts", import.meta.url), "utf8");
+assert.match(declarations, /interface HepBuildResult/);
+assert.match(declarations, /buildHepWithScene[\s\S]*Promise<HepBuildResult>/);
 
 const chunksByName = new Map(chunks.map(chunk => [chunk.fileName, chunk]));
 function collectReachableChunks(includeDynamicImports, rootChunk = entry) {

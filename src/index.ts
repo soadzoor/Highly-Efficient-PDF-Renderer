@@ -241,7 +241,7 @@ export type {
   CanvasInteractionController
 };
 
-export { buildHep } from "./hepBuilder";
+export { buildHep, buildHepWithScene } from "./hepBuilder";
 export { isPdfPasswordError } from "./pdfObjectGenerator";
 export type { PdfPasswordError, PdfPasswordErrorReason } from "./pdfObjectGenerator";
 export { createAnnotationOverlay, pickSceneAnnotation } from "./annotationOverlay";
@@ -273,7 +273,8 @@ export type {
   BuildHepFromPdfOptions,
   BuildHepFromSceneOptions,
   HepCompression,
-  HepEncodingOptions
+  HepEncodingOptions,
+  HepBuildResult
 } from "./hepBuilder";
 
 export type {
