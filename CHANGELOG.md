@@ -8,11 +8,18 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
-- Reduce native WebGL/WebGPU work for sparse compound fills by drawing separated
-  contour groups with tighter bounds and culling individual fills inside large
-  paint runs. Preserve canonical geometry, source IDs, clipping, holes, opacity
-  and color overrides; retain whole fills when antialiasing footprints can overlap
-  or the projected scale is unknown. Existing HEPs benefit without regeneration.
+- Reduce native and Three.js WebGL/WebGPU work for sparse compound fills by
+  drawing separated contour groups with tighter bounds and culling individual
+  fills inside large paint runs. Preserve canonical geometry, source IDs,
+  clipping, holes, opacity, color overrides, mixed batches and page ownership.
+  Retain whole fills when antialiasing footprints can overlap, projection scale
+  is uncertain or compositor resolution cannot use those bounds safely. Three
+  folded paints retain every selected contour and refresh after zoom/culling.
+  Top-down Three cameras also use the optimization after orbiting leaves tiny
+  rotation residues; conservatively bound their remaining perspective instead
+  of requiring exactly constant clip W. Performance captures expose whether
+  fill selection is active and how many sparse paths use contour groups.
+  Existing HEPs benefit without regeneration.
 
 ## [0.1.66] - 2026-10-16
 

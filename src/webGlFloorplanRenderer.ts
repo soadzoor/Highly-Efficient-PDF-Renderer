@@ -3974,7 +3974,11 @@ export class WebGlFloorplanRenderer {
     const plan = this.orderedBatches;
     profile?.beginSection("batchPreparation");
     if (this.orderedTextLod) this.updateTextLodSelection(width, height, x, y, zoom);
-    const rebuilt = plan?.update(runs, this.localToClipRenderingEnabled ? null : 1 / Math.max(zoom, 1e-6), view) ?? false;
+    const unitsPerPixel = this.localToClipRenderingEnabled ? null : 1 / Math.max(zoom, 1e-6);
+    // Composite targets may use a coarser pixel grid; its fill footprint is
+    // not described by the presentation scale used for scheduling/stroke LOD.
+    const rebuilt = plan?.update(runs, unitsPerPixel, view,
+      paintVisibility.requiresCompositing ? null : unitsPerPixel) ?? false;
     profile?.endSection("batchPreparation");
     this.orderedRunsCulled ||= this.strokeRenderingEnabled && (plan?.culledSegmentCount ?? 0) > 0;
     this.orderedRunsCulled ||= this.fillRenderingEnabled && (plan?.culledFillCount ?? 0) > 0;

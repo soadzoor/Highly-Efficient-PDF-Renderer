@@ -238,9 +238,10 @@ export class VectorOrderedBatches {
   }
 
   /** Returns true only when instance data needs uploading again. */
-  update(runs: readonly VectorDrawRun[], unitsPerPixel: number | null = null, view: Readonly<Bounds> | null = null): boolean {
+  update(runs: readonly VectorDrawRun[], unitsPerPixel: number | null = null, view: Readonly<Bounds> | null = null,
+    fillUnitsPerPixel = unitsPerPixel): boolean {
     const clipChanged = this.clipElision?.update(unitsPerPixel) ?? false;
-    const fillsChanged = this.fillSelection.update(unitsPerPixel, view);
+    const fillsChanged = this.fillSelection.update(fillUnitsPerPixel, view);
     const orderChanged = (this.scheduler?.updateScale(unitsPerPixel) ?? false) || this.orderDirty || clipChanged || fillsChanged;
     this.orderDirty = false;
     let sameRuns = this.initialized && runs.length === this.previousRuns.length;

@@ -3419,7 +3419,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
       profile?.endSection("three.imageGradientUpdate");
       profile?.beginSection("three.vectorUpdate");
       if (this.fillMaterialLayer.mesh.visible) {
-        this.fillMaterialLayer.updateFrame(viewState, materialLayerViewport, materialCullingBounds);
+        this.fillMaterialLayer.updateFrame(viewState, materialLayerViewport, materialCullingBounds, usePaintCompositor);
       }
       if (this.strokeMaterialLayer && this.strokeMaterialLayer.mesh.visible) {
         this.strokeMaterialLayer.updateFrame(viewState, materialLayerViewport, materialCullingBounds);

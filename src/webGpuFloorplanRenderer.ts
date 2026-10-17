@@ -4249,7 +4249,11 @@ export class WebGpuFloorplanRenderer {
     // Paints reorder only within a compositor span, so the ordered instance
     // plan is valid with or without transparency groups.
     const plan = this.orderedBatches;
-    const rebuilt = plan?.update(runs, 1 / Math.max(this.zoom, 1e-6), this.orderedCullingBounds) ?? false;
+    const unitsPerPixel = 1 / Math.max(this.zoom, 1e-6);
+    // Pending surfaces can reduce the compositor's resolution independently
+    // of the presentation viewport. Retain canonical fills for that path.
+    const rebuilt = plan?.update(runs, unitsPerPixel, this.orderedCullingBounds,
+      paintVisibility.requiresCompositing ? null : unitsPerPixel) ?? false;
     this.orderedRunsCulled ||= this.strokeRenderingEnabled && (plan?.culledSegmentCount ?? 0) > 0;
     this.orderedRunsCulled ||= this.fillRenderingEnabled && (plan?.culledFillCount ?? 0) > 0;
     if (plan && rebuilt && plan.instanceCount > 0) {

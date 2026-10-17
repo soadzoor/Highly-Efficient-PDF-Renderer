@@ -10,6 +10,7 @@ import { scenePaintRunNeighbours } from "./scenePaintGraph";
 import { getThreeVectorDrawPlan, type ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
 import { VectorStrokeRedundancy } from "./vectorStrokeRedundancy";
 import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
+import type { VectorFillDrawSelection } from "./vectorFillDrawSelection";
 import { HEPR_THREE_LAYER_ORDER_RASTER, HEPR_THREE_LAYER_ORDER_TEXT } from "./threeLayerOrder";
 
 export function vectorDrawRunRenderOrder(index: number, count: number): number {
@@ -162,18 +163,29 @@ export class ThreeVectorDrawRuns {
   /** Whether batch IDs lag the selection because their writes were deferred. */
   private instanceIdsStale = false;
   private readonly entryByMesh = new Map<THREE.Object3D, DrawRunEntry>();
+  private readonly fillSelection: VectorFillDrawSelection | undefined;
+  private readonly fillOrigins: Uint32Array | undefined;
+  private readonly fillCapacity: Uint32Array | undefined;
 
   static create(scene: VectorScene, kind: VectorDrawRun["kind"],
     parent: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>, attribute: string,
-    plan?: ThreeVectorDrawPlan, origins?: Uint32Array): ThreeVectorDrawRuns | null {
-    return scene.drawRuns ? new ThreeVectorDrawRuns(scene, kind, parent, attribute, plan, origins) : null;
+    plan?: ThreeVectorDrawPlan, origins?: Uint32Array, fills?: VectorFillDrawSelection,
+    fillOrigins?: Uint32Array): ThreeVectorDrawRuns | null {
+    return scene.drawRuns ? new ThreeVectorDrawRuns(scene, kind, parent, attribute, plan, origins, fills, fillOrigins) : null;
   }
 
   private constructor(scene: VectorScene, kind: VectorDrawRun["kind"],
     parent: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>, attribute: string,
-    plan?: ThreeVectorDrawPlan, origins?: Uint32Array) {
+    plan?: ThreeVectorDrawPlan, origins?: Uint32Array, fills?: VectorFillDrawSelection, fillOrigins?: Uint32Array) {
     this.scene = scene;
     this.origins = origins;
+    this.fillSelection = fills;
+    this.fillOrigins = fillOrigins;
+    if (fills?.data.parts.size) {
+      const capacity = this.fillCapacity = new Uint32Array(scene.fillPathCount + 1);
+      for (const [id, variants] of fills.data.parts) capacity[id + 1] = Math.max(...variants.map(parts => parts.count)) - 1;
+      for (let id = 1; id < capacity.length; id++) capacity[id] += capacity[id - 1];
+    }
     this.kind = kind;
     this.parent = parent;
     this.attribute = attribute;
@@ -235,6 +247,9 @@ export class ThreeVectorDrawRuns {
     this.parent.geometry.instanceCount = this.sourceCount;
   }
 
+  /** Contour variants may change while the canonical visible IDs stay the same. */
+  invalidateFillSelection(): void { this.entriesCurrent = false; }
+
   finishUpdate(): void {
     const source = this.parent.geometry.getAttribute(this.attribute) as THREE.InstancedBufferAttribute;
     const count = this.parent.geometry.instanceCount;
@@ -251,7 +266,7 @@ export class ThreeVectorDrawRuns {
       return;
     }
     const sourceChanged = source.version !== this.sourceVersion || count !== this.sourceCount;
-    if (!replanned && !sourceChanged) return;
+    if (!replanned && !sourceChanged && this.entriesCurrent) return;
     // Spatial culling can repack the same IDs in a different order. The ordered
     // batches only depend on membership, so reuse their buffers and redundancy
     // decision when no primitive actually entered or left the candidate set.
@@ -334,10 +349,19 @@ export class ThreeVectorDrawRuns {
       for (let item = range.selectionFirst; item < range.selectionEnd; item++) {
         const id = stored ? stored[keys[item] - range.keyFirst] : keys[item];
         if (redundancy && !redundancy.isRetained(id)) continue;
-        values[offset++] = id;
-        values[offset++] = clipCode;
-        values[offset++] = kind;
-        values[offset++] = pages?.[id] ?? 0;
+        if (!this.fillSelection) {
+          values[offset++] = id; values[offset++] = clipCode; values[offset++] = kind; values[offset++] = pages?.[id] ?? 0;
+          continue;
+        }
+        const parts = this.fillSelection?.splitPaths.get(id);
+        const first = parts?.first ?? id, end = first + (parts?.count ?? 1);
+        for (let selected = first; selected < end; selected++) {
+          if (this.fillSelection?.visible && !this.fillSelection.visible[selected]) continue;
+          values[offset++] = selected;
+          values[offset++] = clipCode;
+          values[offset++] = kind;
+          values[offset++] = pages?.[selected] ?? 0;
+        }
       }
     }
     return offset;
@@ -492,6 +516,7 @@ export class ThreeVectorDrawRuns {
     let mixedClips = false;
     for (const range of ranges) {
       count += range.ids?.length ?? range.count;
+      if (this.fillCapacity) count += this.fillCapacity[range.first + range.count] - this.fillCapacity[range.first];
       if ((range.run.clipIndex ?? -1) !== clipIndex) mixedClips = true;
     }
     if (mixedClips) clipIndex = -1;
@@ -520,13 +545,14 @@ export class ThreeVectorDrawRuns {
       }
     }
     const mesh = new THREE.Mesh(geometry, material);
-    mesh.userData.heprDrawRun = { ...ranges[0].run, first: ranges[0].first, count };
+    mesh.userData.heprDrawRun = { ...ranges[0].run, first: ranges[0].first,
+      count: this.fillSelection ? ranges.reduce((sum, range) => sum + range.count, 0) : count };
     // The canonical paints behind this mesh. A mesh with nothing left to draw
     // tells the compositor those paints are off screen, which is what lets it
     // drop the transparency groups that no longer contain anything.
     mesh.userData.heprDrawRunIndices = ranges.map(range => range.index);
     mesh.userData.heprDrawRanges = ranges.map(({ first, count }) => ({ first, count }));
-    mesh.userData.heprCanonicalOrigins = this.origins;
+    mesh.userData.heprCanonicalOrigins = this.fillOrigins ?? this.origins;
     mesh.userData.heprScheduled = this.plan.version > 0;
     mesh.userData.heprInstanceAttribute = this.attribute;
     mesh.frustumCulled = false;
@@ -586,7 +612,14 @@ export class ThreeVectorDrawRuns {
         if (deferred) {
           // Redundant strokes are dropped per ID; count them as the writer will.
           const redundancy = this.strokeRedundancyEnabled ? this.strokeRedundancy : null;
-          if (!redundancy) visible += range.selectionEnd - range.selectionFirst;
+          if (this.fillSelection) for (let item = range.selectionFirst; item < range.selectionEnd; item++) {
+            const id = keys[item], parts = this.fillSelection.splitPaths.get(id);
+            const first = parts?.first ?? id, end = first + (parts?.count ?? 1);
+            for (let selected = first; selected < end; selected++) {
+              if (!this.fillSelection.visible || this.fillSelection.visible[selected]) visible++;
+            }
+          }
+          else if (!redundancy) visible += range.selectionEnd - range.selectionFirst;
           else for (let item = range.selectionFirst; item < range.selectionEnd; item++) {
             if (redundancy.isRetained(keys[item])) visible++;
           }
@@ -611,9 +644,20 @@ export class ThreeVectorDrawRuns {
         for (let item = first; item < end; item++) {
           const id = text ? text.instanceIds[item] : stored ? stored[keys[item] - range.keyFirst] : keys[item];
           if (this.strokeRedundancyEnabled && this.strokeRedundancy && !this.strokeRedundancy.isRetained(id)) continue;
-          if (ids[visible] !== id) { ids[visible] = id; changed = true; }
-          if (clips && clips[visible] !== clipCode) { clips[visible] = clipCode; clipsChanged = true; }
-          visible++;
+          if (!this.fillSelection) {
+            if (ids[visible] !== id) { ids[visible] = id; changed = true; }
+            if (clips && clips[visible] !== clipCode) { clips[visible] = clipCode; clipsChanged = true; }
+            visible++;
+            continue;
+          }
+          const parts = this.fillSelection?.splitPaths.get(id);
+          const first = parts?.first ?? id, end = first + (parts?.count ?? 1);
+          for (let selected = first; selected < end; selected++) {
+            if (this.fillSelection?.visible && !this.fillSelection.visible[selected]) continue;
+            if (ids[visible] !== selected) { ids[visible] = selected; changed = true; }
+            if (clips && clips[visible] !== clipCode) { clips[visible] = clipCode; clipsChanged = true; }
+            visible++;
+          }
         }
       }
       if (deferred) considered += visible;

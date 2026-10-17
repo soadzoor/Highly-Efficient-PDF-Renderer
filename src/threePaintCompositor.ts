@@ -154,8 +154,9 @@ interface ProxyEntry {
   partialSelections?: (PartialGeometrySelection | undefined)[];
   ranges?: readonly { first: number; count: number }[];
   origins?: Uint32Array;
-  /** One-instance geometries of this mesh's folded paints, by canonical index. */
+  /** A folded canonical paint can have several selected contour instances. */
   foldGeometries?: Map<number, THREE.InstancedBufferGeometry>;
+  foldSelection?: Omit<PartialGeometrySelection, "runs">;
   /** The frame `uses` counts for. */
   frame: number;
   /** Stand-ins taken in that frame, across all of its host batches. */
@@ -1358,36 +1359,48 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
   }
 
   /**
-   * A folded paint's own one-instance geometry. A fill's instance data is the
-   * same every frame, so each folded paint builds it once, rather than
-   * rewriting the shared partial buffer once per fold within every frame. A
-   * mesh holding only this paint keeps its canonical buffers.
+   * A folded paint's own geometry, including all its selected contour groups.
+   * Stable selections retain their buffers; zooming or culling can change the
+   * derived instances without changing the canonical paint ID.
    */
   private foldGeometry(proxy: ProxyEntry, run: VectorDrawRun): THREE.BufferGeometry | null {
     const geometry = proxy.source.geometry;
     if (!proxy.attribute || !proxy.run) return geometry;
     const ranges = proxy.ranges ?? [proxy.run];
     if (ranges.every(range => range.first >= run.first && range.first + range.count <= run.first + run.count)) return geometry;
+    const capacity = (geometry as THREE.InstancedBufferGeometry).instanceCount;
+    const attributes = Object.entries(geometry.attributes), previous = proxy.foldSelection;
+    if (!previous || previous.source !== geometry || previous.count !== capacity || previous.index !== geometry.index ||
+        previous.origins !== proxy.origins || previous.attributes.length !== attributes.length ||
+        previous.attributes.some(saved => geometry.getAttribute(saved.name) !== saved.attribute ||
+          (saved.attribute instanceof THREE.InstancedBufferAttribute && saved.attribute.version !== saved.version))) {
+      for (const folded of proxy.foldGeometries?.values() ?? []) disposeOwnedInstances(folded);
+      proxy.foldGeometries?.clear();
+      proxy.foldSelection = { source: geometry, count: capacity, index: geometry.index, origins: proxy.origins,
+        attributes: attributes.map(([name, attribute]) => ({ name, attribute,
+          version: attribute instanceof THREE.InstancedBufferAttribute ? attribute.version : 0 })) };
+    }
     const cached = proxy.foldGeometries?.get(run.first);
     if (cached) return cached;
     const source = geometry.getAttribute(proxy.attribute);
-    const capacity = (geometry as THREE.InstancedBufferGeometry).instanceCount;
-    let item = -1;
-    for (let index = 0; index < capacity && item < 0; index++) {
+    const selected: number[] = [];
+    for (let index = 0; index < capacity; index++) {
       const id = source.getX(index);
-      if ((proxy.origins?.[id] ?? id) === run.first) item = index;
+      if ((proxy.origins?.[id] ?? id) === run.first) selected.push(index);
     }
-    if (item < 0) return null;
+    if (!selected.length) return null;
     const folded = new THREE.InstancedBufferGeometry();
-    for (const [name, attribute] of Object.entries(geometry.attributes)) {
+    for (const [name, attribute] of attributes) {
       if (!(attribute instanceof THREE.InstancedBufferAttribute)) { folded.setAttribute(name, attribute); continue; }
       const ArrayType = attribute.array.constructor as { new(length: number): typeof attribute.array };
-      const array = new ArrayType(attribute.itemSize);
-      for (let component = 0; component < attribute.itemSize; component++) array[component] = attribute.getComponent(item, component);
+      const array = new ArrayType(selected.length * attribute.itemSize);
+      for (let item = 0; item < selected.length; item++) for (let component = 0; component < attribute.itemSize; component++) {
+        array[item * attribute.itemSize + component] = attribute.getComponent(selected[item], component);
+      }
       folded.setAttribute(name, new THREE.InstancedBufferAttribute(array, attribute.itemSize, attribute.normalized));
     }
     folded.setIndex(geometry.index);
-    folded.instanceCount = 1;
+    folded.instanceCount = selected.length;
     (proxy.foldGeometries ??= new Map()).set(run.first, folded);
     return folded;
   }
@@ -1410,6 +1423,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
   private disposePartial(proxy: ProxyEntry): void {
     for (const folded of proxy.foldGeometries?.values() ?? []) disposeOwnedInstances(folded);
     proxy.foldGeometries = undefined;
+    proxy.foldSelection = undefined;
     for (const geometry of proxy.partialGeometries) if (geometry) disposeOwnedInstances(geometry);
     proxy.partialGeometries.length = 0;
     proxy.partialSelections = undefined;

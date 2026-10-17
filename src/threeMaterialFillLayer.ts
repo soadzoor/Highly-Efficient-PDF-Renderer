@@ -3,15 +3,18 @@ import type { ThreePageBinding } from "./threePageTransforms";
 import { requireThreeWebGpuBackend, type ThreeWebGpuBackend } from "./threeMaterialBackend";
 import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTransforms";
 import type { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
-import { vectorFillBandIndex, vectorSceneFillStore } from "./vectorFillBands";
+import { buildVectorFillBandIndex, vectorFillBandIndex } from "./vectorFillBands";
 import { vectorIndexedPathStore } from "./vectorCellIndex";
-import { vectorFillCoverageMetadata } from "./vectorFillCoverage";
+import { vectorFillDrawData, VectorFillDrawSelection, type VectorFillDrawData } from "./vectorFillDrawSelection";
+import { choosePdfCompositeResolution } from "./pdfCompositeBudget";
+import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
 import { acquireThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
 import { enableThreeRawPaintFold, threePaintFoldFragmentGlsl } from "./threePaintFold";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
+import { getThreeRenderPerformance } from "./threeRenderPerformance";
 import { GUARDED_RUN_COUNT, VISIBILITY_GUARD_PIXELS } from "./visibilityGuard";
 import * as THREE from "three";
 
@@ -54,6 +57,9 @@ export class ThreeMaterialFillLayer {
   private readonly vectorClipTexture: THREE.DataTexture;
   private readonly releaseVectorClipTexture: () => void;
   private readonly orderedRuns: ThreeVectorDrawRuns | null;
+  private readonly fillData: VectorFillDrawData;
+  private readonly fillSelection: VectorFillDrawSelection;
+  private readonly scene: VectorScene;
   readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>;
 
   private readonly fillPathMetaTextureA: THREE.DataTexture;
@@ -85,34 +91,36 @@ export class ThreeMaterialFillLayer {
   /** The culling window of the current selection; null when it must be rebuilt. */
   private selectionBounds: CullingBounds | null = null;
   private useLocalToClip = false;
+  private usingFillSelection = false;
 
   constructor(scene: VectorScene, options: FillLayerOptions) {
+    this.scene = scene;
     const fillPathCount = Math.max(0, scene.fillPathCount | 0);
-    const fillSegmentCount = Math.max(0, scene.fillSegmentCount | 0);
     this.fillPathCount = fillPathCount;
-    const pathTextureSize = chooseTextureSize(fillPathCount);
-    const coverage = vectorFillCoverageMetadata(scene);
+    const coverage = this.fillData = vectorFillDrawData(scene, 2 ** 24);
+    this.fillSelection = new VectorFillDrawSelection(coverage);
+    const pathTextureSize = chooseTextureSize(coverage.pathCount);
     // The band and cell indexes follow the segments in the same store, so the
     // texture is sized for all three. A store too large for one goes without.
-    const store = vectorIndexedPathStore({ ...vectorSceneFillStore(scene), ...coverage, pathCount: fillPathCount,
-      segmentCount: fillSegmentCount }, vectorFillBandIndex(scene));
+    const store = vectorIndexedPathStore(coverage, coverage.parts.size
+      ? buildVectorFillBandIndex(coverage) : vectorFillBandIndex(scene));
     const segmentTextureSize = chooseTextureSize(store.texels);
 
     this.fillPathMetaTextureA = createFloatTexture(
       coverage.pathMetaA,
-      fillPathCount,
+      coverage.pathCount,
       pathTextureSize.width,
       pathTextureSize.height
     );
     this.fillPathMetaTextureB = createFloatTexture(
       coverage.pathMetaB,
-      fillPathCount,
+      coverage.pathCount,
       pathTextureSize.width,
       pathTextureSize.height
     );
     this.fillPathMetaTextureC = createFloatTexture(
       coverage.pathMetaC,
-      fillPathCount,
+      coverage.pathCount,
       pathTextureSize.width,
       pathTextureSize.height
     );
@@ -129,7 +137,7 @@ export class ThreeMaterialFillLayer {
       segmentTextureSize.height
     );
 
-    this.visibleFillPathIds = new Float32Array(Math.max(1, fillPathCount));
+    this.visibleFillPathIds = new Float32Array(Math.max(1, coverage.pathCount));
     this.allFillPathIds = new Float32Array(Math.max(1, fillPathCount));
     for (let i = 0; i < fillPathCount; i += 1) {
       this.visibleFillPathIds[i] = i;
@@ -160,7 +168,13 @@ export class ThreeMaterialFillLayer {
       options.vectorOverride[3]
     );
 
-    const pageBinding = options.pageTransforms?.instances("fill", scene);
+    let origins: Uint32Array | undefined;
+    if (coverage.parts.size) {
+      origins = new Uint32Array(coverage.pathCount);
+      for (let id = 0; id < fillPathCount; id++) origins[id] = id;
+      origins.set(coverage.origins, fillPathCount);
+    }
+    const pageBinding = options.pageTransforms?.instances("fill", scene, origins);
     this.mixedPageBinding = pageBinding;
     this.mixedOptions = {
       colorCompositing: options.colorCompositing ?? "linear",
@@ -239,7 +253,8 @@ export class ThreeMaterialFillLayer {
       this.mesh = new THREE.Mesh(geometry, material);
       this.mesh.frustumCulled = false;
       this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_FILL;
-      this.orderedRuns = ThreeVectorDrawRuns.create(scene, "fill", this.mesh, "aFillPathIndex", options.drawPlan);
+      this.orderedRuns = ThreeVectorDrawRuns.create(scene, "fill", this.mesh, "aFillPathIndex", options.drawPlan,
+        undefined, coverage.parts.size ? this.fillSelection : undefined, origins);
     } catch (error) {
       clips.release();
       throw error;
@@ -268,6 +283,17 @@ export class ThreeMaterialFillLayer {
     patchPrimitiveColorTexture(this.fillPathMetaTextureC, scene.fillPathMetaC, updates, "fill", [
       { source: 2, target: 2, component: 2 }
     ]);
+    const b = this.fillPathMetaTextureB.image.data as Float32Array;
+    const c = this.fillPathMetaTextureC.image.data as Float32Array;
+    for (const update of updates) {
+      if (update.ref.kind !== "fill") continue;
+      const variants = this.fillData.parts.get(update.ref.index);
+      if (!variants) continue;
+      const source = update.ref.index * 4;
+      for (const parts of variants) for (let id = parts.first; id < parts.first + parts.count; id++) {
+        b[id * 4 + 2] = b[source + 2]; b[id * 4 + 3] = b[source + 3]; c[id * 4 + 2] = c[source + 2];
+      }
+    }
   }
 
   setVectorOverride(red: number, green: number, blue: number, opacity: number): void {
@@ -291,7 +317,8 @@ export class ThreeMaterialFillLayer {
     }
   }
 
-  updateFrame(viewState: ViewState, viewport: ViewportPixels, cullingBounds?: CullingBounds | null): void {
+  updateFrame(viewState: ViewState, viewport: ViewportPixels, cullingBounds?: CullingBounds | null,
+    compositing = sceneRequiresPaintCompositing(this.scene)): void {
     this.viewportUniform.set(Math.max(1, viewport.width), Math.max(1, viewport.height));
     this.cameraCenterUniform.set(viewState.cameraCenterX, viewState.cameraCenterY);
     this.zoomUniform.value = Math.max(1e-6, viewState.zoom);
@@ -299,8 +326,61 @@ export class ThreeMaterialFillLayer {
       this.webGpuState.zoomUniform.value = this.zoomUniform.value;
     }
     this.orderedRuns?.beginUpdate();
-    this.updateVisibleFillPaths(viewState, viewport, cullingBounds);
+    const resolution = compositing ? choosePdfCompositeResolution(this.scene, viewport.width, viewport.height) : null;
+    // A downscaled surface has wider fragment footprints than the vertex
+    // padding computed from the presentation viewport. Keep whole paints.
+    const reduced = resolution && (resolution.width < viewport.width || resolution.height < viewport.height);
+    const units = reduced ? null : this.fillUnitsPerPixel(viewState, viewport);
+    const zoom = Math.max(1e-6, viewState.zoom);
+    const bounds = cullingBounds ?? (this.useLocalToClip ? null : {
+      minX: viewState.cameraCenterX - viewport.width / (2 * zoom),
+      minY: viewState.cameraCenterY - viewport.height / (2 * zoom),
+      maxX: viewState.cameraCenterX + viewport.width / (2 * zoom),
+      maxY: viewState.cameraCenterY + viewport.height / (2 * zoom)
+    });
+    const selectionChanged = this.fillSelection.update(units, units === null ? null : bounds);
+    if (selectionChanged) this.orderedRuns?.invalidateFillSelection();
+    if (units === null) this.updateVisibleFillPaths(viewState, viewport, cullingBounds);
+    else if (selectionChanged || !this.usingFillSelection) this.updateSelectedFillPaths();
+    this.usingFillSelection = units !== null;
     this.orderedRuns?.finishUpdate();
+    const profile = getThreeRenderPerformance();
+    profile?.add("three.fillSelectionActive", units === null ? 0 : 1);
+    profile?.add("three.fillSplitPaths", this.fillSelection.splitPaths.size);
+  }
+
+  /** Bound affine footprints, including numerical residue in top-down cameras. */
+  private fillUnitsPerPixel(view: ViewState, viewport: ViewportPixels): number | null {
+    if (!this.useLocalToClip) return 1 / Math.max(1e-6, view.zoom);
+    const pages = this.mixedPageBinding?.table;
+    if (!pages) return affineUnitsPerPixel(this.localToClipUniform, viewport);
+    let maximum = 0;
+    for (let page = 0; page < pages.visibility.length; page++) {
+      if (!pages.visibility[page]) continue;
+      const units = affineUnitsPerPixel(pages.projections[page], viewport);
+      if (units === null) return null;
+      maximum = Math.max(maximum, units);
+    }
+    return maximum > 0 ? maximum : null;
+  }
+
+  private updateSelectedFillPaths(): void {
+    this.selectionBounds = null;
+    const visible = this.fillSelection.visible;
+    if (!visible) { this.setAllFillPathsVisible(); return; }
+    let count = 0, changed = false;
+    for (let id = 0; id < this.fillPathCount; id++) {
+      if (!visible[id]) continue;
+      if (this.visibleFillPathIds[count] !== id) { this.visibleFillPathIds[count] = id; changed = true; }
+      count++;
+    }
+    this.usingAllFillPaths = count === this.fillPathCount;
+    this.mesh.geometry.instanceCount = count;
+    if (changed) {
+      this.fillPathIndexAttribute.clearUpdateRanges();
+      this.fillPathIndexAttribute.addUpdateRange(0, count);
+      this.fillPathIndexAttribute.needsUpdate = true;
+    }
   }
 
   dispose(): void {
@@ -404,6 +484,42 @@ export class ThreeMaterialFillLayer {
     this.usingAllFillPaths = true;
     this.mesh.geometry.instanceCount = this.fillPathCount;
   }
+}
+
+/** Bound inverse pixel derivatives over the viewport and neighbouring samples. */
+function affineUnitsPerPixel(matrix: THREE.Matrix4, viewport: ViewportPixels): number | null {
+  const m = matrix.elements;
+  if (!(m[15] > 0)) return null;
+  const w = Math.fround(m[15]);
+  const a = Math.fround(m[0]) * viewport.width / 2, b = Math.fround(m[4]) * viewport.width / 2;
+  const c = Math.fround(m[1]) * viewport.height / 2, d = Math.fround(m[5]) * viewport.height / 2;
+  const tx = Math.fround(m[12]) * viewport.width / 2, ty = Math.fround(m[13]) * viewport.height / 2;
+  const p = Math.fround(m[3]), q = Math.fround(m[7]), determinant = a * d - b * c;
+  const tolerance = 2 ** -20;
+  // Nearly cancelling products cannot establish a reliable inverse from the
+  // Float32 matrices seen by the shader. Keep the original drawing domain.
+  if (Math.abs(determinant) <= (Math.abs(a * d) + Math.abs(b * c)) * tolerance) return null;
+  const inverseWX = c * q - d * p, inverseWY = b * p - a * q;
+  const halfWidth = viewport.width / 2 + 1, halfHeight = viewport.height / 2 + 1;
+  const variation = Math.abs(inverseWX) * halfWidth + Math.abs(inverseWY) * halfHeight;
+  // OrbitControls can leave a nonzero W slope even at zero measured tilt.
+  // Admit only rounding-scale variation, measured relative to this projection
+  // and viewport rather than an absolute matrix epsilon. Still include that
+  // variation in the bound; do not pretend the perspective terms are zero.
+  if (!(variation <= Math.abs(determinant) * tolerance)) return null;
+  const minimumW = Math.abs(determinant) - variation;
+  const depth = w * determinant, offsetX = tx * inverseWX, offsetY = ty * inverseWY;
+  const planarDeterminant = depth + offsetX + offsetY;
+  if (!(planarDeterminant * determinant > 0) || Math.abs(planarDeterminant) <=
+      (Math.abs(depth) + Math.abs(offsetX) + Math.abs(offsetY)) * tolerance) return null;
+  // For inverse homography H^-1, derivative numerators are det(H) times
+  // (d-q*y, q*x-b) and (p*y-c, a-p*x). Their row norms, divided by the
+  // smallest inverse W squared, also bound the shader's finite differences.
+  const units = Math.abs(planarDeterminant) / (minimumW * minimumW) * Math.max(
+    Math.hypot(Math.abs(d) + Math.abs(q) * halfHeight, Math.abs(b) + Math.abs(q) * halfWidth),
+    Math.hypot(Math.abs(c) + Math.abs(p) * halfHeight, Math.abs(a) + Math.abs(p) * halfWidth)
+  ) * (1 + tolerance);
+  return Number.isFinite(units) && units > 0 ? units : null;
 }
 
 function chooseTextureSize(count: number): { width: number; height: number } {

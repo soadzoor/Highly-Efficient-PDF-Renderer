@@ -44,6 +44,9 @@ try {
   assert.equal(plan.batches.length, 1, "parts retain one compatible instanced draw");
   assert.equal(plan.scheduledSpanRunCount(0, 0), 1, "compositor membership counts source paints");
   assert.equal(plan.update(sparse.drawRuns, .75), false, "unchanged AA bucket reuses the instance upload");
+  plan.update(sparse.drawRuns,1,{minX:40,minY:30,maxX:60,maxY:50},null);
+  assert.deepEqual(idsOf(plan),[0],"an unknown compositor footprint retains whole fills without changing scheduling scale");
+  plan.update(sparse.drawRuns,1);
   assert(plan.update(sparse.drawRuns, 128));
   assert.deepEqual(idsOf(plan), [0], "overlapping AA footprints restore the whole compound fill");
   for (const units of [null, NaN, Infinity, 0, -1]) {
