@@ -1,5 +1,6 @@
 import type { OrderedTextLodSelection } from "./orderedTextLod";
-import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
+import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
+import { vectorFillDrawData, VectorFillDrawSelection } from "./vectorFillDrawSelection";
 import type { VectorStrokeLodRuntime } from "./vectorStrokeLodCore";
 import { explicitStrokePaintOrigins } from "./vectorStrokePaintOrder";
 import { scenePaintSpanSegments } from "./scenePaintGraph";
@@ -68,6 +69,8 @@ export class VectorOrderedBatches {
   instanceCount = 0;
   /** Visible strokes omitted temporarily; canonical scene counts never change. */
   culledSegmentCount = 0;
+  /** Renderer fill instances outside the guarded view, including contour groups. */
+  culledFillCount = 0;
   /** True while minification relaxes paint order between sub-pixel neighbours. */
   get paintOrderApproximated(): boolean { return this.scheduler?.paintOrderApproximated ?? false; }
   private readonly runtime: VectorStrokeLodRuntime | null;
@@ -107,13 +110,15 @@ export class VectorOrderedBatches {
   private orderDirty = false;
   private textSelection: OrderedTextLodSelection | null = null;
   private textSelectionRevision = 0;
+  private readonly fillSelection: VectorFillDrawSelection;
 
   get colorBatchingEnabled(): boolean { return this.redundancyEnabled && this.strokeColorsMatchSource; }
   get blackDarkenSourceOverEnabled(): boolean { return this.colorBatchingEnabled && this.blackPreserved; }
 
-  constructor(scene: VectorScene, runtime: VectorStrokeLodRuntime | null) {
+  constructor(scene: VectorScene, runtime: VectorStrokeLodRuntime | null, fills = vectorFillDrawData(scene)) {
     this.scene = scene;
     this.runtime = runtime;
+    this.fillSelection = new VectorFillDrawSelection(fills);
     this.cullingPadding = (runtime?.levels.at(-1)?.tolerance ?? 0) * 2;
     const runs = scene.drawRuns!;
     this.sourceRuns = runs;
@@ -233,9 +238,10 @@ export class VectorOrderedBatches {
   }
 
   /** Returns true only when instance data needs uploading again. */
-  update(runs: readonly VectorDrawRun[], unitsPerPixel: number | null = null): boolean {
+  update(runs: readonly VectorDrawRun[], unitsPerPixel: number | null = null, view: Readonly<Bounds> | null = null): boolean {
     const clipChanged = this.clipElision?.update(unitsPerPixel) ?? false;
-    const orderChanged = (this.scheduler?.updateScale(unitsPerPixel) ?? false) || this.orderDirty || clipChanged;
+    const fillsChanged = this.fillSelection.update(unitsPerPixel, view);
+    const orderChanged = (this.scheduler?.updateScale(unitsPerPixel) ?? false) || this.orderDirty || clipChanged || fillsChanged;
     this.orderDirty = false;
     let sameRuns = this.initialized && runs.length === this.previousRuns.length;
     if (sameRuns && !(runs === this.sourceRuns && this.previousRunsAreSource)) {
@@ -321,6 +327,7 @@ export class VectorOrderedBatches {
     this.spanOrdered = true;
     this.instanceCount = 0;
     this.culledSegmentCount = 0;
+    this.culledFillCount = 0;
     this.visiblePaints.length = 0;
     this.scheduledRuns.fill(0);
     this.scheduledSpanPrefix.fill(0);
@@ -357,6 +364,10 @@ export class VectorOrderedBatches {
       if (kind === "stroke") strokeCount += count;
       if (kind === "stroke" || kind === "fill" || kind === "text") instanceCapacity += count;
     }
+    // Additional contour groups replace a canonical fill only when their AA
+    // bounds are disjoint. Reserve their possible expansion without changing
+    // canonical run ranges or compositor membership.
+    instanceCapacity += this.fillSelection.data.pathCount - this.fillSelection.data.canonicalCount;
     this.uintInstanceData = growUint32(this.uintInstanceData, instanceCapacity * 2);
     if (this.redundancyEnabled) {
       // Only strokes that share a line with another stroke can be culled.
@@ -400,6 +411,18 @@ export class VectorOrderedBatches {
         for (let index = start; index < start + count; index++) {
           const id = this.rankToId[this.selectedRanks[index]];
           if (!this.redundancyEnabled || this.redundancy.isRetained(id)) this.appendInstance(id, clipCode);
+        }
+      } else if (run.kind === "fill") {
+        const visible = this.fillSelection.visible;
+        for (let id = start; id < start + count; id++) {
+          const parts = this.fillSelection.splitPaths.get(id);
+          if (parts) {
+            for (let part = parts.first; part < parts.first + parts.count; part++) {
+              if (!visible || visible[part]) this.appendInstance(part, clipCode);
+              else this.culledFillCount++;
+            }
+          } else if (!visible || visible[id]) this.appendInstance(id, clipCode);
+          else this.culledFillCount++;
         }
       } else {
         for (let id = start; id < start + count; id++) {

@@ -103,6 +103,7 @@ export const fastTests = [
   "fill-index-deferral",
   "quadratic-fill-integral",
   "vector-fill-coverage",
+  "vector-fill-draw-selection",
   "vector-render-comparison",
   "projected-coverage-margin",
   "pdf-layer-controls",

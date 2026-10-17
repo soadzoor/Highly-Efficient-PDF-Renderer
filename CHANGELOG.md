@@ -6,6 +6,14 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Fixed
+
+- Reduce native WebGL/WebGPU work for sparse compound fills by drawing separated
+  contour groups with tighter bounds and culling individual fills inside large
+  paint runs. Preserve canonical geometry, source IDs, clipping, holes, opacity
+  and color overrides; retain whole fills when antialiasing footprints can overlap
+  or the projected scale is unknown. Existing HEPs benefit without regeneration.
+
 ## [0.1.66] - 2026-10-16
 
 ### Added

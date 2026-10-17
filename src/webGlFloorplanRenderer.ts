@@ -15,6 +15,7 @@ import {
 } from "./nativeWebGlCoreShaders";
 import { vectorIndexedPathStore } from "./vectorCellIndex";
 import { vectorFillCoverageMetadata } from "./vectorFillCoverage";
+import { vectorFillDrawData, fillDrawColorTexels, type VectorFillDrawData } from "./vectorFillDrawSelection";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
 import { buildRasterStripBatches } from "./rasterStripBatches";
 import { planRasterTiles, rasterTilePixels, reportRasterTileDownscale, sameRasterTilePlan, type RasterTilePlan } from "./rasterTiles";
@@ -62,7 +63,7 @@ import { MixedVectorBatches, type MixedVectorDrawRun } from "./mixedVectorBatche
 import { MIXED_VECTOR_VERTEX_SHADER_SOURCE, MIXED_VECTOR_FRAGMENT_SHADER_SOURCE,
   MIXED_VECTOR_KIND_ATTRIBUTE, MIXED_VECTOR_VARYING_VECTORS } from "./nativeWebGlMixedVectorShaders";
 import { OrderedTextLodSelection } from "./orderedTextLod";
-import { buildVectorFillBandIndex, vectorFillBandIndex, vectorSceneFillStore } from "./vectorFillBands";
+import { buildVectorFillBandIndex, vectorFillBandIndex } from "./vectorFillBands";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
 import { MAX_VECTOR_CLIP_TEXELS, packVectorClips, UNBOUNDED_VECTOR_CLIP_BOUNDS, vectorClipChainBounds,
   type VectorClipPackingStats } from "./vectorClips";
@@ -715,6 +716,7 @@ export class WebGlFloorplanRenderer {
   private mixedVectorBatchingUnavailable = false;
   private mixedVectorBatches: MixedVectorBatches | null = null;
   private fillCoverageMetadata: ReturnType<typeof vectorFillCoverageMetadata> | null = null;
+  private fillDrawData: VectorFillDrawData | null = null;
   private mixedVectorGpu: { program: WebGLProgram; uniforms: Record<string, WebGLUniformLocation>;
     buffer: WebGLBuffer; vao: WebGLVertexArrayObject; revision: number } | null = null;
   private lastMixedVectorDrawFirst = 0;
@@ -1290,8 +1292,11 @@ export class WebGlFloorplanRenderer {
       const first = this.lastMixedVectorDrawFirst, data = this.mixedVectorBatches.floatInstances;
       const ids: number[] = [], clips: number[] = [], kinds: ("stroke" | "fill")[] = [];
       for (let index = first; index < first + Math.min(instances, 32); index++) {
-        ids.push(data[index * 3]); clips.push(data[index * 3 + 1] - 1);
-        kinds.push(data[index * 3 + 2] === 1 ? "fill" : "stroke");
+        const id = data[index * 3], fill = data[index * 3 + 2] === 1;
+        ids.push(fill && this.fillDrawData && id >= this.fillDrawData.canonicalCount
+          ? this.fillDrawData.origins[id - this.fillDrawData.canonicalCount] : id);
+        clips.push(data[index * 3 + 1] - 1);
+        kinds.push(fill ? "fill" : "stroke");
       }
       return { kind: "mixed-vector", first, indirect: true, ids, clips, kinds, truncated: instances > ids.length };
     }
@@ -1304,7 +1309,9 @@ export class WebGlFloorplanRenderer {
     const ids: number[] = [], clips: number[] = [], selected = this.orderedBatches?.uintInstances;
     if (indirect && !selected) return undefined;
     for (let index = 0; index < Math.min(instances, 32); index++) {
-      ids.push(indirect ? selected![(first + index) * 2] : first + index);
+      const id = indirect ? selected![(first + index) * 2] : first + index;
+      ids.push(this.fillDrawData && id >= this.fillDrawData.canonicalCount
+        ? this.fillDrawData.origins[id - this.fillDrawData.canonicalCount] : id);
       clips.push(indirect ? selected![(first + index) * 2 + 1] - 1 : this.vectorClipIndex);
     }
     return { kind: "fill", first, indirect, ids, clips, truncated: instances > ids.length };
@@ -1694,7 +1701,8 @@ export class WebGlFloorplanRenderer {
     if (this.isDisposed || updates.length === 0) return;
     if (!this.scene) throw new Error("Cannot apply primitive colors before uploading a scene.");
     this.primitiveColors ??= new NativePrimitiveColors(this.scene);
-    const patches = this.primitiveColors.update(updates);
+    const canonicalPatches = this.primitiveColors.update(updates);
+    const patches = this.fillDrawData ? fillDrawColorTexels(this.fillDrawData, canonicalPatches) : canonicalPatches;
     const coverage = this.fillCoverageMetadata;
     if (coverage) for (const patch of patches) {
       const metadata = patch.kind === "fillB" ? coverage.pathMetaB : patch.kind === "fillC" ? coverage.pathMetaC : null;
@@ -1955,6 +1963,7 @@ export class WebGlFloorplanRenderer {
       throw new Error("Cannot upload a scene after the WebGL renderer has been disposed.");
     }
     this.fillCoverageMetadata = null;
+    this.fillDrawData = null;
     if (this.scene !== scene) {
       if (options.preserveRasterResolution) {
         this.rasterResolutionPlanner?.invalidate();
@@ -2266,6 +2275,7 @@ export class WebGlFloorplanRenderer {
   dispose(): void {
     this.paintCompositor?.dispose(); this.paintCompositor = null;
     this.fillCoverageMetadata = null;
+    this.fillDrawData = null;
     this.paintShapeUniforms.clear();
     if (this.isDisposed) {
       return;
@@ -3964,9 +3974,10 @@ export class WebGlFloorplanRenderer {
     const plan = this.orderedBatches;
     profile?.beginSection("batchPreparation");
     if (this.orderedTextLod) this.updateTextLodSelection(width, height, x, y, zoom);
-    const rebuilt = plan?.update(runs, this.localToClipRenderingEnabled ? null : 1 / Math.max(zoom, 1e-6)) ?? false;
+    const rebuilt = plan?.update(runs, this.localToClipRenderingEnabled ? null : 1 / Math.max(zoom, 1e-6), view) ?? false;
     profile?.endSection("batchPreparation");
     this.orderedRunsCulled ||= this.strokeRenderingEnabled && (plan?.culledSegmentCount ?? 0) > 0;
+    this.orderedRunsCulled ||= this.fillRenderingEnabled && (plan?.culledFillCount ?? 0) > 0;
     if (plan && rebuilt) {
       profile?.add("batchRebuilds");
       profile?.add("instanceUploadBytes", plan.instanceCount * 8);
@@ -4412,8 +4423,8 @@ export class WebGlFloorplanRenderer {
       const stride = mixedInstances ? 3 : 2;
       const id = indirect ? instances![instance * stride] : instance;
       const offset = id * 4;
-      if (offset + 3 >= scene.fillPathMetaA.length || !(scene.fillPathMetaA[offset + 1] > 0) ||
-        (!this.paintShapeOnly && !(scene.fillPathMetaC[offset + 3] > 0.001))) continue;
+      if (offset + 3 >= metaA.length || !(metaA[offset + 1] > 0) ||
+        (!this.paintShapeOnly && !((metadata?.pathMetaC ?? scene.fillPathMetaC)[offset + 3] > 0.001))) continue;
       const margin = metadata && metadata.pathMetaC[offset] >= 0
         ? Math.max(0.5 / zoom, 5e-5) + 1e-5 / zoom : 1 / zoom;
       const minX = metaA[offset + 2], minY = metaA[offset + 3];
@@ -5822,13 +5833,14 @@ export class WebGlFloorplanRenderer {
     const gl = this.gl;
     const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
 
-    const pathDims = chooseTextureDimensions(scene.fillPathCount, maxTextureSize);
-    const coverage = vectorFillCoverageMetadata(scene);
+    const coverage = vectorFillDrawData(scene, Math.min(maxTextureSize ** 2, 2 ** 24));
+    this.fillDrawData = coverage;
+    const pathDims = chooseTextureDimensions(coverage.pathCount, maxTextureSize);
     this.fillCoverageMetadata = scene.fillPathCount > 0 ? coverage : null;
     // The band and cell indexes follow the segments in the same store, so the
     // texture is sized for all three. A store too large for one goes without.
-    const indexed = vectorIndexedPathStore({ ...vectorSceneFillStore(scene), pathMetaA: coverage.pathMetaA,
-      pathMetaB: coverage.pathMetaB }, vectorFillBandIndex(scene), maxTextureSize);
+    const indexed = vectorIndexedPathStore(coverage, coverage.parts.size
+      ? buildVectorFillBandIndex(coverage) : vectorFillBandIndex(scene), maxTextureSize);
     const segmentDims = chooseTextureDimensions(indexed.texels, maxTextureSize);
     this.fillBandBase = indexed.bandBase;
     this.fillBandEntries = indexed.bandEntries;
@@ -6009,7 +6021,8 @@ export class WebGlFloorplanRenderer {
     }
     this.vectorLodStats = null;
     this.orderedBatches = scene.drawRuns ? new VectorOrderedBatches(scene,
-      this.vectorLodRuntime && this.vectorLodRuntime.levels.length > 1 ? this.vectorLodRuntime : null) : null;
+      this.vectorLodRuntime && this.vectorLodRuntime.levels.length > 1 ? this.vectorLodRuntime : null,
+      this.fillDrawData ?? undefined) : null;
     this.orderedRunCuller = this.thumbnailMode ? null : this.orderedBatches?.createRunCuller() ?? null;
     if (this.orderedTextLod) this.orderedRunCuller?.includeTextLod(this.orderedTextLod.data);
     this.runLookup = buildCanonicalRunLookup(scene);

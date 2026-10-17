@@ -638,6 +638,19 @@ indexes for other paths. Both index builders already leave these small paths
 unindexed; the builders and shaders share that threshold so the direct scan
 uses the same geometry and coverage calculation.
 
+Native WebGL and WebGPU also use tighter draws for sparse compound fills whose
+closed contours occupy distant parts of one large bounding box. Renderer-only
+contour groups share the original edges and retain nested or overlapping
+contours together. At each scale, groups draw separately only when their padded
+bounds cannot overlap; coarser groups or the original whole fill handle larger
+pixel footprints. Derived groups keep edge integration instead of introducing a
+new subpixel area approximation. Unknown projected scales retain whole fills.
+Individual fills inside large paint runs are culled against a guarded viewport,
+so small pans reuse instance uploads. Source geometry, paint order, clipping,
+primitive picking/color IDs and HEP exports remain unchanged; existing HEPs need
+no regeneration. These optimizations apply to the native renderers; Three's
+material layers retain their existing fill draws.
+
 Segment coverage also integrates a quadratic directly when its control hull
 fits inside the footprint. After clipping a curve to the pixel's rows, its
 remaining piece can use the same exact integral if its control hull stays

@@ -3,10 +3,10 @@ import { buildCompactMonochromeAtlas, type CompactMonochromeAtlas } from "./comp
 import { STROKE_COVERAGE_WGSL, STROKE_DENSITY_WGSL } from "./strokeCoverageShaders";
 import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
 import { vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
-import { MIN_VECTOR_INDEXED_PATH_SEGMENTS, vectorFillBandIndex, buildVectorFillBandIndex,
-  vectorSceneFillStore } from "./vectorFillBands";
+import { MIN_VECTOR_INDEXED_PATH_SEGMENTS, vectorFillBandIndex, buildVectorFillBandIndex } from "./vectorFillBands";
 import { vectorIndexedPathStore } from "./vectorCellIndex";
 import { vectorFillCoverageMetadata } from "./vectorFillCoverage";
+import { vectorFillDrawData, fillDrawColorTexels, type VectorFillDrawData } from "./vectorFillDrawSelection";
 import { VECTOR_CELL_COVERAGE_WGSL } from "./vectorCellShaders";
 import { paintFoldFragmentWgsl } from "./nativePaintFold";
 import { WebGpuPaintFolds } from "./webGpuPaintFold";
@@ -1430,6 +1430,7 @@ export class WebGpuFloorplanRenderer {
   private mixedVectorTextures: any[] = [];
   private mixedVectorBatches: MixedVectorBatches | null = null;
   private fillCoverageMetadata: ReturnType<typeof vectorFillCoverageMetadata> | null = null;
+  private fillDrawData: VectorFillDrawData | null = null;
   private mixedVectorInstanceBuffer: any = null;
   private mixedVectorInstanceCapacityBytes = 0;
   private mixedVectorUploadedRevision = -1;
@@ -2363,7 +2364,8 @@ export class WebGpuFloorplanRenderer {
     if (this.isDisposed || updates.length === 0) return;
     if (!this.scene) throw new Error("Cannot apply primitive colors before uploading a scene.");
     this.primitiveColors ??= new NativePrimitiveColors(this.scene);
-    const patches = this.primitiveColors.update(updates);
+    const canonicalPatches = this.primitiveColors.update(updates);
+    const patches = this.fillDrawData ? fillDrawColorTexels(this.fillDrawData, canonicalPatches) : canonicalPatches;
     const coverage = this.fillCoverageMetadata;
     if (coverage) for (const patch of patches) {
       const metadata = patch.kind === "fillB" ? coverage.pathMetaB : patch.kind === "fillC" ? coverage.pathMetaC : null;
@@ -2622,6 +2624,7 @@ export class WebGpuFloorplanRenderer {
       throw new Error("Cannot upload a scene after the WebGPU renderer has been disposed.");
     }
     this.fillCoverageMetadata = null;
+    this.fillDrawData = null;
     if (this.scene !== scene) {
       this.pageRasterVisibility = undefined;
       if (options.preserveRasterResolution) {
@@ -2692,12 +2695,12 @@ export class WebGpuFloorplanRenderer {
       }
     }
 
-    const fillPathDims = chooseTextureDimensions(scene.fillPathCount, maxTextureSize);
+    const coverage = vectorFillDrawData(scene, Math.min(maxTextureSize ** 2, 2 ** 24));
+    const fillPathDims = chooseTextureDimensions(coverage.pathCount, maxTextureSize);
     // The band and cell indexes follow the segments in the same store, so the
     // texture is sized for all three. A store too large for one goes without.
-    const coverage = vectorFillCoverageMetadata(scene);
-    const fillStore = vectorIndexedPathStore({ ...vectorSceneFillStore(scene), pathMetaA: coverage.pathMetaA,
-      pathMetaB: coverage.pathMetaB }, vectorFillBandIndex(scene), maxTextureSize);
+    const fillStore = vectorIndexedPathStore(coverage, coverage.parts.size
+      ? buildVectorFillBandIndex(coverage) : vectorFillBandIndex(scene), maxTextureSize);
     this.fillBandBase = fillStore.bandBase;
     this.fillBandEntries = fillStore.bandEntries;
     this.fillCellBase = fillStore.cellBase;
@@ -2718,6 +2721,7 @@ export class WebGpuFloorplanRenderer {
 
     this.destroyDataResources();
     this.fillCoverageMetadata = scene.fillPathCount > 0 ? coverage : null;
+    this.fillDrawData = coverage;
     const vectorLodActive = this.prepareVectorLod(scene);
     const strokeRecords = this.orderedBatches?.strokeRecords ?? sceneStrokeRecords(scene);
     const segmentDims = chooseTextureDimensions(strokeRecords.count, maxTextureSize);
@@ -3264,6 +3268,7 @@ export class WebGpuFloorplanRenderer {
   dispose(): void {
     this.paintCompositor?.dispose(); this.paintCompositor = null;
     this.fillCoverageMetadata = null;
+    this.fillDrawData = null;
     this.destroyMixedVectorInstances();
     this.mixedVectorPipeline = null;
     this.orderedInstanceBuffer?.destroy();
@@ -4244,8 +4249,9 @@ export class WebGpuFloorplanRenderer {
     // Paints reorder only within a compositor span, so the ordered instance
     // plan is valid with or without transparency groups.
     const plan = this.orderedBatches;
-    const rebuilt = plan?.update(runs, 1 / Math.max(this.zoom, 1e-6)) ?? false;
+    const rebuilt = plan?.update(runs, 1 / Math.max(this.zoom, 1e-6), this.orderedCullingBounds) ?? false;
     this.orderedRunsCulled ||= this.strokeRenderingEnabled && (plan?.culledSegmentCount ?? 0) > 0;
+    this.orderedRunsCulled ||= this.fillRenderingEnabled && (plan?.culledFillCount ?? 0) > 0;
     if (plan && rebuilt && plan.instanceCount > 0) {
       this.growOrderedInstanceBuffer(plan.uintInstances.byteLength);
       this.gpuDevice.queue.writeBuffer(this.orderedInstanceBuffer, 0, plan.uintInstances.subarray(0, plan.instanceCount * 2));
@@ -4798,7 +4804,8 @@ export class WebGpuFloorplanRenderer {
     this.vectorLodStats = null;
     this.runLookup = buildCanonicalRunLookup(scene);
     this.orderedBatches = scene.drawRuns ? new VectorOrderedBatches(scene,
-      this.vectorLodRuntime && this.vectorLodRuntime.levels.length > 1 ? this.vectorLodRuntime : null) : null;
+      this.vectorLodRuntime && this.vectorLodRuntime.levels.length > 1 ? this.vectorLodRuntime : null,
+      this.fillDrawData ?? undefined) : null;
     this.orderedRunCuller = this.orderedBatches?.createRunCuller() ?? null;
     if (this.orderedTextLod) this.orderedRunCuller?.includeTextLod(this.orderedTextLod.data);
     this.orderedBatches?.setColorCommutationEnabled(!this.primitiveColors?.has("stroke") &&
@@ -5921,6 +5928,7 @@ export class WebGpuFloorplanRenderer {
 
   private destroyDataResources(): void {
     this.fillCoverageMetadata = null;
+    this.fillDrawData = null;
     this.destroyVectorLodResources();
     this.vectorLodRuntime = null;
     this.strokeBindGroupAll = null;
