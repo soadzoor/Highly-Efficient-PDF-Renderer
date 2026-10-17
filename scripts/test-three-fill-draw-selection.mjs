@@ -43,6 +43,22 @@ try {
   const ids = layer => meshes(layer).flatMap(mesh=>values(mesh.geometry));
   const viewport={width:2200,height:120},view={cameraCenterX:500,cameraCenterY:20,zoom:1};
   const full={minX:-10,minY:-10,maxX:1110,maxY:50};
+  function assertFootprint(layer,projection,pixels,label){
+    layer.setLocalToClipTransform(projection);
+    const units=layer.fillUnitsPerPixel(view,pixels);
+    assert(units!==null,`${label}: a finite inverse footprint is established`);
+    const m=projection.elements.map(Math.fround),inverse=new THREE.Matrix3().set(
+      m[0]*pixels.width/2,m[4]*pixels.width/2,m[12]*pixels.width/2,
+      m[1]*pixels.height/2,m[5]*pixels.height/2,m[13]*pixels.height/2,m[3],m[7],m[15]).invert();
+    const local=(x,y)=>{const p=new THREE.Vector3(x,y,1).applyMatrix3(inverse);return p.multiplyScalar(1/p.z);};
+    for(let ix=0;ix<=8;ix++)for(let iy=0;iy<=8;iy++){
+      const x=pixels.width*(ix/8-.5),y=pixels.height*(iy/8-.5);
+      const p=local(x,y),dx=local(x+1,y).sub(p),dy=local(x,y+1).sub(p);
+      assert(units>=Math.max(Math.hypot(dx.x,dy.x),Math.hypot(dx.y,dy.y)),
+        `${label}: the bound covers inverse pixel differences across the viewport`);
+    }
+    return units;
+  }
 
   for(const backend of ["webgl","webgpu"]){
     const scene=sceneOf(),canonical=structuredClone(scene);
@@ -122,32 +138,56 @@ try {
 
     const nearAffine=new THREE.Matrix4().set(2/viewport.width,.5/viewport.width,0,-.8,
       .2/viewport.height,2/viewport.height,0,.25,0,0,1,0,1e-10,-2e-10,0,1);
-    layer.setLocalToClipTransform(nearAffine);refresh();
-    const units=layer.fillUnitsPerPixel(view,viewport);
-    assert(units!==null,"small perspective terms use a bounded footprint");
-    const rounded=nearAffine.elements.map(Math.fround),inverse=new THREE.Matrix3().set(
-      rounded[0]*viewport.width/2,rounded[4]*viewport.width/2,rounded[12]*viewport.width/2,
-      rounded[1]*viewport.height/2,rounded[5]*viewport.height/2,rounded[13]*viewport.height/2,
-      rounded[3],rounded[7],rounded[15]).invert();
-    const local=(x,y)=>{const p=new THREE.Vector3(x,y,1).applyMatrix3(inverse);return p.multiplyScalar(1/p.z);};
-    for(const x of [-viewport.width/2,0,viewport.width/2])for(const y of [-viewport.height/2,0,viewport.height/2]){
-      const p=local(x,y),dx=local(x+1,y).sub(p),dy=local(x,y+1).sub(p);
-      assert(units>=Math.max(Math.hypot(dx.x,dy.x),Math.hypot(dx.y,dy.y)),
-        "the projection bound covers actual inverse pixel differences across the viewport");
-    }
+    assertFootprint(layer,nearAffine,viewport,"small perspective terms");refresh();
     const widerView=nearAffine.clone();
-    for(const component of [0,1,4,5])widerView.elements[component]*=1e-5;
+    for(const component of [0,1,4,5])widerView.elements[component]*=1e-8;
     layer.setLocalToClipTransform(widerView);
     assert.equal(layer.fillUnitsPerPixel(view,viewport),null,
-      "the same W slopes must fall back when a wider view makes their relative variation significant");
+      "the same W slopes fall back when a wider view puts the horizon inside the viewport");
+
+    const dataToLocal=new THREE.Matrix4().makeTranslation(-550,-20,0);
+    for(const tilt of [15,30,45,60]){
+      const angle=tilt*Math.PI/180,azimuth=tilt===60?0:.4;
+      const camera=new THREE.PerspectiveCamera(45,capturedViewport.width/capturedViewport.height,1,5000);
+      camera.position.set(1000*Math.sin(angle)*Math.sin(azimuth),1000*Math.sin(angle)*Math.cos(azimuth),1000*Math.cos(angle));
+      camera.lookAt(0,0,0);camera.updateMatrixWorld();
+      const projection=new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse).multiply(dataToLocal);
+      assertFootprint(layer,projection,capturedViewport,`${backend}: ${tilt}-degree perspective`);
+      layer.updateFrame(view,capturedViewport,full);
+      assert(ids(layer).some(id=>id>=data.canonicalCount),"tilted perspective views retain safe contour splitting");
+      const revision=layer.orderedRuns.revision;layer.updateFrame(view,capturedViewport,full);
+      assert.equal(layer.orderedRuns.revision,revision,"stable tilted views reuse their instances");
+    }
+    const ortho=new THREE.OrthographicCamera(-700,700,500,-500,1,5000);
+    ortho.zoom=2;ortho.updateProjectionMatrix();
+    ortho.position.set(800,400,300);ortho.lookAt(0,0,0);ortho.updateMatrixWorld();
+    const objectTransform=new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(.3,-.2,.5))
+      .scale(new THREE.Vector3(-1.3,.8,1));
+    objectTransform.multiply(new THREE.Matrix4().set(1,.3,0,0,.15,1,0,0,0,0,1,0,0,0,0,1));
+    const transformed=new THREE.Matrix4().multiplyMatrices(ortho.projectionMatrix,ortho.matrixWorldInverse)
+      .multiply(objectTransform).multiply(dataToLocal);
+    assertFootprint(layer,transformed,capturedViewport,`${backend}: tilted orthographic, reflected/scaled/sheared PDF`);
+    layer.updateFrame(view,capturedViewport,full);
+    assert(ids(layer).some(id=>id>=data.canonicalCount));
+    const projective=nearAffine.clone();projective.elements[3]=2e-4;projective.elements[7]=-.001;
+    assertFootprint(layer,projective,viewport,`${backend}: arbitrary projective matrix`);refresh();
+    assert(ids(layer).some(id=>id>=data.canonicalCount));
+    const behindOrigin=new THREE.Matrix4().set(.001,0,0,-20,0,.01,0,0,0,0,1,0,.0001,0,0,-1);
+    assertFootprint(layer,behindOrigin,viewport,"positive on-screen W with a behind-eye data origin");
+    const grazing=new THREE.PerspectiveCamera(45,capturedViewport.width/capturedViewport.height,1,5000);
+    grazing.position.set(0,1000,100);grazing.lookAt(0,0,0);grazing.updateMatrixWorld();
+    layer.setLocalToClipTransform(new THREE.Matrix4().multiplyMatrices(grazing.projectionMatrix,grazing.matrixWorldInverse).multiply(dataToLocal));
+    layer.updateFrame(view,capturedViewport,full);
+    assert.deepEqual(ids(layer),[0,1],"a grazing camera whose horizon crosses the viewport retains whole fills");
+
     layer.setLocalToClipTransform(nearAffine);
 
     const profile=new RenderPerformanceProfiler();profile.start({gpu:false,maxFrames:2});
     profile.beginFrame();withThreeRenderPerformance(profile,()=>refresh());profile.endFrame();
-    const perspective=new THREE.Matrix4();perspective.elements[3]=.001;
+    const perspective=new THREE.Matrix4().makeScale(2/viewport.width,2/viewport.height,1);perspective.elements[3]=.001;
     layer.setLocalToClipTransform(perspective);
     profile.beginFrame();withThreeRenderPerformance(profile,()=>refresh());profile.endFrame();
-    assert.deepEqual(ids(layer),[0,1],"uncertain perspective projections retain canonical fills");
+    assert.deepEqual(ids(layer),[0,1],"horizon-crossing perspective projections retain canonical fills");
     const counters=profile.getReport().counters;
     assert.equal(counters["three.fillSelectionActive"].total,1,"captures distinguish active selection from fallback");
     assert.equal(counters["three.fillSplitPaths"].total,1,"captures expose selected sparse canonical paths");
@@ -195,6 +235,10 @@ try {
     pages.projections[1].elements[7]=-6.123767626590638e-20;
     paged.updateFrame(view,viewport,{minX:-100,minY:-100,maxX:10000,maxY:10000});
     assert(ids(paged).some(id=>id>=pageData.canonicalCount),"page tables also accept bounded top-down rotation residue");
+    pages.projections[1].elements[3]=.0001;
+    assertFootprint(paged,pages.projections[0],viewport,"independently projected pages");
+    paged.updateFrame(view,viewport,{minX:-100,minY:-100,maxX:10000,maxY:10000});
+    assert(ids(paged).some(id=>id>=pageData.canonicalCount),"bounded perspective page tables also select tighter contours");
     pages.projections[1].elements[3]=.001;
     paged.updateFrame(view,viewport,{minX:-100,minY:-100,maxX:10000,maxY:10000});
     assert(ids(paged).every(id=>id<pageData.canonicalCount),"one uncertain page projection restores safe canonical paths");

@@ -349,15 +349,15 @@ export class ThreeMaterialFillLayer {
     profile?.add("three.fillSplitPaths", this.fillSelection.splitPaths.size);
   }
 
-  /** Bound affine footprints, including numerical residue in top-down cameras. */
+  /** Bound inverse pixel footprints for each visible page's planar projection. */
   private fillUnitsPerPixel(view: ViewState, viewport: ViewportPixels): number | null {
     if (!this.useLocalToClip) return 1 / Math.max(1e-6, view.zoom);
     const pages = this.mixedPageBinding?.table;
-    if (!pages) return affineUnitsPerPixel(this.localToClipUniform, viewport);
+    if (!pages) return projectedUnitsPerPixel(this.localToClipUniform, viewport);
     let maximum = 0;
     for (let page = 0; page < pages.visibility.length; page++) {
       if (!pages.visibility[page]) continue;
-      const units = affineUnitsPerPixel(pages.projections[page], viewport);
+      const units = projectedUnitsPerPixel(pages.projections[page], viewport);
       if (units === null) return null;
       maximum = Math.max(maximum, units);
     }
@@ -487,9 +487,8 @@ export class ThreeMaterialFillLayer {
 }
 
 /** Bound inverse pixel derivatives over the viewport and neighbouring samples. */
-function affineUnitsPerPixel(matrix: THREE.Matrix4, viewport: ViewportPixels): number | null {
+function projectedUnitsPerPixel(matrix: THREE.Matrix4, viewport: ViewportPixels): number | null {
   const m = matrix.elements;
-  if (!(m[15] > 0)) return null;
   const w = Math.fround(m[15]);
   const a = Math.fround(m[0]) * viewport.width / 2, b = Math.fround(m[4]) * viewport.width / 2;
   const c = Math.fround(m[1]) * viewport.height / 2, d = Math.fround(m[5]) * viewport.height / 2;
@@ -502,15 +501,20 @@ function affineUnitsPerPixel(matrix: THREE.Matrix4, viewport: ViewportPixels): n
   const inverseWX = c * q - d * p, inverseWY = b * p - a * q;
   const halfWidth = viewport.width / 2 + 1, halfHeight = viewport.height / 2 + 1;
   const variation = Math.abs(inverseWX) * halfWidth + Math.abs(inverseWY) * halfHeight;
-  // OrbitControls can leave a nonzero W slope even at zero measured tilt.
-  // Admit only rounding-scale variation, measured relative to this projection
-  // and viewport rather than an absolute matrix epsilon. Still include that
-  // variation in the bound; do not pretend the perspective terms are zero.
-  if (!(variation <= Math.abs(determinant) * tolerance)) return null;
+  // Inverse homogeneous W is linear in screen XY. Its smallest absolute
+  // value bounds perspective division everywhere in the viewport, including
+  // the neighbouring samples used for fragment derivatives. A horizon inside
+  // that domain, or cancellation at Float32 precision, has no reliable bound.
   const minimumW = Math.abs(determinant) - variation;
+  const uncertainty = (Math.abs(a * d) + Math.abs(b * c) +
+    (Math.abs(c * q) + Math.abs(d * p)) * halfWidth +
+    (Math.abs(b * p) + Math.abs(a * q)) * halfHeight) * tolerance;
+  if (!(minimumW > uncertainty)) return null;
   const depth = w * determinant, offsetX = tx * inverseWX, offsetY = ty * inverseWY;
   const planarDeterminant = depth + offsetX + offsetY;
-  if (!(planarDeterminant * determinant > 0) || Math.abs(planarDeterminant) <=
+  // Positive forward clip W is required on screen, but the data origin itself
+  // can be behind the eye under a translated/projective object transform.
+  if (!(planarDeterminant * Math.sign(determinant) > 0) || Math.abs(planarDeterminant) <=
       (Math.abs(depth) + Math.abs(offsetX) + Math.abs(offsetY)) * tolerance) return null;
   // For inverse homography H^-1, derivative numerators are det(H) times
   // (d-q*y, q*x-b) and (p*y-c, a-p*x). Their row norms, divided by the

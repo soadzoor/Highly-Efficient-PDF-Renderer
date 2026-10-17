@@ -645,14 +645,17 @@ contours together. At each scale, groups draw separately only when their padded
 bounds cannot overlap; coarser groups or the original whole fill handle larger
 pixel footprints. Derived groups keep edge integration instead of introducing a
 new subpixel area approximation. Unknown projected scales retain whole fills.
-Three establishes conservative footprints for affine page projections, including
-top-down perspective views whose clip W is constant on the page. Tiny rotation
-residues from orbit controls also qualify when inverse clip-W variation across
-the viewport is at rounding scale; their perspective terms remain included in
-the footprint bound. Tilted
-perspective, singular transforms and reduced-resolution composite surfaces keep
-whole fills; native compositing also retains canonical fills because its surface
-resolution can change independently of the presentation viewport.
+Three bounds inverse pixel footprints across the viewport and neighbouring
+derivative samples using each page's Float32 planar projection. This supports
+tilted perspective, orthographic and custom projective transforms, including
+rotated, reflected, sheared and nonuniformly scaled pages. Selection uses the
+largest bound across visible pages, with no camera-angle cutoff. Stronger
+foreshortening can select coarser groups or whole fills when pixel footprints
+could overlap. A horizon crossing the sampled viewport, singular or numerically
+uncertain projection, or a viewport mapping entirely behind the eye retains
+whole fills. Reduced-resolution Three composite surfaces also keep whole fills;
+native compositing retains canonical fills because its surface resolution can
+change independently of the presentation viewport.
 Individual fills inside large paint runs are culled against a guarded viewport,
 so small pans reuse instance uploads. Source geometry, paint order, clipping,
 primitive picking/color IDs and HEP exports remain unchanged; existing HEPs need

@@ -15,9 +15,10 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   Retain whole fills when antialiasing footprints can overlap, projection scale
   is uncertain or compositor resolution cannot use those bounds safely. Three
   folded paints retain every selected contour and refresh after zoom/culling.
-  Top-down Three cameras also use the optimization after orbiting leaves tiny
-  rotation residues; conservatively bound their remaining perspective instead
-  of requiring exactly constant clip W. Performance captures expose whether
+  Three conservatively bounds inverse pixel footprints for tilted perspective,
+  orthographic and per-page projective transforms, including tiny orbit-control
+  rotation residues. Horizon-crossing, singular and numerically uncertain
+  projections retain whole fills. Performance captures expose whether
   fill selection is active and how many sparse paths use contour groups.
   Existing HEPs benefit without regeneration.
 
