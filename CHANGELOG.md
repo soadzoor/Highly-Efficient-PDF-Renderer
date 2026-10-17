@@ -21,6 +21,14 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   projections retain whole fills. Performance captures expose whether
   fill selection is active and how many sparse paths use contour groups.
   Existing HEPs benefit without regeneration.
+- Tighten Three.js WebGL/WebGPU closed-fill quads in tilted and transformed
+  views when analytic footprint and hull bounds preserve filtered coverage.
+  Keep existing padding for uncertain projections and compositor targets;
+  performance captures expose projected-padding eligibility.
+- Reuse stroke LOD selections in stationary tilted views, invalidating them
+  for projection, depth clipping, viewport, detail or visibility changes.
+  Share projected viewport culling across translated Reader pages in tilted
+  perspective views, retaining general page culling near horizons.
 
 ## [0.1.66] - 2026-10-16
 

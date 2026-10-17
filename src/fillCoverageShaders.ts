@@ -530,6 +530,46 @@ vec2 heprBoundCoverageMarginFromPixel(vec2 world, vec2 margin, mat2 pathToWorld,
   if (!(scale > 0.0)) return vec2(0.0);
   return margin * scale;
 }
+
+// Certify the complete hull and its largest original margin, rather than a
+// single vertex. A successful certificate leaves the general limiter at one.
+float heprTightFillMarginSupported(vec4 clip, vec4 extent, vec4 expansion, vec2 viewport) {
+  float w = clip.w - extent.w;
+  if (!(w > 1e-6) || !(abs(clip.x) + extent.x <= w) || !(abs(clip.y) + extent.y <= w)) return 0.0;
+  float relativeW = expansion.w / w;
+  float pixels = max((expansion.x + expansion.w) * viewport.x,
+    (expansion.y + expansion.w) * viewport.y) * (0.5 / w);
+  return relativeW * 1.00001 <= 0.25 && (pixels + 2.0 * relativeW) * 1.00001 <= 2.0 ? 1.0 : 0.0;
+}
+
+vec4 heprFillInverseMarginBounds(vec2 size, vec2 originalMargin, float minW, float maxW, float w, vec2 depthSlope) {
+  float slope = (abs(depthSlope.x) * originalMargin.x + abs(depthSlope.y) * originalMargin.y) / w;
+  float lowerFactor = minW / (w * 1.00001);
+  float upperFactor = maxW / w * 1.00001;
+  return vec4(max(originalMargin.x - slope * size.x, 0.0) * lowerFactor,
+    max(originalMargin.y - slope * size.y, 0.0) * lowerFactor,
+    (originalMargin.x + slope * size.x) * upperFactor, (originalMargin.y + slope * size.y) * upperFactor);
+}
+
+vec2 heprProjectedClosedFillMargin(vec2 low, vec2 high, vec2 corner, vec2 originalMargin,
+    vec2 footprint, float aaPixels, mat4 projection, vec2 viewport) {
+  if (!(footprint.x > 0.0) || !(footprint.y > 0.0)) return vec2(-1.0);
+  vec2 margin = max(footprint * (0.5 * aaPixels), vec2(5e-5)) + footprint * 1e-5;
+  vec2 size = high - low;
+  vec4 clip = projection * vec4(low + size * 0.5, 0.0, 1.0);
+  vec4 extent = abs(projection[0]) * (size.x * 0.5) + abs(projection[1]) * (size.y * 0.5);
+  vec2 world = mix(low, high, corner);
+  float w = abs(projection[0].w * world.x + projection[1].w * world.y + projection[3].w);
+  if (!(w > 1e-6)) return vec2(-1.0);
+  // Each row of the inverse Jacobian is W times a vector linear in its
+  // corresponding local coordinate. Bound its change across the whole hull.
+  vec4 bounds = heprFillInverseMarginBounds(size, originalMargin, clip.w - extent.w, clip.w + extent.w, w,
+    vec2(projection[0].w, projection[1].w));
+  if (!(margin.x <= bounds.x) || !(margin.y <= bounds.y)) return vec2(-1.0);
+  vec4 expansion = abs(projection[0]) * bounds.z + abs(projection[1]) * bounds.w;
+  if (heprTightFillMarginSupported(clip, extent, expansion, viewport) < 0.5) return vec2(-1.0);
+  return margin;
+}
 `;
 
 export const FILL_COVERAGE_VERTEX_WGSL = /* wgsl */ `
@@ -600,6 +640,42 @@ fn heprBoundCoverageMarginFromPixel(world: vec2<f32>, margin: vec2<f32>, pathToW
   let scale = heprPixelCoverageExpansionScale(vec4<f32>(pathToPixel[0], pathToPixel[1]), margin, relativeDepth);
   if (!(scale > 0.0)) { return vec2<f32>(0.0); }
   return margin * scale;
+}
+
+fn heprTightFillMarginSupported(clip: vec4<f32>, extent: vec4<f32>, expansion: vec4<f32>, viewport: vec2<f32>) -> f32 {
+  let w = clip.w - extent.w;
+  if (!(w > 0.000001) || !(abs(clip.x) + extent.x <= w) || !(abs(clip.y) + extent.y <= w)) { return 0.0; }
+  let relativeW = expansion.w / w;
+  let pixels = max((expansion.x + expansion.w) * viewport.x,
+    (expansion.y + expansion.w) * viewport.y) * (0.5 / w);
+  return select(0.0, 1.0, relativeW * 1.00001 <= 0.25 && (pixels + 2.0 * relativeW) * 1.00001 <= 2.0);
+}
+
+fn heprFillInverseMarginBounds(size: vec2<f32>, originalMargin: vec2<f32>, minW: f32, maxW: f32, w: f32, depthSlope: vec2<f32>) -> vec4<f32> {
+  let slope = (abs(depthSlope.x) * originalMargin.x + abs(depthSlope.y) * originalMargin.y) / w;
+  let lowerFactor = minW / (w * 1.00001);
+  let upperFactor = maxW / w * 1.00001;
+  return vec4<f32>(max(originalMargin.x - slope * size.x, 0.0) * lowerFactor,
+    max(originalMargin.y - slope * size.y, 0.0) * lowerFactor,
+    (originalMargin.x + slope * size.x) * upperFactor, (originalMargin.y + slope * size.y) * upperFactor);
+}
+
+fn heprProjectedClosedFillMargin(low: vec2<f32>, high: vec2<f32>, corner: vec2<f32>, originalMargin: vec2<f32>,
+    footprint: vec2<f32>, aaPixels: f32, projection: mat4x4<f32>, viewport: vec2<f32>) -> vec2<f32> {
+  if (!(footprint.x > 0.0) || !(footprint.y > 0.0)) { return vec2<f32>(-1.0); }
+  let margin = max(footprint * (0.5 * aaPixels), vec2<f32>(0.00005)) + footprint * 0.00001;
+  let size = high - low;
+  let clip = projection * vec4<f32>(low + size * 0.5, 0.0, 1.0);
+  let extent = abs(projection[0]) * (size.x * 0.5) + abs(projection[1]) * (size.y * 0.5);
+  let world = low + size * corner;
+  let w = abs(projection[0].w * world.x + projection[1].w * world.y + projection[3].w);
+  if (!(w > 0.000001)) { return vec2<f32>(-1.0); }
+  let bounds = heprFillInverseMarginBounds(size, originalMargin, clip.w - extent.w, clip.w + extent.w, w,
+    vec2<f32>(projection[0].w, projection[1].w));
+  if (!(margin.x <= bounds.x) || !(margin.y <= bounds.y)) { return vec2<f32>(-1.0); }
+  let expansion = abs(projection[0]) * bounds.z + abs(projection[1]) * bounds.w;
+  if (heprTightFillMarginSupported(clip, extent, expansion, viewport) < 0.5) { return vec2<f32>(-1.0); }
+  return margin;
 }
 `;
 

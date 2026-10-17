@@ -286,6 +286,10 @@ content near the camera receives more of the budget and finer geometry, distant
 content thins out, and tiles outside the view are skipped. The antialiasing filter
 still fades retained thin strokes continuously. The target is soft: limited
 simplification, clipping, or complex compositing can keep a document above it.
+Stationary tilted views reuse their tile decisions and instance lists when the
+projection, depth clipping, viewport, detail scale and visibility inputs match.
+Perspective pans, zooms and orbits recompute those decisions; affine views can
+also reuse guarded selections during small pans.
 Set Vector LOD to Off for exact strokes at every zoom. Embedded PDF images remain raster layers.
 
 The Draw counter reports selected vector representatives. During native cached
@@ -622,9 +626,13 @@ path's total ink, but other subpixel shapes may move some ink between the at
 most 2×2 pixels they touch: up to a third of a right triangle's area, or about
 6% of a circle's. At overview zooms of dense drawings, this removes the segment
 loop from nearly every fill fragment. Larger paths and open paths keep the
-segment calculation. Flat views use
-a tighter fill quad margin matched to the filter width. General projected
-views retain their conservative margins.
+segment calculation. Flat views use a tighter fill quad margin matched to the
+filter width. Three.js WebGL/WebGPU also tighten closed-fill quads in projected
+views when the bounded viewport footprint and analytic hull checks prove that
+every filtered pixel remains covered. Both ordinary and mixed vector draws use
+this proof. Uncertain projections, fills outside the sampled viewport, fills
+needing the general projection limiter, and compositor targets retain their
+existing margins. There is no camera-angle cutoff.
 
 Ordinary native and Three.js fills also defer spatial-index header reads until
 the area shortcut does not apply. Segment coverage checks the cell index
@@ -665,6 +673,8 @@ of their canonical paint, refreshing their geometry when the selection changes.
 Three performance captures report `three.fillSelectionActive` (eligible layers)
 and `three.fillSplitPaths` (canonical sparse paths selected for contour groups),
 so a capture can distinguish active selection from projection/compositor fallback.
+`three.fillProjectedPaddingEligible` counts layers with a known direct-rendering
+footprint; each fill still checks its own hull before tightening its quad.
 
 Segment coverage also integrates a quadratic directly when its control hull
 fits inside the footprint. After clipping a curve to the pixel's rows, its
@@ -859,6 +869,10 @@ the normal multipage default.
 Reader page views reuse contiguous canonical text buffers; clip-index remapping
 keeps a private copy where needed. Shader preparation follows the rendering path
 selected by the current page transforms and appearance, including page overlays.
+Pages translated within one plane share a single inverse viewport calculation
+in tilted perspective views as well as orthographic views. Bounds include a
+conservative antialiasing margin; horizon-crossing views and independently
+rotated/scaled pages retain general per-page viewport derivation.
 For compatible static documents, page handles retain transforms, picking and
 interaction state without allocating independent paint textures or materials.
 Shared page batches also release the dormant original document materials.
@@ -1014,8 +1028,9 @@ copy(heprPerf.json()); // Chrome/Edge DevTools helper; save each report separate
 
 The example renders on demand, so a stationary view may produce only a few
 frames. Compare CPU section summaries and sampled GPU time, not just the FPS
-readout. Top-down views can reuse stroke selections; tilted perspective views
-currently recompute them every rendered frame. A similar Draw count can therefore
+readout. Stationary tilted views can reuse stroke selections. Perspective pans,
+zooms and orbits still recompute them; affine views can also reuse small pans
+within a guarded selection. A similar Draw count can therefore
 have a different CPU cost. High `three.strokeLodSelection` or
 `three.strokeLodInstances` time points to that preparation path; high GPU time
 with low CPU preparation instead calls for investigating the rendering work.

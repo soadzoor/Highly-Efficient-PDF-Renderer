@@ -341,6 +341,7 @@ uniform ivec2 uFillPathMetaTexSize;
 // Bounds have their own small store: optional clip indexes can fill the main
 // clip texture without disabling quad shrinking.
 uniform int uFillClipBoundsEnabled;
+uniform vec2 uFillProjectedFootprint;
 uniform highp sampler2D uFillClipBoundsTex;
 uniform float uFillAAScreenPx;
 uniform float uVectorClipIndex;
@@ -436,6 +437,11 @@ void main() {
   if (uUseLocalToClip < 0.5 && metaC.x >= 0.0) {
     margin = max(margin * (0.5 * uFillAAScreenPx), vec2(5e-5)) +
       vec2(1e-5 / max(uZoom, 1e-4));
+  }
+  if (uUseLocalToClip >= 0.5 && metaC.x >= 0.0) {
+    vec2 tightMargin = heprProjectedClosedFillMargin(minBounds, maxBounds, corner01, margin,
+      uFillProjectedFootprint, uFillAAScreenPx, uLocalToClip, uViewport);
+    if (tightMargin.x >= 0.0) { margin = tightMargin; }
   }
   margin = heprBoundCoverageMargin(mix(minBounds, maxBounds, corner01), margin, mat2(1.0),
     uUseLocalToClip, uLocalToClip, uViewport);

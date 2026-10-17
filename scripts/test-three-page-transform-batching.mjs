@@ -142,6 +142,15 @@ try {
       camera.position.y=initialCameraY;readerFrame('Reader scroll back');
       camera.zoom*=1.15;camera.updateProjectionMatrix();readerFrame('Reader zoom');
       viewport.width+=32;readerFrame('Reader viewport resize');viewport.width-=32;
+      const orthographic=camera;
+      camera=new THREE.PerspectiveCamera(45,viewport.width/viewport.height,.1,1000);
+      camera.coordinateSystem=orthographic.coordinateSystem;camera.position.set(20,70,180);camera.lookAt(0,-35,0);
+      camera.updateProjectionMatrix();readerFrame('tilted perspective Reader');
+      camera.position.x+=3;camera.lookAt(0,-35,0);readerFrame('tilted perspective Reader pan/orbit');
+      derivations=0;frame();assert.equal(derivations,0,'stationary tilted Reader reuses shared viewport bounds');
+      camera.position.set(0,180,20);camera.lookAt(0,-35,0);derivations=0;frame();
+      assert(derivations>1,'a viewport-crossing horizon retains general per-page derivation');
+      camera=orthographic;readerFrame('returning from a horizon-crossing view');
       pages[2].position.x+=.5;readerFrame('direct page position edit');
       pages[0].visible=false;readerFrame('direct page visibility edit');pages[0].visible=true;
       pages[2].updateMatrix();pages[2].matrixAutoUpdate=false;pages[2].matrix.elements[13]-=1;

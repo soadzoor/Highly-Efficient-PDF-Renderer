@@ -114,16 +114,43 @@ try {
         const records = profile.stop().frameRecords;
         assert.equal(records[0].counters["three.strokeLodReuses"], 1, "top-down frames report selection reuse");
         assert.equal(records[0].counters["three.strokeLodInstanceUpdates"], 0);
+        assert.equal(records[1].counters["three.strokeLodSelections"],1,"orbiting recomputes perspective tile budgets");
+        assert.equal(records[1].counters["three.strokeLodInstanceUpdates"],1);
+        assert.equal(records[2].counters["three.strokeLodReuses"],1,"a stationary tilted view reuses tile selection");
+        assert.equal(records[2].counters["three.strokeLodInstanceUpdates"],0);
         for (const record of records.slice(1)) {
-          assert.equal(record.counters["three.strokeLodSelections"], 1,
-            "tilted frames report recomputation, including a stationary camera with the same draw count");
-          assert.equal(record.counters["three.strokeLodInstanceUpdates"], 1);
           assert.equal(record.counters["three.strokeLodVisibleTiles"], tilted.visibleTileCount);
           assert.equal(record.counters["three.strokeLodActiveLevels"], tilted.activeLevels.length);
         }
         for (const record of records) {
           assert(record.cpuSectionsMs["three.strokeLodSelection"] >= 0);
           assert(record.cpuSectionsMs["three.strokeLodInstances"] >= 0);
+        }
+        if(backend==="webgl"&&!ordered&&!overviewFixture){
+          const runtime=lod.runtime,matrix=runtime.localToClip.slice(),units=runtime.localUnitsPerPixel;
+          const input={...viewState},size={...viewport};
+          const bounds={...object.deriveViewStateFromThreeCamera(camera,viewport).cullingBounds};
+          let tileProjections=0;
+          const projectTiles=runtime.projectTiles;
+          runtime.projectTiles=function(...args){tileProjections++;return projectTiles.apply(this,args);};
+          const update=()=>runtime.update(input,size,bounds);
+          assert.equal(update(),false);assert.equal(tileProjections,0,"identical perspective inputs skip tile projection entirely");
+          const changed=message=>{assert.equal(update(),true,message);assert.equal(update(),false,`${message}: subsequent reuse`);};
+          const moved=matrix.slice();moved[12]+=.01;runtime.setLocalToClipTransform(moved,units);changed("projection translation invalidates reuse");
+          moved[14]+=.01;runtime.setLocalToClipTransform(moved,units);changed("depth clipping invalidates reuse");
+          moved[7]*=1.01;runtime.setLocalToClipTransform(moved,units);changed("perspective slope invalidates reuse");
+          size.width++;changed("viewport width invalidates reuse");size.height++;changed("viewport height invalidates reuse");
+          input.zoom*=1.01;changed("fallback view scale invalidates reuse");
+          input.cameraCenterX++;changed("fallback view center invalidates reuse");
+          bounds.minX++;changed("mutating the culling rectangle invalidates reuse");
+          runtime.updateForLocalUnitsPerPixel(units*1.01);changed("detail scale invalidates reuse");
+          runtime.setForceExact(true);changed("forcing exact detail invalidates reuse");
+          assert(runtime.getStats().activeLevels.every(level=>level.index===0));
+          runtime.setForceExact(false);changed("returning to Auto invalidates reuse");
+          runtime.resetVisible();changed("resetting visibility invalidates reuse");
+          runtime.setScreenSpaceTransform();runtime.update(input,size,bounds);
+          runtime.setLocalToClipTransform(matrix,units);changed("returning from screen-space rendering invalidates reuse");
+          runtime.projectTiles=projectTiles;runtime.resetVisible();frame();
         }
         profile.dispose();
         camera.position.set(0, 0, 3000); frame();

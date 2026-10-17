@@ -6,6 +6,71 @@ export interface PlanarViewport {
   height: number;
 }
 
+/** Local viewport bounds and a conservative inverse fragment footprint. */
+export interface PlanarViewportFootprint extends Bounds {
+  maxUnitsPerPixel: number;
+  unitsPerPixelX: number;
+  unitsPerPixelY: number;
+}
+
+/**
+ * Invert a planar projective viewport, including the neighbouring samples used
+ * by fragment derivatives. Returns null for horizons, hidden planes and
+ * numerically uncertain inverses. Pass Float32 coefficients to match uniforms;
+ * callers doing source-space culling can retain their original precision.
+ */
+export function planarViewportFootprintInto(m: ArrayLike<number>, viewport: PlanarViewport,
+  out: PlanarViewportFootprint): PlanarViewportFootprint | null {
+  if (m.length < 16 || !(viewport.width > 0) || !(viewport.height > 0)) return null;
+  const w = m[15];
+  const a = m[0] * viewport.width / 2, b = m[4] * viewport.width / 2;
+  const c = m[1] * viewport.height / 2, d = m[5] * viewport.height / 2;
+  const tx = m[12] * viewport.width / 2, ty = m[13] * viewport.height / 2;
+  const p = m[3], q = m[7], determinant = a * d - b * c;
+  const tolerance = 2 ** -20;
+  const inverseWX = c * q - d * p, inverseWY = b * p - a * q;
+  const halfWidth = viewport.width / 2 + 1, halfHeight = viewport.height / 2 + 1;
+  const variation = Math.abs(inverseWX) * halfWidth + Math.abs(inverseWY) * halfHeight;
+  // Inverse W is linear in screen XY. Its minimum bounds perspective division
+  // throughout the viewport; include cancellation error in that minimum.
+  const minimumW = Math.abs(determinant) - variation;
+  const uncertainty = (Math.abs(a * d) + Math.abs(b * c) +
+    (Math.abs(c * q) + Math.abs(d * p)) * halfWidth +
+    (Math.abs(b * p) + Math.abs(a * q)) * halfHeight) * tolerance;
+  if (!(minimumW > uncertainty)) return null;
+  const depth = w * determinant, offsetX = tx * inverseWX, offsetY = ty * inverseWY;
+  const planarDeterminant = depth + offsetX + offsetY;
+  // The on-screen plane must be in front of the eye; its data origin need not be.
+  if (!(planarDeterminant * Math.sign(determinant) > 0) || Math.abs(planarDeterminant) <=
+      (Math.abs(depth) + Math.abs(offsetX) + Math.abs(offsetY)) * tolerance) return null;
+  // Inverse derivative numerators are det(H) times (d-q*y, q*x-b) and
+  // (p*y-c, a-p*x). Their row norms also bound finite pixel differences.
+  const factor = Math.abs(planarDeterminant) / (minimumW * minimumW) * (1 + tolerance);
+  const unitsX = factor * Math.hypot(Math.abs(d) + Math.abs(q) * halfHeight, Math.abs(b) + Math.abs(q) * halfWidth);
+  const unitsY = factor * Math.hypot(Math.abs(c) + Math.abs(p) * halfHeight, Math.abs(a) + Math.abs(p) * halfWidth);
+  const units = Math.max(unitsX, unitsY);
+  if (!Number.isFinite(units) || !(units > 0)) return null;
+  const ax = d * w - ty * q, bx = tx * q - b * w, cx = b * ty - tx * d;
+  const ay = ty * p - c * w, by = a * w - tx * p, cy = tx * c - a * ty;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  // With a sign-stable denominator, a linear-fractional coordinate has its
+  // extrema at corners. The exact viewport bounds need no uniform-scale assumption.
+  for (let corner = 0; corner < 4; corner++) {
+    const x = (corner & 1 ? 1 : -1) * viewport.width / 2;
+    const y = (corner & 2 ? 1 : -1) * viewport.height / 2;
+    const inverseW = inverseWX * x + inverseWY * y + determinant;
+    const localX = (ax * x + bx * y + cx) / inverseW;
+    const localY = (ay * x + by * y + cy) / inverseW;
+    minX = Math.min(minX, localX); minY = Math.min(minY, localY);
+    maxX = Math.max(maxX, localX); maxY = Math.max(maxY, localY);
+  }
+  if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) return null;
+  out.minX = minX; out.minY = minY; out.maxX = maxX; out.maxY = maxY;
+  out.maxUnitsPerPixel = units;
+  out.unitsPerPixelX = unitsX; out.unitsPerPixelY = unitsY;
+  return out;
+}
+
 /** Conservative projection information for one local-space rectangle. */
 export interface PlanarBoundsProjection {
   /** False only when the complete rectangle is outside one X/Y clip plane. */

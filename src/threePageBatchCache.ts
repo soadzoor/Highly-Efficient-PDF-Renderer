@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
-import { largestSingularValue2x2 } from "./planarProjection";
+import { planarViewportFootprintInto } from "./planarProjection";
 import type { ThreePageFrame } from "./threePageBatchFrame";
 import type { ThreePageTransforms } from "./threePageTransforms";
 
@@ -64,7 +64,7 @@ export class ThreePageBatchFrameCache {
   private width = NaN;
   private height = NaN;
   private approximate = false;
-  private flatView: { bounds: Bounds; unitsPerPixel: number } | null = null;
+  private sharedView: { bounds: Bounds; unitsPerPixel: number } | null = null;
 
   /**
    * `appearanceRevision`, when supplied, changes whenever any page background
@@ -87,8 +87,8 @@ export class ThreePageBatchFrameCache {
     let changed = reset || originChanged || projectionChanged || this.approximate !== approximate;
     this.camera = camera; this.coordinateSystem = camera.coordinateSystem;
     this.width = viewport.width; this.height = viewport.height; this.approximate = approximate;
-    if (projectionChanged) this.flatView = flatViewport(documentToClip.elements, viewport);
-    const flat = this.flatView;
+    if (projectionChanged) this.sharedView = sharedViewport(documentToClip.elements, viewport);
+    const sharedView = this.sharedView;
     const pending = this.pending;
     pending.length = 0;
     const matrices = this.matrices, poses = this.poses, boxes = this.boxes, translations = this.translations;
@@ -154,9 +154,9 @@ export class ThreePageBatchFrameCache {
       changed = true;
       if (transformChanged || stateChanged || frame.visible) this.applied[index] = 0;
       frame.visible = frame.enabled = enabled === 1;
-      if (frame.visible && flat && this.translated[index]) {
-        const shared = flat.bounds, tx = translations[index * 2], ty = translations[index * 2 + 1];
-        const margin = this.aaPixels[index] * flat.unitsPerPixel, b = index * 4;
+      if (frame.visible && sharedView && this.translated[index]) {
+        const shared = sharedView.bounds, tx = translations[index * 2], ty = translations[index * 2 + 1];
+        const margin = this.aaPixels[index] * sharedView.unitsPerPixel, b = index * 4;
         // Include off-page paint and coarse text, plus conservative screen-space AA.
         const minX = boxes[b] - margin, minY = boxes[b + 1] - margin, maxX = boxes[b + 2] + margin, maxY = boxes[b + 3] + margin;
         if (Number.isFinite(minX + minY + maxX + maxY) &&
@@ -253,20 +253,8 @@ function isXYTranslation(m: readonly number[]): boolean {
   return true;
 }
 
-function flatViewport(m: readonly number[], viewport: Viewport): { bounds: Bounds; unitsPerPixel: number } | null {
-  const w = m[15], determinant = m[0] * m[5] - m[4] * m[1];
-  if (m[3] !== 0 || m[7] !== 0 || !(w > 1e-8) || !Number.isFinite(w) || determinant === 0 || !Number.isFinite(determinant) ||
-      !(viewport.width > 0) || !(viewport.height > 0)) return null;
-  const bounds: Bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
-  for (const x of [-1, 1]) for (const y of [-1, 1]) {
-    const cx = x * w - m[12], cy = y * w - m[13];
-    const px = (m[5] * cx - m[4] * cy) / determinant, py = (m[0] * cy - m[1] * cx) / determinant;
-    bounds.minX = Math.min(bounds.minX, px); bounds.maxX = Math.max(bounds.maxX, px);
-    bounds.minY = Math.min(bounds.minY, py); bounds.maxY = Math.max(bounds.maxY, py);
-  }
-  const sx = viewport.width / (2 * w), sy = viewport.height / (2 * w);
-  const maxStretch = largestSingularValue2x2(m[0] * sx, m[4] * sx, m[1] * sy, m[5] * sy);
-  const unitsPerPixel = maxStretch / Math.abs(determinant * sx * sy);
-  return Number.isFinite(bounds.minX + bounds.minY + bounds.maxX + bounds.maxY + unitsPerPixel) && unitsPerPixel > 0
-    ? { bounds, unitsPerPixel } : null;
+function sharedViewport(m: readonly number[], viewport: Viewport): { bounds: Bounds; unitsPerPixel: number } | null {
+  const bounds = planarViewportFootprintInto(m, viewport,
+    { minX: 0, minY: 0, maxX: 0, maxY: 0, maxUnitsPerPixel: 0, unitsPerPixelX: 0, unitsPerPixelY: 0 });
+  return bounds ? { bounds, unitsPerPixel: bounds.maxUnitsPerPixel } : null;
 }

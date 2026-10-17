@@ -15,6 +15,7 @@ import { acquireThreeVectorClipTexture, initializeThreeVectorClip } from "./thre
 import { enableThreeRawPaintFold, threePaintFoldFragmentGlsl } from "./threePaintFold";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
 import { getThreeRenderPerformance } from "./threeRenderPerformance";
+import { planarViewportFootprintInto, type PlanarViewportFootprint } from "./planarProjection";
 import { GUARDED_RUN_COUNT, VISIBILITY_GUARD_PIXELS } from "./visibilityGuard";
 import * as THREE from "three";
 
@@ -73,6 +74,11 @@ export class ThreeMaterialFillLayer {
   private readonly zoomUniform: { value: number };
   private readonly useLocalToClipUniform: { value: number };
   private readonly localToClipUniform: THREE.Matrix4;
+  private readonly projectionValues = new Float32Array(16);
+  private readonly projectionFootprint: PlanarViewportFootprint = {
+    minX: 0, minY: 0, maxX: 0, maxY: 0, maxUnitsPerPixel: 0, unitsPerPixelX: 0, unitsPerPixelY: 0
+  };
+  private readonly projectedFillFootprint = new THREE.Vector2();
   private readonly vectorOverrideUniform: THREE.Vector4;
   private readonly fillPathCount: number;
   private readonly fillPathIndexAttribute: THREE.InstancedBufferAttribute;
@@ -191,6 +197,7 @@ export class ThreeMaterialFillLayer {
       viewport: this.viewportUniform,
       cameraCenter: this.cameraCenterUniform,
       localToClip: this.localToClipUniform,
+      projectedFillFootprint: this.projectedFillFootprint,
       pageBinding,
       vectorOverride: this.vectorOverrideUniform
     };
@@ -236,6 +243,7 @@ export class ThreeMaterialFillLayer {
           uUseLocalToClip: this.useLocalToClipUniform,
           uLocalToClip: { value: this.localToClipUniform },
           uFillAAScreenPx: { value: 1.0 },
+          uFillProjectedFootprint: { value: this.projectedFillFootprint },
           uVectorOverride: { value: this.vectorOverrideUniform }
         }
       });
@@ -330,7 +338,11 @@ export class ThreeMaterialFillLayer {
     // A downscaled surface has wider fragment footprints than the vertex
     // padding computed from the presentation viewport. Keep whole paints.
     const reduced = resolution && (resolution.width < viewport.width || resolution.height < viewport.height);
+    this.projectedFillFootprint.set(0, 0);
     const units = reduced ? null : this.fillUnitsPerPixel(viewState, viewport);
+    // Nested composite targets can change their pixel grid independently of
+    // the presentation projection. Their fills retain the original padding.
+    if (units === null || compositing) this.projectedFillFootprint.set(0, 0);
     const zoom = Math.max(1e-6, viewState.zoom);
     const bounds = cullingBounds ?? (this.useLocalToClip ? null : {
       minX: viewState.cameraCenterX - viewport.width / (2 * zoom),
@@ -347,21 +359,32 @@ export class ThreeMaterialFillLayer {
     const profile = getThreeRenderPerformance();
     profile?.add("three.fillSelectionActive", units === null ? 0 : 1);
     profile?.add("three.fillSplitPaths", this.fillSelection.splitPaths.size);
+    profile?.add("three.fillProjectedPaddingEligible", this.projectedFillFootprint.x > 0 ? 1 : 0);
   }
 
   /** Bound inverse pixel footprints for each visible page's planar projection. */
   private fillUnitsPerPixel(view: ViewState, viewport: ViewportPixels): number | null {
+    this.projectedFillFootprint.set(0, 0);
     if (!this.useLocalToClip) return 1 / Math.max(1e-6, view.zoom);
     const pages = this.mixedPageBinding?.table;
-    if (!pages) return projectedUnitsPerPixel(this.localToClipUniform, viewport);
+    if (!pages) return this.projectedUnitsPerPixel(this.localToClipUniform, viewport);
     let maximum = 0;
     for (let page = 0; page < pages.visibility.length; page++) {
       if (!pages.visibility[page]) continue;
-      const units = projectedUnitsPerPixel(pages.projections[page], viewport);
+      const units = this.projectedUnitsPerPixel(pages.projections[page], viewport);
       if (units === null) return null;
       maximum = Math.max(maximum, units);
     }
     return maximum > 0 ? maximum : null;
+  }
+
+  private projectedUnitsPerPixel(matrix: THREE.Matrix4, viewport: ViewportPixels): number | null {
+    this.projectionValues.set(matrix.elements);
+    const footprint = planarViewportFootprintInto(this.projectionValues, viewport, this.projectionFootprint);
+    if (!footprint) return null;
+    this.projectedFillFootprint.set(Math.max(this.projectedFillFootprint.x, footprint.unitsPerPixelX),
+      Math.max(this.projectedFillFootprint.y, footprint.unitsPerPixelY));
+    return footprint.maxUnitsPerPixel;
   }
 
   private updateSelectedFillPaths(): void {
@@ -484,46 +507,6 @@ export class ThreeMaterialFillLayer {
     this.usingAllFillPaths = true;
     this.mesh.geometry.instanceCount = this.fillPathCount;
   }
-}
-
-/** Bound inverse pixel derivatives over the viewport and neighbouring samples. */
-function projectedUnitsPerPixel(matrix: THREE.Matrix4, viewport: ViewportPixels): number | null {
-  const m = matrix.elements;
-  const w = Math.fround(m[15]);
-  const a = Math.fround(m[0]) * viewport.width / 2, b = Math.fround(m[4]) * viewport.width / 2;
-  const c = Math.fround(m[1]) * viewport.height / 2, d = Math.fround(m[5]) * viewport.height / 2;
-  const tx = Math.fround(m[12]) * viewport.width / 2, ty = Math.fround(m[13]) * viewport.height / 2;
-  const p = Math.fround(m[3]), q = Math.fround(m[7]), determinant = a * d - b * c;
-  const tolerance = 2 ** -20;
-  // Nearly cancelling products cannot establish a reliable inverse from the
-  // Float32 matrices seen by the shader. Keep the original drawing domain.
-  if (Math.abs(determinant) <= (Math.abs(a * d) + Math.abs(b * c)) * tolerance) return null;
-  const inverseWX = c * q - d * p, inverseWY = b * p - a * q;
-  const halfWidth = viewport.width / 2 + 1, halfHeight = viewport.height / 2 + 1;
-  const variation = Math.abs(inverseWX) * halfWidth + Math.abs(inverseWY) * halfHeight;
-  // Inverse homogeneous W is linear in screen XY. Its smallest absolute
-  // value bounds perspective division everywhere in the viewport, including
-  // the neighbouring samples used for fragment derivatives. A horizon inside
-  // that domain, or cancellation at Float32 precision, has no reliable bound.
-  const minimumW = Math.abs(determinant) - variation;
-  const uncertainty = (Math.abs(a * d) + Math.abs(b * c) +
-    (Math.abs(c * q) + Math.abs(d * p)) * halfWidth +
-    (Math.abs(b * p) + Math.abs(a * q)) * halfHeight) * tolerance;
-  if (!(minimumW > uncertainty)) return null;
-  const depth = w * determinant, offsetX = tx * inverseWX, offsetY = ty * inverseWY;
-  const planarDeterminant = depth + offsetX + offsetY;
-  // Positive forward clip W is required on screen, but the data origin itself
-  // can be behind the eye under a translated/projective object transform.
-  if (!(planarDeterminant * Math.sign(determinant) > 0) || Math.abs(planarDeterminant) <=
-      (Math.abs(depth) + Math.abs(offsetX) + Math.abs(offsetY)) * tolerance) return null;
-  // For inverse homography H^-1, derivative numerators are det(H) times
-  // (d-q*y, q*x-b) and (p*y-c, a-p*x). Their row norms, divided by the
-  // smallest inverse W squared, also bound the shader's finite differences.
-  const units = Math.abs(planarDeterminant) / (minimumW * minimumW) * Math.max(
-    Math.hypot(Math.abs(d) + Math.abs(q) * halfHeight, Math.abs(b) + Math.abs(q) * halfWidth),
-    Math.hypot(Math.abs(c) + Math.abs(p) * halfHeight, Math.abs(a) + Math.abs(p) * halfWidth)
-  ) * (1 + tolerance);
-  return Number.isFinite(units) && units > 0 ? units : null;
 }
 
 function chooseTextureSize(count: number): { width: number; height: number } {

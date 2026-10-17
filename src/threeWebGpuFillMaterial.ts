@@ -41,6 +41,7 @@ export interface ThreeWebGpuFillMaterialOptions {
   viewport: THREE.Vector2;
   cameraCenter: THREE.Vector2;
   localToClip: THREE.Matrix4;
+  projectedFillFootprint?: THREE.Vector2;
   pageBinding?: ThreePageBinding;
   vectorOverride: THREE.Vector4;
 }
@@ -93,7 +94,8 @@ fn heprFillVertexPack(
   viewport: vec2<f32>,
   zoom: f32,
   useLocalToClip: f32,
-  localToClip: mat4x4<f32>
+  localToClip: mat4x4<f32>,
+  projectedFillFootprint: vec2<f32>
 ) -> vec4<f32> {
   let segmentCount = i32(metaA.y);
   let alpha = mix(metaC.w, 1.0, shapeOnly);
@@ -113,6 +115,11 @@ fn heprFillVertexPack(
   if (metaC.x >= 0.0 && useLocalToClip < 0.5) {
     rawMargin = max(rawMargin * (0.5 * fillAAScreenPx), vec2<f32>(0.00005)) +
       vec2<f32>(0.00001 / max(zoom, 0.0001));
+  }
+  if (metaC.x >= 0.0 && useLocalToClip >= 0.5) {
+    let tightMargin = heprProjectedClosedFillMargin(minBounds, maxBounds, corner01, rawMargin,
+      projectedFillFootprint, fillAAScreenPx, localToClip, max(viewport, vec2<f32>(1.0)));
+    if (tightMargin.x >= 0.0) { rawMargin = tightMargin; }
   }
   let margin = heprBoundCoverageMargin(minBounds + (maxBounds - minBounds) * corner01, rawMargin,
     mat2x2<f32>(1.0, 0.0, 0.0, 1.0), useLocalToClip, localToClip, max(viewport, vec2<f32>(1.0)));
@@ -294,7 +301,8 @@ export function createThreeWebGpuFillMaterial(
     viewport: viewportUniform,
     zoom: zoomUniform,
     useLocalToClip: useLocalToClipUniform,
-    localToClip: localToClipUniform
+    localToClip: localToClipUniform,
+    projectedFillFootprint: TSL.uniform(options.projectedFillFootprint ?? new THREE.Vector2())
   }));
   const vertexPackValue = vertexPack as { xy: unknown };
 

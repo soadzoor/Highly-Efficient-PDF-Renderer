@@ -536,6 +536,9 @@ export class VectorStrokeLodRuntime {
   private finiteLocalToClip = false;
   private readonly localToClip = new Float64Array(16);
   private readonly selectionProjectionBasis = new Float64Array(4);
+  private projectedSelectionCurrent = false;
+  private readonly selectedProjection = new Float64Array(16);
+  private readonly selectedView = new Float64Array(11);
   private localUnitsPerPixel = 1;
   private lastVisibleSegmentCount = 0;
   private readonly allLevelBounds: Bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
@@ -583,6 +586,7 @@ export class VectorStrokeLodRuntime {
   }
 
   setScreenSpaceTransform(): void {
+    this.projectedSelectionCurrent = false;
     if (this.useLocalToClip) {
       this.selectionGuard = null;
       this.fullViewBaselineLevelIndex = -1;
@@ -594,6 +598,7 @@ export class VectorStrokeLodRuntime {
   setForceExact(enabled: boolean): void {
     if (this.forceExact === enabled) return;
     this.forceExact = enabled;
+    this.projectedSelectionCurrent = false;
     this.selectionGuard = null;
     this.fullViewBaselineLevelIndex = -1;
     this.tileSelectedLevelIndices.fill(-1);
@@ -654,7 +659,35 @@ export class VectorStrokeLodRuntime {
       this.stats = this.createEmptyStats();
       return true;
     }
-    return this.updateTiledVisibleSegments(viewState, viewport, cullingBounds);
+    const projected = this.useLocalToClip && !this.constantClipW && this.finiteLocalToClip;
+    const previous = this.selectedView;
+    // Perspective budgets depend on the complete projection and viewport.
+    // An identical view can reuse its tile decisions and instance lists, while
+    // a pan, orbit, zoom or depth-clip change must still recompute them.
+    if (projected && this.projectedSelectionCurrent &&
+        this.localToClip.every((value, index) => value === this.selectedProjection[index]) &&
+        previous[0] === viewState.cameraCenterX && previous[1] === viewState.cameraCenterY && previous[2] === viewState.zoom &&
+        previous[3] === viewport.width && previous[4] === viewport.height && previous[5] === this.localUnitsPerPixel &&
+        previous[6] === Number(cullingBounds != null) && (!cullingBounds ||
+          (previous[7] === cullingBounds.minX && previous[8] === cullingBounds.minY &&
+           previous[9] === cullingBounds.maxX && previous[10] === cullingBounds.maxY))) {
+      this.activeLevelIndex = this.stats.baselineLevelIndex;
+      return false;
+    }
+    this.projectedSelectionCurrent = false;
+    const changed = this.updateTiledVisibleSegments(viewState, viewport, cullingBounds);
+    if (projected) {
+      this.selectedProjection.set(this.localToClip);
+      previous[0] = viewState.cameraCenterX; previous[1] = viewState.cameraCenterY; previous[2] = viewState.zoom;
+      previous[3] = viewport.width; previous[4] = viewport.height; previous[5] = this.localUnitsPerPixel;
+      previous[6] = Number(cullingBounds != null);
+      if (cullingBounds) {
+        previous[7] = cullingBounds.minX; previous[8] = cullingBounds.minY;
+        previous[9] = cullingBounds.maxX; previous[10] = cullingBounds.maxY;
+      }
+      this.projectedSelectionCurrent = true;
+    }
+    return changed;
   }
 
   getStats(): VectorStrokeLodStats {
@@ -665,6 +698,7 @@ export class VectorStrokeLodRuntime {
   }
 
   resetVisible(): void {
+    this.projectedSelectionCurrent = false;
     this.fullViewBaselineLevelIndex = -1;
     this.selectionGuard = null;
     this.lastVisibleSegmentCount = 0;

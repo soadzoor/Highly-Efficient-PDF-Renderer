@@ -59,7 +59,7 @@ fn heprMixedWorldPack(
   dataA: vec4<f32>, dataB: vec4<f32>, dataC: vec4<f32>, dataD: vec4<f32>,
   viewport: vec2<f32>, zoom: f32, useLocalToClip: f32,
   localToClip: mat4x4<f32>, localUnitsPerPixel: f32, aaScreenPx: f32, shapeOnly: f32,
-  fillEnabled: f32, strokeEnabled: f32
+  fillEnabled: f32, strokeEnabled: f32, projectedFillFootprint: vec2<f32>
 ) -> vec4<f32> {
   if (select(fillEnabled, strokeEnabled, kind < 0.5) < 0.5) {
     return vec4<f32>(-2.0, -2.0, 0.0, 0.0);
@@ -69,7 +69,7 @@ fn heprMixedWorldPack(
       zoom, useLocalToClip, localUnitsPerPixel, aaScreenPx, shapeOnly);
   }
   let pack = heprFillVertexPack(corner, dataA, dataB, dataC, shapeOnly, aaScreenPx,
-    viewport, zoom, useLocalToClip, localToClip);
+    viewport, zoom, useLocalToClip, localToClip, projectedFillFootprint);
   // Both branches use W for validity; Z carries a stroke's resolved half width.
   return vec4<f32>(pack.xy, 0.0, pack.z);
 }
@@ -163,7 +163,8 @@ export function createThreeWebGpuMixedVectorMaterial(
     viewport, zoom: zoomUniform, useLocalToClip: useLocalToClipUniform,
     localToClip: page.matrix, localUnitsPerPixel: page.units ?? localUnitsPerPixelUniform,
     aaScreenPx: TSL.uniform(1), shapeOnly: shapeOnlyUniform,
-    fillEnabled: fillRenderingUniform, strokeEnabled: strokeRenderingUniform
+    fillEnabled: fillRenderingUniform, strokeEnabled: strokeRenderingUniform,
+    projectedFillFootprint: TSL.uniform(options.projectedFillFootprint ?? new THREE.Vector2())
   }));
   const world = worldPack as { xy: unknown; z: unknown };
   material.vertexNode = call(threeWebGpuStrokeShader.clip, {

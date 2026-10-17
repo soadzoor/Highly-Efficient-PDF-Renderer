@@ -107,6 +107,7 @@ export const fastTests = [
   "three-fill-draw-selection",
   "vector-render-comparison",
   "projected-coverage-margin",
+  "projected-fill-padding",
   "pdf-layer-controls",
   "pdf-annotation-controls",
   "raster-layer-updates",

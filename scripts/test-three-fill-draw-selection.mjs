@@ -191,6 +191,7 @@ try {
     const counters=profile.getReport().counters;
     assert.equal(counters["three.fillSelectionActive"].total,1,"captures distinguish active selection from fallback");
     assert.equal(counters["three.fillSplitPaths"].total,1,"captures expose selected sparse canonical paths");
+    assert.equal(counters["three.fillProjectedPaddingEligible"].total,1,"captures expose a known projected padding footprint");
     for(const matrix of [new THREE.Matrix4().makeScale(0,1,1),new THREE.Matrix4().makeScale(1,1,1).setPosition(Infinity,0,0),
       new THREE.Matrix4().set(1,1,0,0,1,1+1e-8,0,0,0,0,1,0,0,0,0,1),
       new THREE.Matrix4().set(1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,-1)]){
@@ -198,6 +199,7 @@ try {
       assert.deepEqual(ids(layer),[0,1],"invalid, singular and behind-eye projections retain original fills");
     }
     layer.setScreenSpaceTransform();refresh();
+    assert.deepEqual(layer.projectedFillFootprint.toArray(),[0,0],"screen-space transforms clear projected padding bounds");
 
     const b=layer.fillPathMetaTextureB.image.data,c=layer.fillPathMetaTextureC.image.data;
     for(const color of [[.8,.7,.6],null]){
@@ -209,6 +211,10 @@ try {
       }
     }
     const previousScale=globalThis.HEPR_DEBUG_COMPOSITE_SCALE;
+    layer.setLocalToClipTransform(new THREE.Matrix4().makeScale(2/viewport.width,2/viewport.height,1));
+    refresh();assert(layer.projectedFillFootprint.x>0);
+    layer.updateFrame(view,viewport,full,true);
+    assert.deepEqual(layer.projectedFillFootprint.toArray(),[0,0],"nested compositor pixel grids retain original padding");
     try{
       globalThis.HEPR_DEBUG_COMPOSITE_SCALE=.25;
       layer.updateFrame(view,viewport,full,true);
