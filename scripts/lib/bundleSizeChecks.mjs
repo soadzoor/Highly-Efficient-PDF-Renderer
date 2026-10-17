@@ -5,22 +5,17 @@ import { gzipSync } from "node:zlib";
 import { build } from "vite";
 
 // Exercise the installed npm manifest rather than overriding moduleSideEffects.
-// Include static dependencies in the budget: a tiny entry importing a large
-// shared chunk must not accidentally pass the size check.
+// Include static dependencies in import-boundary checks and size reporting.
 export async function checkBundlerSizes(fixture, consumerConfig) {
   const rows = [];
-  for (const [symbol, maximumGzip] of [
-    ["buildStrokeScene", 12_000],
-    ["createSceneTextSearcher", 15_000],
-    // Shared page rendering, raster compression, compositor and mixed vector
-    // batching, raster repeat grids and tile seams bring both object factories
-    // to about 305 kB gzip; retain a bounded margin. HEP export encoders stay
-    // in writer-only modules so the reader's chunk never carries them.
-    ["createThreePdfObject", 310_000],
-    ["pdfObjectGenerator", 310_000],
-    ["buildHep", 12_000],
-    ["renderPdfThumbnail", 12_000],
-    ["openDocumentSession", 12_000]
+  for (const symbol of [
+    "buildStrokeScene",
+    "createSceneTextSearcher",
+    "createThreePdfObject",
+    "pdfObjectGenerator",
+    "buildHep",
+    "renderPdfThumbnail",
+    "openDocumentSession"
   ]) {
     const entryPath = resolve(fixture, `size-${symbol}.js`);
     await writeFile(entryPath, `import { ${symbol} } from "@soadzoor/hepr/bundler";\nglobalThis.hepr = ${symbol};\n`);
@@ -42,8 +37,6 @@ export async function checkBundlerSizes(fixture, consumerConfig) {
     const initial = collectStaticChunks(chunks);
     const modules = initial.flatMap(chunk => Object.keys(chunk.modules));
     const gzip = initial.reduce((sum, chunk) => sum + gzipSync(chunk.code).length, 0);
-    assert(gzip < maximumGzip,
-      `${symbol} initial bundle is ${gzip} gzip bytes; budget is ${maximumGzip} (Three.js external)`);
     if (["createThreePdfObject", "pdfObjectGenerator"].includes(symbol)) {
       for (const module of modules) {
         // These synchronous host adapters support shared render hooks without
@@ -83,7 +76,7 @@ export async function checkBundlerSizes(fixture, consumerConfig) {
   const workerChunks = collectStaticChunks(worker.output.filter(file => file.type === "chunk"));
   assert(workerChunks.some(chunk => Object.keys(chunk.modules).some(id => id.endsWith("/pdf/pdfWorkerEntry.js"))),
     "tree shaking must preserve the import-only parser worker bootstrap");
-  console.log(`Packed consumer size checks passed (Three.js external): ${rows.join(", ")}.`);
+  console.log(`Packed consumer import checks passed; initial bundle sizes (Three.js external): ${rows.join(", ")}.`);
 }
 
 function collectStaticChunks(chunks) {

@@ -1,8 +1,7 @@
 import type { PdfObjectSource } from "./pdfObjectGenerator";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import type { PrimitiveColorInput } from "./colorInput";
-import type { DocumentSessionOpenOptions } from "./documentSession";
-import { waitForLoad } from "./loadCancellation";
+import { openDocumentSession, type DocumentSessionOpenOptions } from "./documentSession";
 import type { ThumbnailStageTiming } from "./thumbnailTypes";
 import { normalizeThumbnailOptions } from "./thumbnailOptions";
 
@@ -43,7 +42,6 @@ export async function renderPdfThumbnail(
 ): Promise<PdfThumbnailResult> {
   normalizeThumbnailOptions(options);
   const started = performance.now();
-  const { openDocumentSession } = await waitForLoad(import("./documentSession"), options.signal);
   const session = await openDocumentSession(source, options);
   let failed = true;
   let result: PdfThumbnailResult;

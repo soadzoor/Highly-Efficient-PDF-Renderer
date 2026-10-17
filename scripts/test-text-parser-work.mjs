@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { compileDensePdfContent as compileNative } from "../src/pdf/nativeContentCompiler.ts";
+import { registerHooks } from "node:module";
+
+const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
+  return nextResolve(context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+(?:[?#]|$)/i.test(specifier)
+    ? `${specifier}.ts` : specifier, context);
+} });
+
+const { compileDensePdfContent: compileNative } = await import("../src/pdf/nativeContentCompiler.ts");
 
 const encoder = new TextEncoder();
 const options = {
@@ -114,3 +121,4 @@ for (const compile of [compileNative]) {
 }
 
 console.log("Text parser allocation and cooperative scheduling tests passed.");
+hooks.deregister();

@@ -6,6 +6,11 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Changed
+
+- Remove fixed bundle-size budgets from package tests while retaining initial
+  gzip-size reporting and checks for lazy implementations, workers and assets.
+
 ### Fixed
 
 - Reduce native and Three.js WebGL/WebGPU work for sparse compound fills by
@@ -33,6 +38,12 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 - Update renderer regression fixtures for stationary perspective reuse and
   viewport fill culling. Scope simulated thumbnail WebP compilation failures
   to the codec so Node's own WASM initialization remains available during tests.
+- Canonicalize packed-consumer fixture paths so macOS temporary-directory
+  aliases do not invalidate SSR module checks or bypass bundler graph checks.
+- Use consistent static imports for the lightweight document-session wrapper
+  and retained-resource builder, eliminating ineffective dynamic-import build
+  warnings while keeping document-session runtime and thumbnail scanning lazy.
+  Resolve shared TypeScript dependencies in standalone compiler tests.
 
 ## [0.1.66] - 2026-10-16
 

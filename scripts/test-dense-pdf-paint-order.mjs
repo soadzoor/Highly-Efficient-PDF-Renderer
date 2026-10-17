@@ -1,11 +1,17 @@
 import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
 
-import {
+const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
+  return nextResolve(context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+(?:[?#]|$)/i.test(specifier)
+    ? `${specifier}.ts` : specifier, context);
+} });
+
+const {
   DENSE_PDF_PAINT_RUN_FILL,
   DENSE_PDF_PAINT_RUN_PATH,
   DENSE_PDF_PAINT_RUN_STROKE,
   compileDensePdfContent
-} from "../src/pdf/nativeContentCompiler.ts";
+} = await import("../src/pdf/nativeContentCompiler.ts");
 
 const content = new TextEncoder().encode(`
   1 0 0 rg 0 0 10 10 re f
@@ -139,3 +145,4 @@ assert.deepEqual([...anisotropicStroke.paintRuns], [DENSE_PDF_PAINT_RUN_PATH, 0,
 assert.deepEqual(anisotropicStroke.pagePaths[0].transform, [2, 0, 0, 1, 0, 0]);
 
 console.log("Dense PDF source paint-order tests passed.");
+hooks.deregister();

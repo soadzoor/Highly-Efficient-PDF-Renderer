@@ -8,7 +8,7 @@
  */
 
 import type { PdfDiagnostic } from "./nativeTypes";
-import type { DensePdfRetainedResourceBuilder, DensePdfPackedRetainedResources } from "./nativeRetainedResources";
+import { DensePdfRetainedResourceBuilder, type DensePdfPackedRetainedResources } from "./nativeRetainedResources";
 import type { ThumbnailStrokeScanResult } from "./nativeThumbnailStrokeScanner";
 import type { ThumbnailStrokePixelSize } from "../thumbnailTypes";
 
@@ -1160,11 +1160,9 @@ async function compileContent(
   assertValidBounds(options.pageBounds, "pageBounds");
   options.signal?.throwIfAborted();
 
-  // Keep ordinary standalone compilation independent of retained storage.
+  // Allocate retained storage only for packed display-program output.
   let packedRetainedResources: DensePdfRetainedResourceBuilder | undefined;
   if (policy.displayProgram && options.compactRetainedResources) {
-    const { DensePdfRetainedResourceBuilder } = await import("./nativeRetainedResources");
-    options.signal?.throwIfAborted();
     packedRetainedResources = new DensePdfRetainedResourceBuilder(options.thumbnail === true);
   }
   if (policy.displayProgram && options.thumbnail && options.thumbnailScale !== undefined) {

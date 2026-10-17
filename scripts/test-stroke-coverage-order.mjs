@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
 
-import { compileDensePdfContent as compileNative } from "../src/pdf/nativeContentCompiler.ts";
+const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
+  return nextResolve(context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+(?:[?#]|$)/i.test(specifier)
+    ? `${specifier}.ts` : specifier, context);
+} });
+
+const { compileDensePdfContent: compileNative } = await import("../src/pdf/nativeContentCompiler.ts");
 
 const nativeSort = Array.prototype.sort;
 const options = {
@@ -61,3 +67,4 @@ for (let seed = 1; seed <= 30; seed += 1) {
 }
 
 console.log("Stroke containment ordering is consistent across sorting algorithms.");
+hooks.deregister();

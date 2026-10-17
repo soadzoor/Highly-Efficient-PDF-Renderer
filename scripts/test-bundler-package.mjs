@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, cp, mkdir, mkdtemp, readFile, readdir, rm, symlink } from "node:fs/promises";
+import { access, cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -12,7 +12,8 @@ import { checkBundlerSizes } from "./lib/bundleSizeChecks.mjs";
 
 const execFileAsync = promisify(execFile);
 const root = fileURLToPath(new URL("../", import.meta.url));
-const fixture = await mkdtemp(resolve(tmpdir(), "hepr-bundler-consumer-"));
+// Vite uses real module paths, including macOS's /var -> /private/var alias.
+const fixture = await realpath(await mkdtemp(resolve(tmpdir(), "hepr-bundler-consumer-")));
 const keepFixture = process.argv.includes("--keep-fixture");
 try {
   await cp(new URL("./fixtures/bundler-consumer/", import.meta.url), fixture, { recursive: true });

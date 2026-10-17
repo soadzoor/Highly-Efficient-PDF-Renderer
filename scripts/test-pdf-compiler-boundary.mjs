@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { access, readdir, readFile } from "node:fs/promises";
+import { registerHooks } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+
+const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
+  return nextResolve(context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+(?:[?#]|$)/i.test(specifier)
+    ? `${specifier}.ts` : specifier, context);
+} });
 
 const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
 const sourceRoot = path.join(repositoryRoot, "src");
@@ -20,6 +26,7 @@ await assertCompilerRuntimeBoundary();
 await assertDirectVectorBoundary();
 
 console.log("PDF compiler boundary contract passed");
+hooks.deregister();
 
 async function assertCompilerImportBoundary() {
   const legacyConsumers = new Set();

@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
 
-import {
+const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
+  return nextResolve(context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+(?:[?#]|$)/i.test(specifier)
+    ? `${specifier}.ts` : specifier, context);
+} });
+
+const {
   DENSE_PDF_VECTOR_SCENE_EVENT_FILL,
   DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE,
   DENSE_PDF_VECTOR_SCENE_EVENT_FORM,
@@ -21,7 +27,7 @@ import {
   DensePdfResourceLimitError,
   getDensePdfPaintSourceIdentity,
   scanDensePdfPreparedResourceReferences
-} from "../src/pdf/nativeContentCompiler.ts";
+} = await import("../src/pdf/nativeContentCompiler.ts");
 
 const encoder = new TextEncoder();
 const NOOP_TEXT_SINK = Object.freeze({ applyOperator() {} });
@@ -59,6 +65,7 @@ await testNonPaintingColorSpaces();
 await testGroupedSelectiveImageCheckpoints();
 
 console.log("Dense PDF content compiler tests passed.");
+hooks.deregister();
 
 async function testNonPaintingColorSpaces() {
   const none = { resourceName: "NoInk", colorSpaceIndex: 0, componentCount: 1,

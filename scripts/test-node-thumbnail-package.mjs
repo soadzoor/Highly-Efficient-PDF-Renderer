@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -9,7 +9,8 @@ import { build } from "vite";
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const scratch = await mkdtemp(resolve(tmpdir(), "hepr-node-thumbnail-package-"));
+// Match Vite's canonical module IDs when checking the installed package graph.
+const scratch = await realpath(await mkdtemp(resolve(tmpdir(), "hepr-node-thumbnail-package-")));
 const installed = resolve(scratch, "node_modules/@soadzoor/hepr");
 const execute = promisify(execFile);
 const globals = new Map(["Worker", "document", "OffscreenCanvas"].map(name => [name, globalThis[name]]));
