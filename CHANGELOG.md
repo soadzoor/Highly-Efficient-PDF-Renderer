@@ -28,7 +28,11 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 - Reuse stroke LOD selections in stationary tilted views, invalidating them
   for projection, depth clipping, viewport, detail or visibility changes.
   Share projected viewport culling across translated Reader pages in tilted
-  perspective views, retaining general page culling near horizons.
+  perspective views, retaining general page culling near horizons. Degenerate
+  planar projections keep their uncached stroke LOD fallback.
+- Update renderer regression fixtures for stationary perspective reuse and
+  viewport fill culling. Scope simulated thumbnail WebP compilation failures
+  to the codec so Node's own WASM initialization remains available during tests.
 
 ## [0.1.66] - 2026-10-16
 

@@ -659,7 +659,8 @@ export class VectorStrokeLodRuntime {
       this.stats = this.createEmptyStats();
       return true;
     }
-    const projected = this.useLocalToClip && !this.constantClipW && this.finiteLocalToClip;
+    const projected = this.useLocalToClip && !this.constantClipW && this.finiteLocalToClip &&
+      invertiblePlanarProjection(this.localToClip);
     const previous = this.selectedView;
     // Perspective budgets depend on the complete projection and viewport.
     // An identical view can reuse its tile decisions and instance lists, while
@@ -2752,6 +2753,13 @@ function normalizeOutputBounds(bounds: Bounds, fallback: Bounds): Bounds {
     return bounds;
   }
   return fallback;
+}
+
+/** Degenerate plane mappings retain the uncached projection fallback. */
+function invertiblePlanarProjection(m: ArrayLike<number>): boolean {
+  const determinant = m[0] * (m[5] * m[15] - m[13] * m[7]) -
+    m[4] * (m[1] * m[15] - m[13] * m[3]) + m[12] * (m[1] * m[7] - m[5] * m[3]);
+  return Number.isFinite(determinant) && determinant !== 0;
 }
 
 function normalizeLocalUnitsPerPixel(value: number): number {

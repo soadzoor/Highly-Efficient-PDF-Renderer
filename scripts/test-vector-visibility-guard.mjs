@@ -177,10 +177,17 @@ try {
   assert(projectedStep(6000, 1, rotated), "a changed orientation invalidates projected selection");
   const tilted = projectionAt(6000); tilted[3] = .0001;
   assert(projectedStep(6000, 1, tilted));
-  assert(projectedStep(6000, 1, tilted), "a varying-W perspective view always recomputes tile budgets");
+  const tiltedMarks = projected.levels.map(level => level.markToken);
+  assert.equal(projectedStep(6000, 1, tilted), false, "a stationary varying-W perspective view reuses its tile budgets");
+  assert.deepEqual(projected.levels.map(level => level.markToken), tiltedMarks, "perspective reuse does not rescan tile primitives");
+  const tiltedPan = projectionAt(6020); tiltedPan[3] = tilted[3];
+  assert(projectedStep(6020, 1, tiltedPan), "a perspective pan recomputes tile budgets even inside the planar guard");
+  assert.equal(projectedStep(6020, 1, tiltedPan), false, "the new perspective view can reuse its own selection");
   const smallSlope = projectionAt(6000); smallSlope[3] = 1e-13;
   assert(projectedStep(6000, 1, smallSlope));
-  assert(projectedStep(6000, 1, smallSlope), "a small raw slope is rejected when its scene-wide effect exceeds roundoff");
+  assert.equal(projectedStep(6000, 1, smallSlope), false, "a stationary small-slope perspective view also reuses its selection");
+  const smallSlopePan = projectionAt(6020); smallSlopePan[3] = smallSlope[3];
+  assert(projectedStep(6020, 1, smallSlopePan), "a scene-wide W variation above roundoff cannot use the affine pan guard");
   assert(projectedStep(6000));
   for (let index = 1; index <= 4; index++) {
     const drifting = projectionAt(6000); drifting[0] *= 1 + index * 4e-13;
@@ -194,6 +201,9 @@ try {
   const zeroW = projectionAt(6000); zeroW[15] = 0;
   assert(projectedStep(6000, 1, zeroW));
   assert(projectedStep(6000, 1, zeroW), "a zero clip W cannot certify cache reuse");
+  const singular = projectionAt(6000); singular[1] = singular[5] = 0; singular[3] = .0001;
+  assert(projectedStep(6000, 1, singular));
+  assert(projectedStep(6000, 1, singular), "a collapsed planar projection cannot certify cache reuse");
   assert(projectedStep(6000, 1, projectionAt(6000), null));
   assert(projectedStep(6000, 1, projectionAt(6000), null), "projection without trusted plane bounds stays uncached");
   assert(projectedStep(6000));

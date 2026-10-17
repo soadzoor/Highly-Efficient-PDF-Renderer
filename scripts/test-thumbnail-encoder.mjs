@@ -30,12 +30,24 @@ try {
 
   const originalCompile = WebAssembly.compile;
   const diagnostics = [];
-  WebAssembly.compile = async () => { throw Error("Synthetic unavailable WASM capability."); };
+  let rejectedCodecCompiles = 0;
+  WebAssembly.compile = async (source, ...options) => {
+    const bytes = ArrayBuffer.isView(source) ? new Uint8Array(source.buffer, source.byteOffset, source.byteLength)
+      : source instanceof ArrayBuffer ? new Uint8Array(source) : null;
+    // Node also lazily compiles its HTTP parser when PNG fallback constructs a
+    // Response. Fail only this codec so unrelated runtime initialization works.
+    if (bytes?.byteLength === binary.byteLength && Buffer.compare(bytes, binary) === 0) {
+      rejectedCodecCompiles++;
+      throw Error("Synthetic unavailable WASM capability.");
+    }
+    return originalCompile.call(WebAssembly, source, ...options);
+  };
   try {
     const fallback = await encodeThumbnailPixelsDirect(fixture, "webp", undefined, diagnostic => diagnostics.push(diagnostic));
     assert.equal(fallback.type, "image/png");
     assert.deepEqual(decodePng(new Uint8Array(await fallback.arrayBuffer())).rgba, fixture.rgba);
   } finally { WebAssembly.compile = originalCompile; }
+  assert.equal(rejectedCodecCompiles, 1, "fallback exercises an actual WebP codec compilation failure");
   assert.equal(diagnostics[0].code, "thumbnail.webp-png-fallback");
 
   const codec = await createThumbnailWebpCodec(binary);

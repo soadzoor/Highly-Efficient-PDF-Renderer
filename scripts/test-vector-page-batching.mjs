@@ -511,17 +511,29 @@ try {
   // Exercise both production dispatchers, including disabling scheduling for
   // GL's arbitrary local-to-clip projection. These checks need no GPU/server.
   for (const Renderer of [WebGlFloorplanRenderer, WebGpuFloorplanRenderer]) {
+    const fullView = { minX: -15, minY: -7, maxX: 225, maxY: 17 };
     const renderer = Object.assign(Object.create(Renderer.prototype), {
       scene, orderedBatches: new VectorOrderedBatches(scene, null), zoom: 10,
+      orderedCullingBounds: fullView,
       vectorLodLevels: [], vectorLodLevelResources: [], rasterRenderingEnabled: false,
       gl: { bindBuffer() {}, bufferData() {} }, gpuDevice: { queue: { writeBuffer() {} } }
     });
     renderer.drawPageBackgroundContentIntoPass = () => {};
     const draw = Renderer === WebGlFloorplanRenderer
-      ? () => renderer.drawSourceOrderedContent(100, 100, 50, 50, 10)
+      ? () => renderer.drawSourceOrderedContent(2400, 240, 105, 5, 10)
       : () => renderer.drawSourceOrderedContentIntoPass({});
     draw();
     assert.equal(renderer.orderedBatches.batches.length, 5);
+    assert.equal(renderer.orderedBatches.culledFillCount, 0, "the scheduling fixture's viewport contains every page fill");
+    assert.deepEqual(paints(renderer.orderedBatches).slice().sort(), original.slice().sort());
+    renderer.orderedCullingBounds = { minX: 40, minY: 0, maxX: 60, maxY: 10 };
+    if (Renderer === WebGlFloorplanRenderer) renderer.drawSourceOrderedContent(200, 100, 50, 5, 10);
+    else draw();
+    assert.equal(renderer.orderedBatches.culledFillCount, 3, "both dispatchers cull fills outside a narrow viewport");
+    assert(paints(renderer.orderedBatches).every(paint => !paint.startsWith("fill:")));
+    renderer.orderedCullingBounds = fullView; draw();
+    assert.equal(renderer.orderedBatches.batches.length, 5, "returning to the full view restores fill batches");
+    assert.deepEqual(paints(renderer.orderedBatches).slice().sort(), original.slice().sort());
     if (Renderer === WebGlFloorplanRenderer) {
       renderer.localToClipRenderingEnabled = true;
       draw();
