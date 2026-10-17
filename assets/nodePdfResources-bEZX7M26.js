@@ -1,0 +1,3 @@
+import{createBundledStandardFontResolver as e}from"./standardFontResolver-DB9aSOrF.js";function t(t={}){return e({...t,loadAsset:t.loadAsset??(async(e,t)=>{t?.throwIfAborted();let r=await i();t?.throwIfAborted();let a=await r.readFile(n(e));return t?.throwIfAborted(),a})})}function n(e){if(!new URL(import.meta.url).pathname.endsWith(`.ts`))try{let t=e.url.pathname.slice(e.url.pathname.lastIndexOf(`/`)+1);return new URL(t,import.meta.resolve(`@soadzoor/hepr/node`))}catch{}return e.url}let r;function i(){return r||=import(
+/* @vite-ignore */
+`node:fs/promises`),r}export{t as createNodeBundledStandardFontResolver};
