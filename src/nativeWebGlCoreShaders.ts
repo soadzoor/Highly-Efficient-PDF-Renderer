@@ -1,5 +1,5 @@
 import { TEXT_RASTER_ATLAS_PADDING_PX } from "./textRasterAtlasConstants";
-import { STROKE_COVERAGE_GLSL, STROKE_DENSITY_GLSL } from "./strokeCoverageShaders";
+import { STROKE_MINIMUM_WIDTH_GLSL, STROKE_COVERAGE_GLSL, STROKE_DENSITY_GLSL } from "./strokeCoverageShaders";
 import { FILL_COVERAGE_GLSL, FILL_COVERAGE_VERTEX_GLSL } from "./fillCoverageShaders";
 import { VECTOR_CELL_COVERAGE_GLSL } from "./vectorCellShaders";
 import { MIN_VECTOR_INDEXED_PATH_SEGMENTS } from "./vectorFillBands";
@@ -20,6 +20,7 @@ float heprThreeLinearCoverageToOutputAlpha(float coverage) {
 
 export const VERTEX_SHADER_SOURCE = `#version 300 es
 precision highp float;
+${STROKE_MINIMUM_WIDTH_GLSL}
 precision highp sampler2D;
 
 layout(location = 0) in vec2 aCorner;
@@ -46,6 +47,7 @@ uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
 uniform float uZoom;
 uniform float uAAScreenPx;
+uniform float uMinimumStrokeWidthPx;
 uniform float uUseLocalToClip;
 uniform mat4 uLocalToClip;
 uniform float uLocalUnitsPerPixel;
@@ -139,6 +141,8 @@ void main() {
     halfWidth = max(0.5 * localUnitsPerPixel, 1e-5);
   }
 
+  halfWidth = heprMinimumStrokeHalfWidth(halfWidth, uUseLocalToClip >= 0.5 ? localUnitsPerPixel : 1.0 / max(uZoom, 1e-12), uMinimumStrokeWidthPx);
+
   float aaWorld = max(localUnitsPerPixel, 0.0001) * uAAScreenPx;
   if (isHairline) {
     aaWorld = max(0.35 * localUnitsPerPixel, 5e-5);
@@ -205,6 +209,7 @@ export const FRAGMENT_SHADER_SOURCE = `#version 300 es
 precision highp float;
 uniform float uStrokeCurveEnabled;
 uniform float uAAScreenPx;
+uniform float uMinimumStrokeWidthPx;
 uniform vec4 uVectorOverride;
 in vec2 vLocal;
 flat in vec2 vP0;
@@ -282,6 +287,7 @@ float distanceToQuadraticBezier(vec2 p, vec2 a, vec2 b, vec2 c) {
 }
 
 ${VECTOR_INSTANCE_CLIP_GLSL}
+${STROKE_MINIMUM_WIDTH_GLSL}
 ${STROKE_COVERAGE_GLSL}
 ${STROKE_DENSITY_GLSL}
 
@@ -306,6 +312,7 @@ void main() {
   float localPerPixel = max(max(pixelToLocalX, pixelToLocalY), 1e-6);
   float aaWorld = max(localPerPixel * uAAScreenPx, 5e-5);
   float halfWidth = vIsHairline >= 0.5 ? max(0.5 * localPerPixel, 1e-5) : vHalfWidth;
+  halfWidth = heprMinimumStrokeHalfWidth(halfWidth, localPerPixel, uMinimumStrokeWidthPx);
 
   float coverage = heprStrokeCoverage(distanceToSegment, halfWidth, aaWorld);
   float alpha = heprThreeLinearCoverageToOutputAlpha(coverage) * vAlpha;

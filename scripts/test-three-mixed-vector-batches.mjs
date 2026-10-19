@@ -141,6 +141,9 @@ try {
   entry.stroke.setVectorOverride(.1, .2, .3, .4); entry.stroke.setStrokeCurveEnabled(false);
   assert.deepEqual(mesh.material.uniforms.uVectorOverride.value.toArray(), [.1, .2, .3, .4]);
   assert.equal(mesh.material.uniforms.uStrokeCurveEnabled.value, 0, "live source uniforms reach the borrowed material");
+  assert.equal(mesh.material.uniforms.uMinimumStrokeWidthPx.value, 1, "WebGL strokes default to a one-pixel floor");
+  entry.stroke.setMinimumStrokeWidth(false);
+  assert.equal(mesh.material.uniforms.uMinimumStrokeWidthPx.value, 0, "mixed WebGL draws share the live width opt-out");
 
   entry.mixed.restore();
   assert.equal(activeSources(entry).length, 4096, "disabling restores every suppressed source mesh");
@@ -239,6 +242,9 @@ try {
   const plan = new ThreeVectorDrawPlan(lodScene); plan.setColorCommutationEnabled(false);
   const lod = new ThreeVectorLodStrokeLayer(lodScene, { drawPlan: plan, strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0] });
   assert(lod.getMixedVectorStrokeLayer(), "ordered LOD exposes its combined canonical and coarse store");
+  lod.setMinimumStrokeWidth(false);
+  assert.equal(lod.getMixedVectorStrokeLayer().getMixedVectorResources().minimumStrokeWidthUniform.value, 0,
+    "coarse and canonical LOD strokes receive the minimum-width opt-out");
   const lodFill = new ThreeMaterialFillLayer(lodScene, { drawPlan: plan, vectorOverride: [0, 0, 0, 0] });
   const lodMixed = new ThreeMixedVectorLayer({ fill: lodFill, stroke: lod.getMixedVectorStrokeLayer(), materialBackend: "webgl" });
   plan.update(10); lod.setVisible(true); lod.updateForLocalUnitsPerPixel(10);
@@ -294,6 +300,10 @@ try {
   gpu.stroke.setStrokeCurveEnabled(false); gpu.stroke.setVectorOverride(.2, .3, .4, .5);
   gpu.refresh(); gpu.mixed.update(gpu.roots, gpuHost, camera);
   assert.equal(gpu.mixed.state.curveUniform.value, 0);
+  assert.equal(gpu.mixed.state.minimumStrokeWidthUniform.value, 1, "WebGPU strokes default to a one-pixel floor");
+  gpu.stroke.setMinimumStrokeWidth(false);
+  gpu.refresh(); gpu.mixed.update(gpu.roots, gpuHost, camera);
+  assert.equal(gpu.mixed.state.minimumStrokeWidthUniform.value, 0, "mixed WebGPU draws receive the live width opt-out");
   assert.deepEqual(gpu.mixed.state.material.fragmentNode ? gpu.stroke.getMixedVectorResources().options.vectorOverride.toArray() : [], [.2, .3, .4, .5]);
   gpu.dispose();
   const failedGpu = layers(sceneOf(), { materialBackend: "webgpu", webGpu }), originalWarn = console.warn;
@@ -336,12 +346,13 @@ try {
   initializing.fill.dispose(); initializing.stroke.dispose();
 
   // Public object switch reaches the native fallback and survives page/material changes.
-  let nativeSetting = true, nativeView = view, nativeFills = true, nativeStrokes = true;
+  let nativeSetting = true, nativeView = view, nativeFills = true, nativeStrokes = true, nativeMinimumWidth;
   const native = new Proxy({ getViewState: () => nativeView, getPresentedViewState: () => nativeView,
     setViewState: value => { nativeView = value; }, getPresentedFrameSerial: () => 0, getRasterLayerUpdates: () => new Map(),
     setMixedVectorBatchingEnabled: value => { nativeSetting = value; }, getSceneStats: () => ({}),
     setFillRenderingEnabled: value => { nativeFills = value; },
-    setStrokeRenderingEnabled: value => { nativeStrokes = value; } },
+    setStrokeRenderingEnabled: value => { nativeStrokes = value; },
+    setMinimumStrokeWidth: value => { nativeMinimumWidth = value; } },
     { get: (target, key) => target[key] ?? (() => {}) });
   const visibilityScene = sceneOf();
   Object.assign(visibilityScene, {
@@ -363,6 +374,17 @@ try {
   const object = await createThreePdfObject({ scene: visibilityScene, sourceKind: "hep", sourceLabel: "mixed" },
     { rendererType: "webgl", vectorLod: "off", textLod: "off", threeColorCompositing: "display" },
     undefined, undefined, () => native);
+  assert.equal(object.getMinimumStrokeWidth(), true);
+  assert.equal(nativeMinimumWidth, true, "the public default reaches native fallback rendering");
+  const canonicalStyles = visibilityScene.styles.slice();
+  object.setMinimumStrokeWidth(false);
+  assert.equal(object.getMinimumStrokeWidth(), false);
+  assert.equal(nativeMinimumWidth, false);
+  assert.equal(object.strokeMaterialLayer.getMixedVectorResources().minimumStrokeWidthUniform.value, 0);
+  const gradientWidthUniform = object.gradientMaterialLayer.getOrderedPaintMeshes()
+    .find(paint => paint.primitiveKind === "gradient-stroke").material.uniforms.uMinimumStrokeWidthPx;
+  assert.equal(gradientWidthUniform.value, 0, "gradient strokes receive the opt-out");
+  assert.deepEqual(visibilityScene.styles, canonicalStyles, "the display floor never modifies canonical stroke styles");
   const world = new THREE.Scene(); world.add(object); world.updateMatrixWorld(true);
   object.drawPlan.setColorCommutationEnabled(false);
   const objectHost = { ...host, isWebGLRenderer: true, outputColorSpace: THREE.LinearSRGBColorSpace,
@@ -406,17 +428,43 @@ try {
   assert.equal(object.getMixedVectorBatchingEnabled(), false); assert.equal(nativeSetting, false);
   assert.equal(object.mixedVectorLayer.group.visible, false);
   assert(object.strokeMaterialLayer.mesh.children.every(child => child.visible));
-  object.setVectorLodMode("auto"); object.setVectorLodMode("off");
+  object.setVectorLodMode("force");
+  assert(object.vectorLodStrokeLayer, "force mode actually replaces the exact stroke material");
+  assert.equal(object.vectorLodStrokeLayer.getMixedVectorStrokeLayer().getMixedVectorResources().minimumStrokeWidthUniform.value, 0,
+    "new LOD materials inherit the minimum-width opt-out");
+  object.setVectorLodMode("off");
   assert.equal(object.getMixedVectorBatchingEnabled(), false, "stroke material rebuilds retain the user setting");
+  assert.equal(object.strokeMaterialLayer.getMixedVectorResources().minimumStrokeWidthUniform.value, 0,
+    "stroke material rebuilds retain the minimum-width opt-out");
   const children = await object.getPages();
   assert(children.every(page => !page.getMixedVectorBatchingEnabled()), "new page handles inherit the setting");
+  assert(children.every(page => !page.getMinimumStrokeWidth()), "new page handles inherit the minimum-width opt-out");
   assert(children.every(page => !page.getFillRenderingEnabled() && page.getStrokeRenderingEnabled()),
     "new page handles inherit independent vector rendering flags");
   object.setFillRenderingEnabled(true);
   assert(children.every(page => page.getFillRenderingEnabled()));
   object.setMixedVectorBatchingEnabled(true);
   assert(children.every(page => page.getMixedVectorBatchingEnabled()));
+  object.setMinimumStrokeWidth(true);
+  assert(children.every(page => page.getMinimumStrokeWidth()), "existing page handles receive runtime width changes");
   object.dispose();
+  for (const rendererType of ["webgl", "webgpu"]) {
+    const optedOut = await createThreePdfObject({ scene: visibilityScene, sourceKind: "hep", sourceLabel: "width opt-out" },
+      { rendererType, vectorLod: "off", textLod: "off", minimumStrokeWidth: false },
+      undefined, undefined, () => native);
+    assert.equal(optedOut.getMinimumStrokeWidth(), false);
+    assert.equal(nativeMinimumWidth, false);
+    assert.equal(optedOut.strokeMaterialLayer.getMixedVectorResources().minimumStrokeWidthUniform.value, 0,
+      "constructor options apply before the first rendered frame");
+    if (rendererType === "webgpu") {
+      const gradientStroke = optedOut.gradientMaterialLayer.getOrderedPaintMeshes()
+        .find(paint => paint.primitiveKind === "gradient-stroke");
+      assert.equal(gradientStroke.strokeState.minimumStrokeWidthUniform.value, 0);
+      optedOut.setMinimumStrokeWidth(true);
+      assert.equal(gradientStroke.strokeState.minimumStrokeWidthUniform.value, 1, "WebGPU gradient strokes toggle at runtime");
+    }
+    optedOut.dispose();
+  }
   console.log("Three mixed vectors: 4096 paints to one draw, order/clips/pages/OCG, stable uploads, LOD resources, lifecycle, GL/GPU fallbacks and public comparison switch passed");
 } finally { globalThis.document = previousDocument; hooks.deregister(); }
 

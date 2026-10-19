@@ -397,6 +397,7 @@ export class ThreeMixedVectorLayer {
     this.state.useLocalToClipUniform.value = source.useLocalToClipUniform.value;
     this.state.localUnitsPerPixelUniform.value = source.localUnitsPerPixelUniform.value;
     this.state.curveUniform.value = source.curveUniform.value;
+    this.state.minimumStrokeWidthUniform.value = source.minimumStrokeWidthUniform.value;
   }
 
   private syncMaterialState(): void {

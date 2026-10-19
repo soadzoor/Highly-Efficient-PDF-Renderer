@@ -1,4 +1,4 @@
-import { STROKE_COVERAGE_WGSL } from "./strokeCoverageShaders";
+import { STROKE_MINIMUM_WIDTH_WGSL, STROKE_COVERAGE_WGSL } from "./strokeCoverageShaders";
 import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { GRADIENT_PARAMETER_WGSL, GRADIENT_BACKGROUND_WGSL } from "./gradientSampling";
@@ -20,6 +20,7 @@ struct CameraUniforms {
   vectorOverride : vec4f,
   fillBands : vec4f,
   fillCells : vec4f,
+  minimumStroke : vec4f,
 };
 `;
 
@@ -289,6 +290,7 @@ ${vectorFillBandLoopWgsl({
 `;
 
 export const GRADIENT_STROKE_WGSL = /* wgsl */ `
+${STROKE_MINIMUM_WIDTH_WGSL}
 ${STROKE_COVERAGE_WGSL}
 ${CAMERA_STRUCT}
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
@@ -356,7 +358,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
     return out;
   }
   let localPerPixel = 1.0 / max(uCamera.zoom, 1e-4);
-  let halfWidth = select(style.x, max(0.5 * localPerPixel, 1e-5), hairline);
+  let halfWidth = heprMinimumStrokeHalfWidth(select(style.x, max(0.5 * localPerPixel, 1e-5), hairline), 1.0 / max(uCamera.zoom, 1e-12), uCamera.minimumStroke.x);
   let aaWorld = select(
     max(localPerPixel, 0.0001) * uCamera.strokeAAScreenPx,
     max(0.35 * localPerPixel, 5e-5),

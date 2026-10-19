@@ -290,6 +290,8 @@ export interface ViewStateUpdateOptions {
 export interface WebGlFloorplanRendererOptions {
   /** Preserve the WebGL drawing buffer after presentation. */
   preserveDrawingBuffer?: boolean;
+  /** Keep vector strokes at least one final device pixel wide. Defaults to true. */
+  minimumStrokeWidth?: boolean;
   /** Combine compatible ordered fill/stroke draws; defaults to true. */
   mixedVectorBatching?: boolean;
   /** @internal Static offscreen rendering without interactive preparation. */
@@ -549,6 +551,7 @@ export class WebGlFloorplanRenderer {
   private readonly uZoom: WebGLUniformLocation;
 
   private readonly uAAScreenPx: WebGLUniformLocation;
+  private readonly uMinimumStrokeWidthPx: WebGLUniformLocation;
 
   private readonly uUseLocalToClip: WebGLUniformLocation;
 
@@ -994,6 +997,7 @@ export class WebGlFloorplanRenderer {
   private textRenderingEnabled = true;
 
   private strokeCurveEnabled = true;
+  private minimumStrokeWidthEnabled = true;
 
   private textVectorOnly = false;
 
@@ -1012,6 +1016,7 @@ export class WebGlFloorplanRenderer {
 
   constructor(canvas: HTMLCanvasElement | OffscreenCanvas, options: WebGlFloorplanRendererOptions = {}) {
     this.canvas = canvas;
+    this.minimumStrokeWidthEnabled = options.minimumStrokeWidth !== false;
     this.thumbnailMode = options.thumbnail === true;
     if (this.thumbnailMode) {
       this.externalFrameDriver = true;
@@ -1170,6 +1175,7 @@ export class WebGlFloorplanRenderer {
       "uLocalToClip",
       "uLocalUnitsPerPixel",
       "uStrokeCurveEnabled",
+      "uMinimumStrokeWidthPx",
       "uVectorOverride",
       "uPrimitiveOverride"
     ]);
@@ -1183,6 +1189,7 @@ export class WebGlFloorplanRenderer {
     this.uCameraCenter = this.mustGetUniformLocation(this.segmentProgram, "uCameraCenter");
     this.uZoom = this.mustGetUniformLocation(this.segmentProgram, "uZoom");
     this.uAAScreenPx = this.mustGetUniformLocation(this.segmentProgram, "uAAScreenPx");
+    this.uMinimumStrokeWidthPx = this.mustGetUniformLocation(this.segmentProgram, "uMinimumStrokeWidthPx");
     this.uUseLocalToClip = this.mustGetUniformLocation(this.segmentProgram, "uUseLocalToClip");
     this.uLocalToClip = this.mustGetUniformLocation(this.segmentProgram, "uLocalToClip");
     this.uLocalUnitsPerPixel = this.mustGetUniformLocation(this.segmentProgram, "uLocalUnitsPerPixel");
@@ -1558,6 +1565,18 @@ export class WebGlFloorplanRenderer {
 
   getTextLodStats(): TextLodStats | null {
     return this.textLodRuntime?.getStats() ?? null;
+  }
+
+  setMinimumStrokeWidth(enabled: boolean): void {
+    const next = Boolean(enabled);
+    if (this.minimumStrokeWidthEnabled === next) return;
+    this.minimumStrokeWidthEnabled = next;
+    this.requestFrame();
+  }
+
+  /** Internal supersampling must preserve the floor in final canvas pixels. */
+  private minimumStrokeWidthPixels(zoom: number): number {
+    return this.minimumStrokeWidthEnabled ? Math.max(1, zoom / Math.max(this.zoom, 1e-12)) : 0;
   }
 
   setStrokeCurveEnabled(enabled: boolean): void {
@@ -3124,6 +3143,7 @@ export class WebGlFloorplanRenderer {
     gl.uniform1f(uniforms.uAAScreenPx, 0.9);
     gl.uniform1f(uniforms.uLocalUnitsPerPixel, this.localToClipRenderingEnabled ? this.localUnitsPerPixel : 1 / Math.max(zoomValue, 1e-6));
     gl.uniform1f(uniforms.uStrokeCurveEnabled, this.strokeCurveEnabled ? 1 : 0);
+    gl.uniform1f(uniforms.uMinimumStrokeWidthPx, this.minimumStrokeWidthPixels(zoomValue));
     gl.uniform4f(
       uniforms.uVectorOverride,
       this.vectorOverrideColor[0],
@@ -4237,7 +4257,7 @@ export class WebGlFloorplanRenderer {
           const uniforms = this.mustGetUniformMap(program, ["uSegmentTexA", "uSegmentTexB", "uSegmentStyleTex", "uSegmentBoundsTex",
             "uSegmentTexSize", "uFillPathMetaTexA", "uFillPathMetaTexB", "uFillPathMetaTexC", "uFillSegmentTexA", "uFillSegmentTexB",
             "uFillPathMetaTexSize", "uFillSegmentTexSize", "uFillBandBase", "uFillCellHeaders", "uFillBandEntries",
-            "uFillClipBoundsEnabled", "uFillClipBoundsTex", "uViewport", "uCameraCenter", "uZoom", "uAAScreenPx", "uFillAAScreenPx",
+            "uFillClipBoundsEnabled", "uFillClipBoundsTex", "uViewport", "uCameraCenter", "uZoom", "uAAScreenPx", "uMinimumStrokeWidthPx", "uFillAAScreenPx",
             "uUseLocalToClip", "uLocalToClip", "uLocalUnitsPerPixel", "uStrokeCurveEnabled", "uVectorOverride", "uMixedVectorEnabled"]);
           buffer = this.mustCreateBuffer(); vao = this.createVertexArray();
           gl.bindVertexArray(vao);
@@ -4322,6 +4342,7 @@ export class WebGlFloorplanRenderer {
       if (this.localToClipRenderingEnabled) gl.uniformMatrix4fv(u.uLocalToClip, false, this.localToClipMatrix);
       gl.uniform1f(u.uLocalUnitsPerPixel, this.localUnitsPerPixel);
       gl.uniform1f(u.uStrokeCurveEnabled, this.strokeCurveEnabled ? 1 : 0);
+      gl.uniform1f(u.uMinimumStrokeWidthPx, this.minimumStrokeWidthPixels(zoom));
       gl.uniform4f(u.uVectorOverride, ...this.vectorOverrideColor, this.vectorOverrideOpacity);
     }
     this.lastMixedVectorDrawFirst = run.first;
@@ -4571,6 +4592,7 @@ export class WebGlFloorplanRenderer {
       gl.uniform2f(this.uCameraCenter, cameraCenterX, cameraCenterY);
       gl.uniform1f(this.uZoom, zoomValue);
       gl.uniform1f(this.uAAScreenPx, 1);
+      gl.uniform1f(this.uMinimumStrokeWidthPx, this.minimumStrokeWidthPixels(zoomValue));
       gl.uniform1f(this.uUseLocalToClip, this.localToClipRenderingEnabled ? 1 : 0);
       gl.uniform1f(this.uLocalUnitsPerPixel, this.localUnitsPerPixel);
       if (this.localToClipRenderingEnabled) {

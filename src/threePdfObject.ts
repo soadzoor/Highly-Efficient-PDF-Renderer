@@ -226,6 +226,9 @@ export interface HeprThreeObjectOptions {
    */
   curveStrokes?: boolean;
 
+  /** Keep vector strokes at least one device pixel wide without changing source geometry. @default true */
+  minimumStrokeWidth?: boolean;
+
   /**
    * Render text as vector glyph geometry only. Raster glyph atlas rendering is
    * disabled when this is true.
@@ -308,6 +311,7 @@ interface RendererConfig {
   vectorLodMode: VectorLodMode;
   textLodMode: TextLodMode;
   strokeCurveEnabled: boolean;
+  minimumStrokeWidth: boolean;
   textVectorOnly: boolean;
   pageBackground: [number, number, number, number];
   vectorOverride: [number, number, number, number];
@@ -478,7 +482,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     let table: ThreePageTransforms | undefined;
     const config = this.rendererConfig;
     const options: HeprThreeObjectOptions = { rendererType: this.rendererType,
-      vectorLod: config.vectorLodMode, textLod: config.textLodMode, curveStrokes: config.strokeCurveEnabled,
+      vectorLod: config.vectorLodMode, textLod: config.textLodMode, curveStrokes: config.strokeCurveEnabled, minimumStrokeWidth: config.minimumStrokeWidth,
       vectorOnly: config.textVectorOnly, threeColorCompositing: config.threeColorCompositing,
       pageBackground: config.pageBackground.slice(0, 3) as [number, number, number], pageBackgroundOpacity: config.pageBackground[3],
       vectorOverrideColor: config.vectorOverride.slice(0, 3) as [number, number, number], vectorOverrideOpacity: config.vectorOverride[3] };
@@ -539,6 +543,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
         // Settings may have changed while resources were being prepared.
         object.setVectorLodMode(config.vectorLodMode); object.setTextLodMode(config.textLodMode);
         object.setStrokeCurveEnabled(config.strokeCurveEnabled);
+        object.setMinimumStrokeWidth(config.minimumStrokeWidth);
         object.setMixedVectorBatchingEnabled(this.mixedVectorBatchingEnabled);
         object.setFillRenderingEnabled(this.fillRenderingEnabled);
         object.setStrokeRenderingEnabled(this.strokeRenderingEnabled);
@@ -714,7 +719,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     views.forEach((page, index) => {
       const object = page.object, other = object.rendererConfig, b = other.pageBackground, o = other.vectorOverride;
       this.pageBatchIncompatible[index] = other.vectorLodMode !== config.vectorLodMode || other.textLodMode !== config.textLodMode ||
-        other.strokeCurveEnabled !== config.strokeCurveEnabled || other.textVectorOnly !== config.textVectorOnly ||
+        other.strokeCurveEnabled !== config.strokeCurveEnabled || other.minimumStrokeWidth !== config.minimumStrokeWidth || other.textVectorOnly !== config.textVectorOnly ||
         object.fillRenderingEnabled !== this.fillRenderingEnabled || object.strokeRenderingEnabled !== this.strokeRenderingEnabled ||
         b[0] !== background[0] || b[1] !== background[1] || b[2] !== background[2] || b[3] !== background[3] ||
         o[0] !== override[0] || o[1] !== override[1] || o[2] !== override[2] || o[3] !== override[3] ||
@@ -763,7 +768,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     for (const { object } of this.pageViews!) {
       const other = object.rendererConfig, b = other.pageBackground, o = other.vectorOverride;
       if (other.vectorLodMode !== config.vectorLodMode || other.textLodMode !== config.textLodMode ||
-          other.strokeCurveEnabled !== config.strokeCurveEnabled || other.textVectorOnly !== config.textVectorOnly ||
+          other.strokeCurveEnabled !== config.strokeCurveEnabled || other.minimumStrokeWidth !== config.minimumStrokeWidth || other.textVectorOnly !== config.textVectorOnly ||
           object.fillRenderingEnabled !== this.fillRenderingEnabled || object.strokeRenderingEnabled !== this.strokeRenderingEnabled ||
           b[0] !== background[0] || b[1] !== background[1] || b[2] !== background[2] || b[3] !== background[3] ||
           o[0] !== override[0] || o[1] !== override[1] || o[2] !== override[2] || o[3] !== override[3] ||
@@ -1336,7 +1341,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   private contentOptions(): HeprThreeObjectOptions {
     const config = this.rendererConfig;
     return { rendererType: this.rendererType, vectorLod: config.vectorLodMode, textLod: config.textLodMode,
-      curveStrokes: config.strokeCurveEnabled, vectorOnly: config.textVectorOnly,
+      curveStrokes: config.strokeCurveEnabled, minimumStrokeWidth: config.minimumStrokeWidth, vectorOnly: config.textVectorOnly,
       threeColorCompositing: config.threeColorCompositing,
       pageBackground: config.pageBackground.slice(0,3) as [number,number,number], pageBackgroundOpacity: config.pageBackground[3],
       vectorOverrideColor: config.vectorOverride.slice(0,3) as [number,number,number], vectorOverrideOpacity: config.vectorOverride[3] };
@@ -2745,6 +2750,27 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     this.lastSyncedFrameSerial = -1;
   }
 
+  /** Enable the one-device-pixel display floor; source stroke widths stay unchanged. */
+  setMinimumStrokeWidth(enabled: boolean): void {
+    if (this.isDisposed) return;
+    const next = Boolean(enabled);
+    this.rendererConfig.minimumStrokeWidth = next;
+    for (const page of this.pageViews ?? []) page.object.setMinimumStrokeWidth(next);
+    this.pageBatch?.setMinimumStrokeWidth(next);
+    this.markPageAppearanceChanged();
+    this.renderer.setMinimumStrokeWidth?.(next);
+    if (!this.deferredMaterials) {
+      this.gradientMaterialLayer.setMinimumStrokeWidth(next);
+      this.strokeMaterialLayer?.setMinimumStrokeWidth(next);
+      this.triangleStrokeLayer?.setMinimumStrokeWidth(next);
+      this.vectorLodStrokeLayer?.setMinimumStrokeWidth(next);
+      this.compactedStrokeLayer?.setMinimumStrokeWidth(next);
+    }
+    this.dispatchEvent({ type: "change", reason: "stroke-rendering" });
+  }
+
+  getMinimumStrokeWidth(): boolean { return this.rendererConfig.minimumStrokeWidth; }
+
   /**
    * Enable or disable curve-aware stroke rendering where supported.
    */
@@ -3023,6 +3049,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
         strokeCurveEnabled: this.rendererConfig.strokeCurveEnabled,
         vectorOverride: this.rendererConfig.vectorOverride
       });
+      this.vectorLodStrokeLayer.setMinimumStrokeWidth(this.rendererConfig.minimumStrokeWidth);
       this.vectorLodStrokeLayer.deactivate();
       this.add(this.vectorLodStrokeLayer.group);
       return;
@@ -3038,6 +3065,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
         strokeCurveEnabled: this.rendererConfig.strokeCurveEnabled,
         vectorOverride: this.rendererConfig.vectorOverride
       });
+      this.strokeMaterialLayer.setMinimumStrokeWidth(this.rendererConfig.minimumStrokeWidth);
       this.strokeMaterialLayer.setVisible(false);
       this.add(this.strokeMaterialLayer.mesh);
     }
@@ -4958,6 +4986,9 @@ function* createThreePdfMaterialSteps(loadedScene: ThreePdfSceneSource, renderer
     }
 
     owned.push(textMaterialLayer);
+    gradientMaterialLayer.setMinimumStrokeWidth(rendererConfig.minimumStrokeWidth);
+    strokeMaterialLayer?.setMinimumStrokeWidth(rendererConfig.minimumStrokeWidth);
+    vectorLodStrokeLayer?.setMinimumStrokeWidth(rendererConfig.minimumStrokeWidth);
     complete = true;
     return { rasterMaterialLayer, gradientMaterialLayer, fillMaterialLayer, strokeMaterialLayer,
       triangleStrokeLayer, vectorLodStrokeLayer, compactedStrokeLayer, textMaterialLayer, textLodLayer, drawPlan };
@@ -5093,6 +5124,7 @@ function normalizeRendererConfig(options: HeprThreeObjectOptions): RendererConfi
     vectorLodMode: normalizeVectorLodMode(options.vectorLod),
     textLodMode: options.textLod === "off" ? "off" : "auto",
     strokeCurveEnabled: options.curveStrokes !== false,
+    minimumStrokeWidth: options.minimumStrokeWidth !== false,
     textVectorOnly: options.vectorOnly === true,
     pageBackground: [pageBackground[0], pageBackground[1], pageBackground[2], pageBackgroundOpacity],
     vectorOverride: [vectorColor[0], vectorColor[1], vectorColor[2], vectorOpacity]
@@ -5111,6 +5143,7 @@ function applyRendererConfig(renderer: RendererApi, config: RendererConfig): voi
   renderer.setStrokeRenderingEnabled?.(true);
   renderer.setTextRenderingEnabled?.(true);
   renderer.setStrokeCurveEnabled(config.strokeCurveEnabled);
+  renderer.setMinimumStrokeWidth?.(config.minimumStrokeWidth);
   renderer.setTextVectorOnly(config.textVectorOnly);
   renderer.setPageBackgroundColor(
     config.pageBackground[0],

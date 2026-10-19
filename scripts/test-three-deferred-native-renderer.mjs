@@ -23,6 +23,7 @@ class NativeRenderer {
   strokeRendering = true;
   setExternalFrameDriver(value) { calls.push(["external", value]); }
   setStrokeCurveEnabled(value) { calls.push(["curve", value]); }
+  setMinimumStrokeWidth(value) { calls.push(["minimumWidth", value]); }
   setMixedVectorBatchingEnabled(value) { this.mixedVectorBatching = Boolean(value); calls.push(["mixed", value]); }
   getMixedVectorBatchingEnabled() { return this.mixedVectorBatching; }
   setFillRenderingEnabled(value) { this.fillRendering = Boolean(value); calls.push(["fills", value]); }
@@ -61,6 +62,8 @@ try {
   renderer.setExternalFrameDriver(true);
   renderer.setStrokeCurveEnabled(true);
   renderer.setStrokeCurveEnabled(false);
+  renderer.setMinimumStrokeWidth(true);
+  renderer.setMinimumStrokeWidth(false);
   assert.equal(renderer.getMixedVectorBatchingEnabled(), true);
   renderer.setMixedVectorBatchingEnabled(true);
   renderer.setMixedVectorBatchingEnabled(false);
@@ -92,6 +95,8 @@ try {
   assert.equal(creations, 1);
   assert.deepEqual(calls[0], ["external", true], "configuration replay must not schedule unseen frames");
   assert.deepEqual(calls.filter(([name]) => name === "curve"), [["curve", false]], "only current config is replayed");
+  assert.deepEqual(calls.filter(([name]) => name === "minimumWidth"), [["minimumWidth", false]],
+    "the minimum-width opt-out remains dormant and replays on first fallback use");
   assert.deepEqual(calls.filter(([name]) => name === "mixed"), [["mixed", false]], "the comparison switch stays dormant until fallback and replays its current value");
   assert.equal(renderer.getMixedVectorBatchingEnabled(), false);
   assert.equal(renderer.getFillRenderingEnabled(), false);

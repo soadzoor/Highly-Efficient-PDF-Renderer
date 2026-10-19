@@ -58,7 +58,7 @@ fn heprMixedWorldPack(
   corner: vec2<f32>, kind: f32,
   dataA: vec4<f32>, dataB: vec4<f32>, dataC: vec4<f32>, dataD: vec4<f32>,
   viewport: vec2<f32>, zoom: f32, useLocalToClip: f32,
-  localToClip: mat4x4<f32>, localUnitsPerPixel: f32, aaScreenPx: f32, shapeOnly: f32,
+  localToClip: mat4x4<f32>, localUnitsPerPixel: f32, aaScreenPx: f32, minimumStrokeWidthPx: f32, shapeOnly: f32,
   fillEnabled: f32, strokeEnabled: f32, projectedFillFootprint: vec2<f32>
 ) -> vec4<f32> {
   if (select(fillEnabled, strokeEnabled, kind < 0.5) < 0.5) {
@@ -66,7 +66,7 @@ fn heprMixedWorldPack(
   }
   if (kind < 0.5) {
     return heprStrokeWorldPack(corner, dataA, dataB, dataC, dataD,
-      zoom, useLocalToClip, localUnitsPerPixel, aaScreenPx, shapeOnly);
+      zoom, useLocalToClip, localUnitsPerPixel, aaScreenPx, minimumStrokeWidthPx, shapeOnly);
   }
   let pack = heprFillVertexPack(corner, dataA, dataB, dataC, shapeOnly, aaScreenPx,
     viewport, zoom, useLocalToClip, localToClip, projectedFillFootprint);
@@ -98,14 +98,14 @@ fn heprMixedVectorFragment(
   halfWidth: f32, segmentTexA: texture_2d<f32>, segmentTexB: texture_2d<f32>, segmentWidth: f32,
   bandBase: f32, bandEntries: f32, cellHeaders: f32,
   fillAAScreenPx: f32, strokeAAScreenPx: f32, curveEnabled: f32,
-  vectorOverride: vec4<f32>, shapeOnly: f32
+  vectorOverride: vec4<f32>, minimumStrokeWidthPx: f32, shapeOnly: f32
 ) -> vec4<f32> {
   // Both paints can discard. Evaluate derivatives before their divergent branch.
   let pixelFootprint = vec2<f32>(length(vec2<f32>(dpdx(local.x), dpdy(local.x))),
     length(vec2<f32>(dpdx(local.y), dpdy(local.y))));
   if (kind < 0.5) {
     return heprMixedStrokeFragment(local, dataA, dataB, dataC, dataD, halfWidth,
-      curveEnabled, strokeAAScreenPx, vectorOverride, shapeOnly, pixelFootprint);
+      curveEnabled, strokeAAScreenPx, vectorOverride, minimumStrokeWidthPx, shapeOnly, pixelFootprint);
   }
   return heprMixedFillFragment(local, dataA, dataB, dataC, segmentTexA, segmentTexB,
     segmentWidth, pathIndex, bandBase, bandEntries, cellHeaders,
@@ -133,6 +133,7 @@ export function createThreeWebGpuMixedVectorMaterial(
   const useLocalToClipUniform = TSL.uniform(0);
   const localUnitsPerPixelUniform = TSL.uniform(1);
   const curveUniform = TSL.uniform(options.strokeCurveEnabled ? 1 : 0);
+  const minimumStrokeWidthUniform = TSL.uniform(1);
   const fillRenderingUniform = TSL.uniform(1);
   const strokeRenderingUniform = TSL.uniform(1);
   const page = pageProjectionNode(options.localToClip, options.pageBinding);
@@ -162,7 +163,7 @@ export function createThreeWebGpuMixedVectorMaterial(
     corner: TSL.attribute("aCorner", "vec2"), kind, dataA, dataB, dataC, dataD,
     viewport, zoom: zoomUniform, useLocalToClip: useLocalToClipUniform,
     localToClip: page.matrix, localUnitsPerPixel: page.units ?? localUnitsPerPixelUniform,
-    aaScreenPx: TSL.uniform(1), shapeOnly: shapeOnlyUniform,
+    aaScreenPx: TSL.uniform(1), minimumStrokeWidthPx: minimumStrokeWidthUniform, shapeOnly: shapeOnlyUniform,
     fillEnabled: fillRenderingUniform, strokeEnabled: strokeRenderingUniform,
     projectedFillFootprint: TSL.uniform(options.projectedFillFootprint ?? new THREE.Vector2())
   }));
@@ -180,9 +181,9 @@ export function createThreeWebGpuMixedVectorMaterial(
     bandEntries: TSL.uniform(options.fillBandEntries ?? 0),
     cellHeaders: TSL.uniform((options.fillCellBase ?? -1) + 1),
     fillAAScreenPx: TSL.uniform(1), strokeAAScreenPx: TSL.uniform(1), curveEnabled: curveUniform,
-    vectorOverride: TSL.uniform(options.vectorOverride), shapeOnly: shapeOnlyUniform
+    vectorOverride: TSL.uniform(options.vectorOverride), minimumStrokeWidthPx: minimumStrokeWidthUniform, shapeOnly: shapeOnlyUniform
   });
   registerThreeNodeClipPosition(material, world.xy);
-  return { material, zoomUniform, useLocalToClipUniform, localUnitsPerPixelUniform, curveUniform,
+  return { material, zoomUniform, useLocalToClipUniform, localUnitsPerPixelUniform, curveUniform, minimumStrokeWidthUniform,
     fillRenderingUniform, strokeRenderingUniform };
 }

@@ -1,6 +1,6 @@
 import { pageProjectionNode } from "./threeWebGpuPageTransforms";
 import type { ThreePageBinding } from "./threePageTransforms";
-import { STROKE_COVERAGE_WGSL, STROKE_DENSITY_WGSL } from "./strokeCoverageShaders";
+import { STROKE_MINIMUM_WIDTH_WGSL, STROKE_COVERAGE_WGSL, STROKE_DENSITY_WGSL } from "./strokeCoverageShaders";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { registerThreeNodeClipPosition } from "./threeWebGpuVectorClips";
 import * as THREE from "three";
@@ -27,6 +27,7 @@ export interface ThreeWebGpuStrokeMaterialState {
   useLocalToClipUniform: MutableUniform<number>;
   localUnitsPerPixelUniform: MutableUniform<number>;
   curveUniform: MutableUniform<number>;
+  minimumStrokeWidthUniform: MutableUniform<number>;
 }
 
 export interface ThreeWebGpuStrokeMaterialOptions {
@@ -113,6 +114,8 @@ fn heprFloatMod(x: f32, y: f32) -> f32 {
 
 const strokeQuadWorldPositionFn = TSL.wgslFn(CORE_WGSL_STROKE_QUAD_WORLD_POSITION_SOURCE);
 
+const minimumStrokeWidthFn = TSL.wgslFn(STROKE_MINIMUM_WIDTH_WGSL);
+
 const worldPackFn = TSL.wgslFn(`
 fn heprStrokeWorldPack(
   corner: vec2<f32>,
@@ -124,6 +127,7 @@ fn heprStrokeWorldPack(
   useLocalToClip: f32,
   localUnitsPerPixelInput: f32,
   aaScreenPx: f32,
+  minimumStrokeWidthPx: f32,
   shapeOnly: f32
 ) -> vec4<f32> {
   let p0 = primitiveA.xy;
@@ -160,6 +164,8 @@ fn heprStrokeWorldPack(
     halfWidth = max(0.5 * localUnitsPerPixel, 0.00001);
   }
 
+  halfWidth = heprMinimumStrokeHalfWidth(halfWidth, select(1.0 / max(zoom, 1e-12), localUnitsPerPixel, useLocalToClip >= 0.5), minimumStrokeWidthPx);
+
   var aaWorld = max(localUnitsPerPixel, 0.0001) * aaScreenPx;
   if (isHairline) {
     aaWorld = max(0.35 * localUnitsPerPixel, 0.00005);
@@ -171,7 +177,7 @@ fn heprStrokeWorldPack(
 
   return vec4<f32>(worldPosition, halfWidth, aaWorld);
 }
-`, [includeNode(floatModFn), includeNode(strokeQuadWorldPositionFn)]);
+`, [includeNode(floatModFn), includeNode(strokeQuadWorldPositionFn), includeNode(minimumStrokeWidthFn)]);
 
 const clipPositionFn = TSL.wgslFn(`
 fn heprStrokeClipPosition(
@@ -219,6 +225,7 @@ fn heprStrokeFragment(
   strokeCurveEnabled: f32,
   aaScreenPx: f32,
   vectorOverride: vec4<f32>,
+  minimumStrokeWidthPx: f32,
   shapeOnly: f32
 ) -> vec4<f32> {
   let p0 = primitiveA.xy;
@@ -258,6 +265,7 @@ fn heprStrokeFragment(
     halfWidth = max(0.5 * localPerPixel, 0.00001);
   }
 
+  halfWidth = heprMinimumStrokeHalfWidth(halfWidth, localPerPixel, minimumStrokeWidthPx);
   let coverage = heprStrokeCoverage(distanceToSegment, halfWidth, aaWorld);
   var alpha = coverage * alphaStyle;
   alpha = heprStrokeLodAlpha(alpha, primitiveType);
@@ -272,6 +280,7 @@ fn heprStrokeFragment(
 }
 `;
 const fragmentDependencies = [
+  includeNode(minimumStrokeWidthFn),
   includeNode(floatModFn),
   includeNode(strokeCoverageFn),
   includeNode(strokeDensityFn),
@@ -307,6 +316,7 @@ export function createThreeWebGpuStrokeMaterial(
   const curveUniform = TSL.uniform(options.strokeCurveEnabled ? 1 : 0);
   const segmentTextureWidthUniform = TSL.uniform(Math.max(1, options.segmentTextureWidth));
   const aaScreenPxUniform = TSL.uniform(1);
+  const minimumStrokeWidthUniform = TSL.uniform(1);
 
   const corner = TSL.attribute("aCorner", "vec2");
   const segmentIndex = TSL.attribute("aSegmentIndex", "float");
@@ -342,6 +352,7 @@ export function createThreeWebGpuStrokeMaterial(
     useLocalToClip: useLocalToClipUniform,
     localUnitsPerPixelInput: pageProjection.units ?? localUnitsPerPixelUniform,
     aaScreenPx: aaScreenPxUniform,
+    minimumStrokeWidthPx: minimumStrokeWidthUniform,
     shapeOnly: shapeOnlyUniform
   }));
   const worldPackValue = worldPack as {
@@ -373,6 +384,7 @@ export function createThreeWebGpuStrokeMaterial(
     strokeCurveEnabled: curveUniform,
     aaScreenPx: aaScreenPxUniform,
     vectorOverride: vectorOverrideUniform,
+    minimumStrokeWidthPx: minimumStrokeWidthUniform,
     shapeOnly: shapeOnlyUniform
   });
 
@@ -383,6 +395,7 @@ export function createThreeWebGpuStrokeMaterial(
     zoomUniform: zoomUniform as MutableUniform<number>,
     useLocalToClipUniform: useLocalToClipUniform as MutableUniform<number>,
     localUnitsPerPixelUniform: localUnitsPerPixelUniform as MutableUniform<number>,
-    curveUniform: curveUniform as MutableUniform<number>
+    curveUniform: curveUniform as MutableUniform<number>,
+    minimumStrokeWidthUniform: minimumStrokeWidthUniform as MutableUniform<number>
   };
 }

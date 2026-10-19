@@ -6,6 +6,14 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Added
+
+- Keep vector strokes at least one final device pixel wide by default in native
+  and Three.js WebGL/WebGPU rendering, including gradient strokes, mixed batches
+  and stroke LOD. Disable the display adjustment with `minimumStrokeWidth: false`
+  or `setMinimumStrokeWidth(false)`. Preserve canonical scene/HEP geometry and
+  account for internal supersampling.
+
 ## [0.1.67] - 2026-10-17
 
 ### Changed

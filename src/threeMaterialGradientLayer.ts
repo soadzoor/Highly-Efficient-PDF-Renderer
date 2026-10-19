@@ -116,6 +116,7 @@ export class ThreeMaterialGradientLayer {
   private readonly localToClipUniform = new THREE.Matrix4();
   private readonly localUnitsPerPixelUniform = { value: 1 };
   private readonly curveUniform: { value: number };
+  private readonly minimumStrokeWidthUniform = { value: 1 };
   private readonly vectorOverrideUniform: THREE.Vector4;
   private readonly colorCompositing: ThreeColorCompositing;
 
@@ -183,6 +184,13 @@ export class ThreeMaterialGradientLayer {
 
   setVisible(visible: boolean): void {
     this.group.visible = visible;
+  }
+
+  setMinimumStrokeWidth(enabled: boolean): void {
+    this.minimumStrokeWidthUniform.value = enabled ? 1 : 0;
+    for (const entry of this.entries) {
+      if (entry.strokeState) entry.strokeState.minimumStrokeWidthUniform.value = this.minimumStrokeWidthUniform.value;
+    }
   }
 
   setStrokeCurveEnabled(enabled: boolean): void {
@@ -629,6 +637,7 @@ export class ThreeMaterialGradientLayer {
         uLocalUnitsPerPixel: this.localUnitsPerPixelUniform,
         uAAScreenPx: { value: 1 },
         uStrokeCurveEnabled: this.curveUniform,
+        uMinimumStrokeWidthPx: this.minimumStrokeWidthUniform,
         uVectorOverride: { value: this.vectorOverrideUniform },
         ...createWebGlGradientUniforms(gradients, sourceGradientIndex, maskGradientIndex)
       }

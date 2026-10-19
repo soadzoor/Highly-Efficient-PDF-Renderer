@@ -86,6 +86,7 @@ export class ThreeMaterialStrokeLayer {
   private readonly localToClipUniform: THREE.Matrix4;
   private localUnitsPerPixelUniform: { value: number };
   private curveUniform: { value: number };
+  private minimumStrokeWidthUniform = { value: 1 };
   private readonly vectorOverrideUniform: THREE.Vector4;
   private readonly segmentCount: number;
   private readonly segmentIndexAttribute: THREE.InstancedBufferAttribute;
@@ -180,6 +181,7 @@ export class ThreeMaterialStrokeLayer {
       this.useLocalToClipUniform = webGpuMaterial.useLocalToClipUniform;
       this.localUnitsPerPixelUniform = webGpuMaterial.localUnitsPerPixelUniform;
       this.curveUniform = webGpuMaterial.curveUniform;
+      this.minimumStrokeWidthUniform = webGpuMaterial.minimumStrokeWidthUniform;
       material = webGpuMaterial.material;
     } else {
       material = new THREE.RawShaderMaterial({
@@ -216,6 +218,7 @@ export class ThreeMaterialStrokeLayer {
           uLocalUnitsPerPixel: this.localUnitsPerPixelUniform,
           uAAScreenPx: { value: 1.0 },
           uStrokeCurveEnabled: this.curveUniform,
+          uMinimumStrokeWidthPx: this.minimumStrokeWidthUniform,
           uVectorOverride: { value: this.vectorOverrideUniform }
         }
       });
@@ -245,7 +248,7 @@ export class ThreeMaterialStrokeLayer {
     return { options: this.mixedOptions, pageBinding: this.mixedPageBinding,
       clipTexture: this.vectorClipTexture, zoomUniform: this.zoomUniform,
       useLocalToClipUniform: this.useLocalToClipUniform, localUnitsPerPixelUniform: this.localUnitsPerPixelUniform,
-      curveUniform: this.curveUniform };
+      curveUniform: this.curveUniform, minimumStrokeWidthUniform: this.minimumStrokeWidthUniform };
   }
 
   setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
@@ -266,6 +269,10 @@ export class ThreeMaterialStrokeLayer {
       return 0;
     }
     return this.orderedRuns?.getRenderedCount() ?? Math.max(0, this.mesh.geometry.instanceCount ?? 0);
+  }
+
+  setMinimumStrokeWidth(enabled: boolean): void {
+    this.minimumStrokeWidthUniform.value = enabled ? 1 : 0;
   }
 
   setStrokeCurveEnabled(enabled: boolean): void {

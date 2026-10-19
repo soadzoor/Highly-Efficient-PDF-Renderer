@@ -20,6 +20,7 @@ try {
       getBoundingClientRect: () => ({ width: 100, height: 100, left: 0, top: 0 }) };
     const renderer = new WebGpuFloorplanRenderer(canvas, device,
       { configure() {}, getCurrentTexture: () => device.createTexture({}) }, "rgba8unorm");
+    device.cameraBuffer = renderer.cameraUniformBuffer;
     Object.assign(renderer, {
       scene: createEmptyVectorScene(), fillPathCount: 5, segmentCount: 10, textInstanceCount: 3,
       fillBindGroup: {}, strokeBindGroupAll: {}, textBindGroup: {},
@@ -75,7 +76,8 @@ try {
     assert.match(text, /i < inData.segmentCount/, "native text traverses the complete glyph");
     frame();
     assert.deepEqual(device.cameraData.slice(16, 22), [-1, 0, -1, 0, 0, 0], "unindexed fill bindings are disabled");
-    assert.deepEqual(device.cameraData.slice(22), [1, 1], "mixed vectors enable both kinds by default");
+    assert.deepEqual(device.cameraData.slice(22, 24), [1, 1], "mixed vectors enable both kinds by default");
+    assert.equal(device.cameraData[24], 1, "the native stroke width floor defaults to one device pixel");
     Object.assign(renderer, { fillBandBase: 41, fillBandEntries: 87, gradientFillBandBase: 91, gradientFillBandEntries: 125,
       fillCellBase: 140, gradientFillCellBase: 170 });
     frame();
@@ -83,9 +85,12 @@ try {
     assert.deepEqual(device.cameraData.slice(16, 22), [41, 87, 91, 125, 141, 171],
       "both fill stores upload distinct band and cell addresses");
     renderer.setFillRenderingEnabled(false); frame();
-    assert.deepEqual(device.cameraData.slice(22), [1, 0], "stroke-only comparisons reject fills in the mixed vertex stage");
+    assert.deepEqual(device.cameraData.slice(22, 24), [1, 0], "stroke-only comparisons reject fills in the mixed vertex stage");
     renderer.setFillRenderingEnabled(true); renderer.setStrokeRenderingEnabled(false); frame();
-    assert.deepEqual(device.cameraData.slice(22), [0, 1], "fill-only comparisons reject strokes in the mixed vertex stage");
+    assert.deepEqual(device.cameraData.slice(22, 24), [0, 1], "fill-only comparisons reject strokes in the mixed vertex stage");
+    renderer.setMinimumStrokeWidth(false); frame();
+    assert.equal(device.cameraData[24], 0, "the width opt-out reaches subsequent native frames");
+    assert.deepEqual(device.cameraData.slice(22, 24), [0, 1], "width changes preserve independent fill/stroke visibility");
   }
 
   {
@@ -268,7 +273,7 @@ function makeDevice() {
     limits: { maxTextureDimension2D: 2048 },
     queue: { writeBuffer(buffer, _offset, data) {
       device.writes.push({ buffer, values: Array.from(data) });
-      if (data instanceof Float32Array && data.length === 24) device.cameraData = [...data];
+      if (buffer === device.cameraBuffer) device.cameraData = [...data];
     }, writeTexture() {}, submit() {} },
     createShaderModule: descriptor => { device.shaders.push(descriptor.code); return descriptor; },
     createBindGroupLayout: descriptor => descriptor,

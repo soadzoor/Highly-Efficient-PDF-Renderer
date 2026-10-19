@@ -1,4 +1,4 @@
-import { STROKE_COVERAGE_GLSL } from "./strokeCoverageShaders";
+import { STROKE_MINIMUM_WIDTH_GLSL, STROKE_COVERAGE_GLSL } from "./strokeCoverageShaders";
 import * as THREE from "three";
 
 import type { VectorScene } from "./pdfVectorExtractor";
@@ -29,6 +29,7 @@ interface CullingBounds {
 
 const TRIANGLE_STROKE_VERTEX_SHADER_SOURCE = `#version 300 es
 precision highp float;
+${STROKE_MINIMUM_WIDTH_GLSL}
 precision highp sampler2D;
 
 layout(location = 0) in vec2 aCorner;
@@ -44,6 +45,7 @@ uniform float uZoom;
 uniform float uUseLocalToClip;
 uniform mat4 uLocalToClip;
 uniform float uLocalUnitsPerPixel;
+uniform float uMinimumStrokeWidthPx;
 uniform vec4 uVectorOverride;
 
 out vec4 vColor;
@@ -93,6 +95,8 @@ void main() {
   if (isHairline) {
     halfWidth = max(0.5 * localUnitsPerPixel, 1e-5);
   }
+
+  halfWidth = heprMinimumStrokeHalfWidth(halfWidth, uUseLocalToClip >= 0.5 ? localUnitsPerPixel : 1.0 / max(uZoom, 1e-12), uMinimumStrokeWidthPx);
 
   float aaWorld = isHairline
     ? max(0.35 * localUnitsPerPixel, 5e-5)
@@ -174,6 +178,7 @@ export class ThreeTriangleStrokeLayer {
   private readonly useLocalToClipUniform: { value: number };
   private readonly localToClipUniform: THREE.Matrix4;
   private readonly localUnitsPerPixelUniform: { value: number };
+  private readonly minimumStrokeWidthUniform = { value: 1 };
   private readonly vectorOverrideUniform: THREE.Vector4;
   private readonly segmentCount: number;
   private readonly segmentIndexAttribute: THREE.InstancedBufferAttribute;
@@ -266,6 +271,7 @@ export class ThreeTriangleStrokeLayer {
         uUseLocalToClip: this.useLocalToClipUniform,
         uLocalToClip: { value: this.localToClipUniform },
         uLocalUnitsPerPixel: this.localUnitsPerPixelUniform,
+        uMinimumStrokeWidthPx: this.minimumStrokeWidthUniform,
         uVectorOverride: { value: this.vectorOverrideUniform }
       }
     });
@@ -285,6 +291,10 @@ export class ThreeTriangleStrokeLayer {
       return 0;
     }
     return Math.max(0, this.mesh.geometry.instanceCount ?? 0);
+  }
+
+  setMinimumStrokeWidth(enabled: boolean): void {
+    this.minimumStrokeWidthUniform.value = enabled ? 1 : 0;
   }
 
   setVectorOverride(red: number, green: number, blue: number, opacity: number): void {

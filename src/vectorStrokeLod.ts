@@ -116,6 +116,10 @@ export class ThreeVectorLodStrokeLayer {
     this.updateGroupVisibility();
   }
 
+  setMinimumStrokeWidth(enabled: boolean): void {
+    for (const layer of this.layers) layer.setMinimumStrokeWidth(enabled);
+  }
+
   setStrokeCurveEnabled(enabled: boolean): void {
     for (const layer of this.layers) {
       layer.setStrokeCurveEnabled(enabled);

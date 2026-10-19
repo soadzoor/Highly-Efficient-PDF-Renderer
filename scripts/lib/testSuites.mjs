@@ -99,6 +99,7 @@ export const fastTests = [
   "openjpeg-host-addresses",
   "webgl-fill-clip-bounds",
   "subpixel-stroke-coverage",
+  "stroke-minimum-width",
   "fill-area-coverage",
   "fill-index-deferral",
   "quadratic-fill-integral",

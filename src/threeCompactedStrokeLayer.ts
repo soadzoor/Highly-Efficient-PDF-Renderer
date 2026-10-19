@@ -1,4 +1,4 @@
-import { STROKE_COVERAGE_GLSL } from "./strokeCoverageShaders";
+import { STROKE_MINIMUM_WIDTH_GLSL, STROKE_COVERAGE_GLSL } from "./strokeCoverageShaders";
 import * as THREE from "three";
 
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
@@ -80,6 +80,7 @@ const ANGLE_STEP = Math.PI / ANGLE_BIN_COUNT;
 
 const COMPACTED_STROKE_VERTEX_SHADER = `
 precision highp float;
+${STROKE_MINIMUM_WIDTH_GLSL}
 
 attribute vec2 aP0;
 attribute vec2 aP1;
@@ -87,6 +88,7 @@ attribute vec2 aStrokeMeta;
 attribute vec4 aColor;
 
 uniform float uLocalUnitsPerPixel;
+uniform float uMinimumStrokeWidthPx;
 uniform vec4 uVectorOverride;
 
 varying vec4 vColor;
@@ -113,6 +115,8 @@ void main() {
   if (isHairline) {
     halfWidth = max(0.5 * localUnitsPerPixel, 1e-5);
   }
+
+  halfWidth = heprMinimumStrokeHalfWidth(halfWidth, localUnitsPerPixel, uMinimumStrokeWidthPx);
 
   float aaWorld = isHairline
     ? max(0.35 * localUnitsPerPixel, 5e-5)
@@ -178,6 +182,7 @@ export class ThreeCompactedStrokeLayer {
   private readonly material: THREE.ShaderMaterial;
   private readonly levels: CompactedLevel[];
   private readonly localUnitsPerPixelUniform: { value: number };
+  private readonly minimumStrokeWidthUniform = { value: 1 };
   private readonly vectorOverrideUniform: THREE.Vector4;
   private activeLevelIndex = -1;
 
@@ -202,6 +207,7 @@ export class ThreeCompactedStrokeLayer {
       toneMapped: false,
       uniforms: {
         uLocalUnitsPerPixel: this.localUnitsPerPixelUniform,
+        uMinimumStrokeWidthPx: this.minimumStrokeWidthUniform,
         uVectorOverride: { value: this.vectorOverrideUniform }
       }
     });
@@ -233,6 +239,10 @@ export class ThreeCompactedStrokeLayer {
       return 0;
     }
     return this.levels[this.activeLevelIndex]?.segmentCount ?? 0;
+  }
+
+  setMinimumStrokeWidth(enabled: boolean): void {
+    this.minimumStrokeWidthUniform.value = enabled ? 1 : 0;
   }
 
   setVectorOverride(red: number, green: number, blue: number, opacity: number): void {

@@ -1,6 +1,6 @@
 import { buildRasterRepeatInstances, type RasterRepeat } from "./rasterRepeat";
 import { buildCompactMonochromeAtlas, type CompactMonochromeAtlas } from "./compactMonochromeRaster";
-import { STROKE_COVERAGE_WGSL, STROKE_DENSITY_WGSL } from "./strokeCoverageShaders";
+import { STROKE_MINIMUM_WIDTH_WGSL, STROKE_COVERAGE_WGSL, STROKE_DENSITY_WGSL } from "./strokeCoverageShaders";
 import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
 import { vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { MIN_VECTOR_INDEXED_PATH_SEGMENTS, vectorFillBandIndex, buildVectorFillBandIndex } from "./vectorFillBands";
@@ -224,8 +224,8 @@ const CLEAR_COLOR = {
   a: 1
 };
 
-const CAMERA_UNIFORM_FLOATS = 24;
-const CAMERA_UNIFORM_BUFFER_BYTES = 96;
+const CAMERA_UNIFORM_FLOATS = 28;
+const CAMERA_UNIFORM_BUFFER_BYTES = 112;
 
 
 const VECTOR_COMPOSITE_UNIFORM_FLOATS = 4;
@@ -247,6 +247,7 @@ fn heprLinearCoverageToOutputAlpha(coverage : f32) -> f32 {
 `;
 
 const STROKE_SHADER_SOURCE = /* wgsl */ `
+${STROKE_MINIMUM_WIDTH_WGSL}
 ${STROKE_COVERAGE_WGSL}
 ${STROKE_DENSITY_WGSL}
 struct CameraUniforms {
@@ -263,6 +264,7 @@ struct CameraUniforms {
   vectorOverride : vec4f,
   fillBands : vec4f,
   fillCells : vec4f,
+  minimumStroke : vec4f,
 };
 
 struct SegmentIdBuffer {
@@ -371,6 +373,8 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
     halfWidth = max(0.5 / max(uCamera.zoom, 1e-4), 1e-5);
   }
 
+  halfWidth = heprMinimumStrokeHalfWidth(halfWidth, 1.0 / max(uCamera.zoom, 1e-12), uCamera.minimumStroke.x);
+
   var aaWorld = max(1.0 / max(uCamera.zoom, 1e-4), 0.0001) * uCamera.strokeAAScreenPx;
   if (isHairline) {
     aaWorld = max(0.35 / max(uCamera.zoom, 1e-4), 5e-5);
@@ -452,6 +456,7 @@ struct CameraUniforms {
   vectorOverride : vec4f,
   fillBands : vec4f,
   fillCells : vec4f,
+  minimumStroke : vec4f,
 };
 
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
@@ -662,6 +667,7 @@ struct CameraUniforms {
   vectorOverride : vec4f,
   fillBands : vec4f,
   fillCells : vec4f,
+  minimumStroke : vec4f,
 };
 
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
@@ -968,6 +974,7 @@ struct CameraUniforms {
   vectorOverride : vec4f,
   fillBands : vec4f,
   fillCells : vec4f,
+  minimumStroke : vec4f,
 };
 
 struct RasterUniforms {
@@ -1523,6 +1530,7 @@ export class WebGpuFloorplanRenderer {
   private maxZoom = 8_192;
 
   private strokeCurveEnabled = true;
+  private minimumStrokeWidthEnabled = true;
 
   private rasterRenderingEnabled = true;
 
@@ -2218,6 +2226,13 @@ export class WebGpuFloorplanRenderer {
 
   getTextLodStats(): TextLodStats | null {
     return this.textLodRuntime?.getStats() ?? null;
+  }
+
+  setMinimumStrokeWidth(enabled: boolean): void {
+    const next = Boolean(enabled);
+    if (this.minimumStrokeWidthEnabled === next) return;
+    this.minimumStrokeWidthEnabled = next;
+    this.requestFrame();
   }
 
   setStrokeCurveEnabled(enabled: boolean): void {
@@ -4492,6 +4507,8 @@ export class WebGpuFloorplanRenderer {
     // Mixed vectors retain their single ordered draw during one-kind comparisons.
     data[22] = this.strokeRenderingEnabled ? 1 : 0;
     data[23] = this.fillRenderingEnabled ? 1 : 0;
+    // Measure the floor in final device pixels, including supersampled passes.
+    data[24] = this.minimumStrokeWidthEnabled ? Math.max(1, zoomValue / Math.max(this.zoom, 1e-12)) : 0;
 
     assertUniformBufferSizeMatches(data, CAMERA_UNIFORM_BUFFER_BYTES, "camera");
     this.gpuDevice.queue.writeBuffer(this.cameraUniformBuffer, 0, data);

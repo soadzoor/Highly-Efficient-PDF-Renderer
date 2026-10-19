@@ -5,7 +5,7 @@ import type { ViewState } from "./webGlFloorplanRenderer";
 const CONFIG_METHODS = new Set([
   "setFrameListener", "setInteractionViewportProvider", "setRasterRenderingEnabled",
   "setRasterTextureResidency", "setFillRenderingEnabled", "setStrokeRenderingEnabled",
-  "setTextRenderingEnabled", "setMixedVectorBatchingEnabled", "setVectorLodMode", "setTextLodMode", "setStrokeCurveEnabled",
+  "setTextRenderingEnabled", "setMixedVectorBatchingEnabled", "setVectorLodMode", "setTextLodMode", "setStrokeCurveEnabled", "setMinimumStrokeWidth",
   "setTextVectorOnly", "setPageBackgroundColor", "setVectorColorOverride",
   "setPrimitiveHighlights", "setSearchHighlights", "setTextSelectionHighlights",
   "setOptionalContentVisibility", "setPageRasterVisibility"

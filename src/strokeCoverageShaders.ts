@@ -1,3 +1,18 @@
+const minimumWidthBody = `
+  return max(halfWidth, 0.5 * localUnitsPerPixel * minimumWidthPx);
+`;
+
+/** Resolve display width without changing canonical stroke geometry. */
+export const STROKE_MINIMUM_WIDTH_GLSL = `
+float heprMinimumStrokeHalfWidth(float halfWidth, float localUnitsPerPixel, float minimumWidthPx) {
+${minimumWidthBody}}
+`;
+
+export const STROKE_MINIMUM_WIDTH_WGSL = `
+fn heprMinimumStrokeHalfWidth(halfWidth: f32, localUnitsPerPixel: f32, minimumWidthPx: f32) -> f32 {
+${minimumWidthBody}}
+`;
+
 /**
  * Filter both sides of a stroke, including when its width is below one pixel.
  * A single signed-distance edge leaves a half-opaque line as width tends to

@@ -1,4 +1,4 @@
-import { STROKE_COVERAGE_GLSL } from "./strokeCoverageShaders";
+import { STROKE_MINIMUM_WIDTH_GLSL, STROKE_COVERAGE_GLSL } from "./strokeCoverageShaders";
 import { VECTOR_CELL_COVERAGE_GLSL } from "./vectorCellShaders";
 import { FILL_COVERAGE_GLSL, FILL_COVERAGE_VERTEX_GLSL } from "./fillCoverageShaders";
 import { GRADIENT_PARAMETER_GLSL, GRADIENT_BACKGROUND_GLSL } from "./gradientSampling";
@@ -290,6 +290,7 @@ void main() {
 
 export const GRADIENT_STROKE_VERTEX_SHADER_SOURCE = `#version 300 es
 precision highp float;
+${STROKE_MINIMUM_WIDTH_GLSL}
 precision highp sampler2D;
 
 uniform sampler2D uRunMetaTexA;
@@ -303,6 +304,7 @@ uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
 uniform float uZoom;
 uniform float uAAScreenPx;
+uniform float uMinimumStrokeWidthPx;
 uniform float uUseLocalToClip;
 uniform mat4 uLocalToClip;
 uniform float uLocalUnitsPerPixel;
@@ -354,7 +356,7 @@ void main() {
   bool isRoundCap = mod(floor(styleFlags * 0.5), 2.0) >= 0.5;
   bool hasClipBounds = mod(floor(styleFlags * 0.25), 2.0) >= 0.5;
   float localUnitsPerPixel = uUseLocalToClip >= 0.5 ? max(uLocalUnitsPerPixel, 1e-6) : 1.0 / max(uZoom, 1e-4);
-  float halfWidth = isHairline ? max(0.5 * localUnitsPerPixel, 1e-5) : style.x;
+  float halfWidth = heprMinimumStrokeHalfWidth(isHairline ? max(0.5 * localUnitsPerPixel, 1e-5) : style.x, uUseLocalToClip >= 0.5 ? localUnitsPerPixel : 1.0 / max(uZoom, 1e-12), uMinimumStrokeWidthPx);
   float aaWorld = isHairline
     ? max(0.35 * localUnitsPerPixel, 5e-5)
     : max(localUnitsPerPixel, 0.0001) * uAAScreenPx;
@@ -410,11 +412,13 @@ void main() {
 
 export const GRADIENT_STROKE_FRAGMENT_SHADER_SOURCE = `#version 300 es
 precision highp float;
+${STROKE_MINIMUM_WIDTH_GLSL}
 ${STROKE_COVERAGE_GLSL}
 precision highp sampler2D;
 
 uniform float uStrokeCurveEnabled;
 uniform float uAAScreenPx;
+uniform float uMinimumStrokeWidthPx;
 uniform vec4 uVectorOverride;
 uniform vec4 uPrimitiveOverride;
 ${GRADIENT_COMMON}
@@ -498,7 +502,7 @@ void main() {
     ? distanceToQuadratic(vLocal, vP0, vP1, vP2)
     : distanceToLine(vLocal, vP0, vP2);
   float aaWorld = max(localPerPixel * uAAScreenPx, 5e-5);
-  float halfWidth = vIsHairline >= 0.5 ? max(0.5 * localPerPixel, 1e-5) : vHalfWidth;
+  float halfWidth = heprMinimumStrokeHalfWidth(vIsHairline >= 0.5 ? max(0.5 * localPerPixel, 1e-5) : vHalfWidth, localPerPixel, uMinimumStrokeWidthPx);
   float coverage = heprStrokeCoverage(distanceValue, halfWidth, aaWorld);
 
   vec4 source = vSourceGradientIndex >= 0

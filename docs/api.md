@@ -408,6 +408,7 @@ AES-256) and does not enforce its permission flags.
 | `vectorLod` | `"auto"` | Use stroke LOD for large scenes; `"off"` keeps exact strokes, `"force"` enables it below the usual threshold. |
 | `textLod` | `"auto"` | Simplify subpixel text clusters; `"off"` keeps exact glyphs. |
 | `curveStrokes` | `true` | Enable curve-aware stroke joins and caps where supported. |
+| `minimumStrokeWidth` | `true` | Keep vector strokes at least one device pixel wide in native and Three.js WebGL/WebGPU rendering. Set `false` to preserve subpixel source widths. |
 | `vectorOnly` | `false` | Use vector glyph geometry instead of the raster glyph atlas. |
 | `pageBackground` | `"#ffffff"` | Page background color. |
 | `pageBackgroundOpacity` | `1` | Page background alpha, from 0 to 1. |
@@ -417,6 +418,11 @@ AES-256) and does not enforce its permission flags.
 
 Colors accept hex strings, numbers such as `0xffffff`, or normalized RGB tuples
 such as `[1, 1, 1]`. See [rendering option types](../src/threePdfObject.ts).
+
+The minimum stroke width is measured in drawing-buffer pixels, including internal
+supersampling, rather than CSS pixels. It changes display width only; canonical
+scene/HEP geometry, fills, text and raster images retain their original data.
+PDF hairlines retain their device-width behavior when the option is disabled.
 
 ## `buildStrokeScene(polylines, defaults?)`
 
@@ -654,6 +660,7 @@ Exporting such a HEP again stores exact ownership. Transforms are runtime presen
 | `subscribeLayerVisibility(listener)` | Observe applied visibility snapshots; returns an unsubscribe function. |
 | `subscribeLayerVisibilityProgress(listener)` | Observe preparation percentage or `null` when idle; immediately reports current progress and returns an unsubscribe function. |
 | `setVectorLodMode(mode)` / `setTextLodMode(mode)` | Change LOD at runtime. |
+| `setMinimumStrokeWidth(enabled)` / `getMinimumStrokeWidth()` | Toggle or inspect the one-device-pixel vector stroke floor; defaults to enabled and persists across page/material changes. |
 | `setPageBackgroundColor(r, g, b, alpha)` | Set normalized page background components. |
 | `setVectorColorOverride(r, g, b, opacity)` | Set normalized vector override components. |
 | `getVectorStrokeLodStats()` / `getTextLodStats()` | Inspect LOD statistics; may return `null` before data is available. |

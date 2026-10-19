@@ -1,6 +1,6 @@
 import { pageProjectionNode } from "./threeWebGpuPageTransforms";
 import type { ThreePageBinding } from "./threePageTransforms";
-import { STROKE_COVERAGE_WGSL } from "./strokeCoverageShaders";
+import { STROKE_MINIMUM_WIDTH_WGSL, STROKE_COVERAGE_WGSL } from "./strokeCoverageShaders";
 import { CLIPPED_PAINT_QUAD_WGSL, FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
 import { UNBOUNDED_VECTOR_CLIP_BOUNDS } from "./vectorClips";
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
@@ -86,6 +86,7 @@ export interface ThreeWebGpuGradientStrokeMaterialState {
   useLocalToClipUniform: MutableUniform<number>;
   localUnitsPerPixelUniform: MutableUniform<number>;
   curveUniform: MutableUniform<number>;
+  minimumStrokeWidthUniform: MutableUniform<number>;
 }
 
 function includeNode(fn: unknown): never {
@@ -348,11 +349,13 @@ ${vectorFillBandLoopWgsl({
 
 const strokeQuadWorldPositionFn = TSL.wgslFn(CORE_WGSL_STROKE_QUAD_WORLD_POSITION_SOURCE);
 
+const minimumStrokeWidthFn = TSL.wgslFn(STROKE_MINIMUM_WIDTH_WGSL);
+
 const strokeWorldPackFn = TSL.wgslFn(`
 fn heprGradientStrokeWorldPack(
   corner: vec2<f32>, primitiveA: vec4<f32>, primitiveB: vec4<f32>, style: vec4<f32>,
   primitiveBounds: vec4<f32>, zoom: f32, useLocalToClip: f32,
-  localUnitsPerPixelInput: f32, aaScreenPx: f32, shapeOnly: f32
+  localUnitsPerPixelInput: f32, aaScreenPx: f32, minimumStrokeWidthPx: f32, shapeOnly: f32
 ) -> vec4<f32> {
   let isQuadratic = primitiveB.z >= 0.5;
   var halfWidth = style.x;
@@ -366,13 +369,14 @@ fn heprGradientStrokeWorldPack(
   }
   let localUnitsPerPixel = select(1.0 / max(zoom, 0.0001), max(localUnitsPerPixelInput, 0.000001), useLocalToClip >= 0.5);
   if (isHairline) { halfWidth = max(0.5 * localUnitsPerPixel, 0.00001); }
+  halfWidth = heprMinimumStrokeHalfWidth(halfWidth, select(1.0 / max(zoom, 1e-12), localUnitsPerPixel, useLocalToClip >= 0.5), minimumStrokeWidthPx);
   var aaWorld = max(localUnitsPerPixel, 0.0001) * aaScreenPx;
   if (isHairline) { aaWorld = max(0.35 * localUnitsPerPixel, 0.00005); }
   let extent = halfWidth + aaWorld;
   let world = heprStrokeQuadWorldPosition(corner * 0.5 + vec2<f32>(0.5), primitiveA.xy, primitiveA.zw, primitiveB.xy, primitiveBounds, extent);
   return vec4<f32>(world, halfWidth, aaWorld);
 }
-`, [includeNode(floatModFn), includeNode(strokeQuadWorldPositionFn)]);
+`, [includeNode(floatModFn), includeNode(strokeQuadWorldPositionFn), includeNode(minimumStrokeWidthFn)]);
 
 const strokeFragmentFns = createThreeWebGpuOutputFragmentFns(`
 fn heprGradientStrokeFragment(
@@ -382,7 +386,7 @@ fn heprGradientStrokeFragment(
   gradientMetaA: texture_2d<f32>, gradientMetaB: texture_2d<f32>,
   gradientMetaC: texture_2d<f32>, gradientMetaD: texture_2d<f32>,
   gradientMetaE: texture_2d<f32>, gradientLut: texture_2d<f32>, gradientMetaWidth: f32,
-  sourceGradientIndex: f32, maskGradientIndex: f32, shapeOnly: f32
+  sourceGradientIndex: f32, maskGradientIndex: f32, minimumStrokeWidthPx: f32, shapeOnly: f32
 ) -> vec4<f32> {
   // Evaluate derivatives in uniform control flow before alpha/clip discards.
   let pixelToLocalX = length(vec2<f32>(dpdx(local.x), dpdy(local.x)));
@@ -399,7 +403,7 @@ fn heprGradientStrokeFragment(
   );
   let localPerPixel = max(max(pixelToLocalX, pixelToLocalY), 0.000001);
   let isHairline = heprGradientFloatMod(styleFlags, 2.0) >= 0.5;
-  let halfWidth = select(halfWidthFromVertex, max(0.5 * localPerPixel, 0.00001), isHairline);
+  let halfWidth = heprMinimumStrokeHalfWidth(select(halfWidthFromVertex, max(0.5 * localPerPixel, 0.00001), isHairline), localPerPixel, minimumStrokeWidthPx);
   let aaWorld = max(localPerPixel * aaScreenPx, 0.00005);
   let coverage = heprStrokeCoverage(distanceToSegment, halfWidth, aaWorld);
   let source = heprSamplePdfGradient(local, sourceGradientIndex, gradientMetaA, gradientMetaB, gradientMetaC, gradientMetaD, gradientMetaE, gradientLut, gradientMetaWidth);
@@ -415,6 +419,7 @@ fn heprGradientStrokeFragment(
 `, [
   includeNode(floatModFn),
   includeNode(strokeCoverageFn),
+  includeNode(minimumStrokeWidthFn),
   includeNode(distanceToLineSegmentFn),
   includeNode(distanceToQuadraticBezierFn),
   includeNode(gradientSampleFn)
@@ -493,6 +498,7 @@ export function createThreeWebGpuGradientStrokeMaterial(
   const useLocalToClipUniform = TSL.uniform(0);
   const localUnitsPerPixelUniform = TSL.uniform(1);
   const curveUniform = TSL.uniform(options.strokeCurveEnabled ? 1 : 0);
+  const minimumStrokeWidthUniform = TSL.uniform(1);
   const segmentWidth = TSL.uniform(Math.max(1, options.segmentTextureWidth));
   const gradientWidth = TSL.uniform(Math.max(1, options.gradientMetaTextureWidth));
   const segmentIndex = TSL.attribute("aSegmentIndex", "float");
@@ -504,7 +510,7 @@ export function createThreeWebGpuGradientStrokeMaterial(
   const worldPack = varyingNode(callNode(strokeWorldPackFn, {
     corner: TSL.attribute("aCorner", "vec2"), primitiveA, primitiveB, style, primitiveBounds,
     zoom: zoomUniform, useLocalToClip: useLocalToClipUniform,
-    localUnitsPerPixelInput: pageProjection.units ?? localUnitsPerPixelUniform, aaScreenPx: TSL.uniform(1), shapeOnly
+    localUnitsPerPixelInput: pageProjection.units ?? localUnitsPerPixelUniform, aaScreenPx: TSL.uniform(1), minimumStrokeWidthPx: minimumStrokeWidthUniform, shapeOnly
   }));
   const worldValue = worldPack as { xy: unknown; z: unknown };
   material.vertexNode = callNode(strokeClipPositionFn, {
@@ -517,6 +523,7 @@ export function createThreeWebGpuGradientStrokeMaterial(
   material.fragmentNode = callNode(strokeFragmentFns[options.colorCompositing], {
     local: worldValue.xy, primitiveA, primitiveB, style, primitiveBounds, shapeOnly,
     halfWidthFromVertex: worldValue.z, strokeCurveEnabled: curveUniform,
+    minimumStrokeWidthPx: minimumStrokeWidthUniform,
     aaScreenPx: TSL.uniform(1), vectorOverride: TSL.uniform(options.vectorOverride), primitiveColor: TSL.uniform(options.primitiveColor),
     ...createGradientNodes(options, gradientWidth)
   });
@@ -526,7 +533,8 @@ export function createThreeWebGpuGradientStrokeMaterial(
     zoomUniform: zoomUniform as MutableUniform<number>,
     useLocalToClipUniform: useLocalToClipUniform as MutableUniform<number>,
     localUnitsPerPixelUniform: localUnitsPerPixelUniform as MutableUniform<number>,
-    curveUniform: curveUniform as MutableUniform<number>
+    curveUniform: curveUniform as MutableUniform<number>,
+    minimumStrokeWidthUniform: minimumStrokeWidthUniform as MutableUniform<number>
   };
 }
 
