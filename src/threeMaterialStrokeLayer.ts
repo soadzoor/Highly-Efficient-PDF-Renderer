@@ -86,7 +86,7 @@ export class ThreeMaterialStrokeLayer {
   private readonly localToClipUniform: THREE.Matrix4;
   private localUnitsPerPixelUniform: { value: number };
   private curveUniform: { value: number };
-  private minimumStrokeWidthUniform = { value: 1 };
+  private minimumStrokeWidthUniform = { value: 0 };
   private readonly vectorOverrideUniform: THREE.Vector4;
   private readonly segmentCount: number;
   private readonly segmentIndexAttribute: THREE.InstancedBufferAttribute;

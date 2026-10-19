@@ -45,14 +45,14 @@ try {
   for (const Renderer of [WebGlFloorplanRenderer, WebGpuFloorplanRenderer]) {
     let frames = 0, camera;
     const renderer = Object.assign(Object.create(Renderer.prototype), {
-      minimumStrokeWidthEnabled: true, zoom: .25, requestFrame: () => frames++,
+      minimumStrokeWidthEnabled: false, zoom: .25, requestFrame: () => frames++,
       gpuDevice: { queue: { writeBuffer(_buffer, _offset, data) { camera = data; } } },
       cameraUniformBuffer: {}, vectorOverrideColor: [.1, .2, .3], vectorOverrideOpacity: .4,
       strokeCurveEnabled: true, strokeRenderingEnabled: true, fillRenderingEnabled: false,
       fillBandBase: 7, fillBandEntries: 11, gradientFillBandBase: 13, gradientFillBandEntries: 17,
       fillCellBase: 19, gradientFillCellBase: 23
     });
-    for (const enabled of [true, false, true]) {
+    for (const enabled of [false, true, false]) {
       renderer.setMinimumStrokeWidth(enabled);
       for (const [baseZoom, scale] of [1e-8, .25, 128].flatMap(zoom => [1, 2, 4].map(scale => [zoom, scale]))) {
         renderer.zoom = baseZoom;

@@ -316,7 +316,7 @@ export function createThreeWebGpuStrokeMaterial(
   const curveUniform = TSL.uniform(options.strokeCurveEnabled ? 1 : 0);
   const segmentTextureWidthUniform = TSL.uniform(Math.max(1, options.segmentTextureWidth));
   const aaScreenPxUniform = TSL.uniform(1);
-  const minimumStrokeWidthUniform = TSL.uniform(1);
+  const minimumStrokeWidthUniform = TSL.uniform(0);
 
   const corner = TSL.attribute("aCorner", "vec2");
   const segmentIndex = TSL.attribute("aSegmentIndex", "float");

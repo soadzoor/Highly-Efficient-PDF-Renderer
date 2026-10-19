@@ -116,7 +116,7 @@ export class ThreeMaterialGradientLayer {
   private readonly localToClipUniform = new THREE.Matrix4();
   private readonly localUnitsPerPixelUniform = { value: 1 };
   private readonly curveUniform: { value: number };
-  private readonly minimumStrokeWidthUniform = { value: 1 };
+  private readonly minimumStrokeWidthUniform = { value: 0 };
   private readonly vectorOverrideUniform: THREE.Vector4;
   private readonly colorCompositing: ThreeColorCompositing;
 

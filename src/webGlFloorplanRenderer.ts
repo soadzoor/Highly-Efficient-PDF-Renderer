@@ -290,7 +290,7 @@ export interface ViewStateUpdateOptions {
 export interface WebGlFloorplanRendererOptions {
   /** Preserve the WebGL drawing buffer after presentation. */
   preserveDrawingBuffer?: boolean;
-  /** Keep vector strokes at least one final device pixel wide. Defaults to true. */
+  /** Keep vector strokes at least one final device pixel wide. Defaults to false. */
   minimumStrokeWidth?: boolean;
   /** Combine compatible ordered fill/stroke draws; defaults to true. */
   mixedVectorBatching?: boolean;
@@ -997,7 +997,7 @@ export class WebGlFloorplanRenderer {
   private textRenderingEnabled = true;
 
   private strokeCurveEnabled = true;
-  private minimumStrokeWidthEnabled = true;
+  private minimumStrokeWidthEnabled = false;
 
   private textVectorOnly = false;
 
@@ -1016,7 +1016,7 @@ export class WebGlFloorplanRenderer {
 
   constructor(canvas: HTMLCanvasElement | OffscreenCanvas, options: WebGlFloorplanRendererOptions = {}) {
     this.canvas = canvas;
-    this.minimumStrokeWidthEnabled = options.minimumStrokeWidth !== false;
+    this.minimumStrokeWidthEnabled = options.minimumStrokeWidth === true;
     this.thumbnailMode = options.thumbnail === true;
     if (this.thumbnailMode) {
       this.externalFrameDriver = true;

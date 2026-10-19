@@ -133,7 +133,7 @@ export function createThreeWebGpuMixedVectorMaterial(
   const useLocalToClipUniform = TSL.uniform(0);
   const localUnitsPerPixelUniform = TSL.uniform(1);
   const curveUniform = TSL.uniform(options.strokeCurveEnabled ? 1 : 0);
-  const minimumStrokeWidthUniform = TSL.uniform(1);
+  const minimumStrokeWidthUniform = TSL.uniform(0);
   const fillRenderingUniform = TSL.uniform(1);
   const strokeRenderingUniform = TSL.uniform(1);
   const page = pageProjectionNode(options.localToClip, options.pageBinding);

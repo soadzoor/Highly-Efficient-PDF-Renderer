@@ -178,7 +178,7 @@ export class ThreeTriangleStrokeLayer {
   private readonly useLocalToClipUniform: { value: number };
   private readonly localToClipUniform: THREE.Matrix4;
   private readonly localUnitsPerPixelUniform: { value: number };
-  private readonly minimumStrokeWidthUniform = { value: 1 };
+  private readonly minimumStrokeWidthUniform = { value: 0 };
   private readonly vectorOverrideUniform: THREE.Vector4;
   private readonly segmentCount: number;
   private readonly segmentIndexAttribute: THREE.InstancedBufferAttribute;

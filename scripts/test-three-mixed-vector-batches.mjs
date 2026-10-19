@@ -141,7 +141,9 @@ try {
   entry.stroke.setVectorOverride(.1, .2, .3, .4); entry.stroke.setStrokeCurveEnabled(false);
   assert.deepEqual(mesh.material.uniforms.uVectorOverride.value.toArray(), [.1, .2, .3, .4]);
   assert.equal(mesh.material.uniforms.uStrokeCurveEnabled.value, 0, "live source uniforms reach the borrowed material");
-  assert.equal(mesh.material.uniforms.uMinimumStrokeWidthPx.value, 1, "WebGL strokes default to a one-pixel floor");
+  assert.equal(mesh.material.uniforms.uMinimumStrokeWidthPx.value, 0, "WebGL strokes default to source widths");
+  entry.stroke.setMinimumStrokeWidth(true);
+  assert.equal(mesh.material.uniforms.uMinimumStrokeWidthPx.value, 1, "mixed WebGL draws share the live width opt-in");
   entry.stroke.setMinimumStrokeWidth(false);
   assert.equal(mesh.material.uniforms.uMinimumStrokeWidthPx.value, 0, "mixed WebGL draws share the live width opt-out");
 
@@ -300,7 +302,10 @@ try {
   gpu.stroke.setStrokeCurveEnabled(false); gpu.stroke.setVectorOverride(.2, .3, .4, .5);
   gpu.refresh(); gpu.mixed.update(gpu.roots, gpuHost, camera);
   assert.equal(gpu.mixed.state.curveUniform.value, 0);
-  assert.equal(gpu.mixed.state.minimumStrokeWidthUniform.value, 1, "WebGPU strokes default to a one-pixel floor");
+  assert.equal(gpu.mixed.state.minimumStrokeWidthUniform.value, 0, "WebGPU strokes default to source widths");
+  gpu.stroke.setMinimumStrokeWidth(true);
+  gpu.refresh(); gpu.mixed.update(gpu.roots, gpuHost, camera);
+  assert.equal(gpu.mixed.state.minimumStrokeWidthUniform.value, 1, "mixed WebGPU draws receive the live width opt-in");
   gpu.stroke.setMinimumStrokeWidth(false);
   gpu.refresh(); gpu.mixed.update(gpu.roots, gpuHost, camera);
   assert.equal(gpu.mixed.state.minimumStrokeWidthUniform.value, 0, "mixed WebGPU draws receive the live width opt-out");
@@ -374,9 +379,12 @@ try {
   const object = await createThreePdfObject({ scene: visibilityScene, sourceKind: "hep", sourceLabel: "mixed" },
     { rendererType: "webgl", vectorLod: "off", textLod: "off", threeColorCompositing: "display" },
     undefined, undefined, () => native);
-  assert.equal(object.getMinimumStrokeWidth(), true);
-  assert.equal(nativeMinimumWidth, true, "the public default reaches native fallback rendering");
+  assert.equal(object.getMinimumStrokeWidth(), false);
+  assert.equal(nativeMinimumWidth, false, "the disabled public default reaches native fallback rendering");
   const canonicalStyles = visibilityScene.styles.slice();
+  object.setMinimumStrokeWidth(true);
+  assert.equal(object.getMinimumStrokeWidth(), true);
+  assert.equal(nativeMinimumWidth, true, "the public opt-in reaches native fallback rendering");
   object.setMinimumStrokeWidth(false);
   assert.equal(object.getMinimumStrokeWidth(), false);
   assert.equal(nativeMinimumWidth, false);
@@ -448,22 +456,23 @@ try {
   object.setMinimumStrokeWidth(true);
   assert(children.every(page => page.getMinimumStrokeWidth()), "existing page handles receive runtime width changes");
   object.dispose();
-  for (const rendererType of ["webgl", "webgpu"]) {
-    const optedOut = await createThreePdfObject({ scene: visibilityScene, sourceKind: "hep", sourceLabel: "width opt-out" },
-      { rendererType, vectorLod: "off", textLod: "off", minimumStrokeWidth: false },
+  for (const rendererType of ["webgl", "webgpu"]) for (const minimumStrokeWidth of [undefined, false, true]) {
+    const configured = await createThreePdfObject({ scene: visibilityScene, sourceKind: "hep", sourceLabel: "width option" },
+      { rendererType, vectorLod: "off", textLod: "off", minimumStrokeWidth },
       undefined, undefined, () => native);
-    assert.equal(optedOut.getMinimumStrokeWidth(), false);
-    assert.equal(nativeMinimumWidth, false);
-    assert.equal(optedOut.strokeMaterialLayer.getMixedVectorResources().minimumStrokeWidthUniform.value, 0,
+    const enabled = minimumStrokeWidth === true;
+    assert.equal(configured.getMinimumStrokeWidth(), enabled);
+    assert.equal(nativeMinimumWidth, enabled);
+    assert.equal(configured.strokeMaterialLayer.getMixedVectorResources().minimumStrokeWidthUniform.value, enabled ? 1 : 0,
       "constructor options apply before the first rendered frame");
     if (rendererType === "webgpu") {
-      const gradientStroke = optedOut.gradientMaterialLayer.getOrderedPaintMeshes()
+      const gradientStroke = configured.gradientMaterialLayer.getOrderedPaintMeshes()
         .find(paint => paint.primitiveKind === "gradient-stroke");
-      assert.equal(gradientStroke.strokeState.minimumStrokeWidthUniform.value, 0);
-      optedOut.setMinimumStrokeWidth(true);
-      assert.equal(gradientStroke.strokeState.minimumStrokeWidthUniform.value, 1, "WebGPU gradient strokes toggle at runtime");
+      assert.equal(gradientStroke.strokeState.minimumStrokeWidthUniform.value, enabled ? 1 : 0);
+      configured.setMinimumStrokeWidth(!enabled);
+      assert.equal(gradientStroke.strokeState.minimumStrokeWidthUniform.value, enabled ? 0 : 1, "WebGPU gradient strokes toggle at runtime");
     }
-    optedOut.dispose();
+    configured.dispose();
   }
   console.log("Three mixed vectors: 4096 paints to one draw, order/clips/pages/OCG, stable uploads, LOD resources, lifecycle, GL/GPU fallbacks and public comparison switch passed");
 } finally { globalThis.document = previousDocument; hooks.deregister(); }

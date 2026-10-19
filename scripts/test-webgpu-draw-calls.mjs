@@ -77,7 +77,7 @@ try {
     frame();
     assert.deepEqual(device.cameraData.slice(16, 22), [-1, 0, -1, 0, 0, 0], "unindexed fill bindings are disabled");
     assert.deepEqual(device.cameraData.slice(22, 24), [1, 1], "mixed vectors enable both kinds by default");
-    assert.equal(device.cameraData[24], 1, "the native stroke width floor defaults to one device pixel");
+    assert.equal(device.cameraData[24], 0, "the native stroke width floor defaults to disabled");
     Object.assign(renderer, { fillBandBase: 41, fillBandEntries: 87, gradientFillBandBase: 91, gradientFillBandEntries: 125,
       fillCellBase: 140, gradientFillCellBase: 170 });
     frame();
@@ -88,6 +88,8 @@ try {
     assert.deepEqual(device.cameraData.slice(22, 24), [1, 0], "stroke-only comparisons reject fills in the mixed vertex stage");
     renderer.setFillRenderingEnabled(true); renderer.setStrokeRenderingEnabled(false); frame();
     assert.deepEqual(device.cameraData.slice(22, 24), [0, 1], "fill-only comparisons reject strokes in the mixed vertex stage");
+    renderer.setMinimumStrokeWidth(true); frame();
+    assert.equal(device.cameraData[24], 1, "the width opt-in reaches subsequent native frames");
     renderer.setMinimumStrokeWidth(false); frame();
     assert.equal(device.cameraData[24], 0, "the width opt-out reaches subsequent native frames");
     assert.deepEqual(device.cameraData.slice(22, 24), [0, 1], "width changes preserve independent fill/stroke visibility");

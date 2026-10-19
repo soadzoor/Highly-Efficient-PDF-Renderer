@@ -1530,7 +1530,7 @@ export class WebGpuFloorplanRenderer {
   private maxZoom = 8_192;
 
   private strokeCurveEnabled = true;
-  private minimumStrokeWidthEnabled = true;
+  private minimumStrokeWidthEnabled = false;
 
   private rasterRenderingEnabled = true;
 

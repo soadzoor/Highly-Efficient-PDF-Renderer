@@ -182,7 +182,7 @@ export class ThreeCompactedStrokeLayer {
   private readonly material: THREE.ShaderMaterial;
   private readonly levels: CompactedLevel[];
   private readonly localUnitsPerPixelUniform: { value: number };
-  private readonly minimumStrokeWidthUniform = { value: 1 };
+  private readonly minimumStrokeWidthUniform = { value: 0 };
   private readonly vectorOverrideUniform: THREE.Vector4;
   private activeLevelIndex = -1;
 

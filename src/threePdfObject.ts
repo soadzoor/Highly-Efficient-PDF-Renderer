@@ -226,7 +226,7 @@ export interface HeprThreeObjectOptions {
    */
   curveStrokes?: boolean;
 
-  /** Keep vector strokes at least one device pixel wide without changing source geometry. @default true */
+  /** Keep vector strokes at least one device pixel wide without changing source geometry. @default false */
   minimumStrokeWidth?: boolean;
 
   /**
@@ -5124,7 +5124,7 @@ function normalizeRendererConfig(options: HeprThreeObjectOptions): RendererConfi
     vectorLodMode: normalizeVectorLodMode(options.vectorLod),
     textLodMode: options.textLod === "off" ? "off" : "auto",
     strokeCurveEnabled: options.curveStrokes !== false,
-    minimumStrokeWidth: options.minimumStrokeWidth !== false,
+    minimumStrokeWidth: options.minimumStrokeWidth === true,
     textVectorOnly: options.vectorOnly === true,
     pageBackground: [pageBackground[0], pageBackground[1], pageBackground[2], pageBackgroundOpacity],
     vectorOverride: [vectorColor[0], vectorColor[1], vectorColor[2], vectorOpacity]

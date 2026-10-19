@@ -498,7 +498,7 @@ export function createThreeWebGpuGradientStrokeMaterial(
   const useLocalToClipUniform = TSL.uniform(0);
   const localUnitsPerPixelUniform = TSL.uniform(1);
   const curveUniform = TSL.uniform(options.strokeCurveEnabled ? 1 : 0);
-  const minimumStrokeWidthUniform = TSL.uniform(1);
+  const minimumStrokeWidthUniform = TSL.uniform(0);
   const segmentWidth = TSL.uniform(Math.max(1, options.segmentTextureWidth));
   const gradientWidth = TSL.uniform(Math.max(1, options.gradientMetaTextureWidth));
   const segmentIndex = TSL.attribute("aSegmentIndex", "float");

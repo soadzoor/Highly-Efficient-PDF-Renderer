@@ -58,6 +58,18 @@ try {
     return { mock, renderer, counters, install, frame };
   };
 
+  for (const minimumStrokeWidth of [undefined, false, true]) {
+    const h = setup({ minimumStrokeWidth });
+    h.install(makePlan()); h.frame();
+    const width = () => h.mock.draws.find(draw => draw.program === h.renderer.mixedVectorGpu.program)
+      .uniforms.get("uMinimumStrokeWidthPx");
+    const enabled = minimumStrokeWidth === true;
+    assert.equal(width(), enabled ? 1 : 0, "native WebGL preserves source widths unless explicitly enabled");
+    h.renderer.setMinimumStrokeWidth(!enabled); h.frame();
+    assert.equal(width(), enabled ? 0 : 1, "native WebGL retains runtime width toggles");
+    h.renderer.dispose();
+  }
+
   for (const combined of [16, 19, 32]) {
     const h = setup({}, { combined }), { renderer: r, mock, counters } = h;
     const plan = makePlan(4_096); h.install(plan);
