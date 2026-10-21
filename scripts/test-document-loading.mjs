@@ -675,6 +675,7 @@ async function testScanCompressionPreferences() {
     readerNavigationSource: null, readerNavigationScene: null, reader: threeReaderMock(),
     getReaderPageRects: () => new Float32Array(), syncPageCameraControls: noop,
     ocrTextCheckboxElement: { checked: false }, pageStreamingCheckboxElement: { checked: false },
+    minimumStrokeWidthCheckboxElement: { checked: false },
     compressScansCheckboxElement: { checked: true }, openButtonElement: {}, fileInputElement: {},
     exampleDropdown: { setDisabled: noop }, pageLayoutButtons: [],
     readPageBackgroundColor: () => [1, 1, 1, 1], readVectorOverrideColor: () => [0, 0, 0, 0],
@@ -698,7 +699,8 @@ async function testScanCompressionPreferences() {
   };
   const install = (sourceKind, sourceOptions) => {
     three.replacePdfObject({ sourceKind, sourceOptions, sceneData: {},
-      renderer: { setInteractionViewportProvider: noop }, setFrameListener: noop, addEventListener: noop },
+      renderer: { setInteractionViewportProvider: noop }, setFrameListener: noop, addEventListener: noop,
+      setMinimumStrokeWidth: noop },
     { fitCamera: false });
     three.setLoadControlsEnabled(true);
   };
@@ -1635,6 +1637,7 @@ async function testThreeBackendReplacement() {
       assert.equal(host.activeThreeRendererBackend, "webgl", "The old context stays installed while shaders compile");
       assert.equal(previous.disposals, 0);
       assert.equal(host.currentPdfObject, previous);
+      host.minimumStrokeWidthCheckboxElement.checked = true;
       await Promise.resolve();
       if (failure === "compile") throw new Error("Shader preparation failed");
       if (failure === "cancel") host.sourceLoadController.abort(new Error("Switch cancelled"));
@@ -1763,6 +1766,8 @@ async function testThreeBackendReplacement() {
       setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop,
       waitForNextRenderedFrame: async () => {
         assert.equal(host.currentPdfObject, replacement);
+        assert.equal(replacement.minimumStrokeWidth, true,
+          "replacement rendering uses the latest checkbox choice, including changes during preparation");
         submissions.push("installed");
       },
       warmThreeRenderer: async (token, signal) => {
@@ -1838,7 +1843,8 @@ function demoHost() {
     readerNavigationSource: null, readerNavigationScene: null,
     setStatus: noop, clearLoadedStatus: noop, requestRender: noop,
     drawCallMeter: { reset: noop }, drawCallCounter: { recordNativeFrame: noop },
-    backendSelectElement: {}, vectorLodSelectElement: {}, textLodSelectElement: {}
+    backendSelectElement: {}, vectorLodSelectElement: {}, textLodSelectElement: {},
+    minimumStrokeWidthCheckboxElement: { checked: false }
   };
 }
 function threeReaderMock() {
@@ -1852,6 +1858,7 @@ function demoObject(id) {
     id, sourceLabel: id, sourceKind: "pdf", disposals: 0,
     renderer: { setInteractionViewportProvider: noop },
     setFrameListener: noop,
+    setMinimumStrokeWidth(enabled) { this.minimumStrokeWidth = enabled; },
     dispose() { this.disposals += 1; }
   };
 }

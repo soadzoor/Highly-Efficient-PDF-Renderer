@@ -169,6 +169,10 @@
         width: min(220px, 100%);
       }
 
+      .number-row input[type="checkbox"] {
+        justify-self: start;
+      }
+
       .number-row input[type="color"] {
         width: 44px;
         height: 28px;
@@ -644,6 +648,10 @@
           <option value="off">Off</option>
           <option value="force">Force</option>
         </select>
+      </div>
+      <div class="number-row">
+        <label for="minimum-stroke-width-checkbox" title="Keep thin vector lines at least one device pixel wide.">Minimum stroke width (1 px)</label>
+        <input id="minimum-stroke-width-checkbox" type="checkbox" autocomplete="off" />
       </div>
       <div class="number-row">
         <label for="text-lod-select">Text LOD</label>

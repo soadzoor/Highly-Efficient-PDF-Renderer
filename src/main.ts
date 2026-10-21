@@ -120,6 +120,7 @@ const dropIndicator = document.querySelector<HTMLDivElement>("#drop-indicator");
 const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select");
 const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-mode");
 const textLodSelect = document.querySelector<HTMLSelectElement>("#text-lod-mode");
+const minimumStrokeWidthCheckbox = document.querySelector<HTMLInputElement>("#minimum-stroke-width-checkbox");
 const pageBackgroundColorInput = document.querySelector<HTMLInputElement>("#page-bg-color");
 const pageBackgroundOpacitySlider = document.querySelector<HTMLInputElement>("#page-bg-opacity-slider");
 const pageBackgroundOpacityInput = document.querySelector<HTMLInputElement>("#page-bg-opacity");
@@ -171,6 +172,7 @@ if (
   !backendSelect ||
   !vectorLodSelect ||
   !textLodSelect ||
+  !minimumStrokeWidthCheckbox ||
   !pageBackgroundColorInput ||
   !pageBackgroundOpacitySlider ||
   !pageBackgroundOpacityInput ||
@@ -266,6 +268,7 @@ const uiControlManager = createUiControlManager(
   {
     vectorLodSelect: vectorLodSelectElement,
     textLodSelect: textLodSelectElement,
+    minimumStrokeWidthCheckbox,
     pageBackgroundColorInput: pageBackgroundColorInputElement,
     pageBackgroundOpacitySlider: pageBackgroundOpacitySliderElement,
     pageBackgroundOpacityInput: pageBackgroundOpacityInputElement,
@@ -609,6 +612,7 @@ function initializeRendererCommon(rendererApi: RendererApi): void {
   rendererApi.setVectorLodMode?.(uiControlManager.readVectorLodModeInput());
   rendererApi.setTextLodMode?.(uiControlManager.readTextLodModeInput());
   rendererApi.setStrokeCurveEnabled(true);
+  rendererApi.setMinimumStrokeWidth?.(uiControlManager.readMinimumStrokeWidthInput());
   rendererApi.setTextVectorOnly(false);
   const pageBackgroundColor = uiControlManager.readPageBackgroundColorInput();
   rendererApi.setPageBackgroundColor(
@@ -1041,6 +1045,9 @@ uiControlManager.bindEventListeners({
   },
   onTextLodModeChange: (mode) => {
     applyTextLodMode(mode);
+  },
+  onMinimumStrokeWidthChange: (enabled) => {
+    renderer.setMinimumStrokeWidth?.(enabled);
   }
 });
 

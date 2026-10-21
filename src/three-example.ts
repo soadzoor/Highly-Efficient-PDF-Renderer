@@ -85,6 +85,7 @@ const downloadPdfButton = document.querySelector<HTMLButtonElement>("#download-p
 const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select");
 const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-select");
 const textLodSelect = document.querySelector<HTMLSelectElement>("#text-lod-select");
+const minimumStrokeWidthCheckbox = document.querySelector<HTMLInputElement>("#minimum-stroke-width-checkbox");
 const touchRotateCheckbox = document.querySelector<HTMLInputElement>("#touch-rotate-checkbox");
 const textSelectionCheckbox = document.querySelector<HTMLInputElement>("#text-selection-checkbox");
 const ocrTextCheckbox = document.querySelector<HTMLInputElement>("#ocr-text-checkbox");
@@ -141,6 +142,7 @@ if (
   !backendSelect ||
   !vectorLodSelect ||
   !textLodSelect ||
+  !minimumStrokeWidthCheckbox ||
   !touchRotateCheckbox ||
   !textSelectionCheckbox ||
   !ocrTextCheckbox ||
@@ -194,6 +196,7 @@ const downloadPdfButtonElement = downloadPdfButton;
 const backendSelectElement = backendSelect;
 const vectorLodSelectElement = vectorLodSelect;
 const textLodSelectElement = textLodSelect;
+const minimumStrokeWidthCheckboxElement = minimumStrokeWidthCheckbox;
 const touchRotateCheckboxElement = touchRotateCheckbox;
 const textSelectionCheckboxElement = textSelectionCheckbox;
 const ocrTextCheckboxElement = ocrTextCheckbox;
@@ -922,6 +925,11 @@ textLodSelectElement.addEventListener("change", () => {
   setStatus(`Text LOD mode set to ${formatTextLodMode(textLod)}.`);
   updateDrawStatsMeter();
   updateLodStatsMeter();
+  requestRender();
+}, { signal: lifetimeSignal });
+
+minimumStrokeWidthCheckboxElement.addEventListener("change", () => {
+  currentPdfObject?.setMinimumStrokeWidth(minimumStrokeWidthCheckboxElement.checked);
   requestRender();
 }, { signal: lifetimeSignal });
 
@@ -1710,6 +1718,7 @@ function readThreeObjectOptions(): Omit<HeprThreeObjectOptions, "rendererType"> 
     threeColorCompositing: "display",
     vectorLod: readVectorLodMode(),
     textLod: readTextLodMode(),
+    minimumStrokeWidth: minimumStrokeWidthCheckboxElement.checked,
     pageBackground: [pageBackground[0], pageBackground[1], pageBackground[2]],
     pageBackgroundOpacity: pageBackground[3],
     vectorOverrideColor: [vectorOverride[0], vectorOverride[1], vectorOverride[2]],
@@ -2146,6 +2155,8 @@ function replacePdfObject(
   const previousReaderIdentity = readerDocumentIdentity;
   const sameScene = previousObject?.sceneData === nextObject.sceneData;
   nextObject.renderer.setInteractionViewportProvider(() => renderer.domElement.getBoundingClientRect());
+  // The checkbox may have changed while the replacement was loading.
+  nextObject.setMinimumStrokeWidth(minimumStrokeWidthCheckboxElement.checked);
   lastNativeDrawStats = null;
   nextObject.setFrameListener((stats) => {
     lastNativeDrawStats = stats;

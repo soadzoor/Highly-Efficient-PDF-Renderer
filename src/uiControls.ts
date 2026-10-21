@@ -9,6 +9,7 @@ type ColorRenderer = Pick<RendererApi, "setPageBackgroundColor" | "setVectorColo
 export interface UiControlElements {
   vectorLodSelect: HTMLSelectElement;
   textLodSelect: HTMLSelectElement;
+  minimumStrokeWidthCheckbox: HTMLInputElement;
   pageBackgroundColorInput: HTMLInputElement;
   pageBackgroundOpacitySlider: HTMLInputElement;
   pageBackgroundOpacityInput: HTMLInputElement;
@@ -20,12 +21,14 @@ export interface UiControlElements {
 export interface UiControlCallbacks {
   onVectorLodModeChange(mode: VectorLodMode): void;
   onTextLodModeChange(mode: TextLodMode): void;
+  onMinimumStrokeWidthChange(enabled: boolean): void;
 }
 
 export interface UiControlManager {
   bindEventListeners(callbacks: UiControlCallbacks): void;
   readVectorLodModeInput(): VectorLodMode;
   readTextLodModeInput(): TextLodMode;
+  readMinimumStrokeWidthInput(): boolean;
   readPageBackgroundColorInput(): ColorRgba;
   readVectorColorOverrideInput(): ColorRgba;
   applyPageBackgroundColorFromControls(): void;
@@ -43,6 +46,10 @@ export function createUiControlManager(
 
   function readTextLodModeInput(): TextLodMode {
     return elements.textLodSelect.value === "off" ? "off" : "auto";
+  }
+
+  function readMinimumStrokeWidthInput(): boolean {
+    return elements.minimumStrokeWidthCheckbox.checked;
   }
 
   function readPageBackgroundOpacityPercent(value: string): number {
@@ -144,6 +151,10 @@ export function createUiControlManager(
       callbacks.onTextLodModeChange(readTextLodModeInput());
     });
 
+    elements.minimumStrokeWidthCheckbox.addEventListener("change", () => {
+      callbacks.onMinimumStrokeWidthChange(readMinimumStrokeWidthInput());
+    });
+
     elements.pageBackgroundColorInput.addEventListener("input", () => {
       applyPageBackgroundColorFromControls();
     });
@@ -181,6 +192,7 @@ export function createUiControlManager(
     bindEventListeners,
     readVectorLodModeInput,
     readTextLodModeInput,
+    readMinimumStrokeWidthInput,
     readPageBackgroundColorInput,
     readVectorColorOverrideInput,
     applyPageBackgroundColorFromControls,

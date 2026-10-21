@@ -6,6 +6,12 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Added
+
+- Add a minimum stroke width checkbox to the native and Three.js demo settings.
+  Keep it unchecked by default, apply changes immediately, and retain the choice
+  when loading documents or switching rendering backends.
+
 ## [0.1.68] - 2026-10-19
 
 ### Added
