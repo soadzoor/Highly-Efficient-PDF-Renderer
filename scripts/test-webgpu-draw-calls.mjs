@@ -88,8 +88,8 @@ try {
     assert.deepEqual(device.cameraData.slice(22, 24), [1, 0], "stroke-only comparisons reject fills in the mixed vertex stage");
     renderer.setFillRenderingEnabled(true); renderer.setStrokeRenderingEnabled(false); frame();
     assert.deepEqual(device.cameraData.slice(22, 24), [0, 1], "fill-only comparisons reject strokes in the mixed vertex stage");
-    renderer.setMinimumStrokeWidth(true); frame();
-    assert.equal(device.cameraData[24], 1, "the width opt-in reaches subsequent native frames");
+    renderer.setMinimumStrokeWidth(.5); frame();
+    assert.equal(device.cameraData[24], .5, "the width opt-in reaches subsequent native frames");
     renderer.setMinimumStrokeWidth(false); frame();
     assert.equal(device.cameraData[24], 0, "the width opt-out reaches subsequent native frames");
     assert.deepEqual(device.cameraData.slice(22, 24), [0, 1], "width changes preserve independent fill/stroke visibility");

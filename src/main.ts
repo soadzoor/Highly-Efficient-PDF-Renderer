@@ -120,7 +120,7 @@ const dropIndicator = document.querySelector<HTMLDivElement>("#drop-indicator");
 const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select");
 const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-mode");
 const textLodSelect = document.querySelector<HTMLSelectElement>("#text-lod-mode");
-const minimumStrokeWidthCheckbox = document.querySelector<HTMLInputElement>("#minimum-stroke-width-checkbox");
+const minimumStrokeWidthInput = document.querySelector<HTMLInputElement>("#minimum-stroke-width-input");
 const pageBackgroundColorInput = document.querySelector<HTMLInputElement>("#page-bg-color");
 const pageBackgroundOpacitySlider = document.querySelector<HTMLInputElement>("#page-bg-opacity-slider");
 const pageBackgroundOpacityInput = document.querySelector<HTMLInputElement>("#page-bg-opacity");
@@ -172,7 +172,7 @@ if (
   !backendSelect ||
   !vectorLodSelect ||
   !textLodSelect ||
-  !minimumStrokeWidthCheckbox ||
+  !minimumStrokeWidthInput ||
   !pageBackgroundColorInput ||
   !pageBackgroundOpacitySlider ||
   !pageBackgroundOpacityInput ||
@@ -268,7 +268,7 @@ const uiControlManager = createUiControlManager(
   {
     vectorLodSelect: vectorLodSelectElement,
     textLodSelect: textLodSelectElement,
-    minimumStrokeWidthCheckbox,
+    minimumStrokeWidthInput,
     pageBackgroundColorInput: pageBackgroundColorInputElement,
     pageBackgroundOpacitySlider: pageBackgroundOpacitySliderElement,
     pageBackgroundOpacityInput: pageBackgroundOpacityInputElement,
@@ -1046,8 +1046,8 @@ uiControlManager.bindEventListeners({
   onTextLodModeChange: (mode) => {
     applyTextLodMode(mode);
   },
-  onMinimumStrokeWidthChange: (enabled) => {
-    renderer.setMinimumStrokeWidth?.(enabled);
+  onMinimumStrokeWidthChange: (width) => {
+    renderer.setMinimumStrokeWidth?.(width);
   }
 });
 

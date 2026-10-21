@@ -1,3 +1,4 @@
+import { normalizeMinimumStrokeWidth } from "./minimumStrokeWidth";
 import { buildRasterRepeatInstances, type RasterRepeat } from "./rasterRepeat";
 import { buildCompactMonochromeAtlas, type CompactMonochromeAtlas } from "./compactMonochromeRaster";
 import { STROKE_MINIMUM_WIDTH_WGSL, STROKE_COVERAGE_WGSL, STROKE_DENSITY_WGSL } from "./strokeCoverageShaders";
@@ -1530,7 +1531,7 @@ export class WebGpuFloorplanRenderer {
   private maxZoom = 8_192;
 
   private strokeCurveEnabled = true;
-  private minimumStrokeWidthEnabled = false;
+  private minimumStrokeWidthPx = 0;
 
   private rasterRenderingEnabled = true;
 
@@ -2228,10 +2229,11 @@ export class WebGpuFloorplanRenderer {
     return this.textLodRuntime?.getStats() ?? null;
   }
 
-  setMinimumStrokeWidth(enabled: boolean): void {
-    const next = Boolean(enabled);
-    if (this.minimumStrokeWidthEnabled === next) return;
-    this.minimumStrokeWidthEnabled = next;
+  setMinimumStrokeWidth(width: number | boolean): void {
+    const next = normalizeMinimumStrokeWidth(width);
+    if (this.minimumStrokeWidthPx === next) return;
+    this.minimumStrokeWidthPx = next;
+    this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
 
@@ -4255,7 +4257,7 @@ export class WebGpuFloorplanRenderer {
   private drawSourceOrderedContentIntoPass(pass: any): number {
     this.vectorClipIndex = -1;
     let strokes = 0;
-    const candidates = this.orderedRunCuller?.select(this.orderedCullingBounds, 1 / Math.max(this.zoom, 1e-6), this.orderedBatches?.cullingPadding) ?? this.scene!.drawRuns!;
+    const candidates = this.orderedRunCuller?.select(this.orderedCullingBounds, 1 / Math.max(this.zoom, 1e-6), Math.max(this.orderedBatches?.cullingPadding ?? 0, this.minimumStrokeWidthPx / Math.max(this.zoom, 1e-6))) ?? this.scene!.drawRuns!;
     const visibility = this.optionalContentVisibility;
     const paintVisibility = this.scenePaintVisibility ??= new ScenePaintVisibility(this.scene!);
     paintVisibility.setVisibility(visibility);
@@ -4267,7 +4269,7 @@ export class WebGpuFloorplanRenderer {
     const unitsPerPixel = 1 / Math.max(this.zoom, 1e-6);
     // Pending surfaces can reduce the compositor's resolution independently
     // of the presentation viewport. Retain canonical fills for that path.
-    const rebuilt = plan?.update(runs, unitsPerPixel, this.orderedCullingBounds,
+    const rebuilt = plan?.update(runs, unitsPerPixel * Math.max(1, this.minimumStrokeWidthPx), this.orderedCullingBounds,
       paintVisibility.requiresCompositing ? null : unitsPerPixel) ?? false;
     this.orderedRunsCulled ||= this.strokeRenderingEnabled && (plan?.culledSegmentCount ?? 0) > 0;
     this.orderedRunsCulled ||= this.fillRenderingEnabled && (plan?.culledFillCount ?? 0) > 0;
@@ -4508,7 +4510,7 @@ export class WebGpuFloorplanRenderer {
     data[22] = this.strokeRenderingEnabled ? 1 : 0;
     data[23] = this.fillRenderingEnabled ? 1 : 0;
     // Measure the floor in final device pixels, including supersampled passes.
-    data[24] = this.minimumStrokeWidthEnabled ? Math.max(1, zoomValue / Math.max(this.zoom, 1e-12)) : 0;
+    data[24] = this.minimumStrokeWidthPx * Math.max(1, zoomValue / Math.max(this.zoom, 1e-12));
 
     assertUniformBufferSizeMatches(data, CAMERA_UNIFORM_BUFFER_BYTES, "camera");
     this.gpuDevice.queue.writeBuffer(this.cameraUniformBuffer, 0, data);
@@ -4656,7 +4658,7 @@ export class WebGpuFloorplanRenderer {
     const halfViewWidth = viewportWidthPx / (2 * safeZoom);
     const halfViewHeight = viewportHeightPx / (2 * safeZoom);
 
-    const margin = Math.max(16 / safeZoom, this.scene.maxHalfWidth * 2);
+    const margin = Math.max((16 + this.minimumStrokeWidthPx * 0.5) / safeZoom, this.scene.maxHalfWidth * 2);
 
     const viewMinX = viewCenterX - halfViewWidth - margin;
     const viewMaxX = viewCenterX + halfViewWidth + margin;
@@ -4753,6 +4755,7 @@ export class WebGpuFloorplanRenderer {
     }
 
     const safeZoom = Math.max(zoomValue, 1e-6);
+    this.vectorLodRuntime.setMinimumStrokeWidth(this.minimumStrokeWidthPx);
     this.vectorLodRuntime.setScreenSpaceTransform();
     this.vectorLodRuntime.updateForLocalUnitsPerPixel(1 / safeZoom);
     const updated = this.vectorLodRuntime.update(

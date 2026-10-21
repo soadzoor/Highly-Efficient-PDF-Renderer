@@ -6,6 +6,7 @@ import { createLoadProgressReporter } from "../src/loadProgress.ts";
 import { waitForLoad } from "../src/loadCancellation.ts";
 import { resolveHepLodOptions } from "../src/hepLodOptions.ts";
 import { sourceFunction } from "./lib/sourceFunction.mjs";
+import { readMinimumStrokeWidthValue } from "../src/uiControls.ts";
 
 const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
 const lodPromptSource = await readFile(new URL("../src/hepLodPrompt.ts", import.meta.url), "utf8");
@@ -675,7 +676,7 @@ async function testScanCompressionPreferences() {
     readerNavigationSource: null, readerNavigationScene: null, reader: threeReaderMock(),
     getReaderPageRects: () => new Float32Array(), syncPageCameraControls: noop,
     ocrTextCheckboxElement: { checked: false }, pageStreamingCheckboxElement: { checked: false },
-    minimumStrokeWidthCheckboxElement: { checked: false },
+    readMinimumStrokeWidthValue, minimumStrokeWidthInputElement: { value: "0" },
     compressScansCheckboxElement: { checked: true }, openButtonElement: {}, fileInputElement: {},
     exampleDropdown: { setDisabled: noop }, pageLayoutButtons: [],
     readPageBackgroundColor: () => [1, 1, 1, 1], readVectorOverrideColor: () => [0, 0, 0, 0],
@@ -1637,7 +1638,7 @@ async function testThreeBackendReplacement() {
       assert.equal(host.activeThreeRendererBackend, "webgl", "The old context stays installed while shaders compile");
       assert.equal(previous.disposals, 0);
       assert.equal(host.currentPdfObject, previous);
-      host.minimumStrokeWidthCheckboxElement.checked = true;
+      host.minimumStrokeWidthInputElement.value = "0.5";
       await Promise.resolve();
       if (failure === "compile") throw new Error("Shader preparation failed");
       if (failure === "cancel") host.sourceLoadController.abort(new Error("Switch cancelled"));
@@ -1766,8 +1767,8 @@ async function testThreeBackendReplacement() {
       setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop,
       waitForNextRenderedFrame: async () => {
         assert.equal(host.currentPdfObject, replacement);
-        assert.equal(replacement.minimumStrokeWidth, true,
-          "replacement rendering uses the latest checkbox choice, including changes during preparation");
+        assert.equal(replacement.minimumStrokeWidth, .5,
+          "replacement rendering uses the latest numeric width, including changes during preparation");
         submissions.push("installed");
       },
       warmThreeRenderer: async (token, signal) => {
@@ -1844,7 +1845,7 @@ function demoHost() {
     setStatus: noop, clearLoadedStatus: noop, requestRender: noop,
     drawCallMeter: { reset: noop }, drawCallCounter: { recordNativeFrame: noop },
     backendSelectElement: {}, vectorLodSelectElement: {}, textLodSelectElement: {},
-    minimumStrokeWidthCheckboxElement: { checked: false }
+    readMinimumStrokeWidthValue, minimumStrokeWidthInputElement: { value: "0" }
   };
 }
 function threeReaderMock() {

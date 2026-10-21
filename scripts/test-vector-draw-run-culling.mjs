@@ -200,7 +200,7 @@ try {
   // Production submission paths use the filtered list, in its original order.
   const gl = Object.create(WebGlFloorplanRenderer.prototype);
   const gpu = Object.create(WebGpuFloorplanRenderer.prototype);
-  const flags = { scene, orderedRunCuller: culler, orderedCullingBounds: view, zoom: 1,
+  const flags = { scene, orderedRunCuller: culler, orderedCullingBounds: view, zoom: 1, minimumStrokeWidthPx: 0,
     fillRenderingEnabled: true, strokeRenderingEnabled: true, textRenderingEnabled: true, rasterRenderingEnabled: true };
   Object.assign(gl, flags); Object.assign(gpu, flags);
   const calls = [];

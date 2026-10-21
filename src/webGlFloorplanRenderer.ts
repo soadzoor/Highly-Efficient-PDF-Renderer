@@ -1,3 +1,4 @@
+import { normalizeMinimumStrokeWidth } from "./minimumStrokeWidth";
 import { buildCompactMonochromeAtlas, type CompactMonochromeAtlas } from "./compactMonochromeRaster";
 import {
   VERTEX_SHADER_SOURCE,
@@ -290,8 +291,8 @@ export interface ViewStateUpdateOptions {
 export interface WebGlFloorplanRendererOptions {
   /** Preserve the WebGL drawing buffer after presentation. */
   preserveDrawingBuffer?: boolean;
-  /** Keep vector strokes at least one final device pixel wide. Defaults to false. */
-  minimumStrokeWidth?: boolean;
+  /** Minimum vector stroke width in final device pixels; 0 disables it. Booleans map to 0/1. */
+  minimumStrokeWidth?: number | boolean;
   /** Combine compatible ordered fill/stroke draws; defaults to true. */
   mixedVectorBatching?: boolean;
   /** @internal Static offscreen rendering without interactive preparation. */
@@ -997,7 +998,7 @@ export class WebGlFloorplanRenderer {
   private textRenderingEnabled = true;
 
   private strokeCurveEnabled = true;
-  private minimumStrokeWidthEnabled = false;
+  private minimumStrokeWidthPx = 0;
 
   private textVectorOnly = false;
 
@@ -1016,7 +1017,7 @@ export class WebGlFloorplanRenderer {
 
   constructor(canvas: HTMLCanvasElement | OffscreenCanvas, options: WebGlFloorplanRendererOptions = {}) {
     this.canvas = canvas;
-    this.minimumStrokeWidthEnabled = options.minimumStrokeWidth === true;
+    this.minimumStrokeWidthPx = normalizeMinimumStrokeWidth(options.minimumStrokeWidth);
     this.thumbnailMode = options.thumbnail === true;
     if (this.thumbnailMode) {
       this.externalFrameDriver = true;
@@ -1567,16 +1568,17 @@ export class WebGlFloorplanRenderer {
     return this.textLodRuntime?.getStats() ?? null;
   }
 
-  setMinimumStrokeWidth(enabled: boolean): void {
-    const next = Boolean(enabled);
-    if (this.minimumStrokeWidthEnabled === next) return;
-    this.minimumStrokeWidthEnabled = next;
+  setMinimumStrokeWidth(width: number | boolean): void {
+    const next = normalizeMinimumStrokeWidth(width);
+    if (this.minimumStrokeWidthPx === next) return;
+    this.minimumStrokeWidthPx = next;
+    this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
 
   /** Internal supersampling must preserve the floor in final canvas pixels. */
   private minimumStrokeWidthPixels(zoom: number): number {
-    return this.minimumStrokeWidthEnabled ? Math.max(1, zoom / Math.max(this.zoom, 1e-12)) : 0;
+    return this.minimumStrokeWidthPx * Math.max(1, zoom / Math.max(this.zoom, 1e-12));
   }
 
   setStrokeCurveEnabled(enabled: boolean): void {
@@ -3967,7 +3969,9 @@ export class WebGlFloorplanRenderer {
     let strokes = 0;
     profile?.beginSection("paintVisibility");
     const view = this.localToClipRenderingEnabled ? this.orderedCullingBounds : vectorViewBounds(width, height, x, y, zoom);
-    const candidates = this.orderedRunCuller?.select(view, 1 / Math.max(zoom, 1e-6), this.orderedBatches?.cullingPadding) ?? this.scene!.drawRuns!;
+    const minimumStrokePixels = this.minimumStrokeWidthPixels(zoom);
+    const cullingPadding = Math.max(this.orderedBatches?.cullingPadding ?? 0, minimumStrokePixels / Math.max(zoom, 1e-6));
+    const candidates = this.orderedRunCuller?.select(view, 1 / Math.max(zoom, 1e-6), cullingPadding) ?? this.scene!.drawRuns!;
     const visibility = this.optionalContentVisibility;
     const paintVisibility = this.scenePaintVisibility ??= new ScenePaintVisibility(this.scene!);
     paintVisibility.setVisibility(visibility);
@@ -3997,7 +4001,7 @@ export class WebGlFloorplanRenderer {
     const unitsPerPixel = this.localToClipRenderingEnabled ? null : 1 / Math.max(zoom, 1e-6);
     // Composite targets may use a coarser pixel grid; its fill footprint is
     // not described by the presentation scale used for scheduling/stroke LOD.
-    const rebuilt = plan?.update(runs, unitsPerPixel, view,
+    const rebuilt = plan?.update(runs, unitsPerPixel === null ? null : unitsPerPixel * Math.max(1, minimumStrokePixels), view,
       paintVisibility.requiresCompositing ? null : unitsPerPixel) ?? false;
     profile?.endSection("batchPreparation");
     this.orderedRunsCulled ||= this.strokeRenderingEnabled && (plan?.culledSegmentCount ?? 0) > 0;
@@ -4817,7 +4821,7 @@ export class WebGlFloorplanRenderer {
     const halfViewWidth = viewportWidthPx / (2 * safeZoom);
     const halfViewHeight = viewportHeightPx / (2 * safeZoom);
 
-    const margin = Math.max(16 / safeZoom, this.scene.maxHalfWidth * 2);
+    const margin = Math.max((16 + this.minimumStrokeWidthPx * 0.5) / safeZoom, this.scene.maxHalfWidth * 2);
 
     const viewMinX = viewCenterX - halfViewWidth - margin;
     const viewMaxX = viewCenterX + halfViewWidth + margin;
@@ -4908,7 +4912,7 @@ export class WebGlFloorplanRenderer {
       return;
     }
 
-    const margin = Math.max(16 * Math.max(localUnitsPerPixel, 1e-9), this.scene.maxHalfWidth * 2);
+    const margin = Math.max((16 + this.minimumStrokeWidthPx * 0.5) * Math.max(localUnitsPerPixel, 1e-9), this.scene.maxHalfWidth * 2);
     const viewMinX = bounds.minX - margin;
     const viewMinY = bounds.minY - margin;
     const viewMaxX = bounds.maxX + margin;
@@ -4991,6 +4995,7 @@ export class WebGlFloorplanRenderer {
       return;
     }
 
+    this.vectorLodRuntime.setMinimumStrokeWidth(this.minimumStrokeWidthPx);
     if (this.localToClipRenderingEnabled) {
       this.vectorLodRuntime.setLocalToClipTransform(this.localToClipMatrix, localUnitsPerPixel);
     } else {

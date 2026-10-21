@@ -9,7 +9,7 @@ type ColorRenderer = Pick<RendererApi, "setPageBackgroundColor" | "setVectorColo
 export interface UiControlElements {
   vectorLodSelect: HTMLSelectElement;
   textLodSelect: HTMLSelectElement;
-  minimumStrokeWidthCheckbox: HTMLInputElement;
+  minimumStrokeWidthInput: HTMLInputElement;
   pageBackgroundColorInput: HTMLInputElement;
   pageBackgroundOpacitySlider: HTMLInputElement;
   pageBackgroundOpacityInput: HTMLInputElement;
@@ -21,14 +21,14 @@ export interface UiControlElements {
 export interface UiControlCallbacks {
   onVectorLodModeChange(mode: VectorLodMode): void;
   onTextLodModeChange(mode: TextLodMode): void;
-  onMinimumStrokeWidthChange(enabled: boolean): void;
+  onMinimumStrokeWidthChange(width: number): void;
 }
 
 export interface UiControlManager {
   bindEventListeners(callbacks: UiControlCallbacks): void;
   readVectorLodModeInput(): VectorLodMode;
   readTextLodModeInput(): TextLodMode;
-  readMinimumStrokeWidthInput(): boolean;
+  readMinimumStrokeWidthInput(): number;
   readPageBackgroundColorInput(): ColorRgba;
   readVectorColorOverrideInput(): ColorRgba;
   applyPageBackgroundColorFromControls(): void;
@@ -48,8 +48,8 @@ export function createUiControlManager(
     return elements.textLodSelect.value === "off" ? "off" : "auto";
   }
 
-  function readMinimumStrokeWidthInput(): boolean {
-    return elements.minimumStrokeWidthCheckbox.checked;
+  function readMinimumStrokeWidthInput(): number {
+    return readMinimumStrokeWidthValue(elements.minimumStrokeWidthInput);
   }
 
   function readPageBackgroundOpacityPercent(value: string): number {
@@ -151,7 +151,7 @@ export function createUiControlManager(
       callbacks.onTextLodModeChange(readTextLodModeInput());
     });
 
-    elements.minimumStrokeWidthCheckbox.addEventListener("change", () => {
+    elements.minimumStrokeWidthInput.addEventListener("input", () => {
       callbacks.onMinimumStrokeWidthChange(readMinimumStrokeWidthInput());
     });
 
@@ -208,4 +208,10 @@ function clamp(value: number, min: number, max: number): number {
     return max;
   }
   return value;
+}
+
+/** Incomplete or negative edits disable the floor until a valid value is entered. */
+export function readMinimumStrokeWidthValue(input: HTMLInputElement): number {
+  const value = Number(input.value);
+  return Number.isFinite(value) ? Math.max(0, value) : 0;
 }

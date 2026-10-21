@@ -513,7 +513,7 @@ try {
   for (const Renderer of [WebGlFloorplanRenderer, WebGpuFloorplanRenderer]) {
     const fullView = { minX: -15, minY: -7, maxX: 225, maxY: 17 };
     const renderer = Object.assign(Object.create(Renderer.prototype), {
-      scene, orderedBatches: new VectorOrderedBatches(scene, null), zoom: 10,
+      scene, orderedBatches: new VectorOrderedBatches(scene, null), zoom: 10, minimumStrokeWidthPx: 0,
       orderedCullingBounds: fullView,
       vectorLodLevels: [], vectorLodLevelResources: [], rasterRenderingEnabled: false,
       gl: { bindBuffer() {}, bufferData() {} }, gpuDevice: { queue: { writeBuffer() {} } }

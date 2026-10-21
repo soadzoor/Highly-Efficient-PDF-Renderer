@@ -82,8 +82,8 @@
           </select>
         </div>
         <div class="number-row">
-          <label for="minimum-stroke-width-checkbox" title="Keep thin vector lines at least one device pixel wide.">Minimum stroke width (1 px)</label>
-          <input id="minimum-stroke-width-checkbox" type="checkbox" autocomplete="off" />
+          <label for="minimum-stroke-width-input" title="Minimum vector stroke width in device pixels. 0 preserves source widths.">Minimum stroke width (px)</label>
+          <input id="minimum-stroke-width-input" type="number" min="0" step="any" value="0" autocomplete="off" />
         </div>
         <div class="number-row">
           <label for="text-lod-mode">Text LOD</label>

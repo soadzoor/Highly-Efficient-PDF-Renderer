@@ -379,15 +379,15 @@ try {
   const object = await createThreePdfObject({ scene: visibilityScene, sourceKind: "hep", sourceLabel: "mixed" },
     { rendererType: "webgl", vectorLod: "off", textLod: "off", threeColorCompositing: "display" },
     undefined, undefined, () => native);
-  assert.equal(object.getMinimumStrokeWidth(), false);
-  assert.equal(nativeMinimumWidth, false, "the disabled public default reaches native fallback rendering");
+  assert.equal(object.getMinimumStrokeWidth(), 0);
+  assert.equal(nativeMinimumWidth, 0, "the disabled public default reaches native fallback rendering");
   const canonicalStyles = visibilityScene.styles.slice();
   object.setMinimumStrokeWidth(true);
-  assert.equal(object.getMinimumStrokeWidth(), true);
-  assert.equal(nativeMinimumWidth, true, "the public opt-in reaches native fallback rendering");
+  assert.equal(object.getMinimumStrokeWidth(), 1);
+  assert.equal(nativeMinimumWidth, 1, "the public opt-in reaches native fallback rendering");
   object.setMinimumStrokeWidth(false);
-  assert.equal(object.getMinimumStrokeWidth(), false);
-  assert.equal(nativeMinimumWidth, false);
+  assert.equal(object.getMinimumStrokeWidth(), 0);
+  assert.equal(nativeMinimumWidth, 0);
   assert.equal(object.strokeMaterialLayer.getMixedVectorResources().minimumStrokeWidthUniform.value, 0);
   const gradientWidthUniform = object.gradientMaterialLayer.getOrderedPaintMeshes()
     .find(paint => paint.primitiveKind === "gradient-stroke").material.uniforms.uMinimumStrokeWidthPx;
@@ -436,41 +436,42 @@ try {
   assert.equal(object.getMixedVectorBatchingEnabled(), false); assert.equal(nativeSetting, false);
   assert.equal(object.mixedVectorLayer.group.visible, false);
   assert(object.strokeMaterialLayer.mesh.children.every(child => child.visible));
+  object.setMinimumStrokeWidth(.5);
   object.setVectorLodMode("force");
   assert(object.vectorLodStrokeLayer, "force mode actually replaces the exact stroke material");
-  assert.equal(object.vectorLodStrokeLayer.getMixedVectorStrokeLayer().getMixedVectorResources().minimumStrokeWidthUniform.value, 0,
-    "new LOD materials inherit the minimum-width opt-out");
+  assert.equal(object.vectorLodStrokeLayer.getMixedVectorStrokeLayer().getMixedVectorResources().minimumStrokeWidthUniform.value, .5,
+    "new LOD materials inherit the fractional width");
   object.setVectorLodMode("off");
   assert.equal(object.getMixedVectorBatchingEnabled(), false, "stroke material rebuilds retain the user setting");
-  assert.equal(object.strokeMaterialLayer.getMixedVectorResources().minimumStrokeWidthUniform.value, 0,
-    "stroke material rebuilds retain the minimum-width opt-out");
+  assert.equal(object.strokeMaterialLayer.getMixedVectorResources().minimumStrokeWidthUniform.value, .5,
+    "stroke material rebuilds retain the fractional width");
   const children = await object.getPages();
   assert(children.every(page => !page.getMixedVectorBatchingEnabled()), "new page handles inherit the setting");
-  assert(children.every(page => !page.getMinimumStrokeWidth()), "new page handles inherit the minimum-width opt-out");
+  assert(children.every(page => page.getMinimumStrokeWidth() === .5), "new page handles inherit the minimum-width opt-out");
   assert(children.every(page => !page.getFillRenderingEnabled() && page.getStrokeRenderingEnabled()),
     "new page handles inherit independent vector rendering flags");
   object.setFillRenderingEnabled(true);
   assert(children.every(page => page.getFillRenderingEnabled()));
   object.setMixedVectorBatchingEnabled(true);
   assert(children.every(page => page.getMixedVectorBatchingEnabled()));
-  object.setMinimumStrokeWidth(true);
-  assert(children.every(page => page.getMinimumStrokeWidth()), "existing page handles receive runtime width changes");
+  object.setMinimumStrokeWidth(10);
+  assert(children.every(page => page.getMinimumStrokeWidth() === 10), "existing page handles receive runtime width changes");
   object.dispose();
-  for (const rendererType of ["webgl", "webgpu"]) for (const minimumStrokeWidth of [undefined, false, true]) {
+  for (const rendererType of ["webgl", "webgpu"]) for (const minimumStrokeWidth of [undefined, false, true, 0, .5, 10]) {
     const configured = await createThreePdfObject({ scene: visibilityScene, sourceKind: "hep", sourceLabel: "width option" },
       { rendererType, vectorLod: "off", textLod: "off", minimumStrokeWidth },
       undefined, undefined, () => native);
-    const enabled = minimumStrokeWidth === true;
-    assert.equal(configured.getMinimumStrokeWidth(), enabled);
-    assert.equal(nativeMinimumWidth, enabled);
-    assert.equal(configured.strokeMaterialLayer.getMixedVectorResources().minimumStrokeWidthUniform.value, enabled ? 1 : 0,
+    const width = typeof minimumStrokeWidth === "number" ? minimumStrokeWidth : minimumStrokeWidth === true ? 1 : 0;
+    assert.equal(configured.getMinimumStrokeWidth(), width);
+    assert.equal(nativeMinimumWidth, width);
+    assert.equal(configured.strokeMaterialLayer.getMixedVectorResources().minimumStrokeWidthUniform.value, width,
       "constructor options apply before the first rendered frame");
     if (rendererType === "webgpu") {
       const gradientStroke = configured.gradientMaterialLayer.getOrderedPaintMeshes()
         .find(paint => paint.primitiveKind === "gradient-stroke");
-      assert.equal(gradientStroke.strokeState.minimumStrokeWidthUniform.value, enabled ? 1 : 0);
-      configured.setMinimumStrokeWidth(!enabled);
-      assert.equal(gradientStroke.strokeState.minimumStrokeWidthUniform.value, enabled ? 0 : 1, "WebGPU gradient strokes toggle at runtime");
+      assert.equal(gradientStroke.strokeState.minimumStrokeWidthUniform.value, width);
+      configured.setMinimumStrokeWidth(.25);
+      assert.equal(gradientStroke.strokeState.minimumStrokeWidthUniform.value, .25, "WebGPU gradient strokes toggle at runtime");
     }
     configured.dispose();
   }

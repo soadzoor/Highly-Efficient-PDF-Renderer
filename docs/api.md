@@ -408,7 +408,7 @@ AES-256) and does not enforce its permission flags.
 | `vectorLod` | `"auto"` | Use stroke LOD for large scenes; `"off"` keeps exact strokes, `"force"` enables it below the usual threshold. |
 | `textLod` | `"auto"` | Simplify subpixel text clusters; `"off"` keeps exact glyphs. |
 | `curveStrokes` | `true` | Enable curve-aware stroke joins and caps where supported. |
-| `minimumStrokeWidth` | `false` | Set `true` to keep vector strokes at least one device pixel wide in native and Three.js WebGL/WebGPU rendering. Disabled by default to preserve subpixel source widths. |
+| `minimumStrokeWidth` | `0` | Minimum vector stroke width in device pixels, for example `0.5`, `1` or `10`. `0` preserves source widths. Legacy `false`/`true` inputs map to `0`/`1`. |
 | `vectorOnly` | `false` | Use vector glyph geometry instead of the raster glyph atlas. |
 | `pageBackground` | `"#ffffff"` | Page background color. |
 | `pageBackgroundOpacity` | `1` | Page background alpha, from 0 to 1. |
@@ -423,6 +423,9 @@ The minimum stroke width is measured in drawing-buffer pixels, including interna
 supersampling, rather than CSS pixels. It changes display width only; canonical
 scene/HEP geometry, fills, text and raster images retain their original data.
 PDF hairlines retain their device-width behavior when the option is disabled.
+Widths must be finite and non-negative. Both demos expose a numeric control
+with a default of `0`. This is a display-width adjustment, so tuning it can
+change the apparent darkness of dense linework without changing source colors.
 
 ## `buildStrokeScene(polylines, defaults?)`
 
@@ -660,7 +663,7 @@ Exporting such a HEP again stores exact ownership. Transforms are runtime presen
 | `subscribeLayerVisibility(listener)` | Observe applied visibility snapshots; returns an unsubscribe function. |
 | `subscribeLayerVisibilityProgress(listener)` | Observe preparation percentage or `null` when idle; immediately reports current progress and returns an unsubscribe function. |
 | `setVectorLodMode(mode)` / `setTextLodMode(mode)` | Change LOD at runtime. |
-| `setMinimumStrokeWidth(enabled)` / `getMinimumStrokeWidth()` | Toggle or inspect the one-device-pixel vector stroke floor; defaults to disabled and persists across page/material changes. |
+| `setMinimumStrokeWidth(width)` / `getMinimumStrokeWidth()` | Set or read the minimum stroke width as a number of device pixels; defaults to `0` and persists across page/material changes. The setter also accepts legacy booleans. |
 | `setPageBackgroundColor(r, g, b, alpha)` | Set normalized page background components. |
 | `setVectorColorOverride(r, g, b, opacity)` | Set normalized vector override components. |
 | `getVectorStrokeLodStats()` / `getTextLodStats()` | Inspect LOD statistics; may return `null` before data is available. |

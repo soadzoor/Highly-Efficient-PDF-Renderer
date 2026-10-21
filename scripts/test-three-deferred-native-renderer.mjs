@@ -63,7 +63,7 @@ try {
   renderer.setStrokeCurveEnabled(true);
   renderer.setStrokeCurveEnabled(false);
   renderer.setMinimumStrokeWidth(true);
-  renderer.setMinimumStrokeWidth(false);
+  renderer.setMinimumStrokeWidth(.5);
   assert.equal(renderer.getMixedVectorBatchingEnabled(), true);
   renderer.setMixedVectorBatchingEnabled(true);
   renderer.setMixedVectorBatchingEnabled(false);
@@ -95,7 +95,7 @@ try {
   assert.equal(creations, 1);
   assert.deepEqual(calls[0], ["external", true], "configuration replay must not schedule unseen frames");
   assert.deepEqual(calls.filter(([name]) => name === "curve"), [["curve", false]], "only current config is replayed");
-  assert.deepEqual(calls.filter(([name]) => name === "minimumWidth"), [["minimumWidth", false]],
+  assert.deepEqual(calls.filter(([name]) => name === "minimumWidth"), [["minimumWidth", .5]],
     "the minimum-width opt-out remains dormant and replays on first fallback use");
   assert.deepEqual(calls.filter(([name]) => name === "mixed"), [["mixed", false]], "the comparison switch stays dormant until fallback and replays its current value");
   assert.equal(renderer.getMixedVectorBatchingEnabled(), false);

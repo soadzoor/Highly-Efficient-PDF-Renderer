@@ -87,8 +87,8 @@ export interface RendererApi {
   /** Enable or disable curve-aware stroke rendering. */
   setStrokeCurveEnabled(enabled: boolean): void;
 
-  /** Keep vector strokes at least one device pixel wide; disabled by default. */
-  setMinimumStrokeWidth?(enabled: boolean): void;
+  /** Minimum vector stroke width in device pixels; 0 disables it. Booleans map to 0/1. */
+  setMinimumStrokeWidth?(width: number | boolean): void;
 
   /** Force text to render as vector geometry only. */
   setTextVectorOnly(enabled: boolean): void;

@@ -1,3 +1,4 @@
+import { normalizeMinimumStrokeWidth } from "./minimumStrokeWidth";
 import { requireThreeWebGpuBackend, type ThreeWebGpuBackend } from "./threeMaterialBackend";
 import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTransforms";
 import { buildVectorFillBandIndex } from "./vectorFillBands";
@@ -186,8 +187,8 @@ export class ThreeMaterialGradientLayer {
     this.group.visible = visible;
   }
 
-  setMinimumStrokeWidth(enabled: boolean): void {
-    this.minimumStrokeWidthUniform.value = enabled ? 1 : 0;
+  setMinimumStrokeWidth(width: number | boolean): void {
+    this.minimumStrokeWidthUniform.value = normalizeMinimumStrokeWidth(width);
     for (const entry of this.entries) {
       if (entry.strokeState) entry.strokeState.minimumStrokeWidthUniform.value = this.minimumStrokeWidthUniform.value;
     }

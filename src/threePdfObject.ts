@@ -1,3 +1,4 @@
+import { normalizeMinimumStrokeWidth } from "./minimumStrokeWidth";
 import type { ThreeWebGpuBackend } from "./threeMaterialBackend";
 import { ThreePageTransforms } from "./threePageTransforms";
 import { updateThreePageBatchFrame } from "./threePageBatchFrame";
@@ -226,8 +227,8 @@ export interface HeprThreeObjectOptions {
    */
   curveStrokes?: boolean;
 
-  /** Keep vector strokes at least one device pixel wide without changing source geometry. @default false */
-  minimumStrokeWidth?: boolean;
+  /** Minimum vector stroke width in device pixels; 0 preserves source widths. Booleans map to 0/1. @default 0 */
+  minimumStrokeWidth?: number | boolean;
 
   /**
    * Render text as vector glyph geometry only. Raster glyph atlas rendering is
@@ -311,7 +312,7 @@ interface RendererConfig {
   vectorLodMode: VectorLodMode;
   textLodMode: TextLodMode;
   strokeCurveEnabled: boolean;
-  minimumStrokeWidth: boolean;
+  minimumStrokeWidth: number;
   textVectorOnly: boolean;
   pageBackground: [number, number, number, number];
   vectorOverride: [number, number, number, number];
@@ -2750,11 +2751,12 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     this.lastSyncedFrameSerial = -1;
   }
 
-  /** Enable the one-device-pixel display floor; source stroke widths stay unchanged. */
-  setMinimumStrokeWidth(enabled: boolean): void {
+  /** Set the device-pixel display floor; 0 disables it and source geometry stays unchanged. */
+  setMinimumStrokeWidth(width: number | boolean): void {
     if (this.isDisposed) return;
-    const next = Boolean(enabled);
+    const next = normalizeMinimumStrokeWidth(width);
     this.rendererConfig.minimumStrokeWidth = next;
+    this.drawPlan?.setMinimumStrokeWidth(next);
     for (const page of this.pageViews ?? []) page.object.setMinimumStrokeWidth(next);
     this.pageBatch?.setMinimumStrokeWidth(next);
     this.markPageAppearanceChanged();
@@ -2769,7 +2771,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     this.dispatchEvent({ type: "change", reason: "stroke-rendering" });
   }
 
-  getMinimumStrokeWidth(): boolean { return this.rendererConfig.minimumStrokeWidth; }
+  getMinimumStrokeWidth(): number { return this.rendererConfig.minimumStrokeWidth; }
 
   /**
    * Enable or disable curve-aware stroke rendering where supported.
@@ -4986,6 +4988,7 @@ function* createThreePdfMaterialSteps(loadedScene: ThreePdfSceneSource, renderer
     }
 
     owned.push(textMaterialLayer);
+    drawPlan?.setMinimumStrokeWidth(rendererConfig.minimumStrokeWidth);
     gradientMaterialLayer.setMinimumStrokeWidth(rendererConfig.minimumStrokeWidth);
     strokeMaterialLayer?.setMinimumStrokeWidth(rendererConfig.minimumStrokeWidth);
     vectorLodStrokeLayer?.setMinimumStrokeWidth(rendererConfig.minimumStrokeWidth);
@@ -5124,7 +5127,7 @@ function normalizeRendererConfig(options: HeprThreeObjectOptions): RendererConfi
     vectorLodMode: normalizeVectorLodMode(options.vectorLod),
     textLodMode: options.textLod === "off" ? "off" : "auto",
     strokeCurveEnabled: options.curveStrokes !== false,
-    minimumStrokeWidth: options.minimumStrokeWidth === true,
+    minimumStrokeWidth: normalizeMinimumStrokeWidth(options.minimumStrokeWidth),
     textVectorOnly: options.vectorOnly === true,
     pageBackground: [pageBackground[0], pageBackground[1], pageBackground[2], pageBackgroundOpacity],
     vectorOverride: [vectorColor[0], vectorColor[1], vectorColor[2], vectorOpacity]

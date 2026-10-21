@@ -1,3 +1,4 @@
+import { normalizeMinimumStrokeWidth } from "./minimumStrokeWidth";
 import type { ThreeWebGpuStrokeMaterialOptions } from "./threeWebGpuStrokeMaterial";
 import type { ThreePageBinding } from "./threePageTransforms";
 import { requireThreeWebGpuBackend, type ThreeWebGpuBackend } from "./threeMaterialBackend";
@@ -271,8 +272,8 @@ export class ThreeMaterialStrokeLayer {
     return this.orderedRuns?.getRenderedCount() ?? Math.max(0, this.mesh.geometry.instanceCount ?? 0);
   }
 
-  setMinimumStrokeWidth(enabled: boolean): void {
-    this.minimumStrokeWidthUniform.value = enabled ? 1 : 0;
+  setMinimumStrokeWidth(width: number | boolean): void {
+    this.minimumStrokeWidthUniform.value = normalizeMinimumStrokeWidth(width);
   }
 
   setStrokeCurveEnabled(enabled: boolean): void {
@@ -438,7 +439,7 @@ export class ThreeMaterialStrokeLayer {
     const safeZoom = Math.max(1e-6, viewState.zoom);
     const halfViewWidth = Math.max(1, viewport.width) / (2 * safeZoom);
     const halfViewHeight = Math.max(1, viewport.height) / (2 * safeZoom);
-    const margin = Math.max(16 / safeZoom, this.maxHalfWidth * 2, 0.5);
+    const margin = Math.max((16 + this.minimumStrokeWidthUniform.value * 0.5) / safeZoom, this.maxHalfWidth * 2, 0.5);
 
     const viewMinX = cullingBounds
       ? cullingBounds.minX - margin

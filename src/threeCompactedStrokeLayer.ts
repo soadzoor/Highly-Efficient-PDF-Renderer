@@ -1,3 +1,4 @@
+import { normalizeMinimumStrokeWidth } from "./minimumStrokeWidth";
 import { STROKE_MINIMUM_WIDTH_GLSL, STROKE_COVERAGE_GLSL } from "./strokeCoverageShaders";
 import * as THREE from "three";
 
@@ -241,8 +242,10 @@ export class ThreeCompactedStrokeLayer {
     return this.levels[this.activeLevelIndex]?.segmentCount ?? 0;
   }
 
-  setMinimumStrokeWidth(enabled: boolean): void {
-    this.minimumStrokeWidthUniform.value = enabled ? 1 : 0;
+  setMinimumStrokeWidth(width: number | boolean): void {
+    this.minimumStrokeWidthUniform.value = normalizeMinimumStrokeWidth(width);
+    // The canonical tile spheres cannot bound arbitrary shader-expanded widths.
+    for (const level of this.levels) for (const mesh of level.meshes) mesh.frustumCulled = this.minimumStrokeWidthUniform.value === 0;
   }
 
   setVectorOverride(red: number, green: number, blue: number, opacity: number): void {

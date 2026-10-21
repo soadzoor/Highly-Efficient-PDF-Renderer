@@ -170,9 +170,9 @@ try {
 
   for (const Renderer of [WebGlFloorplanRenderer, WebGpuFloorplanRenderer]) {
     let updated = false, invalidations = 0;
-    const renderer = Object.assign(Object.create(Renderer.prototype), { scene: dense,
+    const renderer = Object.assign(Object.create(Renderer.prototype), { scene: dense, minimumStrokeWidthPx: 0,
       orderedBatches: { invalidate() { invalidations++; } }, vectorLodRuntime: {
-        setScreenSpaceTransform() {}, updateForLocalUnitsPerPixel() {}, update() { return updated; },
+        setMinimumStrokeWidth() {}, setScreenSpaceTransform() {}, updateForLocalUnitsPerPixel() {}, update() { return updated; },
         getStats() { return { renderedSegments: 3 }; }
       } });
     const update = Renderer === WebGlFloorplanRenderer
@@ -194,7 +194,7 @@ try {
   for (const location of [1, 2, 3]) low.bindOrderedInstanceAttribute(location, 5);
   assert.deepEqual(pointers.map(p => [p[0], p[4], p[5]]), [[1, 8, 40], [4, 8, 44], [2, 8, 40], [4, 8, 44], [3, 8, 40], [4, 8, 44]]);
   assert(bound.every(b => b === "instances"));
-  const flags = { scene, orderedBatches: mixed, vectorLodLevels: [{ texture: "combined" }],
+  const flags = { scene, orderedBatches: mixed, minimumStrokeWidthPx: 0, vectorLodLevels: [{ texture: "combined" }],
     vectorLodLevelResources: [{ bindGroup: "combined" }], fillRenderingEnabled: true,
     strokeRenderingEnabled: true, textRenderingEnabled: true, rasterRenderingEnabled: false };
   const gl = Object.assign(Object.create(WebGlFloorplanRenderer.prototype), flags);
@@ -238,7 +238,7 @@ try {
     const plan = new VectorOrderedBatches(layerScene, null);
     const draws = [], uploads = [];
     const instance = Object.assign(Object.create(Renderer.prototype), {
-      scene: layerScene, orderedBatches: plan, zoom: 1,
+      scene: layerScene, orderedBatches: plan, zoom: 1, minimumStrokeWidthPx: 0,
       optionalContentVisibility: { revision: 0, conditions: Uint8Array.of(1, 1), layers: [] },
       vectorLodLevels: [], vectorLodLevelResources: [], orderedTextureBindings: [],
       strokeRenderingEnabled: true, fillRenderingEnabled: false, textRenderingEnabled: false, rasterRenderingEnabled: false,
@@ -287,7 +287,7 @@ try {
     const plan = new VectorOrderedBatches(redundantScene, null);
     const uploads = [], counts = [];
     const instance = Object.assign(Object.create(Renderer.prototype), {
-      scene: redundantScene, orderedBatches: plan, zoom: 1,
+      scene: redundantScene, orderedBatches: plan, zoom: 1, minimumStrokeWidthPx: 0,
       optionalContentVisibility: { revision: 0, conditions: Uint8Array.of(1, 1), layers: [] },
       vectorLodLevels: [], vectorLodLevelResources: [], orderedTextureBindings: [],
       strokeRenderingEnabled: true, fillRenderingEnabled: false, textRenderingEnabled: false, rasterRenderingEnabled: false,

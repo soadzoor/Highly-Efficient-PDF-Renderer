@@ -58,15 +58,15 @@ try {
     return { mock, renderer, counters, install, frame };
   };
 
-  for (const minimumStrokeWidth of [undefined, false, true]) {
+  for (const minimumStrokeWidth of [undefined, false, true, 0, .5, 10]) {
     const h = setup({ minimumStrokeWidth });
     h.install(makePlan()); h.frame();
     const width = () => h.mock.draws.find(draw => draw.program === h.renderer.mixedVectorGpu.program)
       .uniforms.get("uMinimumStrokeWidthPx");
-    const enabled = minimumStrokeWidth === true;
-    assert.equal(width(), enabled ? 1 : 0, "native WebGL preserves source widths unless explicitly enabled");
-    h.renderer.setMinimumStrokeWidth(!enabled); h.frame();
-    assert.equal(width(), enabled ? 0 : 1, "native WebGL retains runtime width toggles");
+    const expected = typeof minimumStrokeWidth === "number" ? minimumStrokeWidth : minimumStrokeWidth === true ? 1 : 0;
+    assert.equal(width(), expected, "native WebGL preserves source widths unless explicitly enabled");
+    h.renderer.setMinimumStrokeWidth(.25); h.frame();
+    assert.equal(width(), .25, "native WebGL retains runtime width toggles");
     h.renderer.dispose();
   }
 

@@ -6,6 +6,15 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Changed
+
+- Replace the minimum stroke width checkbox in both demos with a numeric
+  device-pixel width, defaulting to `0`. Support fractional values such as `0.5`
+  and larger widths without changing canonical geometry. The API option and
+  setter accept numbers or legacy booleans (`false` = `0`, `true` = `1`);
+  `getMinimumStrokeWidth()` now returns the numeric width. Reject negative and
+  non-finite API values and widen visibility and paint-overlap bounds as needed.
+
 ## [0.1.69] - 2026-10-21
 
 ### Added

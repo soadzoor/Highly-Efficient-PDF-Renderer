@@ -1,3 +1,4 @@
+import { normalizeMinimumStrokeWidth } from "./minimumStrokeWidth";
 // Build/representation changes must bump HEP_VECTOR_LOD_VERSION in hepLod.ts.
 import {
   CompactStrokeIntervalGroups, NumberTupleTable,
@@ -529,6 +530,7 @@ export class VectorStrokeLodRuntime {
   private projectedRectDepth = 0;
   private projectedRectArea = 0;
   private readonly maxHalfWidth: number;
+  private minimumStrokeWidthPx = 0;
   private activeLevelIndex = 0;
   private forceExact = false;
   private useLocalToClip = false;
@@ -592,6 +594,17 @@ export class VectorStrokeLodRuntime {
       this.fullViewBaselineLevelIndex = -1;
     }
     this.useLocalToClip = false;
+  }
+
+  /** Widen visibility bounds without changing LOD geometry or density selection. */
+  setMinimumStrokeWidth(width: number | boolean): void {
+    const next = normalizeMinimumStrokeWidth(width);
+    if (this.minimumStrokeWidthPx === next) return;
+    this.minimumStrokeWidthPx = next;
+    this.projectedSelectionCurrent = false;
+    this.selectionGuard = null;
+    this.fullViewBaselineLevelIndex = -1;
+    this.tileSelectedLevelIndices.fill(-1);
   }
 
   /** Temporarily retain primitive identity without rebuilding the LOD payload. */
@@ -736,7 +749,7 @@ export class VectorStrokeLodRuntime {
     viewport: ViewportPixels,
     cullingBounds?: CullingBounds | null
   ): boolean {
-    const viewBounds = resolveStrokeViewBounds(viewState, viewport, cullingBounds, this.maxHalfWidth);
+    const viewBounds = resolveStrokeViewBounds(viewState, viewport, cullingBounds, this.maxHalfWidth, this.minimumStrokeWidthPx);
     const screenErrorLevelIndex = this.chooseLevelIndex(this.localUnitsPerPixel);
     const maxLevelIndex = Math.max(screenErrorLevelIndex,
       this.chooseLevelIndex(this.localUnitsPerPixel, LOD_OVERVIEW_SCREEN_ERROR_BUDGET_PX, true));
@@ -1026,7 +1039,7 @@ export class VectorStrokeLodRuntime {
     for (let axis = 0; axis < 2; axis++) {
       // |clip x| <= w and |clip y| <= w, widened by the screen margin. These
       // planes all pass through the eye, so they also exclude W <= 0.
-      const widen = 1 + LOD_PROJECTED_MARGIN_PX / (axis === 0 ? this.projectedHalfWidth : this.projectedHalfHeight);
+      const widen = 1 + (LOD_PROJECTED_MARGIN_PX + this.minimumStrokeWidthPx * 0.5) / (axis === 0 ? this.projectedHalfWidth : this.projectedHalfHeight);
       for (let side = 0; side < 2; side++) {
         const sign = side === 0 ? 1 : -1;
         const offset = (axis * 2 + side) * 3;
@@ -2202,12 +2215,13 @@ export function resolveStrokeViewBounds(
   viewState: ViewState,
   viewport: ViewportPixels,
   cullingBounds: CullingBounds | null | undefined,
-  maxHalfWidth: number
+  maxHalfWidth: number,
+  minimumStrokeWidthPx = 0
 ): CullingBounds {
   const safeZoom = Math.max(1e-6, viewState.zoom);
   const halfViewWidth = Math.max(1, viewport.width) / (2 * safeZoom);
   const halfViewHeight = Math.max(1, viewport.height) / (2 * safeZoom);
-  const margin = Math.max(16 / safeZoom, maxHalfWidth * 2, 0.5);
+  const margin = Math.max((16 + minimumStrokeWidthPx * 0.5) / safeZoom, maxHalfWidth * 2, 0.5);
 
   return cullingBounds
     ? {

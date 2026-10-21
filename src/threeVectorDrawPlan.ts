@@ -1,3 +1,4 @@
+import { normalizeMinimumStrokeWidth } from "./minimumStrokeWidth";
 import { normalizeScenePaintGraph, scenePaintSpanSegments, type ScenePaintNode } from "./scenePaintGraph";
 import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import { VectorPageDrawScheduler } from "./vectorPageDrawScheduler";
@@ -30,6 +31,8 @@ export class ThreeVectorDrawPlan {
   private readonly scene: VectorScene;
   private readonly independentPageRuns: Uint16Array | null;
   private unitsPerPixel: number | null = null;
+  private minimumStrokeWidthPx = 0;
+
   private colorCommutationEnabled = true;
   private blackPreserved = true;
   private strokeColorsMatchSource = true;
@@ -59,6 +62,19 @@ export class ThreeVectorDrawPlan {
     this.scheduler = this.createScheduler();
   }
 
+  private get coverageUnitsPerPixel(): number | null {
+    return this.unitsPerPixel === null ? null : this.unitsPerPixel * Math.max(1, this.minimumStrokeWidthPx);
+  }
+
+  /** Include display widening in paint-order overlap proofs. */
+  setMinimumStrokeWidth(width: number | boolean): void {
+    const next = normalizeMinimumStrokeWidth(width);
+    if (next === this.minimumStrokeWidthPx) return;
+    this.minimumStrokeWidthPx = next;
+    this.scheduler?.updateScale(this.coverageUnitsPerPixel);
+    this.reschedule();
+  }
+
   /** Scheduled run indices; canonical order until a pixel scale is supplied. */
   get order(): readonly number[] { return this.ordered; }
 
@@ -83,7 +99,7 @@ export class ThreeVectorDrawPlan {
     if (this.textLodData === data) return;
     this.textLodData = data;
     this.scheduler?.includeTextLod(data);
-    this.scheduler?.updateScale(this.unitsPerPixel);
+    this.scheduler?.updateScale(this.coverageUnitsPerPixel);
     this.reschedule();
   }
 
@@ -119,7 +135,7 @@ export class ThreeVectorDrawPlan {
   update(unitsPerPixel: number | null): boolean {
     const scale = Number.isFinite(unitsPerPixel) && (unitsPerPixel ?? 0) > 0 ? unitsPerPixel : null;
     this.unitsPerPixel = scale;
-    if (!(this.scheduler?.updateScale(scale) ?? false)) return false;
+    if (!(this.scheduler?.updateScale(this.coverageUnitsPerPixel) ?? false)) return false;
     return this.reschedule();
   }
 
@@ -138,7 +154,7 @@ export class ThreeVectorDrawPlan {
     this.scheduler = this.createScheduler();
     if (this.textLodData) this.scheduler?.includeTextLod(this.textLodData);
     this.scheduler?.setColorCommutationEnabled(this.colorCommutationEnabled);
-    this.scheduler?.updateScale(this.unitsPerPixel);
+    this.scheduler?.updateScale(this.coverageUnitsPerPixel);
     // Even unchanged run order needs new meshes when effect boundaries change.
     this.version++;
     this.reschedule();
