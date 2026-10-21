@@ -1,3 +1,4 @@
+import { STROKE_AREA_COVERAGE_GLSL } from "./strokeAreaCoverageShaders";
 import { normalizeMinimumStrokeWidth } from "./minimumStrokeWidth";
 import { STROKE_MINIMUM_WIDTH_GLSL, STROKE_COVERAGE_GLSL } from "./strokeCoverageShaders";
 import * as THREE from "three";
@@ -102,7 +103,7 @@ void main() {
   float aaWorld = isHairline
     ? max(0.35 * localUnitsPerPixel, 5e-5)
     : max(localUnitsPerPixel, 0.0001);
-  float extent = halfWidth + aaWorld;
+  float extent = halfWidth + max(aaWorld, localUnitsPerPixel);
   float capExtent = isRoundCap ? extent : aaWorld;
   vec2 tangent = axisLen > 1e-6 ? axis / axisLen : vec2(1.0, 0.0);
   vec2 normal = vec2(-tangent.y, tangent.x);
@@ -132,6 +133,7 @@ void main() {
 const TRIANGLE_STROKE_FRAGMENT_SHADER_SOURCE = `#version 300 es
 precision highp float;
 ${STROKE_COVERAGE_GLSL}
+${STROKE_AREA_COVERAGE_GLSL}
 
 in vec4 vColor;
 in vec2 vStrokeCoord;
@@ -142,22 +144,14 @@ flat in float vIsRoundCap;
 out vec4 outColor;
 
 void main() {
+  vec2 pixelDx = dFdx(vStrokeCoord);
+  vec2 pixelDy = dFdy(vStrokeCoord);
   if (vColor.a <= 0.001) {
     discard;
   }
 
-  float edgeDistance = abs(vStrokeCoord.y) - vHalfWidth;
-  if (vIsRoundCap >= 0.5) {
-    if (vStrokeCoord.x < 0.0) {
-      edgeDistance = length(vStrokeCoord) - vHalfWidth;
-    } else if (vStrokeCoord.x > vAxisLength) {
-      edgeDistance = length(vec2(vStrokeCoord.x - vAxisLength, vStrokeCoord.y)) - vHalfWidth;
-    }
-  } else {
-    edgeDistance = max(edgeDistance, max(-vStrokeCoord.x, vStrokeCoord.x - vAxisLength));
-  }
-
-  float coverage = heprStrokeCoverage(edgeDistance + vHalfWidth, vHalfWidth, vAAWorld);
+  float coverage = heprLinearStrokeCoverage(vStrokeCoord, vec2(0.0), vec2(vAxisLength, 0.0),
+    vHalfWidth, pixelDx, pixelDy, vIsRoundCap);
   float alpha = coverage * vColor.a;
   if (alpha <= 0.001) {
     discard;

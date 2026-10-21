@@ -16,8 +16,9 @@ ${minimumWidthBody}}
 /**
  * Filter both sides of a stroke, including when its width is below one pixel.
  * A single signed-distance edge leaves a half-opaque line as width tends to
- * zero. Subtracting the opposite edge preserves the stroke's integrated ink
- * while retaining the existing filter for strokes wider than the AA radius.
+ * zero. Subtracting the opposite edge preserves integrated width across a
+ * straight interior, but not the 2D area of round caps. Curves retain this
+ * distance filter; straight strokes/dots use strokeAreaCoverageShaders.
  * Device hairlines supply their resolved half-pixel width at the call site.
  */
 const coverageBody = `

@@ -95,9 +95,9 @@ try {
       "ineligible open contours retain their original nonzero or even-odd fill rule");
     assert.match(fragment, /heprStrokeLodAlpha\(alpha, primitiveType\)/);
     const mixed = fnBody(fragment, "heprMixedVectorFragment");
-    assert(mixed.indexOf("dpdx(local.x)") < mixed.indexOf("if (kind"), "derivatives precede kind selection");
-    assert.equal((fragment.match(/dpdx\(/g) ?? []).length, 2);
-    assert.equal((fragment.match(/dpdy\(/g) ?? []).length, 2);
+    assert(mixed.indexOf("dpdx(local)") < mixed.indexOf("if (kind"), "derivatives precede kind selection");
+    assert.equal((fragment.match(/dpdx\(/g) ?? []).length, 1);
+    assert.equal((fragment.match(/dpdy\(/g) ?? []).length, 1);
     for (const [create, baselineName, mixedName] of [
       [createThreeWebGpuStrokeMaterial, "heprStrokeFragment", "heprMixedStrokeFragment"],
       [createThreeWebGpuFillMaterial, "heprFillFragment", "heprMixedFillFragment"]
@@ -105,7 +105,11 @@ try {
       const original = create(input), baseline = build(original.material, geometry).fragmentShader;
       const expected = fnBody(baseline, baselineName)
         .replaceAll("length(vec2<f32>(dpdx(local.x), dpdy(local.x)))", "pixelFootprint.x")
-        .replaceAll("length(vec2<f32>(dpdx(local.y), dpdy(local.y)))", "pixelFootprint.y");
+        .replaceAll("length(vec2<f32>(dpdx(local.y), dpdy(local.y)))", "pixelFootprint.y")
+        .replaceAll("length(vec2<f32>(pixelDx.x, pixelDy.x))", "pixelFootprint.x")
+        .replaceAll("length(vec2<f32>(pixelDx.y, pixelDy.y))", "pixelFootprint.y")
+        .replaceAll("dpdx(local)", "pixelDxInput")
+        .replaceAll("dpdy(local)", "pixelDyInput");
       assert.equal(fnBody(fragment, mixedName), expected, "mixed fragments retain exact existing paint and coverage math");
       original.material.dispose();
     }
@@ -131,7 +135,7 @@ try {
     const clippedShaders = build(clipped, geometry);
     assert.match(clippedShaders.fragmentShader, /heprVectorClip\(/);
     assert.match(clippedShaders.vertexShader, /aVectorClipIndex/, "per-instance clipping follows each mixed paint");
-    assert.equal((clippedShaders.fragmentShader.match(/dpdx\(/g) ?? []).length, 2,
+    assert.equal((clippedShaders.fragmentShader.match(/dpdx\(/g) ?? []).length, 1,
       "clip cloning retains the common derivative evaluation");
     const restore = setThreePdfShapeOnly(clipped, true); restore();
     clipped.dispose(); state.material.dispose();

@@ -1,3 +1,4 @@
+import { STROKE_AREA_COVERAGE_WGSL } from "./strokeAreaCoverageShaders";
 import { STROKE_MINIMUM_WIDTH_WGSL, STROKE_COVERAGE_WGSL } from "./strokeCoverageShaders";
 import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
@@ -292,6 +293,7 @@ ${vectorFillBandLoopWgsl({
 export const GRADIENT_STROKE_WGSL = /* wgsl */ `
 ${STROKE_MINIMUM_WIDTH_WGSL}
 ${STROKE_COVERAGE_WGSL}
+${STROKE_AREA_COVERAGE_WGSL}
 ${CAMERA_STRUCT}
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
 @group(0) @binding(1) var uRunMetaA : texture_2d<f32>;
@@ -364,7 +366,9 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
     max(0.35 * localPerPixel, 5e-5),
     hairline
   );
-  let extent = halfWidth + aaWorld;
+  let pixelPadding = 0.7071068 * localPerPixel;
+  var extent = halfWidth + pixelPadding;
+  if (primitiveB.z >= 0.5) { extent = halfWidth + max(aaWorld, pixelPadding); }
   let corner = cornerFromVertexIndex(vertexIndex) * 0.5 + 0.5;
   let world = mix(bounds.xy - vec2f(extent), bounds.zw + vec2f(extent), corner);
   let screen = (world - uCamera.cameraCenter) * uCamera.zoom + 0.5 * uCamera.viewport;
@@ -386,6 +390,8 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
 
 @fragment
 fn fsMain(inData : StrokeOut) -> @location(0) vec4f {
+  let pixelDx = dpdx(inData.local);
+  let pixelDy = dpdy(inData.local);
   // Keep derivative evaluation in uniform control flow, before clipping and
   // alpha tests can discard individual fragments.
   let dx = length(vec2f(dpdx(inData.local.x), dpdy(inData.local.x)));
@@ -397,13 +403,13 @@ fn fsMain(inData : StrokeOut) -> @location(0) vec4f {
     (inData.local.x < inData.clipBounds.x || inData.local.y < inData.clipBounds.y ||
       inData.local.x > inData.clipBounds.z || inData.local.y > inData.clipBounds.w)
   ) { discard; }
-  let distanceValue = select(
-    distanceToLine(inData.local, inData.p0, inData.p2),
-    distanceToQuadratic(inData.local, inData.p0, inData.p1, inData.p2),
-    uCamera.strokeCurveEnabled >= 0.5 && inData.primitiveType >= 0.5
-  );
   let aaWorld = max(localPerPixel * uCamera.strokeAAScreenPx, 5e-5);
-  let coverage = heprStrokeCoverage(distanceValue, inData.halfWidth, aaWorld);
+  var coverage: f32;
+  if (uCamera.strokeCurveEnabled >= 0.5 && inData.primitiveType >= 0.5) {
+    coverage = heprStrokeCoverage(distanceToQuadratic(inData.local, inData.p0, inData.p1, inData.p2), inData.halfWidth, aaWorld);
+  } else {
+    coverage = heprLinearStrokeCoverage(inData.local, inData.p0, inData.p2, inData.halfWidth, pixelDx, pixelDy, 1.0);
+  }
   let source = select(vec4f(inData.solidColor, 1.0), samplePdfGradient(inData.sourceGradient, inData.local), inData.sourceGradient >= 0);
   let maskAlpha = select(1.0, samplePdfGradient(inData.maskGradient, inData.local).a, inData.maskGradient >= 0);
   let alpha = coverage * inData.alpha * source.a * maskAlpha;

@@ -1595,6 +1595,7 @@ const performanceCapture = {
       gpuTimer: activeThreeRendererBackend === "webgpu" ? new ThreeWebGpuFrameTimer(renderer as never) : undefined
     });
     captureContext = {
+      url: window.location.href, heprVersion: __HEPR_PACKAGE_VERSION__,
       diagnosticsVersion: 3, threeRevision: THREE.REVISION, browser: navigator.userAgent,
       shaderErrorChecks: activeThreeRendererBackend === "webgl" ? (renderer as THREE.WebGLRenderer).debug.checkShaderErrors : null,
       initialCamera: describeThreePerformanceCamera(camera, controls.target),

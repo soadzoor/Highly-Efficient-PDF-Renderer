@@ -1,3 +1,4 @@
+import { threeWebGpuStrokeAreaCoverageFn } from "./threeWebGpuStrokeAreaCoverage";
 import { pageProjectionNode } from "./threeWebGpuPageTransforms";
 import type { ThreePageBinding } from "./threePageTransforms";
 import { STROKE_MINIMUM_WIDTH_WGSL, STROKE_COVERAGE_WGSL } from "./strokeCoverageShaders";
@@ -372,7 +373,7 @@ fn heprGradientStrokeWorldPack(
   halfWidth = heprMinimumStrokeHalfWidth(halfWidth, select(1.0 / max(zoom, 1e-12), localUnitsPerPixel, useLocalToClip >= 0.5), minimumStrokeWidthPx);
   var aaWorld = max(localUnitsPerPixel, 0.0001) * aaScreenPx;
   if (isHairline) { aaWorld = max(0.35 * localUnitsPerPixel, 0.00005); }
-  let extent = halfWidth + aaWorld;
+  let extent = halfWidth + max(aaWorld, localUnitsPerPixel);
   let world = heprStrokeQuadWorldPosition(corner * 0.5 + vec2<f32>(0.5), primitiveA.xy, primitiveA.zw, primitiveB.xy, primitiveBounds, extent);
   return vec4<f32>(world, halfWidth, aaWorld);
 }
@@ -388,24 +389,26 @@ fn heprGradientStrokeFragment(
   gradientMetaE: texture_2d<f32>, gradientLut: texture_2d<f32>, gradientMetaWidth: f32,
   sourceGradientIndex: f32, maskGradientIndex: f32, minimumStrokeWidthPx: f32, shapeOnly: f32
 ) -> vec4<f32> {
+  let pixelDx = dpdx(local);
+  let pixelDy = dpdy(local);
   // Evaluate derivatives in uniform control flow before alpha/clip discards.
-  let pixelToLocalX = length(vec2<f32>(dpdx(local.x), dpdy(local.x)));
-  let pixelToLocalY = length(vec2<f32>(dpdx(local.y), dpdy(local.y)));
+  let pixelToLocalX = length(vec2<f32>(pixelDx.x, pixelDy.x));
+  let pixelToLocalY = length(vec2<f32>(pixelDx.y, pixelDy.y));
   let styleFlags = floor(primitiveB.w / 2.0 + 0.000001);
   let alphaStyle = primitiveB.w - styleFlags * 2.0;
   if (alphaStyle <= 0.001 && shapeOnly < 0.5) { discard; }
   let hasClipBounds = heprGradientFloatMod(floor(styleFlags * 0.25), 2.0) >= 0.5;
   if (hasClipBounds && (local.x < primitiveBounds.x || local.y < primitiveBounds.y || local.x > primitiveBounds.z || local.y > primitiveBounds.w)) { discard; }
-  let distanceToSegment = select(
-    heprDistanceToLineSegment(local, primitiveA.xy, primitiveB.xy),
-    heprDistanceToQuadraticBezier(local, primitiveA.xy, primitiveA.zw, primitiveB.xy),
-    strokeCurveEnabled >= 0.5 && primitiveB.z >= 0.5
-  );
   let localPerPixel = max(max(pixelToLocalX, pixelToLocalY), 0.000001);
   let isHairline = heprGradientFloatMod(styleFlags, 2.0) >= 0.5;
   let halfWidth = heprMinimumStrokeHalfWidth(select(halfWidthFromVertex, max(0.5 * localPerPixel, 0.00001), isHairline), localPerPixel, minimumStrokeWidthPx);
   let aaWorld = max(localPerPixel * aaScreenPx, 0.00005);
-  let coverage = heprStrokeCoverage(distanceToSegment, halfWidth, aaWorld);
+  var coverage: f32;
+  if (strokeCurveEnabled >= 0.5 && primitiveB.z >= 0.5) {
+    coverage = heprStrokeCoverage(heprDistanceToQuadraticBezier(local, primitiveA.xy, primitiveA.zw, primitiveB.xy), halfWidth, aaWorld);
+  } else {
+    coverage = heprLinearStrokeCoverage(local, primitiveA.xy, primitiveB.xy, halfWidth, pixelDx, pixelDy, 1.0);
+  }
   let source = heprSamplePdfGradient(local, sourceGradientIndex, gradientMetaA, gradientMetaB, gradientMetaC, gradientMetaD, gradientMetaE, gradientLut, gradientMetaWidth);
   let mask = heprSamplePdfGradient(local, maskGradientIndex, gradientMetaA, gradientMetaB, gradientMetaC, gradientMetaD, gradientMetaE, gradientLut, gradientMetaWidth);
   let sourceColor = select(style.yzw, source.rgb, sourceGradientIndex >= -0.5);
@@ -419,6 +422,7 @@ fn heprGradientStrokeFragment(
 `, [
   includeNode(floatModFn),
   includeNode(strokeCoverageFn),
+  includeNode(threeWebGpuStrokeAreaCoverageFn),
   includeNode(minimumStrokeWidthFn),
   includeNode(distanceToLineSegmentFn),
   includeNode(distanceToQuadraticBezierFn),

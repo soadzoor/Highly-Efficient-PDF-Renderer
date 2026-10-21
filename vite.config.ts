@@ -34,11 +34,12 @@ export default defineConfig(({ mode }) => {
     };
   }
 
+  const { version } = JSON.parse(readFileSync(resolve(import.meta.dirname, "package.json"), "utf8"));
   return {
+    define: { __HEPR_PACKAGE_VERSION__: JSON.stringify(version) },
     plugins: [shaderCommentCompactionPlugin(sourceDir), {
       name: "package-version-label",
       transformIndexHtml(html) {
-        const { version } = JSON.parse(readFileSync(resolve(import.meta.dirname, "package.json"), "utf8"));
         return html.replaceAll("%HEPR_PACKAGE_VERSION%", version);
       }
     }],

@@ -1,3 +1,4 @@
+import { STROKE_AREA_COVERAGE_WGSL } from "./strokeAreaCoverageShaders";
 import { normalizeMinimumStrokeWidth } from "./minimumStrokeWidth";
 import { buildRasterRepeatInstances, type RasterRepeat } from "./rasterRepeat";
 import { buildCompactMonochromeAtlas, type CompactMonochromeAtlas } from "./compactMonochromeRaster";
@@ -250,6 +251,7 @@ fn heprLinearCoverageToOutputAlpha(coverage : f32) -> f32 {
 const STROKE_SHADER_SOURCE = /* wgsl */ `
 ${STROKE_MINIMUM_WIDTH_WGSL}
 ${STROKE_COVERAGE_WGSL}
+${STROKE_AREA_COVERAGE_WGSL}
 ${STROKE_DENSITY_WGSL}
 struct CameraUniforms {
   viewport : vec2f,
@@ -381,7 +383,9 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
     aaWorld = max(0.35 / max(uCamera.zoom, 1e-4), 5e-5);
   }
 
-  let extent = halfWidth + aaWorld;
+  let pixelPadding = 0.7071068 / max(uCamera.zoom, 1e-4);
+  var extent = halfWidth + pixelPadding;
+  if (isQuadratic) { extent = halfWidth + max(aaWorld, pixelPadding); }
   let corner01 = cornerFromVertexIndex(vertexIndex) * 0.5 + 0.5;
   let worldPosition = heprStrokeQuadWorldPosition(corner01, p0, p1, p2, primitiveBounds, extent);
 
@@ -410,6 +414,8 @@ ${VECTOR_CLIP_WGSL}
 
 @fragment
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
+  let pixelDx = dpdx(inData.local);
+  let pixelDy = dpdy(inData.local);
   if (inData.alpha <= 0.001) {
     discard;
   }
@@ -423,13 +429,12 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   }
 
   let useCurve = uCamera.strokeCurveEnabled >= 0.5 && inData.primitiveType >= 0.5;
-  let distanceToSegment = select(
-    heprDistanceToLineSegment(inData.local, inData.p0, inData.p2),
-    heprDistanceToQuadraticBezier(inData.local, inData.p0, inData.p1, inData.p2),
-    useCurve
-  );
-
-  let coverage = heprStrokeCoverage(distanceToSegment, inData.halfWidth, inData.aaWorld);
+  var coverage: f32;
+  if (useCurve) {
+    coverage = heprStrokeCoverage(heprDistanceToQuadraticBezier(inData.local, inData.p0, inData.p1, inData.p2), inData.halfWidth, inData.aaWorld);
+  } else {
+    coverage = heprLinearStrokeCoverage(inData.local, inData.p0, inData.p2, inData.halfWidth, pixelDx, pixelDy, 1.0);
+  }
   var alpha = heprLinearCoverageToOutputAlpha(coverage) * inData.alpha;
   alpha = heprStrokeLodAlpha(alpha, inData.primitiveType);
 

@@ -73,7 +73,7 @@ for (const [file, language] of [
 ]) {
   const source = await readFile(new URL(`../src/${file}`, import.meta.url), "utf8");
   assert(source.includes(`STROKE_COVERAGE_${language}`), `${file} includes the shared filter`);
-  assert(source.includes("heprStrokeCoverage("), `${file} applies the shared filter`);
+  assert(source.includes("heprLinearStrokeCoverage("), `${file} applies pixel-area coverage to straight strokes`);
   if (file !== "threeCompactedStrokeLayer.ts") {
     // Evaluate the actual vertex rejection clause independently of alpha.
     // A short segment can span many pixels after zoom and must reach the GPU.

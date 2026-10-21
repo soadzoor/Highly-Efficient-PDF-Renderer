@@ -1,3 +1,4 @@
+import { STROKE_AREA_COVERAGE_GLSL } from "./strokeAreaCoverageShaders";
 import { STROKE_MINIMUM_WIDTH_GLSL, STROKE_COVERAGE_GLSL } from "./strokeCoverageShaders";
 import { VECTOR_CELL_COVERAGE_GLSL } from "./vectorCellShaders";
 import { FILL_COVERAGE_GLSL, FILL_COVERAGE_VERTEX_GLSL } from "./fillCoverageShaders";
@@ -367,7 +368,10 @@ void main() {
     return;
   }
 
-  float extent = halfWidth + aaWorld;
+  float pixelPadding = localUnitsPerPixel;
+  if (uUseLocalToClip < 0.5 && primitiveType < 0.5) { pixelPadding *= 0.7071068; }
+  float extent = halfWidth + pixelPadding;
+  if (primitiveType >= 0.5) { extent = halfWidth + max(aaWorld, pixelPadding); }
   vec2 axisDelta = p2 - p0;
   float axisLength = length(axisDelta);
   vec2 axisU = axisLength > 1e-6 ? axisDelta / axisLength : vec2(1.0, 0.0);
@@ -414,6 +418,7 @@ export const GRADIENT_STROKE_FRAGMENT_SHADER_SOURCE = `#version 300 es
 precision highp float;
 ${STROKE_MINIMUM_WIDTH_GLSL}
 ${STROKE_COVERAGE_GLSL}
+${STROKE_AREA_COVERAGE_GLSL}
 precision highp sampler2D;
 
 uniform float uStrokeCurveEnabled;
@@ -489,8 +494,10 @@ float distanceToQuadratic(vec2 point, vec2 p0, vec2 p1, vec2 p2) {
 }
 
 void main() {
-  float dx = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
-  float dy = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
+  vec2 pixelDx = dFdx(vLocal);
+  vec2 pixelDy = dFdy(vLocal);
+  float dx = length(vec2(pixelDx.x, pixelDy.x));
+  float dy = length(vec2(pixelDx.y, pixelDy.y));
   float localPerPixel = max(max(dx, dy), 1e-6);
   if (vAlpha <= 0.001) discard;
   if (
@@ -498,12 +505,14 @@ void main() {
     (vLocal.x < vClipBounds.x || vLocal.y < vClipBounds.y || vLocal.x > vClipBounds.z || vLocal.y > vClipBounds.w)
   ) discard;
 
-  float distanceValue = uStrokeCurveEnabled >= 0.5 && vPrimitiveType >= 0.5
-    ? distanceToQuadratic(vLocal, vP0, vP1, vP2)
-    : distanceToLine(vLocal, vP0, vP2);
   float aaWorld = max(localPerPixel * uAAScreenPx, 5e-5);
   float halfWidth = heprMinimumStrokeHalfWidth(vIsHairline >= 0.5 ? max(0.5 * localPerPixel, 1e-5) : vHalfWidth, localPerPixel, uMinimumStrokeWidthPx);
-  float coverage = heprStrokeCoverage(distanceValue, halfWidth, aaWorld);
+  float coverage;
+  if (uStrokeCurveEnabled >= 0.5 && vPrimitiveType >= 0.5) {
+    coverage = heprStrokeCoverage(distanceToQuadratic(vLocal, vP0, vP1, vP2), halfWidth, aaWorld);
+  } else {
+    coverage = heprLinearStrokeCoverage(vLocal, vP0, vP2, halfWidth, pixelDx, pixelDy, 1.0);
+  }
 
   vec4 source = vSourceGradientIndex >= 0
     ? samplePdfGradient(vSourceGradientIndex, vLocal)

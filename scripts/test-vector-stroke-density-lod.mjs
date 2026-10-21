@@ -3,6 +3,8 @@ import { readFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
 import { STROKE_COVERAGE_GLSL, STROKE_COVERAGE_WGSL,
   STROKE_DENSITY_GLSL, STROKE_DENSITY_WGSL } from "../src/strokeCoverageShaders.ts";
+import { STROKE_AREA_COVERAGE_GLSL } from "../src/strokeAreaCoverageShaders.ts";
+import { evaluateGlsl } from "./lib/scalarShaderEval.mjs";
 
 const hooks = registerHooks({ resolve(s, c, n) {
   return n(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? s + ".ts" : s, c);
@@ -23,6 +25,8 @@ const coverage = scalar(STROKE_COVERAGE_GLSL, "distanceValue, halfWidth, aaWorld
 const coverageWgsl = scalar(STROKE_COVERAGE_WGSL, "distanceValue, halfWidth, aaWorld");
 const density = scalar(STROKE_DENSITY_GLSL, "alpha, primitiveType");
 const densityWgsl = scalar(STROKE_DENSITY_WGSL, "alpha, primitiveType");
+const areaCoverage = evaluateGlsl(STROKE_AREA_COVERAGE_GLSL, { atan: Math.atan2 }).heprLinearStrokeCoverage;
+const point = (x, y) => ({ x, y });
 for (const alpha of [0, 1e-8, .001, .02, .2, .5, .99, 1]) {
   for (const type of [0, 1]) assert.equal(density(alpha, type), alpha, "canonical lines and curves keep their exact alpha");
   for (const count of [1, 8, 64, 2048]) {
@@ -93,9 +97,8 @@ for (const finite of [false, true]) {
   }
 }
 
-// Independent round-capsule distance oracle uses the generated centerlines and
-// actual filter. It measures existing renderer ink, not ideal capsule area:
-// the existing finite-cap filter is not a two-dimensional area convolution.
+// Evaluate the actual pixel-area filter against the generated exact/LOD
+// centerlines, applying repeated source-over only after resolving coverage.
 function samples(scene) {
   const result = new Map();
   for (let id = 0; id < scene.segmentCount; id++) {
@@ -108,24 +111,23 @@ function samples(scene) {
   }
   return [...result.values()];
 }
-function sample(scene, x, y, units, prepared = samples(scene), aa = .75) {
+function sample(scene, x, y, units, prepared = samples(scene)) {
   let transmission = 1;
   for (const { row: [ax, ay, bx, by, radius], count } of prepared) {
-    const x0 = ax / units, y0 = ay / units, dx = (bx - ax) / units, dy = (by - ay) / units;
-    const t = dx * dx + dy * dy > 0 ? clamp(((x - x0) * dx + (y - y0) * dy) / (dx * dx + dy * dy), 0, 1) : 0;
-    const distance = Math.hypot(x - x0 - t * dx, y - y0 - t * dy);
-    transmission *= 1 - density(coverage(distance, radius / units, aa), 1 - count);
+    const alpha = areaCoverage(point(x, y), point(ax / units, ay / units), point(bx / units, by / units),
+      radius / units, point(1, 0), point(0, 1), 1);
+    transmission *= 1 - density(alpha, 1 - count);
   }
   return 1 - transmission;
 }
-function compareInk(scene, reduced, units, aa) {
+function compareInk(scene, reduced, units, extentMargin) {
   const source = samples(scene), target = samples(reduced);
   let ink = 0, reducedInk = 0, l1 = 0, maxError = 0;
-  const extent = Math.max(1.4, .2 / units + aa), steps = 88;
+  const extent = Math.max(1.4, .2 / units + extentMargin), steps = 88;
   for (let ix = 0; ix < steps; ix++) for (let iy = 0; iy < steps; iy++) {
     const x = ((ix + .37) / steps * 2 - 1) * extent;
     const y = ((iy + .61) / steps * 2 - 1) * extent;
-    const expected = sample(scene, x, y, units, source, aa), actual = sample(reduced, x, y, units, target, aa);
+    const expected = sample(scene, x, y, units, source), actual = sample(reduced, x, y, units, target);
     ink += expected; reducedInk += actual;
     l1 += Math.abs(expected - actual); maxError = Math.max(maxError, Math.abs(expected - actual));
   }
@@ -144,11 +146,11 @@ for (const pattern of ["eight corners", "eight segments", "repeated grid", "anti
   });
   const scene = makeScene(marks), levels = buildVectorStrokeLodScenes(scene);
   assert(levels.length > 1, `${pattern} produces actual weighted geometry`);
-  for (const units of [.4, 1, 4, 16, 64]) for (const aa of [.5, .75, 1]) {
+  for (const units of [.4, 1, 4, 16, 64]) for (const extentMargin of [.5, .75, 1]) {
     const selected = chooseLevel(levels, units);
     assert.equal(weights(selected.scene).reduce((a, b) => a + b), scene.segmentCount,
       "adaptive subdivision preserves total source multiplicity");
-    const errors = compareInk(scene, selected.scene, units, aa);
+    const errors = compareInk(scene, selected.scene, units, extentMargin);
     quality.push(errors);
     assert(errors.relativeInkError < .01, `${pattern} at ${units} units/px loses less than 1% integrated ink: ${JSON.stringify(errors)}`);
     assert(errors.relativeL1 < .025, `${pattern} keeps its spatial tone: ${JSON.stringify(errors)}`);

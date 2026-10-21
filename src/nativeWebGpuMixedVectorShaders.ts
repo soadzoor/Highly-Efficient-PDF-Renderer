@@ -56,6 +56,15 @@ export function buildNativeWebGpuMixedVectorShader(strokeSource: string, fillSou
   const footprint = /  \/\/ The path-space footprint of this pixel, taken before any discard\.\n(  let footprint = max\([\s\S]*?vec2f\(1e-4\)\);)/;
   const footprintMatch = fill.match(footprint);
   if (!footprintMatch) throw new Error("Missing mixed vector fill footprint");
+  stroke = stroke
+    .replace("  let pixelDx = dpdx(inData.local);\n  let pixelDy = dpdy(inData.local);\n", "")
+    .replace("fn MixedStrokeDataFragment(inData : MixedStrokeData)",
+      "fn MixedStrokeDataFragment(inData : MixedStrokeData, pixelDx : vec2f, pixelDy : vec2f)");
+  const pixelFootprint = footprintMatch[1]
+    .replaceAll("dpdx(inData.local.x)", "pixelDx.x")
+    .replaceAll("dpdy(inData.local.x)", "pixelDy.x")
+    .replaceAll("dpdx(inData.local.y)", "pixelDx.y")
+    .replaceAll("dpdy(inData.local.y)", "pixelDy.y");
   fill = fill.replace(footprint, "")
     .replace("fn MixedFillDataFragment(inData : MixedFillData)", "fn MixedFillDataFragment(inData : MixedFillData, footprint : vec2f)");
   return `${stroke}\n${fill}\n
@@ -104,7 +113,9 @@ fn vsMain(@builtin(vertex_index) vertexIndex: u32, @builtin(instance_index) inst
 @fragment
 fn fsMain(inData: MixedVectorData) -> @location(0) vec4f {
   // Derivatives must precede the per-instance dispatch, whose condition is not uniform.
-${footprintMatch[1]}
+  let pixelDx = dpdx(inData.local);
+  let pixelDy = dpdy(inData.local);
+${pixelFootprint}
   if (inData.kind == 0u) {
     var value: MixedStrokeData;
     value.local = inData.local; value.color = inData.color; value.alpha = inData.alpha;
@@ -113,7 +124,7 @@ ${footprintMatch[1]}
     value.halfWidth = inData.data1.z; value.aaWorld = inData.data1.w;
     value.primitiveType = inData.data2.x; value.hasClipBounds = inData.data2.y;
     value.clipBounds = inData.data3;
-    return MixedStrokeDataFragment(value);
+    return MixedStrokeDataFragment(value, pixelDx, pixelDy);
   }
   var value: MixedFillData;
   value.local = inData.local; value.color = inData.color; value.alpha = inData.alpha;

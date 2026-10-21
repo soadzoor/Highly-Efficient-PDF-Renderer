@@ -89,8 +89,10 @@ void main() {
 `;
 
 const fragmentStroke = branchSource(FRAGMENT_SHADER_SOURCE, "heprMixedStrokeFragment")
-  .replace("length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)))", "heprMixedLocalPerPixel.x")
-  .replace("length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)))", "heprMixedLocalPerPixel.y");
+  .replace("length(vec2(pixelDx.x, pixelDy.x))", "heprMixedLocalPerPixel.x")
+  .replace("length(vec2(pixelDx.y, pixelDy.y))", "heprMixedLocalPerPixel.y")
+  .replace("dFdx(vLocal)", "heprMixedPixelDx")
+  .replace("dFdy(vLocal)", "heprMixedPixelDy");
 const fragmentFill = withoutColorHelpers(branchSource(FILL_FRAGMENT_SHADER_SOURCE, "heprMixedFillFragment")
   .replace(VECTOR_INSTANCE_CLIP_GLSL, ""))
   // Reserved by some GLES compilers; changing the local name preserves reads.
@@ -100,7 +102,7 @@ const fragmentFill = withoutColorHelpers(branchSource(FILL_FRAGMENT_SHADER_SOURC
 
 export const MIXED_VECTOR_FRAGMENT_SHADER_SOURCE = mergeSources(
   // The branch helpers read this global after main computes it for every lane.
-  `vec2 heprMixedLocalPerPixel = vec2(0.0);\n${fragmentStroke}`, fragmentFill) + `
+  `vec2 heprMixedLocalPerPixel = vec2(0.0);\nvec2 heprMixedPixelDx = vec2(0.0);\nvec2 heprMixedPixelDy = vec2(0.0);\n${fragmentStroke}`, fragmentFill) + `
 flat in float vVectorKind;
 flat in vec4 vMixedA;
 flat in vec4 vMixedB;
@@ -110,9 +112,11 @@ flat in ivec3 vMixedSegments;
 
 void main() {
   // Derivatives precede the kind branch and either paint's early discards.
+  heprMixedPixelDx = dFdx(vLocal);
+  heprMixedPixelDy = dFdy(vLocal);
   heprMixedLocalPerPixel = vec2(
-    length(vec2(dFdx(vLocal.x), dFdy(vLocal.x))),
-    length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)))
+    length(vec2(heprMixedPixelDx.x, heprMixedPixelDy.x)),
+    length(vec2(heprMixedPixelDx.y, heprMixedPixelDy.y))
   );
   if (vVectorKind < 0.5) {
     vP0 = vMixedA.xy;

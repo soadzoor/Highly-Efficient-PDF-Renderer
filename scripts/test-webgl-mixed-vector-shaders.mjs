@@ -31,6 +31,7 @@ try {
     vFillRule: 1, vSegmentStart: 16777217, vSegmentCount: 16777219,
     vMixedA: null, vMixedB: null, vMixedC: null, vMixedD: null, vMixedSegments: null,
     vVectorKind: 0, vLocal: vec(2, 3), heprMixedLocalPerPixel: null,
+    heprMixedPixelDx: null, heprMixedPixelDy: null,
     uMixedVectorEnabled: vec(1, 1), gl_Position: vec(0, 0, 0, 1),
     vColor: vec(1, 1, 1), vAlpha: 1, vVectorClipIndex: -1
   };
@@ -52,9 +53,9 @@ try {
   }
 
   const main = functionBody(fragment, "main");
-  assert(main.indexOf("dFdx(vLocal.x)") < main.indexOf("if (vVectorKind"));
-  assert.equal((fragment.match(/dFdx\(/g) ?? []).length, 2);
-  assert.equal((fragment.match(/dFdy\(/g) ?? []).length, 2,
+  assert(main.indexOf("dFdx(vLocal)") < main.indexOf("if (vVectorKind"));
+  assert.equal((fragment.match(/dFdx\(/g) ?? []).length, 1);
+  assert.equal((fragment.match(/dFdy\(/g) ?? []).length, 1,
     "coverage derivatives are evaluated once before branch helpers can discard");
   for (const name of ["heprVectorClip", "heprThreeEncodeOutputColor", "heprThreeLinearCoverageToOutputAlpha"]) {
     assert.equal((fragment.match(new RegExp(`(?:float|vec4) ${name}\\(`, "g")) ?? []).length, 1,
@@ -125,8 +126,8 @@ function runEntry(source, fields) {
     function heprMixedFillVertex() { painted = "fill"; }
     function heprMixedStrokeFragment() { painted = "stroke"; }
     function heprMixedFillFragment() { painted = "fill"; }
-    function dFdx() { return 0.25; }
-    function dFdy() { return 0.5; }
+    function dFdx() { return vec2(0.25, 0.0); }
+    function dFdy() { return vec2(0.0, 0.5); }
     ${functionBody(source, "main").replace(/\breturn;/g, "return { gl_Position, painted };")}
     return { ${keys.join(", ")}, painted };
   `)(...keys.map(name => swizzled(fields[name])), constructor, constructor, constructor,

@@ -1,3 +1,4 @@
+import { STROKE_AREA_COVERAGE_GLSL } from "./strokeAreaCoverageShaders";
 import { TEXT_RASTER_ATLAS_PADDING_PX } from "./textRasterAtlasConstants";
 import { STROKE_MINIMUM_WIDTH_GLSL, STROKE_COVERAGE_GLSL, STROKE_DENSITY_GLSL } from "./strokeCoverageShaders";
 import { FILL_COVERAGE_GLSL, FILL_COVERAGE_VERTEX_GLSL } from "./fillCoverageShaders";
@@ -148,7 +149,12 @@ void main() {
     aaWorld = max(0.35 * localUnitsPerPixel, 5e-5);
   }
 
-  float extent = halfWidth + aaWorld;
+  float pixelPadding = localUnitsPerPixel;
+  if (uUseLocalToClip < 0.5 && !isQuadratic) {
+    pixelPadding *= 0.7071068;
+  }
+  float extent = halfWidth + pixelPadding;
+  if (isQuadratic) { extent = halfWidth + max(aaWorld, pixelPadding); }
   vec2 corner01 = aCorner * 0.5 + 0.5;
 
   // Candidate A: axis-aligned quad over the (possibly clip-intersected) primitive bounds.
@@ -289,9 +295,12 @@ float distanceToQuadraticBezier(vec2 p, vec2 a, vec2 b, vec2 c) {
 ${VECTOR_INSTANCE_CLIP_GLSL}
 ${STROKE_MINIMUM_WIDTH_GLSL}
 ${STROKE_COVERAGE_GLSL}
+${STROKE_AREA_COVERAGE_GLSL}
 ${STROKE_DENSITY_GLSL}
 
 void main() {
+  vec2 pixelDx = dFdx(vLocal);
+  vec2 pixelDy = dFdy(vLocal);
   if (vAlpha <= 0.001) {
     discard;
   }
@@ -303,18 +312,19 @@ void main() {
     discard;
   }
 
-  float distanceToSegment = (uStrokeCurveEnabled >= 0.5 && vPrimitiveType >= 0.5)
-    ? distanceToQuadraticBezier(vLocal, vP0, vP1, vP2)
-    : distanceToLineSegment(vLocal, vP0, vP2);
-
-  float pixelToLocalX = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
-  float pixelToLocalY = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
+  float pixelToLocalX = length(vec2(pixelDx.x, pixelDy.x));
+  float pixelToLocalY = length(vec2(pixelDx.y, pixelDy.y));
   float localPerPixel = max(max(pixelToLocalX, pixelToLocalY), 1e-6);
   float aaWorld = max(localPerPixel * uAAScreenPx, 5e-5);
   float halfWidth = vIsHairline >= 0.5 ? max(0.5 * localPerPixel, 1e-5) : vHalfWidth;
   halfWidth = heprMinimumStrokeHalfWidth(halfWidth, localPerPixel, uMinimumStrokeWidthPx);
 
-  float coverage = heprStrokeCoverage(distanceToSegment, halfWidth, aaWorld);
+  float coverage;
+  if (uStrokeCurveEnabled >= 0.5 && vPrimitiveType >= 0.5) {
+    coverage = heprStrokeCoverage(distanceToQuadraticBezier(vLocal, vP0, vP1, vP2), halfWidth, aaWorld);
+  } else {
+    coverage = heprLinearStrokeCoverage(vLocal, vP0, vP2, halfWidth, pixelDx, pixelDy, 1.0);
+  }
   float alpha = heprThreeLinearCoverageToOutputAlpha(coverage) * vAlpha;
   alpha = heprStrokeLodAlpha(alpha, vPrimitiveType);
 

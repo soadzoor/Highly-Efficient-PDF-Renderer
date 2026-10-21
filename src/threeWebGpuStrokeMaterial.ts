@@ -1,3 +1,4 @@
+import { threeWebGpuStrokeAreaCoverageFn } from "./threeWebGpuStrokeAreaCoverage";
 import { pageProjectionNode } from "./threeWebGpuPageTransforms";
 import type { ThreePageBinding } from "./threePageTransforms";
 import { STROKE_MINIMUM_WIDTH_WGSL, STROKE_COVERAGE_WGSL, STROKE_DENSITY_WGSL } from "./strokeCoverageShaders";
@@ -171,7 +172,7 @@ fn heprStrokeWorldPack(
     aaWorld = max(0.35 * localUnitsPerPixel, 0.00005);
   }
 
-  let extent = halfWidth + aaWorld;
+  let extent = halfWidth + max(aaWorld, localUnitsPerPixel);
   let corner01 = corner * 0.5 + vec2<f32>(0.5);
   let worldPosition = heprStrokeQuadWorldPosition(corner01, p0, p1, p2, primitiveBounds, extent);
 
@@ -228,6 +229,8 @@ fn heprStrokeFragment(
   minimumStrokeWidthPx: f32,
   shapeOnly: f32
 ) -> vec4<f32> {
+  let pixelDx = dpdx(local);
+  let pixelDy = dpdy(local);
   let p0 = primitiveA.xy;
   let p1 = primitiveA.zw;
   let p2 = primitiveB.xy;
@@ -248,15 +251,8 @@ fn heprStrokeFragment(
     discard;
   }
 
-  var distanceToSegment: f32;
-  if (strokeCurveEnabled >= 0.5 && primitiveType >= 0.5) {
-    distanceToSegment = heprDistanceToQuadraticBezier(local, p0, p1, p2);
-  } else {
-    distanceToSegment = heprDistanceToLineSegment(local, p0, p2);
-  }
-
-  let pixelToLocalX = length(vec2<f32>(dpdx(local.x), dpdy(local.x)));
-  let pixelToLocalY = length(vec2<f32>(dpdx(local.y), dpdy(local.y)));
+  let pixelToLocalX = length(vec2<f32>(pixelDx.x, pixelDy.x));
+  let pixelToLocalY = length(vec2<f32>(pixelDx.y, pixelDy.y));
   let localPerPixel = max(max(pixelToLocalX, pixelToLocalY), 0.000001);
   let isHairline = heprFloatMod(styleFlags, 2.0) >= 0.5;
   let aaWorld = max(localPerPixel * aaScreenPx, 0.00005);
@@ -266,7 +262,12 @@ fn heprStrokeFragment(
   }
 
   halfWidth = heprMinimumStrokeHalfWidth(halfWidth, localPerPixel, minimumStrokeWidthPx);
-  let coverage = heprStrokeCoverage(distanceToSegment, halfWidth, aaWorld);
+  var coverage: f32;
+  if (strokeCurveEnabled >= 0.5 && primitiveType >= 0.5) {
+    coverage = heprStrokeCoverage(heprDistanceToQuadraticBezier(local, p0, p1, p2), halfWidth, aaWorld);
+  } else {
+    coverage = heprLinearStrokeCoverage(local, p0, p2, halfWidth, pixelDx, pixelDy, 1.0);
+  }
   var alpha = coverage * alphaStyle;
   alpha = heprStrokeLodAlpha(alpha, primitiveType);
   if (alpha <= 0.0) {
@@ -283,6 +284,7 @@ const fragmentDependencies = [
   includeNode(minimumStrokeWidthFn),
   includeNode(floatModFn),
   includeNode(strokeCoverageFn),
+  includeNode(threeWebGpuStrokeAreaCoverageFn),
   includeNode(strokeDensityFn),
   includeNode(distanceToLineSegmentFn),
   includeNode(distanceToQuadraticBezierFn)

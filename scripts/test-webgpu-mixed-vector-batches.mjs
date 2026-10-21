@@ -61,8 +61,8 @@ try {
     assert.match(output, /@interpolate\(flat\) indices: vec3i/, "fill addresses and path IDs retain integer precision");
     const fragment = shader.slice(shader.lastIndexOf("@fragment"));
     assert(fragment.indexOf("dpdx(") < fragment.indexOf("if (inData.kind"));
-    assert.equal((shader.match(/dpdx\(/g) ?? []).length, 2);
-    assert.equal((shader.match(/dpdy\(/g) ?? []).length, 2);
+    assert.equal((shader.match(/dpdx\(/g) ?? []).length, 1);
+    assert.equal((shader.match(/dpdy\(/g) ?? []).length, 1);
     const stroke = { position: vec(1, 2, 3, 4), local: vec(5, 6), color: vec(.1, .2, .3), alpha: .4,
       vectorClipIndex: 7, p0: vec(8, 9), p1: vec(10, 11), p2: vec(12, 13),
       halfWidth: 14, aaWorld: 15, primitiveType: -3, hasClipBounds: 1, clipBounds: vec(16, 17, 18, 19) };
@@ -233,7 +233,8 @@ function executeWrapper(source, name, scope, args) {
     .replace(/let footprint = max\([\s\S]*?vec2f\(1e-4\)\);/, "let footprint = vec2f(1, 1);")
     .replace(/\bvar (\w+): \w+;/g, "let $1 = {};")
     .replace(/\b(\d+)u\b/g, "$1");
-  const context = { vec2f: vec, vec2i: vec, vec3i: vec, vec4f: vec, ...scope };
+  const context = { vec2f: vec, vec2i: vec, vec3i: vec, vec4f: vec,
+    dpdx: () => vec(1, 0), dpdy: () => vec(0, 1), ...scope };
   const parameters = name === "vsMain" ? ["vertexIndex", "instanceIndex"] : ["inData"];
   return new Function(...Object.keys(context), ...parameters, body)(...Object.values(context), ...args);
 }

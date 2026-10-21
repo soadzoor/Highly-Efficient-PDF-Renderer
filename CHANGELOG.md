@@ -6,6 +6,11 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Added
+
+- Include the page URL and build's HEPR package version in native and Three.js
+  demo performance captures so exported measurements identify their source.
+
 ### Changed
 
 - Replace the minimum stroke width checkbox in both demos with a numeric
@@ -14,6 +19,14 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   setter accept numbers or legacy booleans (`false` = `0`, `true` = `1`);
   `getMinimumStrokeWidth()` now returns the numeric width. Reject negative and
   non-finite API values and widen visibility and paint-overlap bounds as needed.
+
+### Fixed
+
+- Use pixel-area antialiasing for straight vector strokes and round dots across
+  native and Three.js WebGL/WebGPU, including gradients and mixed vector batches.
+  Reduce excess darkness around tiny round caps and preserve subpixel coverage
+  through rotation and scaling. Keep minimum stroke width as a separate display
+  adjustment, disabled by default. Curved strokes retain their existing filter.
 
 ## [0.1.69] - 2026-10-21
 

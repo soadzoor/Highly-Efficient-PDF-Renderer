@@ -829,6 +829,7 @@ const performanceCapture = {
     captureProfiler?.stop();
     captureProfiler = renderer.getPerformanceProfiler();
     captureContext = {
+      url: window.location.href, heprVersion: __HEPR_PACKAGE_VERSION__,
       document: lastParsedSceneLabel, backend: renderer instanceof WebGlFloorplanRenderer ? "webgl" : "webgpu",
       browser: navigator.userAgent,
       mixedVectorBatching: renderer.getMixedVectorBatchingEnabled?.() ?? null,

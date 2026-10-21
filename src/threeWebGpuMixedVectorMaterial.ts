@@ -78,9 +78,13 @@ fn heprMixedWorldPack(
 /** Reuse exact paint coverage while supplying uniform derivatives from the caller. */
 function mixedFragmentSource(source: string, name: string): string {
   return source.replace(/fn hepr(?:Stroke|Fill)Fragment\(/, `fn ${name}(`)
-    .replace("shapeOnly: f32\n)", "shapeOnly: f32,\n  pixelFootprint: vec2<f32>\n)")
+    .replace("shapeOnly: f32\n)", "shapeOnly: f32,\n  pixelFootprint: vec2<f32>,\n  pixelDxInput: vec2<f32>, pixelDyInput: vec2<f32>\n)")
     .replaceAll("length(vec2<f32>(dpdx(local.x), dpdy(local.x)))", "pixelFootprint.x")
-    .replaceAll("length(vec2<f32>(dpdx(local.y), dpdy(local.y)))", "pixelFootprint.y");
+    .replaceAll("length(vec2<f32>(dpdx(local.y), dpdy(local.y)))", "pixelFootprint.y")
+    .replaceAll("length(vec2<f32>(pixelDx.x, pixelDy.x))", "pixelFootprint.x")
+    .replaceAll("length(vec2<f32>(pixelDx.y, pixelDy.y))", "pixelFootprint.y")
+    .replaceAll("dpdx(local)", "pixelDxInput")
+    .replaceAll("dpdy(local)", "pixelDyInput");
 }
 
 const strokeFragmentFn: unknown = TSL.wgslFn(
@@ -101,15 +105,17 @@ fn heprMixedVectorFragment(
   vectorOverride: vec4<f32>, minimumStrokeWidthPx: f32, shapeOnly: f32
 ) -> vec4<f32> {
   // Both paints can discard. Evaluate derivatives before their divergent branch.
-  let pixelFootprint = vec2<f32>(length(vec2<f32>(dpdx(local.x), dpdy(local.x))),
-    length(vec2<f32>(dpdx(local.y), dpdy(local.y))));
+  let pixelDx = dpdx(local);
+  let pixelDy = dpdy(local);
+  let pixelFootprint = vec2<f32>(length(vec2<f32>(pixelDx.x, pixelDy.x)),
+    length(vec2<f32>(pixelDx.y, pixelDy.y)));
   if (kind < 0.5) {
     return heprMixedStrokeFragment(local, dataA, dataB, dataC, dataD, halfWidth,
-      curveEnabled, strokeAAScreenPx, vectorOverride, minimumStrokeWidthPx, shapeOnly, pixelFootprint);
+      curveEnabled, strokeAAScreenPx, vectorOverride, minimumStrokeWidthPx, shapeOnly, pixelFootprint, pixelDx, pixelDy);
   }
   return heprMixedFillFragment(local, dataA, dataB, dataC, segmentTexA, segmentTexB,
     segmentWidth, pathIndex, bandBase, bandEntries, cellHeaders,
-    fillAAScreenPx, vectorOverride, shapeOnly, pixelFootprint);
+    fillAAScreenPx, vectorOverride, shapeOnly, pixelFootprint, pixelDx, pixelDy);
 }
 `, [strokeFragmentFn, fillFragmentFn]);
 
