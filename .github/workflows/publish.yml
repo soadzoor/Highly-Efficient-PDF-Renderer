@@ -73,9 +73,25 @@ jobs:
 
       - name: Publish package
         if: steps.registry.outputs.already-published != 'true'
+        shell: bash
         env:
           NPM_DIST_TAG: ${{ steps.registry.outputs.npm-tag }}
-        run: npm publish --access public --tag "$NPM_DIST_TAG"
+        run: |
+          publish_log="$(mktemp "$RUNNER_TEMP/hepr-npm-publish.XXXXXX")"
+          trap 'rm -f "$publish_log"' EXIT
+          for attempt in 1 2 3; do
+            if npm publish --access public --tag "$NPM_DIST_TAG" 2>&1 | tee "$publish_log"; then
+              exit 0
+            fi
+            if ! grep -q 'TLOG_CREATE_ENTRY_ERROR' "$publish_log" ||
+               ! grep -q 'equivalent entry already exists in the transparency log' "$publish_log" ||
+               [ "$attempt" -eq 3 ]; then
+              echo "::error::npm publication failed. Re-run failed jobs for this release tag; do not bump the version."
+              exit 1
+            fi
+            echo "::warning::Sigstore returned a duplicate transparency-log entry; retrying npm publish (attempt $((attempt + 1))/3)."
+            sleep "$((attempt * 10))"
+          done
 
       - name: Create or update GitHub Release notes
         env:

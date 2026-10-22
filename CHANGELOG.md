@@ -6,6 +6,14 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Fixed
+
+- Retry npm publication when Sigstore reports a duplicate transparency-log
+  entry, retaining provenance and failing immediately on other publish errors.
+  Document how to rerun a failed publication for its existing release tag and
+  clarify that successful local release/demo deployment does not confirm npm
+  publication.
+
 ## [0.1.70] - 2026-10-21
 
 ### Added

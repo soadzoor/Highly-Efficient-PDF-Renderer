@@ -109,6 +109,10 @@ The next patch after `0.1.56` is `0.1.57`; the release command determines and
 writes the version, so leave pending notes under `Unreleased` until then. The
 finalizer leaves an empty `Unreleased` section ready for subsequent changes.
 
+`npm run release-and-deploy` runs the same release command and then builds and
+pushes the demo artifacts. npm publication runs separately in GitHub Actions;
+successful local completion or demo deployment does not confirm publication.
+
 If a build or version hook fails after the version bump, stop and inspect the
 working tree: the package version may already be modified. Resolve the failure
 and review that state before retrying; rerunning blindly can bump it again.
@@ -119,6 +123,15 @@ changelog version agree. The **Publish to npm** workflow publishes the package,
 then creates or updates the GitHub Release with that version's curated notes.
 The npm package includes `CHANGELOG.md`. Publishing failures do not create a
 GitHub Release; check the workflow result even after the local command succeeds.
+
+The publish step retries npm's duplicate Sigstore transparency-log error up to
+three attempts, waiting 10 and then 20 seconds, while keeping provenance enabled.
+Other publication errors fail immediately. If a version is missing from npm,
+open the failed **Publish to npm** run in GitHub Actions and choose **Re-run failed
+jobs**. This retries the existing tag without changing its version or Git history.
+Do not rerun `release-new-version` or `release-and-deploy` to repair publication:
+they create another patch version.
+
 If npm publication succeeded but the GitHub Release step failed, rerun that
 workflow job. It skips npm publication only when the registry identifies the
 same version and source commit, then retries the release notes. Other registry

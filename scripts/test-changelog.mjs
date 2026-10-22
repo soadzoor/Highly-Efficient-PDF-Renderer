@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -319,4 +320,106 @@ test("publish workflow stops on GitHub authorization or service errors without c
     await assert.rejects(() => h.run(), new RegExp(`GitHub Release lookup.*${status}`, "i"));
     assert.equal(h.commands.length, 0);
   }
+});
+
+async function publishHarness(t, failures = [], npmTag = "latest") {
+  const source = await readFile(new URL("../.github/workflows/publish.yml", import.meta.url), "utf8");
+  const step = source.match(/      - name: Publish package\n([\s\S]*?)(?=\n      - name:)/)?.[1];
+  assert.match(step, /^        shell: bash$/m, "explicit Bash enables pipefail for the npm/tee pipeline");
+  const script = step.match(/        run: \|\n([\s\S]*)/)[1].replace(/^          /gm, "");
+  const root = await mkdtemp(join(tmpdir(), "hep-publish-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const commandsPath = join(root, "commands.json");
+  const delaysPath = join(root, "delays.json");
+  await writeFile(join(root, "package.json"), '{"type":"module"}');
+  await writeFile(commandsPath, "[]");
+  await writeFile(delaysPath, "[]");
+  await writeFile(join(root, "npm"), `#!/usr/bin/env node
+import { readFileSync, writeFileSync } from "node:fs";
+const commands = JSON.parse(readFileSync(process.env.HEPR_PUBLISH_COMMANDS, "utf8"));
+commands.push(process.argv.slice(2));
+writeFileSync(process.env.HEPR_PUBLISH_COMMANDS, JSON.stringify(commands));
+const failure = JSON.parse(process.env.HEPR_PUBLISH_FAILURES)[commands.length - 1];
+if (failure) {
+  console.error(failure);
+  process.exit(1);
+}
+console.log("Published fixture package.");
+`, { mode: 0o755 });
+  await writeFile(join(root, "sleep"), `#!/usr/bin/env node
+import { readFileSync, writeFileSync } from "node:fs";
+const delays = JSON.parse(readFileSync(process.env.HEPR_PUBLISH_DELAYS, "utf8"));
+delays.push(process.argv[2]);
+writeFileSync(process.env.HEPR_PUBLISH_DELAYS, JSON.stringify(delays));
+`, { mode: 0o755 });
+  const result = spawnSync("bash", ["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${root}:${process.env.PATH}`,
+      RUNNER_TEMP: root,
+      NPM_DIST_TAG: npmTag,
+      HEPR_PUBLISH_COMMANDS: commandsPath,
+      HEPR_PUBLISH_DELAYS: delaysPath,
+      HEPR_PUBLISH_FAILURES: JSON.stringify(failures)
+    }
+  });
+  assert.ifError(result.error);
+  return {
+    status: result.status,
+    output: result.stdout + result.stderr,
+    commands: JSON.parse(await readFile(commandsPath, "utf8")),
+    delays: JSON.parse(await readFile(delaysPath, "utf8"))
+  };
+}
+
+const duplicateProvenanceError = "npm error code TLOG_CREATE_ENTRY_ERROR\n" +
+  "npm error error creating tlog entry - (409) an equivalent entry already exists in the transparency log with UUID fixture";
+
+test("npm publishing succeeds immediately for stable and prerelease dist-tags", async t => {
+  for (const npmTag of ["latest", "next"]) {
+    const h = await publishHarness(t, [], npmTag);
+    assert.equal(h.status, 0, h.output);
+    assert.deepEqual(h.commands, [["publish", "--access", "public", "--tag", npmTag]]);
+    assert.deepEqual(h.delays, []);
+    assert.doesNotMatch(h.output, /::warning::|::error::/);
+  }
+});
+
+test("npm publishing retries duplicate Sigstore entries with provenance still enabled", async t => {
+  const h = await publishHarness(t, [duplicateProvenanceError, duplicateProvenanceError]);
+  assert.equal(h.status, 0, h.output);
+  assert.equal(h.commands.length, 3);
+  for (const command of h.commands) {
+    assert.deepEqual(command, ["publish", "--access", "public", "--tag", "latest"]);
+  }
+  assert.deepEqual(h.delays, ["10", "20"]);
+  assert.match(h.output, /::warning::Sigstore/);
+  assert.doesNotMatch(h.output, /::error::/);
+});
+
+test("npm publishing fails after three duplicate Sigstore errors", async t => {
+  const h = await publishHarness(t, Array(3).fill(duplicateProvenanceError));
+  assert.equal(h.status, 1, h.output);
+  assert.equal(h.commands.length, 3);
+  assert.deepEqual(h.delays, ["10", "20"]);
+  assert.match(h.output, /::error::npm publication failed.*do not bump the version/);
+});
+
+test("npm publishing does not retry authentication, version conflicts or other provenance errors", async t => {
+  for (const failure of [
+    "npm error code E401\nnpm error Unauthorized",
+    "npm error code E403\nnpm error You cannot publish over the previously published versions",
+    "npm error code TLOG_CREATE_ENTRY_ERROR\nnpm error unexpected provenance failure",
+    "npm error equivalent entry already exists in the transparency log"
+  ]) {
+    const h = await publishHarness(t, [failure]);
+    assert.equal(h.status, 1, h.output);
+    assert.equal(h.commands.length, 1);
+    assert.deepEqual(h.delays, []);
+  }
+  const h = await publishHarness(t, [duplicateProvenanceError, "npm error code E401"]);
+  assert.equal(h.status, 1, h.output);
+  assert.equal(h.commands.length, 2);
+  assert.deepEqual(h.delays, ["10"]);
 });
