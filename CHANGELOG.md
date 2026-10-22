@@ -6,6 +6,8 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+## [0.1.71] - 2026-10-22
+
 ### Changed
 
 - Rename the native renderer classes and source modules to `WebGlPdfRenderer`
@@ -642,7 +644,7 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   shadings, and physical press calibration are tracked in the
   [follow-up checklist](docs/development.md#font-local-postscript-follow-ups).
 
-[Unreleased]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.70...HEAD
+[Unreleased]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.71...HEAD
 [0.1.57]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.56...v0.1.57
 [0.1.58]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.57...v0.1.58
 [0.1.59]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.58...v0.1.59
@@ -657,3 +659,4 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 [0.1.68]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.67...v0.1.68
 [0.1.69]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.68...v0.1.69
 [0.1.70]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.69...v0.1.70
+[0.1.71]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.70...v0.1.71
