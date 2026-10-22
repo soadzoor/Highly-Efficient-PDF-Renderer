@@ -8,7 +8,7 @@ const hooks = registerHooks({ resolve(s, c, n) {
   return n(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? `${s}.ts` : s, c);
 } });
 try {
-  const { WebGlFloorplanRenderer: Renderer } = await import("../src/webGlFloorplanRenderer.ts");
+  const { WebGlPdfRenderer: Renderer } = await import("../src/webGlPdfRenderer.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { packVectorClips, vectorClipChainBounds, UNBOUNDED_VECTOR_CLIP_BOUNDS } = await import("../src/vectorClips.ts");
   const { VECTOR_INSTANCE_CLIP_GLSL } = await import("../src/vectorClipShaders.ts");

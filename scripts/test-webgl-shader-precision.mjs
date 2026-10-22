@@ -109,7 +109,7 @@ for (const address of [2 ** 23 - 1, 2 ** 23 + 1, 2 ** 24 - 1]) {
     "cell records preserve high odd texture addresses");
 }
 for (const file of ["nativeWebGlCoreShaders.ts", "nativeGradientWebGlShaders.ts", "nativeGradientWebGpuShaders.ts",
-  "webGpuFloorplanRenderer.ts", "threeWebGpuFillMaterial.ts", "threeWebGpuTextMaterial.ts",
+  "webGpuPdfRenderer.ts", "threeWebGpuFillMaterial.ts", "threeWebGpuTextMaterial.ts",
   "threeWebGpuGradientMaterial.ts", "threeWebGpuStrokeMaterial.ts", "threeTriangleStrokeLayer.ts",
   "threeMaterialGradientLayer.ts"]) {
   assert.doesNotMatch(readFileSync(root + file, "utf8"), /\b(?:int|i32)\([A-Za-z_]\w*(?:\.[xyzw])? \+ 0\.5\)/,

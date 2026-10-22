@@ -5,14 +5,14 @@ const hooks = registerHooks({ resolve(s, c, n) {
   return n(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? `${s}.ts` : s, c);
 } });
 try {
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { WebGlPaintCompositor } = await import("../src/webGlPaintCompositor.ts");
 
   for (const capacity of [16, 19, 26, 27, 32]) {
     const mock = mockGl(capacity);
     // This fixture exercises the separate programs' shared binding cache.
-    const r = new WebGlFloorplanRenderer({ getContext: () => mock.gl }, { mixedVectorBatching: false });
+    const r = new WebGlPdfRenderer({ getContext: () => mock.gl }, { mixedVectorBatching: false });
     assert.equal(mock.calls.filter(([name, key]) => name === "getParameter" && key === 1).length, 1,
       "sampler capacity is queried once at construction");
     assert.equal(r.orderedDedicatedTextureUnits, capacity >= 19);

@@ -10,7 +10,7 @@ const original = new Map(["OffscreenCanvas", "document", "requestAnimationFrame"
 const canvases = [];
 try {
   const { buildStrokeScene } = await import("../src/strokeSceneBuilder.ts");
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
   const { ThumbnailSceneRenderer, renderThumbnailScene } = await import("../src/thumbnailRenderer.ts");
   setGlobal("requestAnimationFrame", () => { throw new Error("Thumbnail work must not schedule RAF."); });
   setGlobal("cancelAnimationFrame", () => { throw new Error("Thumbnail work must not cancel RAF."); });
@@ -108,15 +108,18 @@ try {
   const lineworkBefore = structuredClone(linework);
   const lineworkPixels = await service.render(linework, { ...options, maxDimension: 10 });
   assert.deepEqual([lineworkPixels.width, lineworkPixels.height], [10, 5]);
-  const minimumHalfWidth = .5 / Math.min(10 / 101, 5 / 53), localLinework = renderer.scene;
+  const localLinework = renderer.scene;
   for (const key of ["styles", "gradientStrokeStyles"]) {
-    assert.notEqual(localLinework[key], linework[key], "overview style arrays are privately owned before setScene uploads them");
+    assert.equal(localLinework[key], linework[key], "overview rendering reuses source styles without copying or widening them");
     assert.equal(localLinework[key][0], 0, "native device hairlines retain zero half-width");
-    assert(Math.abs(localLinework[key][4] - minimumHalfWidth) < 1e-6, "thin positive half-widths use the actual rounded viewport scale");
+    assert.equal(localLinework[key][4], lineworkBefore[key][4], "thin positive half-widths retain source geometry");
     assert.equal(localLinework[key][8], 20, "larger source widths remain unchanged");
     assert.deepEqual([...localLinework[key]].filter((_, index) => index % 4), [...linework[key]].filter((_, index) => index % 4),
-      "overview widening preserves all style color channels");
+      "overview rendering preserves all style color channels");
   }
+  assert.equal(localLinework.maxHalfWidth, linework.maxHalfWidth, "the display floor does not rewrite source width metadata");
+  const widths = canvas.calls.filter(call => call[0] === "uniform1f" && call[1].name === "uMinimumStrokeWidthPx");
+  assert(widths.length > 0 && widths.every(call => call[2] === 1), "solid and gradient thumbnail shaders use the shared one-output-pixel minimum across sizes");
   assert.deepEqual(linework, lineworkBefore, "stronger overview linework never changes canonical geometry, styles, clips or width metadata");
   const cancelled = new AbortController(); cancelled.abort(new Error("removed PDF"));
   await assert.rejects(async () => service.render(scene, options, cancelled.signal), /removed PDF/);
@@ -141,8 +144,8 @@ try {
   await assert.rejects(renderThumbnailScene(scene, options), error => error.code === "thumbnail.webgl-unavailable");
 
   const interactiveCanvas = mockCanvas(2, 1), thumbnailCanvas = mockCanvas(2, 1);
-  const interactive = new WebGlFloorplanRenderer(interactiveCanvas);
-  const thumbnail = new WebGlFloorplanRenderer(thumbnailCanvas, { thumbnail: true });
+  const interactive = new WebGlPdfRenderer(interactiveCanvas);
+  const thumbnail = new WebGlPdfRenderer(thumbnailCanvas, { thumbnail: true });
   assert(thumbnailCanvas.calls.filter(call => call[0] === "createProgram").length < interactiveCanvas.calls.filter(call => call[0] === "createProgram").length,
     "snapshot construction omits interactive shader programs");
   assert(thumbnailCanvas.calls.filter(call => call[0] === "createBuffer").length < interactiveCanvas.calls.filter(call => call[0] === "createBuffer").length,

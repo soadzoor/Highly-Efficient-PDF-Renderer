@@ -27,7 +27,7 @@ import {
   type RasterTilePlan
 } from "./rasterTiles";
 import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
-import type { ViewState } from "./webGlFloorplanRenderer";
+import type { ViewState } from "./webGlPdfRenderer";
 import { detectMonochromeRaster, type MonochromeRaster } from "./monochromeRaster";
 import { monochromeRasterFragmentGlsl } from "./monochromeRasterWebGlShader";
 import { pagePlaceholderTime, pagePlaceholderVertexGlsl, pagePlaceholderFragmentGlsl } from "./pageLoadingPlaceholder";

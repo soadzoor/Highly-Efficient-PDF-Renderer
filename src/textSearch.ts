@@ -2,7 +2,7 @@ import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import type { RendererApi, SearchHighlightSet } from "./rendererTypes";
 import { computeCharRangeHighlightBounds } from "./sceneTextGeometry";
 import type { OptionalContentSnapshot } from "./optionalContent";
-import type { ViewState } from "./webGlFloorplanRenderer";
+import type { ViewState } from "./webGlPdfRenderer";
 import { isSceneTextCharVisible } from "./optionalContentText";
 
 export interface TextSearchMatch {

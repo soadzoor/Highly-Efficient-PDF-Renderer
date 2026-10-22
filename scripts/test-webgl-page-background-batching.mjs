@@ -5,9 +5,9 @@ const hooks = registerHooks({ resolve(s, c, next) {
   return next(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? `${s}.ts` : s, c);
 } });
 try {
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
   const mock = mockGl();
-  const renderer = new WebGlFloorplanRenderer({ width: 1920, height: 945, getContext: () => mock.gl });
+  const renderer = new WebGlPdfRenderer({ width: 1920, height: 945, getContext: () => mock.gl });
   renderer.externalFrameDriver = true;
   const counters = new Map();
   renderer.performanceProfiler = { enabled: true, add(name, value = 1) { counters.set(name, value); }, dispose() {} };

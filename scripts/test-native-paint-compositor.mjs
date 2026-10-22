@@ -10,8 +10,8 @@ try {
   const { WebGpuPaintCompositor, beginPdfManagedRenderPass } = await import("../src/webGpuPaintCompositor.ts");
   const { WebGpuPaintFolds } = await import("../src/webGpuPaintFold.ts");
   const { WebGlPaintCompositor } = await import("../src/webGlPaintCompositor.ts");
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const { compositeScenePaintGraph } = await import("../src/scenePaintCompositor.ts");
   const { ScenePaintPlan } = await import("../src/scenePaintPlan.ts");
   const { pdfShapeCoverageWgsl } = await import("../src/pdfShapeCoverage.ts");
@@ -46,7 +46,7 @@ try {
     globalThis.GPUBufferUsage = { UNIFORM: 1, COPY_DST: 2, STORAGE: 4 };
     globalThis.GPUTextureUsage = { TEXTURE_BINDING: 1, COPY_DST: 2 };
     globalThis.GPUShaderStage = { VERTEX: 1, FRAGMENT: 2 };
-    const renderer = new WebGpuFloorplanRenderer({}, device, { configure() {} }, "rgba8unorm");
+    const renderer = new WebGpuPdfRenderer({}, device, { configure() {} }, "rgba8unorm");
     const shader = renderer.rasterPipeline.descriptor.fragment.module.code;
     assert.match(shader.slice(shader.indexOf("@fragment")), /uRaster\.matrixB\.z/);
     const rasterUniform = renderer.rasterBindGroupLayout.entries.find(entry => entry.binding === 1);
@@ -303,7 +303,7 @@ try {
   // mask, then restores neutral opacity when the next ordinary paint draws.
   {
     const values = new Map(), textures = [];
-    const renderer = Object.create(WebGlFloorplanRenderer.prototype);
+    const renderer = Object.create(WebGlPdfRenderer.prototype);
     Object.assign(renderer, { paintFoldUnit: 27, paintFoldUniforms: new Map(), gl: {
       TEXTURE0: 0, TEXTURE_2D: 1, activeTexture() {}, bindTexture(_kind, texture) { textures.push(texture); },
       getUniformLocation(_program, name) { return name; },

@@ -34,7 +34,7 @@ import {
   type VectorLodMode,
   type PDFLoadProgress
 } from "./index";
-import type { DrawStats } from "./webGlFloorplanRenderer";
+import type { DrawStats } from "./webGlPdfRenderer";
 import {
   normalizeExampleManifestEntries,
   resolveAppAssetUrl,

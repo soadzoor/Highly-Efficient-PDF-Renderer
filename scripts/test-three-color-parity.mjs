@@ -17,7 +17,7 @@ const sourcePaths = {
   textLayer: "src/threeMaterialTextLayer.ts",
   strokeLayer: "src/threeMaterialStrokeLayer.ts",
   directWebGl: "src/nativeWebGlCoreShaders.ts",
-  directWebGpu: "src/webGpuFloorplanRenderer.ts",
+  directWebGpu: "src/webGpuPdfRenderer.ts",
   gradient: "src/threeWebGpuGradientMaterial.ts"
 };
 

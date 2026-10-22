@@ -33,7 +33,7 @@ import {
   type VectorStrokeLodStats,
   type ViewportPixels
 } from "./vectorStrokeLodCore";
-import type { ViewState } from "./webGlFloorplanRenderer";
+import type { ViewState } from "./webGlPdfRenderer";
 import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 
 interface VectorStrokeLodLayerOptions {

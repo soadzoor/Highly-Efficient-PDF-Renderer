@@ -6,6 +6,17 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Changed
+
+- Rename the native renderer classes and source modules to `WebGlPdfRenderer`
+  and `WebGpuPdfRenderer` to reflect support for general PDF content. Update
+  internal callers, tests and documentation; retain the old class names,
+  WebGL options type and source module paths as deprecated compatibility aliases.
+- Use the shared one-device-pixel minimum stroke width for WebGL thumbnails,
+  removing thumbnail-only stroke-style copies and widening. Preserve prominent
+  overview linework, source geometry, paint ordering and clipping; Canvas2D
+  thumbnail coverage and preparation remain unchanged.
+
 ### Fixed
 
 - Retry npm publication when Sigstore reports a duplicate transparency-log

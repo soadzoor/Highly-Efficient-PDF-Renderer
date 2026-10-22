@@ -66,7 +66,7 @@ for (const [file, language] of [
   ["nativeGradientWebGlShaders.ts", "GLSL"],
   ["threeTriangleStrokeLayer.ts", "GLSL"],
   ["threeCompactedStrokeLayer.ts", "GLSL"],
-  ["webGpuFloorplanRenderer.ts", "WGSL"],
+  ["webGpuPdfRenderer.ts", "WGSL"],
   ["nativeGradientWebGpuShaders.ts", "WGSL"],
   ["threeWebGpuStrokeMaterial.ts", "WGSL"],
   ["threeWebGpuGradientMaterial.ts", "WGSL"]

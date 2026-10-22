@@ -238,7 +238,7 @@ pan, zoom, and rotation. The object's `fitToBounds()`, `setViewState()`, and
 or control your application's three.js camera.
 
 The standalone viewer renders directly to its canvas through
-`WebGlFloorplanRenderer` or `WebGpuFloorplanRenderer`. Both backends support
+`WebGlPdfRenderer` or `WebGpuPdfRenderer`. Both backends support
 vector content, raster layers, search highlights, and selection highlights.
 See the [API reference](api.md) for integration points.
 

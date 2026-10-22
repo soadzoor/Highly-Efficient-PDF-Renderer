@@ -13,7 +13,7 @@ import {
   type TextLodMode,
   type TextLodStats
 } from "./textLodCore";
-import type { ViewState } from "./webGlFloorplanRenderer";
+import type { ViewState } from "./webGlPdfRenderer";
 
 interface ViewportPixels {
   width: number;

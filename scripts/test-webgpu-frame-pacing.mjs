@@ -8,7 +8,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 const globals = Object.fromEntries(["requestAnimationFrame", "cancelAnimationFrame"].map(key => [key, globalThis[key]]));
 
 try {
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   let callbacks = new Map(), nextHandle = 1;
   globalThis.requestAnimationFrame = callback => { callbacks.set(nextHandle, callback); return nextHandle++; };
   globalThis.cancelAnimationFrame = handle => { callbacks.delete(handle); };
@@ -22,7 +22,7 @@ try {
 
   const create = ({ workDone = true } = {}) => {
     const gpu = [];
-    const renderer = Object.assign(Object.create(WebGpuFloorplanRenderer.prototype), {
+    const renderer = Object.assign(Object.create(WebGpuPdfRenderer.prototype), {
       rafHandle: 0, externalFrameDriver: false, externalFramePending: false, isDisposed: false,
       gpuFramesInFlight: 0, framePendingOnGpu: false,
       gpuDevice: { queue: workDone ? {

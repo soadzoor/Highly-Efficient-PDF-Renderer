@@ -5,7 +5,7 @@ const hooks = registerHooks({ resolve(s, c, n) {
   return n(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? `${s}.ts` : s, c);
 } });
 try {
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
   const { RenderPerformanceProfiler } = await import("../src/renderPerformance.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   let now = 0, rebuild = true, uploads = 0;
@@ -14,7 +14,7 @@ try {
     drawRuns: [{ kind: "stroke", first: 0, count: 3 }, { kind: "fill", first: 0, count: 2 },
       { kind: "text", first: 0, count: 7 }] });
   const batches = scene.drawRuns.map(run => ({ ...run, clipIndex: -2 }));
-  const instance = Object.assign(Object.create(WebGlFloorplanRenderer.prototype), {
+  const instance = Object.assign(Object.create(WebGlPdfRenderer.prototype), {
     scene, performanceProfiler: profile, canvas: { width: 100, height: 100 },
     cameraCenterX: 50, cameraCenterY: 50, zoom: 1, segmentCount: 3,
     strokeRenderingEnabled: true, fillRenderingEnabled: true, textRenderingEnabled: true,

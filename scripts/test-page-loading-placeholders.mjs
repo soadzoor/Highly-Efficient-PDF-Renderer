@@ -13,8 +13,8 @@ try {
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
   const { ScenePageViews } = await import("../src/scenePageViews.ts");
   const { hasVisiblePagePlaceholders, pagePlaceholderTime, pagePlaceholderAnimationEnabled } = await import("../src/pageLoadingPlaceholder.ts");
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const view = { width:400,height:500,cameraCenterX:300,cameraCenterY:400,zoom:1 };
   const session = { info:{ pages:[0,1].map(index => ({ index,width:600,height:800 })) },
     async compileVectorPage() {
@@ -56,7 +56,7 @@ try {
 
     assert.notEqual(pagePlaceholderTime(200),pagePlaceholderTime(700));
     assert(Math.abs(pagePlaceholderTime(2600)-pagePlaceholderTime(200)) < 1e-12,"shader time wraps without precision loss");
-    for (const Renderer of [WebGlFloorplanRenderer,WebGpuFloorplanRenderer]) {
+    for (const Renderer of [WebGlPdfRenderer,WebGpuPdfRenderer]) {
       let frames = 0;
       const renderer = Object.assign(Object.create(Renderer.prototype), {
         canvas:{ width:400,height:500 },scene,rasterRenderingEnabled:true,pageRects:scene.pageRects,pageBackgroundColor:[1,1,1,1],

@@ -5,8 +5,8 @@ const hooks = registerHooks({ resolve(s, c, n) {
 } });
 try {
   const { VectorDrawRunCuller, vectorViewBounds } = await import("../src/vectorDrawRunCulling.ts");
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { VectorOrderedBatches } = await import("../src/vectorOrderedBatches.ts");
   const { VectorStrokeLodRuntime, buildRuntimeTileBuckets, storePrebuiltVectorStrokeLodRuntime } = await import("../src/vectorStrokeLodCore.ts");
@@ -176,13 +176,13 @@ try {
   const usageDescriptor = Object.getOwnPropertyDescriptor(globalThis, "GPUBufferUsage");
   Object.defineProperty(globalThis, "GPUBufferUsage", { configurable: true, value: { STORAGE: 1, COPY_DST: 2 } });
   try {
-    for (const Renderer of [WebGlFloorplanRenderer, WebGpuFloorplanRenderer]) {
+    for (const Renderer of [WebGlPdfRenderer, WebGpuPdfRenderer]) {
       const renderer = Object.create(Renderer.prototype);
       Object.assign(renderer, { scene: merged, vectorLodMode: "force", orderedInstanceBuffer: { destroy() {} },
         vectorOverrideColor: [0, 0, 0], vectorOverrideOpacity: 0,
         gpuDevice: { createBuffer: () => ({ destroy() {} }) },
         uploadSegments() {}, uploadVectorLodLevels() {}, uploadVectorClips() {}, destroyVectorLodResources() {} });
-      const rebuild = Renderer === WebGlFloorplanRenderer ? "rebuildVectorLod" : "prepareVectorLod";
+      const rebuild = Renderer === WebGlPdfRenderer ? "rebuildVectorLod" : "prepareVectorLod";
       storePrebuiltVectorStrokeLodRuntime(merged, mergedRuntime);
       assert(renderer[rebuild](merged));
       assert(renderer.orderedRunCuller.select(farView, .01, renderer.orderedBatches.cullingPadding).includes(paint),
@@ -198,8 +198,8 @@ try {
   }
 
   // Production submission paths use the filtered list, in its original order.
-  const gl = Object.create(WebGlFloorplanRenderer.prototype);
-  const gpu = Object.create(WebGpuFloorplanRenderer.prototype);
+  const gl = Object.create(WebGlPdfRenderer.prototype);
+  const gpu = Object.create(WebGpuPdfRenderer.prototype);
   const flags = { scene, orderedRunCuller: culler, orderedCullingBounds: view, zoom: 1, minimumStrokeWidthPx: 0,
     fillRenderingEnabled: true, strokeRenderingEnabled: true, textRenderingEnabled: true, rasterRenderingEnabled: true };
   Object.assign(gl, flags); Object.assign(gpu, flags);

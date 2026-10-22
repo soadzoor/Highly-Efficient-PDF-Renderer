@@ -13,7 +13,7 @@ try {
   const { vectorPathCellStore, vectorIndexedPathStore, buildVectorPathCells } = await import("../src/vectorCellIndex.ts");
   const { buildVectorFillBandIndex } = await import("../src/vectorFillBands.ts");
   const { packVectorClips } = await import("../src/vectorClips.ts");
-  const { CORE_FILL_FRAGMENT_SHADER_SOURCE } = await import("../src/webGlFloorplanRenderer.ts");
+  const { CORE_FILL_FRAGMENT_SHADER_SOURCE } = await import("../src/webGlPdfRenderer.ts");
   const { GRADIENT_FILL_VERTEX_SHADER_SOURCE } = await import("../src/nativeGradientWebGlShaders.ts");
 
   // Hosts reuse the core fill shader without knowing about cells (Three's

@@ -11,7 +11,7 @@ import {
   normalizeThreeRawShaderSource,
   normalizeThreeStrokeRawFragmentShaderSource
 } from "./threeRawShaderColorSpace";
-import type { ViewState } from "./webGlFloorplanRenderer";
+import type { ViewState } from "./webGlPdfRenderer";
 
 interface TriangleStrokeLayerOptions {
   vectorOverride: [number, number, number, number];

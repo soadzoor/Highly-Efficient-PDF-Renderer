@@ -12,7 +12,7 @@ import {
   materializeVectorStrokeLodLevel, vectorStrokeLodLevelScene, type VectorStrokeLodRecordStore
 } from "./vectorStrokeLodStorage";
 import type {Bounds, VectorScene} from "./pdfVectorExtractor";
-import type {ViewState} from "./webGlFloorplanRenderer";
+import type {ViewState} from "./webGlPdfRenderer";
 import { VISIBILITY_GUARD_PIXELS } from "./visibilityGuard";
 
 /**

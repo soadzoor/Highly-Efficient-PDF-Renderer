@@ -36,7 +36,7 @@ try {
   const { waitForLoad, yieldForLoad } = await import("../src/loadCancellation.ts");
   const nativeSource = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
   const threeSource = await readFile(new URL("../src/three-example.ts", import.meta.url), "utf8");
-  class WebGlFloorplanRenderer {
+  class WebGlPdfRenderer {
     serial = 0;
     requests = 0;
     pending = false;
@@ -50,12 +50,12 @@ try {
     }
     renderExternalFrame() { assert.fail("warm-up must preserve native frame pacing"); }
   }
-  class WebGpuFloorplanRenderer extends WebGlFloorplanRenderer {}
-  for (const Renderer of [WebGlFloorplanRenderer, WebGpuFloorplanRenderer]) {
+  class WebGpuPdfRenderer extends WebGlPdfRenderer {}
+  for (const Renderer of [WebGlPdfRenderer, WebGpuPdfRenderer]) {
     now = 0; callbacks.clear();
     const target = new Renderer();
     const host = vm.createContext({ warmViewerRendering, yieldForLoad, AbortController,
-      WebGlFloorplanRenderer, webGpuRendererClass: WebGpuFloorplanRenderer, renderer: target });
+      WebGlPdfRenderer, webGpuRendererClass: WebGpuPdfRenderer, renderer: target });
     vm.runInContext(sourceFunction(nativeSource, "warmNativeRenderer"), host);
     await runToCompletion(host.warmNativeRenderer(target, new AbortController().signal));
     assert.equal(target.requests, 12);
@@ -76,7 +76,7 @@ try {
 
   now = 0; callbacks.clear();
   const nativeHost = vm.createContext({ warmViewerRendering, yieldForLoad,
-    WebGlFloorplanRenderer, webGpuRendererClass: WebGpuFloorplanRenderer, renderer: {} });
+    WebGlPdfRenderer, webGpuRendererClass: WebGpuPdfRenderer, renderer: {} });
   vm.runInContext(sourceFunction(nativeSource, "warmNativeRenderer"), nativeHost);
   await nativeHost.warmNativeRenderer(nativeHost.renderer, new AbortController().signal);
   assert.equal(callbacks.size, 0, "other native renderer types are left to their own load lifecycle");

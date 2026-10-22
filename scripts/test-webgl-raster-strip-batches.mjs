@@ -6,7 +6,7 @@ const hooks = registerHooks({ resolve(s, c, n) {
 } });
 
 try {
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { buildRasterStripBatches } = await import("../src/rasterStripBatches.ts");
   const scene = Object.assign(createEmptyVectorScene(), {
@@ -20,7 +20,7 @@ try {
     ]
   });
   const canonical = structuredClone(scene);
-  const { renderer, mock } = makeRenderer(WebGlFloorplanRenderer, scene);
+  const { renderer, mock } = makeRenderer(WebGlPdfRenderer, scene);
   renderer.uploadRasterLayers(scene);
   assert.equal(renderer.rasterLayers.length, 9, "canonical resources remain available for fallback");
   assert.equal(renderer.rasterStripBatches.size, 2);
@@ -91,7 +91,7 @@ try {
   assert.deepEqual(renderer.rasterLayers[0].matrix, replacement.matrix);
   assert.deepEqual(scene, canonical, "render-only batching and replacements preserve the canonical scene");
 
-  const fresh = makeRenderer(WebGlFloorplanRenderer, scene);
+  const fresh = makeRenderer(WebGlPdfRenderer, scene);
   fresh.renderer.uploadRasterLayers(scene);
   const old = [...fresh.renderer.rasterStripBatches.values()];
   fresh.renderer.setRasterTextureResidency(false);
@@ -105,7 +105,7 @@ try {
 
   // An optimization allocation failure must release partial atlases while
   // leaving the successfully uploaded original document renderable.
-  const failing = makeRenderer(WebGlFloorplanRenderer, scene);
+  const failing = makeRenderer(WebGlPdfRenderer, scene);
   failing.mock.failBufferAt = 2;
   const warn = console.warn, warnings = [];
   console.warn = (...args) => warnings.push(args);

@@ -21,9 +21,9 @@ const [
 ]).finally(() => hooks.deregister());
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
-const webGl = await readFile(path.resolve(scriptDir, "../src/webGlFloorplanRenderer.ts"), "utf8")
+const webGl = await readFile(path.resolve(scriptDir, "../src/webGlPdfRenderer.ts"), "utf8")
   + await readFile(path.resolve(scriptDir, "../src/nativeWebGlCoreShaders.ts"), "utf8");
-const webGpu = await readFile(path.resolve(scriptDir, "../src/webGpuFloorplanRenderer.ts"), "utf8");
+const webGpu = await readFile(path.resolve(scriptDir, "../src/webGpuPdfRenderer.ts"), "utf8");
 
 assert.equal(
   TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE,

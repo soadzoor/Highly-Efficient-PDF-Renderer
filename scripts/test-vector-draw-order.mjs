@@ -19,8 +19,8 @@ try {
   const { validateVectorDrawRuns, defaultVectorDrawRuns } = await import("../src/vectorDrawOrder.ts");
   const { buildHep } = await import("../src/hepBuilder.ts");
   const { loadSceneFromHep } = await import("../src/hep.ts");
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const { initializeThreeVectorClip, createThreeVectorClipTexture } = await import("../src/threeVectorClips.ts");
   const { ThreeVectorDrawRuns, vectorDrawRunRenderOrder } = await import("../src/threeVectorDrawRuns.ts");
   const { applyThreePdfOverlayPaintOrder } = await import("../src/threePdfPaintOrder.ts");
@@ -116,7 +116,7 @@ try {
 
   // Exercise production dispatch without a browser or GPU context.
   const expected = scene.drawRuns.map(run => [run.kind, run.first, run.count]);
-  const glRenderer = Object.create(WebGlFloorplanRenderer.prototype);
+  const glRenderer = Object.create(WebGlPdfRenderer.prototype);
   Object.assign(glRenderer, { scene, rasterRenderingEnabled: true, fillRenderingEnabled: true,
     strokeRenderingEnabled: true, textRenderingEnabled: true });
   let calls = [];
@@ -140,7 +140,7 @@ try {
 
   // WebGL's instance-attribute offsets must address each retained range, not
   // restart at instance zero on every draw.
-  const lowLevel = Object.create(WebGlFloorplanRenderer.prototype);
+  const lowLevel = Object.create(WebGlPdfRenderer.prototype);
   const attributes = [], draws = [];
   lowLevel.gl = new Proxy({
     vertexAttribPointer: (...args) => attributes.push(args),
@@ -155,7 +155,7 @@ try {
   assert.deepEqual(attributes.map(args => [args[0], args[5]]), [[3, 8], [1, 12], [2, 20]]);
   assert.deepEqual(draws.map(args => args[3]), [1, 2, 2]);
 
-  const gpuRenderer = Object.create(WebGpuFloorplanRenderer.prototype);
+  const gpuRenderer = Object.create(WebGpuPdfRenderer.prototype);
   Object.assign(gpuRenderer, { scene, rasterRenderingEnabled: true, fillRenderingEnabled: true,
     strokeRenderingEnabled: true, textRenderingEnabled: true, fillPipeline: "fill", strokePipeline: "stroke",
     textPipeline: "text", rasterPipeline: "raster", fillBindGroup: "fill", strokeBindGroupAll: "all-strokes",

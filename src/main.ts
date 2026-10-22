@@ -17,7 +17,7 @@ import { waitForLoad, yieldAfterPaint, yieldForLoad } from "./loadCancellation";
 import { warmViewerRendering } from "./viewerRenderWarmup";
 import type { ThumbnailSceneRenderer } from "./thumbnailRenderer";
 
-import { WebGlFloorplanRenderer, type DrawStats, type SceneStats, type ViewState } from "./webGlFloorplanRenderer";
+import { WebGlPdfRenderer, type DrawStats, type SceneStats, type ViewState } from "./webGlPdfRenderer";
 import {
   composeVectorScenesInColumn,
   composeVectorScenesInGrid,
@@ -238,7 +238,7 @@ const vectorColorInputElement = vectorColorInput;
 const vectorOpacitySliderElement = vectorOpacitySlider;
 const vectorOpacityInputElement = vectorOpacityInput;
 let renderer: RendererApi;
-let webGpuRendererClass: typeof import("./webGpuFloorplanRenderer").WebGpuFloorplanRenderer | null = null;
+let webGpuRendererClass: typeof import("./webGpuPdfRenderer").WebGpuPdfRenderer | null = null;
 let lastParsedScene: VectorScene | null = null;
 // Reader transforms are presentation state. HEP exports keep the original grid.
 let lastCanonicalScene: VectorScene | null = null;
@@ -632,15 +632,15 @@ function initializeRendererCommon(rendererApi: RendererApi): void {
 }
 
 function createWebGlRenderer(targetCanvas: HTMLCanvasElement): RendererApi {
-  const next = new WebGlFloorplanRenderer(targetCanvas);
+  const next = new WebGlPdfRenderer(targetCanvas);
   initializeRendererCommon(next);
   return next;
 }
 
 async function createWebGpuRenderer(targetCanvas: HTMLCanvasElement): Promise<RendererApi> {
-  const { WebGpuFloorplanRenderer } = await import("./webGpuFloorplanRenderer");
-  webGpuRendererClass = WebGpuFloorplanRenderer;
-  const next = await WebGpuFloorplanRenderer.create(targetCanvas);
+  const { WebGpuPdfRenderer } = await import("./webGpuPdfRenderer");
+  webGpuRendererClass = WebGpuPdfRenderer;
+  const next = await WebGpuPdfRenderer.create(targetCanvas);
   initializeRendererCommon(next);
   return next;
 }
@@ -823,14 +823,14 @@ const performanceCapture = {
     renderer.setMixedVectorBatchingEnabled(enabled);
   },
   start(options: RenderPerformanceOptions = {}): string {
-    if (!(renderer instanceof WebGlFloorplanRenderer) && !(webGpuRendererClass && renderer instanceof webGpuRendererClass)) {
+    if (!(renderer instanceof WebGlPdfRenderer) && !(webGpuRendererClass && renderer instanceof webGpuRendererClass)) {
       throw new Error("This performance capture supports the native WebGL and WebGPU renderers.");
     }
     captureProfiler?.stop();
     captureProfiler = renderer.getPerformanceProfiler();
     captureContext = {
       url: window.location.href, heprVersion: __HEPR_PACKAGE_VERSION__,
-      document: lastParsedSceneLabel, backend: renderer instanceof WebGlFloorplanRenderer ? "webgl" : "webgpu",
+      document: lastParsedSceneLabel, backend: renderer instanceof WebGlPdfRenderer ? "webgl" : "webgpu",
       browser: navigator.userAgent,
       mixedVectorBatching: renderer.getMixedVectorBatchingEnabled?.() ?? null,
       fillRendering: renderer.getFillRenderingEnabled?.() ?? null,
@@ -1731,7 +1731,7 @@ function prepareNativeSceneLoad(target: RendererApi, scene: VectorScene, pages: 
 
 /** Keep native frame pacing while warming the view that will become interactive. */
 async function warmNativeRenderer(target: RendererApi, signal: AbortSignal): Promise<void> {
-  if (!(target instanceof WebGlFloorplanRenderer) && !(webGpuRendererClass && target instanceof webGpuRendererClass)) return;
+  if (!(target instanceof WebGlPdfRenderer) && !(webGpuRendererClass && target instanceof webGpuRendererClass)) return;
   await warmViewerRendering({ signal, renderFrame: async warmupSignal => {
     warmupSignal.throwIfAborted();
     if (target !== renderer) return;

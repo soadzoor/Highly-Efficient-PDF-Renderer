@@ -6,11 +6,11 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 } });
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const layer = value => ({ width: 1, height: 1, data: new Uint8Array([value, 0, 0, 255]), matrix: new Float32Array([1, 0, 0, 1, 0, 0]), opacity: 0.5 });
-  for (const [Renderer, resident, slots] of [[WebGlFloorplanRenderer, "rasterTextureResidencyEnabled", "rasterLayers"],
-    [WebGpuFloorplanRenderer, "rasterTextureResidency", "rasterLayerResources"]]) {
+  for (const [Renderer, resident, slots] of [[WebGlPdfRenderer, "rasterTextureResidencyEnabled", "rasterLayers"],
+    [WebGpuPdfRenderer, "rasterTextureResidency", "rasterLayerResources"]]) {
     let allocations = 0, releases = 0, frames = 0;
     const texture = () => ({ id: ++allocations, destroy() { releases++; } });
     const source = createEmptyVectorScene(); source.rasterLayers = [layer(10)];

@@ -12,7 +12,7 @@ globalThis.GPUTextureUsage = { TEXTURE_BINDING: 1, COPY_DST: 2 };
 globalThis.GPUShaderStage = { VERTEX: 1, FRAGMENT: 2 };
 
 try {
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const { buildRasterStripBatches } = await import("../src/rasterStripBatches.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const scene = makeScene(createEmptyVectorScene);
@@ -21,7 +21,7 @@ try {
   assert.deepEqual(expected.map(batch => [batch.first, batch.count]), [[0, 4], [4, 6]]);
   const create = () => {
     const device = makeDevice();
-    const renderer = new WebGpuFloorplanRenderer({}, device, { configure() {}, unconfigure() {} }, "rgba8unorm");
+    const renderer = new WebGpuPdfRenderer({}, device, { configure() {}, unconfigure() {} }, "rgba8unorm");
     renderer.scene = scene;
     renderer.requestFrame = () => {};
     renderer.vectorClipBindGroups = [{ clip: -2 }, { clip: -1 }, { clip: 0 }];

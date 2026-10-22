@@ -11,8 +11,8 @@ globalThis.GPUBufferUsage = { UNIFORM: 1, COPY_DST: 2, STORAGE: 4 };
 globalThis.GPUTextureUsage = { TEXTURE_BINDING: 1, COPY_DST: 2 };
 
 try {
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const { WebGlPrimitiveHighlights, WebGpuPrimitiveHighlights } = await import("../src/nativePrimitiveHighlights.ts");
   const { packVectorClips } = await import("../src/vectorClips.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
@@ -32,7 +32,7 @@ try {
       glUploads.push({ width, height, data: data.slice() });
     }
   }, { get(target, key) { return target[key] ?? (() => {}); } });
-  const webgl = Object.assign(Object.create(WebGlFloorplanRenderer.prototype), { gl });
+  const webgl = Object.assign(Object.create(WebGlPdfRenderer.prototype), { gl });
   webgl.uploadVectorClips(scene);
   assert(glUploads[0].width <= maxSize && glUploads[0].height <= maxSize);
   assert.deepEqual(glUploads[0].data.subarray(0, fitted.length), fitted,
@@ -50,7 +50,7 @@ try {
       texImage2D() { resourceChanges++; }
     }, { get(target, key) { return target[key] ?? (() => {}); } });
     const previousClipTexture = {}, previousBoundsTexture = {}, previousBoundsCache = new WeakMap();
-    const unavailable = Object.assign(Object.create(WebGlFloorplanRenderer.prototype), {
+    const unavailable = Object.assign(Object.create(WebGlPdfRenderer.prototype), {
       gl: unavailableGl, vectorClipTexture: previousClipTexture,
       vectorClipBoundsTexture: previousBoundsTexture, rasterTextureClipBounds: previousBoundsCache
     });
@@ -70,7 +70,7 @@ try {
     createBuffer: () => ({ destroy() {} }),
     queue: { writeBuffer() {} }
   };
-  const webgpu = Object.assign(Object.create(WebGpuFloorplanRenderer.prototype), {
+  const webgpu = Object.assign(Object.create(WebGpuPdfRenderer.prototype), {
     gpuDevice: gpu, vectorClipBuffers: [], vectorClipBindGroups: [],
     createFloatTexture(width, height, data) {
       gpuUploads.push({ width, height, data: data.slice() });
@@ -149,7 +149,7 @@ try {
       manyUploads.push({ width, height, data: data.slice() });
     }
   }, { get(target, key) { return target[key] ?? (() => {}); } });
-  const manyRenderer = Object.assign(Object.create(WebGlFloorplanRenderer.prototype), { gl: manyGl });
+  const manyRenderer = Object.assign(Object.create(WebGlPdfRenderer.prototype), { gl: manyGl });
   const rectangle = { parent: -1, fillRule: 0,
     edges: Float32Array.of(0, 0, 1, 0, 1, 0, 1, 1, 1, 1, 0, 1, 0, 1, 0, 0) };
   manyRenderer.uploadVectorClips({ ...scene, clipPaths: Array(256 * 1024 + 1).fill(rectangle) });

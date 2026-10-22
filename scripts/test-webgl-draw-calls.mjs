@@ -6,7 +6,7 @@ const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
     !/\.[a-z0-9]+$/i.test(specifier) ? `${specifier}.ts` : specifier, context);
 } });
 try {
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const draws = [], frames = [];
   const gl = new Proxy({}, { get(_target, name) {
@@ -20,7 +20,7 @@ try {
       if (name === "getUniformLocation") return {};
     };
   } });
-  const renderer = new WebGlFloorplanRenderer({ width: 100, height: 100, getContext: () => gl });
+  const renderer = new WebGlPdfRenderer({ width: 100, height: 100, getContext: () => gl });
   const scene = Object.assign(createEmptyVectorScene(), { segmentCount: 100, fillPathCount: 10, textInstanceCount: 20 });
   Object.assign(renderer, {
     scene, segmentCount: 100, fillPathCount: 10, textInstanceCount: 20, usingAllSegments: true,

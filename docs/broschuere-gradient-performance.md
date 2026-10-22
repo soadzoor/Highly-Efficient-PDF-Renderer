@@ -416,7 +416,7 @@ zoom 0.103 and 8–9 ms at zoom 0.557. The HEP loaded in Node matches the
 capture's source counts (1,410 paints, 2,897 strokes, 3,574 fills, 20,881
 glyphs). Two headless tools were run against it; neither executes GPU work:
 
-- A recording WebGL2 context under the real `WebGlFloorplanRenderer` traced the
+- A recording WebGL2 context under the real `WebGlPdfRenderer` traced the
   complete command stream of one frame at the capture's camera positions.
 - A cost model replayed each traced draw's fragment control flow (quads from
   the uploaded textures, band loops, clip-chain walks, antialiased clip probes)
@@ -702,7 +702,7 @@ follow-up.
 Follow-up files:
 
 - `src/nativeRenderPolicy.ts`, `src/nativePanCache.ts`,
-  `src/webGlFloorplanRenderer.ts`, `src/webGpuFloorplanRenderer.ts`: cache
+  `src/webGlPdfRenderer.ts`, `src/webGpuPdfRenderer.ts`: cache
   eligibility, bounded sizing, ordered refresh and curve-mode invalidation.
 - `src/webGlPaintCompositor.ts`, `src/pdfCompositeBudget.ts`,
   `src/scenePaintCompositor.ts`: known native state, cached budget estimates and
@@ -1032,8 +1032,8 @@ No PDF conversion or browser session was run.
 
 Implementation files: `gradientMaskFold.ts`, `nativePaintFold.ts`,
 `scenePaintCompositor.ts`, `threePaintFold.ts`, `threePaintCompositor.ts`,
-`webGlFloorplanRenderer.ts`, `webGlPaintCompositor.ts`,
-`webGpuFloorplanRenderer.ts`, `webGpuPaintCompositor.ts`, and `webGpuPaintFold.ts`.
+`webGlPdfRenderer.ts`, `webGlPaintCompositor.ts`,
+`webGpuPdfRenderer.ts`, `webGpuPaintCompositor.ts`, and `webGpuPaintFold.ts`.
 Regression changes are in `test-native-paint-compositor.mjs`,
 `test-pdf-compositing.mjs`, `test-three-gradient-mask-fold.mjs`,
 `test-three-paint-compositor.mjs`, and `test-webgpu-draw-calls.mjs`.

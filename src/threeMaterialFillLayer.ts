@@ -29,7 +29,7 @@ import { HEPR_THREE_LAYER_ORDER_FILL } from "./threeLayerOrder";
 import { normalizeThreeRawShaderSource } from "./threeRawShaderColorSpace";
 import type { ThreeWebGpuFillMaterialState } from "./threeWebGpuFillMaterial";
 import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
-import type { ViewState } from "./webGlFloorplanRenderer";
+import type { ViewState } from "./webGlPdfRenderer";
 
 interface FillLayerOptions {
   pageTransforms?: ThreePageTransforms;

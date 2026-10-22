@@ -8,8 +8,8 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { NativePrimitiveColors, WebGpuPrimitiveGradientColors, coalescePrimitiveColorTexels } = await import("../src/nativePrimitiveColors.ts");
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const { WebGlPrimitiveHighlights, WebGpuPrimitiveHighlights } = await import("../src/nativePrimitiveHighlights.ts");
   const { estimateHighlightLocalUnitsPerPixel } = await import("../src/primitiveHighlightProjection.ts");
   const { PRIMITIVE_HIGHLIGHT_FRAGMENT_GLSL, PRIMITIVE_HIGHLIGHT_COVERAGE_WGSL } = await import("../src/primitiveHighlightShaders.ts");
@@ -59,7 +59,7 @@ try {
   globalThis.GPUBufferUsage = { UNIFORM: 1, COPY_DST: 2, STORAGE: 4 };
   globalThis.GPUTextureUsage = { TEXTURE_BINDING: 1, COPY_DST: 2 };
   globalThis.GPUShaderStage = { VERTEX: 1, FRAGMENT: 2 };
-  for (const [Renderer, backend] of [[WebGlFloorplanRenderer, "gl"], [WebGpuFloorplanRenderer, "gpu"]]) {
+  for (const [Renderer, backend] of [[WebGlPdfRenderer, "gl"], [WebGpuPdfRenderer, "gpu"]]) {
     const forceExact = [], textModes = [], colorCommutation = [], blackSourceOver = [];
     let frames = 0, invalidations = 0;
     const instance = Object.assign(Object.create(Renderer.prototype), {
@@ -154,7 +154,7 @@ try {
   const renderColors = new WebGpuPrimitiveGradientColors(device, {});
   renderColors.update([{ ref: { kind: "gradient-fill", index: 0 }, color: [1, 0, 0] },
     { ref: { kind: "gradient-stroke", index: 0 }, color: [0, 1, 0] }]);
-  const gpuRenderer = Object.assign(Object.create(WebGpuFloorplanRenderer.prototype), {
+  const gpuRenderer = Object.assign(Object.create(WebGpuPdfRenderer.prototype), {
     scene: gradientScene, gradientData: gradientScene, gpuDevice: device, primitiveGradientColors: renderColors,
     segmentCount: 0, fillPathCount: 0, textInstanceCount: 0, fillRenderingEnabled: true,
     strokeRenderingEnabled: true, textRenderingEnabled: true, rasterRenderingEnabled: true,

@@ -1,5 +1,5 @@
 import type { VectorScene } from "./pdfVectorExtractor";
-import type { SceneStats } from "./webGlFloorplanRenderer";
+import type { SceneStats } from "./webGlPdfRenderer";
 import type { RendererApi, RendererBackend } from "./rendererTypes";
 
 type LoadedSourceKind = "pdf" | "hep" | null;

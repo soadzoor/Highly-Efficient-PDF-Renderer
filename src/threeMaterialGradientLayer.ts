@@ -31,7 +31,7 @@ import type {
   ThreeWebGpuGradientStrokeMaterialState
 } from "./threeWebGpuGradientMaterial";
 import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
-import type { ViewState } from "./webGlFloorplanRenderer";
+import type { ViewState } from "./webGlPdfRenderer";
 
 interface GradientLayerOptions {
   pageTransforms?: ThreePageTransforms;

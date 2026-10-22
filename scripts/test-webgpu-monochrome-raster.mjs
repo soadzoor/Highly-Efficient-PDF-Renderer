@@ -12,7 +12,7 @@ globalThis.GPUTextureUsage = { TEXTURE_BINDING: 1, COPY_DST: 2 };
 globalThis.GPUShaderStage = { VERTEX: 1, FRAGMENT: 2 };
 
 try {
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { buildPackedMonochromeMipAtlas, expandMonochromeRaster, monochromeRasterTile } = await import("../src/monochromeRaster.ts");
   const { planRasterTiles } = await import("../src/rasterTiles.ts");
@@ -20,7 +20,7 @@ try {
   const { RasterResolutionPlanner } = await import("../src/rasterResolution.ts");
   const create = (limit = 2048) => {
     const device = makeDevice(limit);
-    const renderer = new WebGpuFloorplanRenderer({}, device, { configure() {}, unconfigure() {} }, "rgba8unorm");
+    const renderer = new WebGpuPdfRenderer({}, device, { configure() {}, unconfigure() {} }, "rgba8unorm");
     renderer.requestFrame = () => {};
     return { device, renderer };
   };

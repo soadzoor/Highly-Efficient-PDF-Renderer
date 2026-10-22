@@ -45,7 +45,7 @@ for (const distance of [0, .05, .3, .6, 1]) {
 // weighting must follow coverage conversion and paint opacity, not precede it.
 assert.match(CORE_STROKE_FRAGMENT_SHADER_SOURCE,
   /float alpha = heprThreeLinearCoverageToOutputAlpha\(coverage\) \* vAlpha;\s*alpha = heprStrokeLodAlpha\(alpha, vPrimitiveType\);/);
-const gpuSource = await readFile(new URL("../src/webGpuFloorplanRenderer.ts", import.meta.url), "utf8");
+const gpuSource = await readFile(new URL("../src/webGpuPdfRenderer.ts", import.meta.url), "utf8");
 const gpuStroke = gpuSource.slice(gpuSource.indexOf("const STROKE_SHADER_SOURCE"), gpuSource.indexOf("const FILL_SHADER_SOURCE"));
 assert.match(gpuStroke, /var alpha = heprLinearCoverageToOutputAlpha\(coverage\) \* inData\.alpha;\s*alpha = heprStrokeLodAlpha\(alpha, inData\.primitiveType\);/);
 assert.match(pdfShapeCoverageWgsl(gpuStroke), /var alpha = heprLinearCoverageToOutputAlpha\(coverage\) \* 1\.0;\s*alpha = heprStrokeLodAlpha\(alpha, inData\.primitiveType\);/);

@@ -77,10 +77,10 @@ for (const [name, shader] of [["GLSL", evaluateGlsl(FILL_COVERAGE_GLSL)], ["WGSL
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const read = async relativePath => {
   const source = await readFile(path.resolve(scriptDir, relativePath), "utf8");
-  return relativePath === "../src/webGlFloorplanRenderer.ts"
+  return relativePath === "../src/webGlPdfRenderer.ts"
     ? source + await readFile(path.resolve(scriptDir, "../src/nativeWebGlCoreShaders.ts"), "utf8") : source;
 };
-for (const relativePath of ["../src/webGlFloorplanRenderer.ts", "../src/webGpuFloorplanRenderer.ts", "../src/threeWebGpuTextMaterial.ts"]) {
+for (const relativePath of ["../src/webGlPdfRenderer.ts", "../src/webGpuPdfRenderer.ts", "../src/threeWebGpuTextMaterial.ts"]) {
   const source = await read(relativePath);
   const language = relativePath.includes("webGl") ? "GLSL" : "WGSL";
   assert(source.includes(`FILL_COVERAGE_${language}`), `${relativePath} includes the shared glyph filter`);
@@ -104,7 +104,7 @@ for (const relativePath of ["../src/webGlFloorplanRenderer.ts", "../src/webGpuFl
   assert.match(source, /mipCap = min\(1\.0, \$\{TEXT_RASTER_ATLAS_PADDING_PX\}\.0 \//,
     `${relativePath} caps atlas mips at the tile padding`);
 }
-for (const relativePath of ["../src/webGlFloorplanRenderer.ts", "../src/webGpuFloorplanRenderer.ts", "../src/threeMaterialTextLayer.ts"]) {
+for (const relativePath of ["../src/webGlPdfRenderer.ts", "../src/webGpuPdfRenderer.ts", "../src/threeMaterialTextLayer.ts"]) {
   assert.match(await read(relativePath), /writeTextGlyphInkDensities\(/, `${relativePath} uploads glyph ink densities`);
 }
 

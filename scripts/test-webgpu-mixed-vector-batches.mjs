@@ -9,12 +9,12 @@ globalThis.GPUBufferUsage = { UNIFORM: 1, COPY_DST: 2, STORAGE: 4 };
 globalThis.GPUTextureUsage = { TEXTURE_BINDING: 1, COPY_DST: 2 };
 globalThis.GPUShaderStage = { VERTEX: 1, FRAGMENT: 2 };
 try {
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const { MIXED_VECTOR_WGPU_VARYING_COMPONENTS, MIXED_VECTOR_WGPU_VARYING_VARIABLES } =
     await import("../src/nativeWebGpuMixedVectorShaders.ts");
   const create = () => {
     const device = makeDevice();
-    const renderer = new WebGpuFloorplanRenderer({}, device, { configure() {}, unconfigure() {} }, "rgba8unorm");
+    const renderer = new WebGpuPdfRenderer({}, device, { configure() {}, unconfigure() {} }, "rgba8unorm");
     renderer.requestFrame = () => { device.frames++; };
     renderer.drawPageBackgroundContentIntoPass = () => {};
     const batches = [

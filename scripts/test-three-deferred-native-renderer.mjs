@@ -207,9 +207,9 @@ async function testWebGpuFactory() {
       requestDevice: async () => device }), getPreferredCanvasFormat: () => "bgra8unorm"
   } } });
   try {
-    const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+    const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
     device = makeDevice(); device.features.add("texture-compression-bc");
-    const dormant = await WebGpuFloorplanRenderer.createDeferred(gpuCanvas);
+    const dormant = await WebGpuPdfRenderer.createDeferred(gpuCanvas);
     dormant.setExternalFrameDriver(true); dormant.setStrokeCurveEnabled(false);
     dormant.setViewState({ cameraCenterX: 5, cameraCenterY: 6, zoom: 7 });
     assert.equal(contexts, 0, "preparing a deferred WebGPU fallback does not acquire/configure the canvas");
@@ -219,7 +219,7 @@ async function testWebGpuFactory() {
     assert.equal(device.destroyed, 1, "cancellation/disposal releases an unused prepared device exactly once");
 
     device = makeDevice();
-    const deferred = await WebGpuFloorplanRenderer.createDeferred(gpuCanvas);
+    const deferred = await WebGpuPdfRenderer.createDeferred(gpuCanvas);
     deferred.setExternalFrameDriver(true);
     assert.equal(deferred.getSceneStats(), null);
     assert(device.pipelines >= 8, "the native pipelines are compiled when a native resource is requested");
@@ -230,13 +230,13 @@ async function testWebGpuFactory() {
     assert.equal(unconfigures, 1);
 
     device = makeDevice();
-    const eager = await WebGpuFloorplanRenderer.create(gpuCanvas);
+    const eager = await WebGpuPdfRenderer.create(gpuCanvas);
     assert(device.pipelines >= 8, "native WebGPU creation remains eager");
     eager.dispose();
     assert.equal(device.destroyed, 1);
 
     device = makeDevice();
-    const failed = await WebGpuFloorplanRenderer.createDeferred({ ...canvas, getContext: () => null });
+    const failed = await WebGpuPdfRenderer.createDeferred({ ...canvas, getContext: () => null });
     assert.throws(() => failed.getSceneStats(), /canvas context/);
     failed.dispose();
     assert.equal(device.destroyed, 1, "deferred context acquisition failure releases the prepared device");

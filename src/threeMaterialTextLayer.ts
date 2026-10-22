@@ -29,7 +29,7 @@ import {
 } from "./threeRawShaderColorSpace";
 import type { ThreeWebGpuTextMaterialState } from "./threeWebGpuTextMaterial";
 import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
-import type { ViewState } from "./webGlFloorplanRenderer";
+import type { ViewState } from "./webGlPdfRenderer";
 
 interface TextLayerOptions {
   /** Canonical paints must not retain the temporary combined Text LOD arrays. */

@@ -1,6 +1,6 @@
 import type { VectorScene } from "./pdfVectorExtractor";
 import type { RendererApi, SceneUpdateOptions } from "./rendererTypes";
-import type { SceneStats } from "./webGlFloorplanRenderer";
+import type { SceneStats } from "./webGlPdfRenderer";
 import { createEmptyVectorScene } from "./emptyVectorScene";
 import { validateRasterLayerUpdates } from "./rasterLayerUpdates";
 import type { RasterLayer } from "./pdfVectorExtractor";

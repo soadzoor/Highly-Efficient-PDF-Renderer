@@ -52,8 +52,8 @@ const hooks = registerHooks({ resolve(s, c, next) {
   return next(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? `${s}.ts` : s, c);
 } });
 try {
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const { buildStrokeScene } = await import("../src/strokeSceneBuilder.ts");
   const { ThreeMaterialStrokeLayer } = await import("../src/threeMaterialStrokeLayer.ts");
   const { ThreeTriangleStrokeLayer } = await import("../src/threeTriangleStrokeLayer.ts");
@@ -99,7 +99,7 @@ try {
   runtime.setMinimumStrokeWidth(100);
   assert.equal(runtime.update(view, viewport), true, "a wider floor invalidates stationary LOD visibility caches");
   assert.equal(runtime.getStats().renderedSegments, 2, "LOD visibility includes shader-expanded strokes outside the viewport");
-  for (const Renderer of [WebGlFloorplanRenderer, WebGpuFloorplanRenderer]) {
+  for (const Renderer of [WebGlPdfRenderer, WebGpuPdfRenderer]) {
     let frames = 0, camera;
     const renderer = Object.assign(Object.create(Renderer.prototype), {
       minimumStrokeWidthPx: 0, zoom: .25, requestFrame: () => frames++,
@@ -115,7 +115,7 @@ try {
       for (const [baseZoom, scale] of [1e-8, .25, 128].flatMap(zoom => [1, 2, 4].map(scale => [zoom, scale]))) {
         renderer.zoom = baseZoom;
         const zoom = renderer.zoom * scale;
-        if (Renderer === WebGlFloorplanRenderer) {
+        if (Renderer === WebGlPdfRenderer) {
           assert.equal(renderer.minimumStrokeWidthPixels(zoom), width * scale);
         } else {
           renderer.updateCameraUniforms(800 * scale, 600 * scale, 0, 0, zoom, false);

@@ -6,11 +6,11 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
     ? `${specifier}.ts` : specifier, context);
 } });
 try {
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
   const { planRasterTiles } = await import("../src/rasterTiles.ts");
   const source = { width: 8, height: 8, data: new Uint8Array(8 * 8 * 4).fill(127),
     matrix: Float32Array.of(8, 0, 0, 8, 0, 0), opacity: .5, pageIndex: 0, paintOrder: 0 };
-  const { renderer, mock } = fixture(WebGlFloorplanRenderer);
+  const { renderer, mock } = fixture(WebGlPdfRenderer);
   assert.equal(renderer.getSceneRasterLayers({ rasterLayers: [source] })[0], source,
     "already normalized canonical layers do not need metadata wrappers");
   assert.equal(renderer.classifyRasterLayerSource(source, true), source,
@@ -62,18 +62,18 @@ try {
   assert.equal(renderer.createRasterLayerGpu(source, 0), restored, "placement LRU still restores the original lease");
   renderer.deleteRasterLayerTextures(restored);
 
-  const distinct = fixture(WebGlFloorplanRenderer);
+  const distinct = fixture(WebGlPdfRenderer);
   const controls = [source, { ...source, interpolate: false }, { ...source, data: source.data.slice() },
     { ...source, width: 4, height: 16 }].map((input, index) => distinct.renderer.createRasterLayerGpu(input, index));
   assert.equal(distinct.mock.created, 4, "sampling, dimensions and canonical pixel identity distinguish textures");
   for (const resource of controls) distinct.renderer.deleteRasterLayerTextures(resource);
   assert.equal(distinct.mock.alive.size, 0);
-  const otherContext = fixture(WebGlFloorplanRenderer);
+  const otherContext = fixture(WebGlPdfRenderer);
   const otherResource = otherContext.renderer.createRasterLayerGpu(source, 0);
   assert.equal(otherContext.mock.created, 1, "resources never cross WebGL contexts");
   otherContext.renderer.deleteRasterLayerTextures(otherResource);
 
-  const tiled = fixture(WebGlFloorplanRenderer, 32);
+  const tiled = fixture(WebGlPdfRenderer, 32);
   const wide = { ...source, width: 78, height: 1, data: new Uint8Array(78 * 4).fill(127) };
   const plan = planRasterTiles(wide.width, wide.height, 32);
   const first = tiled.renderer.createRasterLayerGpu(wide, 0, plan);
@@ -90,7 +90,7 @@ try {
   tiled.renderer.deleteRasterLayerTextures(second); tiled.renderer.deleteRasterLayerTextures(changed);
   assert.equal(tiled.mock.alive.size, 0);
 
-  const packed = fixture(WebGlFloorplanRenderer);
+  const packed = fixture(WebGlPdfRenderer);
   const bits = { ...source, width: 9, height: 2,
     monochrome: { data: Uint8Array.of(128, 0, 64, 0), colors: Uint8Array.of(0, 0, 0, 255, 255, 255, 255, 255) },
     get data() { assert.fail("packed resource identity must not expand RGBA"); } };
@@ -105,7 +105,7 @@ try {
   packed.renderer.deleteRasterLayerTextures(mono2); packed.renderer.deleteRasterLayerTextures(otherPalette);
   assert.equal(packed.mock.alive.size, 0);
 
-  const compressed = fixture(WebGlFloorplanRenderer);
+  const compressed = fixture(WebGlPdfRenderer);
   let compressedUploads = 0;
   compressed.renderer.rasterCompression = {
     uploadEncoded() { compressedUploads++; return { texture: compressed.renderer.mustCreateTexture(), uvScale: [1, 1] }; }
@@ -123,7 +123,7 @@ try {
   for (const resource of [compressed1, compressed2, otherEncoded, ordinary]) compressed.renderer.deleteRasterLayerTextures(resource);
   assert.equal(compressed.mock.alive.size, 0);
 
-  const prepared = fixture(WebGlFloorplanRenderer);
+  const prepared = fixture(WebGlPdfRenderer);
   const derivative = { plan: compressedPlan, pixels: [source.data.slice()] };
   const prepared1 = prepared.renderer.createRasterLayerGpu(source, 0, compressedPlan, null, derivative);
   const prepared2 = prepared.renderer.createRasterLayerGpu({ ...source, paintOrder: 1 }, 1, compressedPlan, null, derivative);
@@ -133,7 +133,7 @@ try {
   for (const resource of [prepared1, prepared2, otherDerivative]) prepared.renderer.deleteRasterLayerTextures(resource);
   assert.equal(prepared.mock.alive.size, 0);
 
-  const failed = fixture(WebGlFloorplanRenderer);
+  const failed = fixture(WebGlPdfRenderer);
   failed.mock.failUpload = true;
   assert.throws(() => failed.renderer.createRasterLayerGpu(source, 0), /upload failed/);
   assert.equal(failed.mock.alive.size, 0); assert.equal(failed.renderer.estimatedRasterResidentBytes(), 0);

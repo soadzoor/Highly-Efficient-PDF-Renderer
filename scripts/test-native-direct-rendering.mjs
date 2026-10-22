@@ -7,13 +7,21 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 } });
 
 try {
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
+  const legacyWebGl = await import("../src/webGlFloorplanRenderer.ts");
+  const legacyWebGpu = await import("../src/webGpuFloorplanRenderer.ts");
+  assert.equal(legacyWebGl.WebGlFloorplanRenderer, WebGlPdfRenderer,
+    "the legacy WebGL module and class name retain constructor identity");
+  assert.equal(legacyWebGpu.WebGpuFloorplanRenderer, WebGpuPdfRenderer,
+    "the legacy WebGPU module and class name retain constructor identity and static factories");
+  assert.equal(legacyWebGl.WebGlPdfRenderer, WebGlPdfRenderer);
+  assert.equal(legacyWebGpu.WebGpuPdfRenderer, WebGpuPdfRenderer);
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { VectorDrawRunCuller, vectorViewBounds } = await import("../src/vectorDrawRunCulling.ts");
   const { VectorStrokeLodRuntime, buildRuntimeTileBuckets } = await import("../src/vectorStrokeLodCore.ts");
   const { VISIBILITY_GUARD_PIXELS: guard } = await import("../src/visibilityGuard.ts");
-  const backends = [["WebGL", WebGlFloorplanRenderer], ["WebGPU", WebGpuFloorplanRenderer]];
+  const backends = [["WebGL", WebGlPdfRenderer], ["WebGPU", WebGpuPdfRenderer]];
   for (const [backend, Renderer] of backends) {
     // Meets the former paint-count threshold. Four columns let viewport
     // movement remove strokes progressively before the pointer is released.

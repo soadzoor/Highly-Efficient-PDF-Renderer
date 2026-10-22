@@ -11,7 +11,7 @@ Object.defineProperty(globalThis, "navigator", { configurable: true, value: { de
 console.warn = (...args) => warnings.push(args.join(" "));
 
 try {
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { automaticRasterMemoryBudget, estimateRasterTextureBytes } = await import("../src/rasterMemoryBudget.ts");
   const { buildRasterStripBatches } = await import("../src/rasterStripBatches.ts");
@@ -26,7 +26,7 @@ try {
     monochrome: { data: new Uint8Array(128 * 1024).fill(0x55), colors: Uint8Array.of(0, 0, 0, 255, 255, 255, 255, 255) },
     get data() { expanded++; throw new Error("Packed pixels must remain lazy"); },
     matrix: Float32Array.of(1024, 0, 0, 1024, 4, 0), paintOrder: 4, pageIndex: 0 });
-  const { renderer, mock } = fixture(WebGlFloorplanRenderer, scene, estimateRasterTextureBytes);
+  const { renderer, mock } = fixture(WebGlPdfRenderer, scene, estimateRasterTextureBytes);
   renderer.uploadRasterLayers(scene);
   const uploadSizes = mock.uploads.map(upload => [upload.width, upload.height]);
   assert.equal(renderer.rasterLayers.length, 5);
@@ -79,7 +79,7 @@ try {
   const concurrentScene = Object.assign(createEmptyVectorScene(), {
     rasterLayers: Array.from({ length: 2 }, (_, index) => image(256, 256, rgbaData(256, 256), index))
   });
-  const concurrent = fixture(WebGlFloorplanRenderer, concurrentScene, estimateRasterTextureBytes);
+  const concurrent = fixture(WebGlPdfRenderer, concurrentScene, estimateRasterTextureBytes);
   concurrent.renderer.uploadRasterLayers(concurrentScene);
   const firstUpdate = concurrent.renderer.prepareRasterLayerUpdates(new Map([[0, replacement]]));
   const secondUpdate = concurrent.renderer.prepareRasterLayerUpdates(new Map([[1, replacement]]));
@@ -102,7 +102,7 @@ try {
       rasterLayers: Array.from({ length: 4 }, (_, index) => image(4, height, rgbaData(4, height), index)),
       drawRuns: [{ kind: "raster", first: 0, count: 4 }]
     });
-    const current = fixture(WebGlFloorplanRenderer, small, estimateRasterTextureBytes);
+    const current = fixture(WebGlPdfRenderer, small, estimateRasterTextureBytes);
     const [batch] = build(small), bytes = batch.data.byteLength + batch.instances.byteLength;
     current.renderer[upload](small, 4096, bytes - 1);
     assert.equal(current.renderer[slots].size, 0, "insufficient remaining bytes skip the duplicate allocation");
@@ -115,7 +115,7 @@ try {
   }
   {
     const scan = scene.rasterLayers[4];
-    const current = fixture(WebGlFloorplanRenderer, Object.assign(createEmptyVectorScene(), { rasterLayers: [scan] }), estimateRasterTextureBytes);
+    const current = fixture(WebGlPdfRenderer, Object.assign(createEmptyVectorScene(), { rasterLayers: [scan] }), estimateRasterTextureBytes);
     Object.assign(current.renderer, { rasterResolutionPlanner: new RasterResolutionPlanner(), rasterResolutionView: null,
       rasterRenderingEnabled: true, canvas: { width: 512, height: 512 }, cameraCenterX: 512, cameraCenterY: 512, zoom: .1 });
     current.renderer.uploadRasterLayers(current.renderer.scene);
@@ -152,7 +152,7 @@ try {
     tiles[1].matrix[4] = 4097.125;
     const scene = Object.assign(createEmptyVectorScene(), { rasterLayers: tiles,
       drawRuns: [{ kind: "raster", first: 0, count: 2 }] });
-    const { renderer, mock } = fixture(WebGlFloorplanRenderer, scene, estimateRasterTextureBytes);
+    const { renderer, mock } = fixture(WebGlPdfRenderer, scene, estimateRasterTextureBytes);
     Object.assign(renderer, { rasterResolutionPlanner: new RasterResolutionPlanner(), rasterResolutionView: null,
       rasterRenderingEnabled: true, canvas: { width: 512, height: 512 }, cameraCenterX: 4097, cameraCenterY: 1, zoom: .1 });
     renderer.uploadRasterLayers(scene);
@@ -167,7 +167,7 @@ try {
   }
   {
     const scene = Object.assign(createEmptyVectorScene(), { rasterLayers: [image(24, 24, rgbaData(24, 24), 0), image(24, 24, rgbaData(24, 24), 1)] });
-    const { renderer, mock } = fixture(WebGlFloorplanRenderer, scene, estimateRasterTextureBytes);
+    const { renderer, mock } = fixture(WebGlPdfRenderer, scene, estimateRasterTextureBytes);
     renderer.uploadRasterLayers(scene);
     const old = renderer.rasterLayers.slice(), createResource = renderer.createRasterLayerGpu.bind(renderer);
     let preparedUploads = 0, ticks = 0;

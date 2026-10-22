@@ -12,13 +12,13 @@ globalThis.GPUTextureUsage = { TEXTURE_BINDING: 1, COPY_DST: 2, RENDER_ATTACHMEN
 globalThis.GPUShaderStage = { VERTEX: 1, FRAGMENT: 2 };
 
 try {
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const create = () => {
     const device = makeDevice();
     const canvas = { width: 100, height: 100,
       getBoundingClientRect: () => ({ width: 100, height: 100, left: 0, top: 0 }) };
-    const renderer = new WebGpuFloorplanRenderer(canvas, device,
+    const renderer = new WebGpuPdfRenderer(canvas, device,
       { configure() {}, getCurrentTexture: () => device.createTexture({}) }, "rgba8unorm");
     device.cameraBuffer = renderer.cameraUniformBuffer;
     Object.assign(renderer, {

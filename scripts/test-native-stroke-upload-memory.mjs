@@ -10,8 +10,8 @@ globalThis.GPUTextureUsage = { TEXTURE_BINDING: 1, COPY_DST: 2, RENDER_ATTACHMEN
 globalThis.GPUShaderStage = { VERTEX: 1, FRAGMENT: 2 };
 const fields = ["endpoints", "primitiveMeta", "styles", "primitiveBounds"];
 try {
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { sceneStrokeRecords, strokeTextureRows } = await import("../src/strokeRecords.ts");
   const sceneOf = count => Object.assign(createEmptyVectorScene(), {
@@ -70,7 +70,7 @@ try {
       const bits = new Uint32Array(backing.buffer, scene[field].byteOffset, scene[field].length);
       for (let i = 0; i < bits.length; i++) bits[i] = [0x80000000, 0x7fc00001, 0x3f800001, 0xbf800001][(i + index) % 4];
     }
-    const gl = glMock(), renderer = Object.assign(Object.create(WebGlFloorplanRenderer.prototype), { gl });
+    const gl = glMock(), renderer = Object.assign(Object.create(WebGlPdfRenderer.prototype), { gl });
     const textures = Object.fromEntries(["A", "B", "C", "D"].map(key => [`texture${key}`, gl.createTexture()]));
     const dims = renderer.uploadStrokeTextureSet(sceneStrokeRecords(scene), textures);
     for (const [index, texture] of Object.values(textures).entries()) {
@@ -80,7 +80,7 @@ try {
       assert(scene[fields[Object.values(textures).indexOf(upload.texture)]].buffer === upload.data.buffer);
       assert(upload.data.byteLength <= 4 * 1024 * 1024, "WebGL driver submissions have bounded source views");
     }
-    const device = gpuMock(), gpu = Object.assign(Object.create(WebGpuFloorplanRenderer.prototype), { gpuDevice: device });
+    const device = gpuMock(), gpu = Object.assign(Object.create(WebGpuPdfRenderer.prototype), { gpuDevice: device });
     for (const field of fields) {
       const texture = gpu.createFloatTexture(dims.textureWidth, dims.textureHeight, scene[field]);
       verifyBytes(texture, scene[field], `${count} WebGPU texels`);
@@ -93,12 +93,12 @@ try {
   }
 
   // Generic float textures also allow a partially populated last texel.
-  const device = gpuMock(), gpu = Object.assign(Object.create(WebGpuFloorplanRenderer.prototype), { gpuDevice: device });
+  const device = gpuMock(), gpu = Object.assign(Object.create(WebGpuPdfRenderer.prototype), { gpuDevice: device });
   const partial = Float32Array.of(1, 2, 3, 4, 5, 6);
   verifyBytes(gpu.createFloatTexture(3, 2, partial), partial, "partial RGBA texel is zero-filled");
   assert.throws(() => gpu.createFloatTexture(1, 1, new Float32Array(5)), /exceeds texture size/);
 
-  for (const [backend, Renderer] of [["WebGL", WebGlFloorplanRenderer], ["WebGPU", WebGpuFloorplanRenderer]]) {
+  for (const [backend, Renderer] of [["WebGL", WebGlPdfRenderer], ["WebGPU", WebGpuPdfRenderer]]) {
     const gl = glMock(), device = gpuMock();
     const canvas = { width: 100, height: 100, getContext: () => gl };
     const renderer = backend === "WebGL" ? new Renderer(canvas)
@@ -237,7 +237,7 @@ try {
   }
 
   // Progressive page completion must not send visible scans back through preview tiers.
-  for (const [backend, Renderer] of [["WebGL", WebGlFloorplanRenderer], ["WebGPU", WebGpuFloorplanRenderer]]) {
+  for (const [backend, Renderer] of [["WebGL", WebGlPdfRenderer], ["WebGPU", WebGpuPdfRenderer]]) {
     const canvas = { width: 1024, height: 1024, getContext: () => glMock() };
     const renderer = backend === "WebGL" ? new Renderer(canvas)
       : new Renderer(canvas, gpuMock(), { configure() {} }, "rgba8unorm");
@@ -280,7 +280,7 @@ try {
   const oldBuffer = growthDevice.createBuffer({ size: 8 });
   const clipTexture = growthDevice.createTexture({ size: { width: 1, height: 1 }, format: "rgba32float" });
   const clipBuffer = growthDevice.createBuffer({ size: 32 });
-  const growth = Object.assign(Object.create(WebGpuFloorplanRenderer.prototype), {
+  const growth = Object.assign(Object.create(WebGpuPdfRenderer.prototype), {
     gpuDevice: growthDevice, orderedInstanceBuffer: oldBuffer, orderedInstanceCapacityBytes: 8,
     vectorClipTexture: clipTexture, vectorClipBuffers: [clipBuffer], vectorClipBindGroupLayout: {},
     scene: { ...sceneOf(1), drawRuns: [] }, zoom: 1,

@@ -1,7 +1,7 @@
 import type { RendererApi, SceneUpdateOptions } from "./rendererTypes";
 import type { RasterLayer, VectorScene } from "./pdfVectorExtractor";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
-import type { DrawStats, ViewState } from "./webGlFloorplanRenderer";
+import type { DrawStats, ViewState } from "./webGlPdfRenderer";
 import { validateRasterLayerUpdates } from "./rasterLayerUpdates";
 import type { DeferredSceneRendererApi } from "./deferredRendererApi";
 

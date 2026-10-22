@@ -13,8 +13,8 @@ try {
   const { VectorDrawRunCuller } = await import("../src/vectorDrawRunCulling.ts");
   const { createDefaultOptionalContentSnapshot } = await import("../src/optionalContent.ts");
   const { createOrthographicLocalToClip } = await import("../src/planarProjection.ts");
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const count = 60_000;
   const rectangle = (x0, y0, x1, y1) => ({ parent: -1, fillRule: 0,
     edges: Float32Array.of(x0,y0,x1,y0, x1,y0,x1,y1, x1,y1,x0,y1, x0,y1,x0,y0) });
@@ -135,7 +135,7 @@ try {
   assert.deepEqual(cornerPlan.batches.map(b => b.kind), ["text","fill","text"], "returning paints retain coarse overlap order");
 
   let reference;
-  for (const [backend, Renderer] of [["WebGL", WebGlFloorplanRenderer], ["WebGPU", WebGpuFloorplanRenderer]]) {
+  for (const [backend, Renderer] of [["WebGL", WebGlPdfRenderer], ["WebGPU", WebGpuPdfRenderer]]) {
     const runtime = new TextLodRuntime(build), selection = new OrderedTextLodSelection(scene, build.data);
     const plan = new VectorOrderedBatches(scene, null), calls = [];
     let uploads = 0, pipeline;
@@ -205,7 +205,7 @@ try {
     assert.equal(plan.instanceCount, count + 1, `${backend}: resource fallback retains exact drawing`);
   }
   assert.deepEqual(scene, canonical, "rendering preserves canonical geometry, clips, layers and paint order");
-  for (const file of ["webGlFloorplanRenderer.ts","webGpuFloorplanRenderer.ts"]) {
+  for (const file of ["webGlPdfRenderer.ts","webGpuPdfRenderer.ts"]) {
     const source = await readFile(new URL(`../src/${file}`, import.meta.url), "utf8");
     assert.doesNotMatch(source, /textLodBuildResult = scene.drawRuns \? null/, "ordered metadata alone must not disable LOD");
     assert.match(source, /textLodBuildResult = (?:this.thumbnailMode \|\| )?this.scenePaintVisibility.requiresCompositing \? null/,

@@ -53,7 +53,7 @@ usage and the [container specification](HEP_CONTAINER.md) for the wire format.
 | Source loading and page composition | [`pdfObjectGenerator.ts`](../src/pdfObjectGenerator.ts), [`pdfVectorExtractor.ts`](../src/pdfVectorExtractor.ts) |
 | Native PDF engine | [`src/pdf/`](../src/pdf/), [`pdfSession.ts`](../src/pdfSession.ts) |
 | HEP export and import | [`hepBuilder.ts`](../src/hepBuilder.ts), [`hep.ts`](../src/hep.ts), [`hepContainer.ts`](../src/hepContainer.ts) |
-| Standalone rendering | [`webGlFloorplanRenderer.ts`](../src/webGlFloorplanRenderer.ts), [`webGpuFloorplanRenderer.ts`](../src/webGpuFloorplanRenderer.ts) |
+| Standalone rendering | [`webGlPdfRenderer.ts`](../src/webGlPdfRenderer.ts), [`webGpuPdfRenderer.ts`](../src/webGpuPdfRenderer.ts) |
 | Three.js object | [`threePdfObject.ts`](../src/threePdfObject.ts) |
 | Level of detail | [`vectorStrokeLodCore.ts`](../src/vectorStrokeLodCore.ts), [`textLodCore.ts`](../src/textLodCore.ts) |
 | Search and selection | [`textSearch.ts`](../src/textSearch.ts), [`textSelection.ts`](../src/textSelection.ts) |

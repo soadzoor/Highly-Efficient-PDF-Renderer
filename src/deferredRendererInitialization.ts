@@ -1,6 +1,6 @@
 import type { Bounds } from "./pdfVectorExtractor";
 import type { RendererApi, ViewStateUpdateOptions } from "./rendererTypes";
-import type { ViewState } from "./webGlFloorplanRenderer";
+import type { ViewState } from "./webGlPdfRenderer";
 
 const CONFIG_METHODS = new Set([
   "setFrameListener", "setInteractionViewportProvider", "setRasterRenderingEnabled",

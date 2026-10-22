@@ -12,7 +12,7 @@ Object.defineProperty(globalThis, "navigator", { configurable: true, value: { de
 
 try {
   const { WebGlRasterCompression, detectWebGlRasterCompression } = await import("../src/webGlRasterCompression.ts");
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { estimateCompressedRasterBytes, rasterCompressionMipLayout } = await import("../src/rasterCompression.ts");
   const { automaticRasterMemoryBudget, estimateRasterTextureBytes } = await import("../src/rasterMemoryBudget.ts");
@@ -137,7 +137,7 @@ try {
   lost.gl.deleteTexture(afterLoss.texture); reset.dispose();
   assert.equal(lost.alive.size, 0, "context restoration recreates both programs and workspace");
 
-  const padded = mockGl(32), paddedRenderer = makeRenderer(WebGlFloorplanRenderer, padded.gl, createEmptyVectorScene());
+  const padded = mockGl(32), paddedRenderer = makeRenderer(WebGlPdfRenderer, padded.gl, createEmptyVectorScene());
   const paddedLayer = paddedRenderer.createRasterLayerGpu({ width: 7, height: 11,
     data: new Uint8Array(7 * 11 * 4).fill(255), matrix: Float32Array.of(7, 0, 0, 11, 0, 0) }, 0, undefined, "bc7");
   assert.deepEqual(paddedLayer.uv, Float32Array.of(0, 0, 7 / 8, 11 / 12), "whole-image GPU layers preserve logical UVs after block padding");
@@ -154,7 +154,7 @@ try {
     rasterLayers: Array.from({ length: 4 }, (_, index) => ({ width: 1024, height: 1024, data: smooth,
       matrix: Float32Array.of(1024, 0, 0, 1024, index, 0), opacity: 0.5, paintOrder: index, pageIndex: 0 }))
   });
-  const success = mockGl(4096), renderer = makeRenderer(WebGlFloorplanRenderer, success.gl, scene);
+  const success = mockGl(4096), renderer = makeRenderer(WebGlPdfRenderer, success.gl, scene);
   renderer.uploadRasterLayers(scene);
   assert(renderer.rasterLayers.every(layer => layer.compressionFormat === "bc7"));
   assert(renderer.rasterLayers.every(layer => layer.estimatedBytes === estimateCompressedRasterBytes(1024, 1024, "bc7")),
@@ -170,7 +170,7 @@ try {
   assert.equal(success.alive.size, 0);
 
   const fallback = mockGl(4096); fallback.astc = false; fallback.fail = "compressed";
-  const fallbackRenderer = makeRenderer(WebGlFloorplanRenderer, fallback.gl, scene);
+  const fallbackRenderer = makeRenderer(WebGlPdfRenderer, fallback.gl, scene);
   fallbackRenderer.uploadRasterLayers(scene);
   assert(fallbackRenderer.rasterLayers.every(layer => !layer.compressionFormat));
   assert(fallback.rgbaUploads.every(upload => upload.width < 1024), "failed compression replans RGBA resolution instead of retaining an over-budget full-size fallback");

@@ -172,7 +172,7 @@ try {
   const { buildVectorFillBandIndex } = await import("../src/vectorFillBands.ts");
   const { vectorFillCoverageMetadata } = await import("../src/vectorFillCoverage.ts");
   const { FILL_VERTEX_SHADER_SOURCE, FILL_FRAGMENT_SHADER_SOURCE } = await import("../src/nativeWebGlCoreShaders.ts");
-  const gpuSource = await readFile(new URL("../src/webGpuFloorplanRenderer.ts", import.meta.url), "utf8");
+  const gpuSource = await readFile(new URL("../src/webGpuPdfRenderer.ts", import.meta.url), "utf8");
   const gpuFillSource = gpuSource.slice(gpuSource.indexOf("const FILL_SHADER_SOURCE"), gpuSource.indexOf("const TEXT_SHADER_SOURCE"));
   // Execute each shipped native padding block on one axis. Open paths cannot
   // take the tighter support bound: their winding may extend outside the hull.
@@ -347,7 +347,7 @@ for (let i = 0; i < 4000; i += 1) {
 for (const [file, language] of [
   ["nativeWebGlCoreShaders.ts", "GLSL"],
   ["nativeGradientWebGlShaders.ts", "GLSL"],
-  ["webGpuFloorplanRenderer.ts", "WGSL"],
+  ["webGpuPdfRenderer.ts", "WGSL"],
   ["nativeGradientWebGpuShaders.ts", "WGSL"],
   ["threeWebGpuFillMaterial.ts", "WGSL"],
   ["threeWebGpuTextMaterial.ts", "WGSL"],

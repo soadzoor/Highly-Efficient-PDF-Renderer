@@ -139,7 +139,7 @@ real GPU.
 | --- | --- |
 | Storage and shaders | `src/compactMonochromeRaster.ts`, `src/compactMonochromeShaders.ts`, `src/monochromeRaster.ts`, `src/monochromeRasterWebGlShader.ts`, `src/monochromeRasterWebGpuShaders.ts` |
 | Preparation and budgets | `src/rasterPreparationCore.ts`, `src/rasterPreparationWorker.ts`, `src/rasterMemoryBudget.ts` |
-| Native and Three GPU integration | `src/webGlFloorplanRenderer.ts`, `src/webGpuFloorplanRenderer.ts`, `src/threeRasterTextures.ts`, `src/threeWebGpuRasterMaterial.ts` |
+| Native and Three GPU integration | `src/webGlPdfRenderer.ts`, `src/webGpuPdfRenderer.ts`, `src/threeRasterTextures.ts`, `src/threeWebGpuRasterMaterial.ts` |
 | PDF decoding and metadata | `src/pdf/codecs/jbig2SymbolKernel.ts`, `src/pdf/codecs/jbig2ArithmeticDecoder.ts`, `src/pdf/nativeJbig2Codec.ts`, `src/pdf/nativeCcitt.ts`, `src/pdf/nativeImage.ts`, `src/pdf/nativeVectorPage.ts` |
 | Tests | `scripts/test-compact-monochrome-raster.mjs`, `scripts/test-jbig2-symbol-storage.mjs`, `scripts/test-webgl-monochrome-raster.mjs`, `scripts/test-webgpu-monochrome-raster.mjs`, `scripts/test-three-raster-storage.mjs`, `scripts/test-webgpu-raster-memory-budget.mjs`, `scripts/test-webgl-raster-memory-budget.mjs`, `scripts/test-webgl-raster-atlas-batches.mjs`, `scripts/test-raster-worker-package.mjs`, `scripts/lib/imageCodecFixtures.mjs`, `scripts/lib/testSuites.mjs` |
 | Documentation and attribution | `docs/api.md`, `docs/monochrome-gpu-storage.md`, `THIRD_PARTY_NOTICES` |

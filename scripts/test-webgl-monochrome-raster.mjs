@@ -7,7 +7,7 @@ const hooks = registerHooks({ resolve(s, c, next) {
 } });
 
 try {
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
   const { createMonochromeRasterLayer, expandMonochromeRaster } = await import("../src/monochromeRaster.ts");
   const { monochromeRasterFragmentGlsl } = await import("../src/monochromeRasterWebGlShader.ts");
   const { RASTER_FRAGMENT_SHADER_SOURCE } = await import("../src/nativeWebGlCoreShaders.ts");
@@ -21,7 +21,7 @@ try {
     get data() { expanded++; return expandMonochromeRaster(mono, 9, 2); },
     matrix: Float32Array.of(9, 0, 0, 2, 0, 0), paintOrder: 0, pageIndex: 0
   };
-  const { renderer, mock } = makeRenderer(WebGlFloorplanRenderer, 64);
+  const { renderer, mock } = makeRenderer(WebGlPdfRenderer, 64);
   const sources = renderer.getSceneRasterLayers({ rasterLayers: [layer] });
   assert.equal(expanded, 0, "collecting packed sources does not materialize legacy RGBA");
   const gpu = renderer.createRasterLayerGpu(sources[0], 0);
@@ -44,7 +44,7 @@ try {
 
   // An explicit PDF Interpolate=false keeps packed storage while selecting
   // exact base pixels, even when a compact filtered atlas was prepared.
-  const nearest = makeRenderer(WebGlFloorplanRenderer, 64);
+  const nearest = makeRenderer(WebGlPdfRenderer, 64);
   const nearestSource = nearest.renderer.getSceneRasterLayers({ rasterLayers: [{ ...layer, interpolate: false }] })[0];
   assert.equal(nearestSource.interpolate, false);
   const nearestGpu = nearest.renderer.createRasterLayerGpu(nearestSource, 0);
@@ -60,7 +60,7 @@ try {
   assert(nearest.mock.calls.some(call => call[0] === "texParameteri" && call[2] === "TEXTURE_MAG_FILTER" && call[3] === "NEAREST"));
   nearest.renderer.deleteRasterLayerTextures(nearestGpu); nearest.renderer.deleteRasterLayerTextures(coverageNearest);
 
-  const rgbaNearest = makeRenderer(WebGlFloorplanRenderer, 64);
+  const rgbaNearest = makeRenderer(WebGlPdfRenderer, 64);
   const threeColors = { width: 3, height: 1, data: Uint8Array.of(255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255),
     matrix: layer.matrix, interpolate: false };
   const rgbaGpu = rgbaNearest.renderer.createRasterLayerGpu(threeColors, 0);
@@ -75,7 +75,7 @@ try {
     "a single source pixel supplies a complete coverage sampler");
   renderer.deleteRasterLayerTextures(single);
 
-  const tiled = makeRenderer(WebGlFloorplanRenderer, 32);
+  const tiled = makeRenderer(WebGlPdfRenderer, 32);
   const wide = createMonochromeRasterLayer({ width: 78, height: 1, matrix: layer.matrix, paintOrder: 0, pageIndex: 0 },
     { data: Uint8Array.from({ length: 10 }, () => 0x55), colors: mono.colors });
   const tiledGpu = tiled.renderer.createRasterLayerGpu(wide, 0);
@@ -113,18 +113,18 @@ try {
   assert(mock.calls.some(call => call[0] === "uniform1f" && call[1] === "uRasterMonochrome" && call[2] === 0));
   renderer.deleteRasterLayerTextures(rgba);
 
-  const failed = makeRenderer(WebGlFloorplanRenderer, 64);
+  const failed = makeRenderer(WebGlPdfRenderer, 64);
   failed.mock.failTexture = 2;
   assert.throws(() => failed.renderer.createRasterLayerGpu(layer, 0), /texture/i);
   assert.equal(failed.mock.alive.size, 0, "failed coverage texture creation releases the packed texture");
-  const uploadFailed = makeRenderer(WebGlFloorplanRenderer, 64);
+  const uploadFailed = makeRenderer(WebGlPdfRenderer, 64);
   uploadFailed.mock.failUpload = 2;
   assert.throws(() => uploadFailed.renderer.createRasterLayerGpu(layer, 0), /upload/i);
   assert.equal(uploadFailed.mock.alive.size, 0, "failed mip upload releases both textures");
   assert.deepEqual(uploadFailed.mock.calls.filter(call => call[0] === "pixelStorei").at(-1), ["pixelStorei", "UNPACK_ALIGNMENT", 4]);
 
   {
-    const { renderer: compactRenderer, mock: compactMock } = makeRenderer(WebGlFloorplanRenderer, 512);
+    const { renderer: compactRenderer, mock: compactMock } = makeRenderer(WebGlPdfRenderer, 512);
     const bits = { data: new Uint8Array(512 * 512 / 8).fill(255), colors: mono.colors };
     const source = { width: 512, height: 512, monochrome: bits, matrix: Float32Array.of(512,0,0,512,0,0),
       get data() { assert.fail("compact upload must not expand RGBA"); } };
@@ -137,12 +137,12 @@ try {
     compactRenderer.drawRasterTile(resource);
     assert(compactMock.calls.some(call => call[0] === "uniform1f" && call[1] === "uRasterMonochrome" && call[2] === 3));
     compactRenderer.deleteRasterLayerTextures(resource);assert.equal(compactMock.alive.size, 0);
-    const failed = makeRenderer(WebGlFloorplanRenderer, 512);failed.mock.failUpload = 1;
+    const failed = makeRenderer(WebGlPdfRenderer, 512);failed.mock.failUpload = 1;
     assert.throws(() => failed.renderer.createRasterLayerGpu(source, 0), /upload failed/);
     assert.equal(failed.mock.alive.size, 0, "failed compact uploads release the atlas");
   }
   {
-    const { renderer: preparedRenderer, mock: preparedMock } = makeRenderer(WebGlFloorplanRenderer, 512);
+    const { renderer: preparedRenderer, mock: preparedMock } = makeRenderer(WebGlPdfRenderer, 512);
     const source = { width:512,height:512,matrix:Float32Array.of(512,0,0,512,0,0),paintOrder:0,pageIndex:0,
       monochrome:{ data:new Uint8Array(512*512/8).fill(255),colors:mono.colors },
       get data() { assert.fail("stored monochrome display preparation must keep canonical RGBA lazy"); } };

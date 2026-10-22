@@ -42,7 +42,7 @@ export async function checkBundlerSizes(fixture, consumerConfig) {
         // These synchronous host adapters support shared render hooks without
         // importing WebGPU materials or Three's node graph.
         const hostAdapter = /\/threeWebGpu(?:SubmissionBatch|UniformUpdates)\.js$/.test(module);
-        assert(hostAdapter || !/\/(?:webGlFloorplanRenderer|webGpuFloorplanRenderer|threeWebGpu[^/]*|hepWriter|hepBuilderRuntime|hepContainerWriter|pdfSession)\.js$/.test(module),
+        assert(hostAdapter || !/\/(?:webGlPdfRenderer|webGpuPdfRenderer|threeWebGpu[^/]*|hepWriter|hepBuilderRuntime|hepContainerWriter|pdfSession)\.js$/.test(module),
           `${symbol} eagerly includes an optional implementation: ${module}`);
       }
       assert(!initial.some(chunk => chunk.imports.some(id => id === "three/webgpu" || id === "three/tsl")),
@@ -54,7 +54,7 @@ export async function checkBundlerSizes(fixture, consumerConfig) {
     }
     if (["renderPdfThumbnail", "openDocumentSession"].includes(symbol)) {
       for (const module of modules) {
-        assert(!/\/(?:documentSessionRuntime|pdfSession|nativeVectorPage|webGlFloorplanRenderer|webGpuFloorplanRenderer|thumbnailRenderer|thumbnailEncoder|thumbnailEncodingCore|hepReader|hepWriter|hepBuilderRuntime)\.js$/.test(module),
+        assert(!/\/(?:documentSessionRuntime|pdfSession|nativeVectorPage|webGlPdfRenderer|webGpuPdfRenderer|thumbnailRenderer|thumbnailEncoder|thumbnailEncodingCore|hepReader|hepWriter|hepBuilderRuntime)\.js$/.test(module),
           `${symbol} eagerly includes thumbnail preparation, rendering or encoding: ${module}`);
       }
     }

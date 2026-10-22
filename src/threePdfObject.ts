@@ -74,7 +74,7 @@ import {
   type VectorStrokeLodStats,
   type VectorLodMode
 } from "./vectorStrokeLod";
-import type { DrawStats, ViewState } from "./webGlFloorplanRenderer";
+import type { DrawStats, ViewState } from "./webGlPdfRenderer";
 import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 
 export type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
@@ -5015,13 +5015,13 @@ async function createNativeRenderer(
   renderCanvas: HTMLCanvasElement
 ): Promise<RendererApi> {
   if (rendererType === "webgpu") {
-    const { WebGpuFloorplanRenderer } = await import("./webGpuFloorplanRenderer");
-    return WebGpuFloorplanRenderer.createDeferred(renderCanvas);
+    const { WebGpuPdfRenderer } = await import("./webGpuPdfRenderer");
+    return WebGpuPdfRenderer.createDeferred(renderCanvas);
   }
-  const { WebGlFloorplanRenderer } = await import("./webGlFloorplanRenderer");
+  const { WebGlPdfRenderer } = await import("./webGlPdfRenderer");
   const { deferRendererInitialization } = await import("./deferredRendererInitialization");
-  return deferRendererInitialization(renderCanvas, WebGlFloorplanRenderer.prototype,
-    () => new WebGlFloorplanRenderer(renderCanvas));
+  return deferRendererInitialization(renderCanvas, WebGlPdfRenderer.prototype,
+    () => new WebGlPdfRenderer(renderCanvas));
 }
 
 /**

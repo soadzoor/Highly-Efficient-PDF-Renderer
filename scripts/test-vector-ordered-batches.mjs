@@ -8,8 +8,8 @@ try {
   const { VectorOrderedBatches } = await import("../src/vectorOrderedBatches.ts");
   const { strokePaintOrigins } = await import("../src/vectorStrokePaintOrder.ts");
   const { VectorStrokeLodRuntime, prebuildVectorStrokeLodRuntime, buildVectorStrokeLodScenes } = await import("../src/vectorStrokeLodCore.ts");
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const { strokeRecordSegment } = await import("../src/strokeRecords.ts");
 
   const scene = makeScene(60);
@@ -168,14 +168,14 @@ try {
   lod.update({ cameraCenterX: 500, cameraCenterY: 500, zoom: 100 }, { width: 1000, height: 1000 });
   assert(lod.getStats().activeLevels.every(level => level.index === 0), "deep zoom restores exact strokes");
 
-  for (const Renderer of [WebGlFloorplanRenderer, WebGpuFloorplanRenderer]) {
+  for (const Renderer of [WebGlPdfRenderer, WebGpuPdfRenderer]) {
     let updated = false, invalidations = 0;
     const renderer = Object.assign(Object.create(Renderer.prototype), { scene: dense, minimumStrokeWidthPx: 0,
       orderedBatches: { invalidate() { invalidations++; } }, vectorLodRuntime: {
         setMinimumStrokeWidth() {}, setScreenSpaceTransform() {}, updateForLocalUnitsPerPixel() {}, update() { return updated; },
         getStats() { return { renderedSegments: 3 }; }
       } });
-    const update = Renderer === WebGlFloorplanRenderer
+    const update = Renderer === WebGlPdfRenderer
       ? () => renderer.updateVectorLodVisibleSet(overview, viewport, null, 10)
       : () => renderer.updateVectorLodVisibleSet(510, 490, 1000, 1000, 0.1);
     update();
@@ -186,7 +186,7 @@ try {
   }
 
   // Exercise actual GL instance offsets and both native batch dispatchers.
-  const low = Object.create(WebGlFloorplanRenderer.prototype);
+  const low = Object.create(WebGlPdfRenderer.prototype);
   const pointers = [], bound = [];
   low.gl = new Proxy({ bindBuffer: (_target, buffer) => bound.push(buffer),
     vertexAttribPointer: (...args) => pointers.push(args) }, { get: (o, k) => o[k] ?? (() => {}) });
@@ -197,7 +197,7 @@ try {
   const flags = { scene, orderedBatches: mixed, minimumStrokeWidthPx: 0, vectorLodLevels: [{ texture: "combined" }],
     vectorLodLevelResources: [{ bindGroup: "combined" }], fillRenderingEnabled: true,
     strokeRenderingEnabled: true, textRenderingEnabled: true, rasterRenderingEnabled: false };
-  const gl = Object.assign(Object.create(WebGlFloorplanRenderer.prototype), flags);
+  const gl = Object.assign(Object.create(WebGlPdfRenderer.prototype), flags);
   const calls = [];
   gl.drawStrokeInstances = (store, _buffer, count, _w, _h, _x, _y, _z, first) => {
     assert.equal(store.texture, "combined"); calls.push(["stroke", first, count]);
@@ -207,7 +207,7 @@ try {
   assert.equal(gl.drawSourceOrderedContent(100, 100, 50, 50, 1), 6);
   const expected = mixed.batches.map(b => [b.kind, b.first, b.count]);
   assert.deepEqual(calls, expected);
-  const gpu = Object.assign(Object.create(WebGpuFloorplanRenderer.prototype), flags, {
+  const gpu = Object.assign(Object.create(WebGpuPdfRenderer.prototype), flags, {
     fillPipeline: "fill", strokePipeline: "stroke", textPipeline: "text", fillBindGroup: "fill",
     strokeBindGroupAll: "exact", textBindGroup: "text", vectorClipBindGroups: ["instances", "none"]
   });
@@ -234,7 +234,7 @@ try {
   layerScene.paintGraph = { roots: [{ kind: "group", alpha: 1, isolated: false, knockout: false,
     blendMode: "Normal", optionalContent: 0, children: [{ kind: "draw", runIndex: 0 }, { kind: "draw", runIndex: 1 }] }] };
   const originalRuns = structuredClone(layerScene.drawRuns);
-  for (const Renderer of [WebGlFloorplanRenderer, WebGpuFloorplanRenderer]) {
+  for (const Renderer of [WebGlPdfRenderer, WebGpuPdfRenderer]) {
     const plan = new VectorOrderedBatches(layerScene, null);
     const draws = [], uploads = [];
     const instance = Object.assign(Object.create(Renderer.prototype), {
@@ -250,7 +250,7 @@ try {
       destroyVectorMinifyResources() {}, requestFrame() {}
     });
     const pass = { setPipeline() {}, setBindGroup() {}, draw(_vertices, count) { draws.push(count); } };
-    const render = () => Renderer === WebGlFloorplanRenderer
+    const render = () => Renderer === WebGlPdfRenderer
       ? instance.drawSourceOrderedContent(100, 100, 50, 50, 1) : instance.drawSourceOrderedContentIntoPass(pass);
     assert.equal(render(), 4);
     assert.deepEqual(draws, [4], "a passthrough graph batches separately conditioned strokes in one draw");
@@ -283,7 +283,7 @@ try {
   ];
   redundantScene.optionalContent = structuredClone(layerScene.optionalContent);
   const canonical = structuredClone(redundantScene);
-  for (const Renderer of [WebGlFloorplanRenderer, WebGpuFloorplanRenderer]) {
+  for (const Renderer of [WebGlPdfRenderer, WebGpuPdfRenderer]) {
     const plan = new VectorOrderedBatches(redundantScene, null);
     const uploads = [], counts = [];
     const instance = Object.assign(Object.create(Renderer.prototype), {
@@ -299,7 +299,7 @@ try {
       destroyVectorMinifyResources() {}, requestFrame() {}
     });
     const pass = { setPipeline() {}, setBindGroup() {}, draw(_vertices, count) { counts.push(count); } };
-    const render = () => Renderer === WebGlFloorplanRenderer
+    const render = () => Renderer === WebGlPdfRenderer
       ? instance.drawSourceOrderedContent(100, 100, 50, 50, 1) : instance.drawSourceOrderedContentIntoPass(pass);
     assert.equal(render(), 1, "both native dispatchers omit the covered opaque stroke");
     assert.equal(instance.getRedundantSegmentCount(), 1);
@@ -330,7 +330,7 @@ try {
   const previousUsage = globalThis.GPUBufferUsage;
   globalThis.GPUBufferUsage = { STORAGE: 1, COPY_DST: 2 };
   try {
-    for (const Renderer of [WebGlFloorplanRenderer, WebGpuFloorplanRenderer]) {
+    for (const Renderer of [WebGlPdfRenderer, WebGpuPdfRenderer]) {
       const renderer = Object.create(Renderer.prototype);
       renderer.vectorLodMode = "force";
       renderer.vectorOverrideColor = [0.4, 0.5, 0.6];
@@ -362,7 +362,7 @@ try {
     else globalThis.GPUBufferUsage = previousUsage;
   }
 
-  const uniforms = Object.create(WebGlFloorplanRenderer.prototype);
+  const uniforms = Object.create(WebGlPdfRenderer.prototype);
   uniforms.vectorClipIndex = -2;
   uniforms.orderedUniformPrograms = new Set();
   assert.equal(uniforms.prepareOrderedProgram("stroke"), true);
@@ -373,7 +373,7 @@ try {
   uniforms.vectorClipIndex = -1;
   assert.equal(uniforms.prepareOrderedProgram("stroke"), true, "legacy draws always set their own uniforms");
 
-  const textureRenderer = Object.create(WebGlFloorplanRenderer.prototype);
+  const textureRenderer = Object.create(WebGlPdfRenderer.prototype);
   const textureCalls = [];
   let activeUnit;
   const textureRuns = ["stroke", "fill", "stroke", "raster", "stroke"].map(kind =>

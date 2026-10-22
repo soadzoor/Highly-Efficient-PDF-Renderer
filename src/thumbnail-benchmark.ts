@@ -1,7 +1,7 @@
 import { openDocumentSession } from "./documentSession";
 import { renderPdfThumbnail, normalizeThumbnailOptions, type PdfThumbnailOptions, type PdfThumbnailResult } from "./pdfThumbnail";
 import { loadPdfSceneFromSource, type LoadedPdfScene } from "./pdfObjectGenerator";
-import { WebGlFloorplanRenderer } from "./webGlFloorplanRenderer";
+import { WebGlPdfRenderer } from "./webGlPdfRenderer";
 import { ThumbnailEncoder } from "./thumbnailEncoder";
 import { thumbnailSize } from "./thumbnailTypes";
 import { RetainedPageReplay } from "./retainedPageReplay";
@@ -217,7 +217,7 @@ function errorText(error: unknown): string { return error instanceof Error ? `${
  * output size. This is a diagnostic baseline, not an exact old Reader replay. */
 class InteractiveBaseline implements BenchSession {
   private loaded: LoadedPdfScene | undefined;
-  private renderer: WebGlFloorplanRenderer | undefined;
+  private renderer: WebGlPdfRenderer | undefined;
   private canvas: HTMLCanvasElement | undefined;
   private readonly encoder = new ThumbnailEncoder();
   private replay: RetainedPageReplay | undefined;
@@ -240,7 +240,7 @@ class InteractiveBaseline implements BenchSession {
       const factoryStarted = performance.now();
       const canvas = this.canvas = document.createElement("canvas");
       canvas.width = size.width; canvas.height = size.height;
-      this.renderer = new WebGlFloorplanRenderer(canvas, { preserveDrawingBuffer: true });
+      this.renderer = new WebGlPdfRenderer(canvas, { preserveDrawingBuffer: true });
       this.renderer.setExternalFrameDriver(true);
       options.onTiming?.({ stage: "factory", durationMs: performance.now() - factoryStarted });
       const uploadStarted = performance.now();

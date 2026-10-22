@@ -94,7 +94,7 @@ is claimed until this device check passes.
 - Storage and ordering: `src/vectorStrokeLodStorage.ts`,
   `src/vectorOrderedBatches.ts`.
 - Renderers: `src/vectorStrokeLod.ts`, `src/threeMaterialStrokeLayer.ts`,
-  `src/webGlFloorplanRenderer.ts`, `src/webGpuFloorplanRenderer.ts`.
+  `src/webGlPdfRenderer.ts`, `src/webGpuPdfRenderer.ts`.
 - Tests and tooling: `scripts/test-vector-lod-memory.mjs`,
   `scripts/test-vector-lod-storage.mjs`,
   `scripts/test-native-stroke-upload-memory.mjs`,
@@ -222,8 +222,8 @@ different order; apart from framebuffer rounding, that does not change blending.
   `src/strokeRecords.ts` (new), `src/vectorOrderedBatches.ts`,
   `src/vectorDrawRunCulling.ts`, `src/vectorPageDrawScheduler.ts`,
   `src/vectorRunClipElision.ts`, `src/vectorStrokeRedundancy.ts`.
-- Renderers and viewer: `src/webGlFloorplanRenderer.ts`,
-  `src/webGpuFloorplanRenderer.ts`, `src/vectorStrokeLod.ts`,
+- Renderers and viewer: `src/webGlPdfRenderer.ts`,
+  `src/webGpuPdfRenderer.ts`, `src/vectorStrokeLod.ts`,
   `src/threeVectorDrawPlan.ts`, `src/threeMaterialStrokeLayer.ts`,
   `src/threeWebGpuStrokeMaterial.ts`, `src/threePrimitiveColors.ts`,
   `src/main.ts`.

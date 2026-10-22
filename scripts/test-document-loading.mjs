@@ -1221,7 +1221,7 @@ async function testNativeBackendLoading() {
   let imports = 0;
   let failImport = true;
   const initialized = [];
-  class WebGpuFloorplanRenderer {
+  class WebGpuPdfRenderer {
     static async create(canvas) {
       if (canvas.fail) throw new Error("GPU initialization failed");
       return new this(canvas);
@@ -1234,12 +1234,12 @@ async function testNativeBackendLoading() {
     loadWebGpuModule: async () => {
       imports++;
       if (failImport) throw new Error("Backend chunk unavailable");
-      return { WebGpuFloorplanRenderer };
+      return { WebGpuPdfRenderer };
     }
   });
   // Replace only the module-loading boundary; exercise the real factory body.
   const factory = sourceFunction(source, "createWebGpuRenderer")
-    .replace('import("./webGpuFloorplanRenderer")', "loadWebGpuModule()");
+    .replace('import("./webGpuPdfRenderer")', "loadWebGpuModule()");
   vm.runInContext(factory, host);
   assert.equal(imports, 0, "Defining the factory must not load the optional backend");
   await assert.rejects(host.createWebGpuRenderer({}), /chunk unavailable/);

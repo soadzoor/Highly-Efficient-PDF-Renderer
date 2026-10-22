@@ -8,11 +8,11 @@ const zipSource = await readFile(new URL("../src/hepShared.ts", import.meta.url)
 
 assert.match(
   mainSource,
-  /import\s*\{[^}]*\bWebGlFloorplanRenderer\b[^}]*\}\s*from\s*["']\.\/webGlFloorplanRenderer["']/s,
+  /import\s*\{[^}]*\bWebGlPdfRenderer\b[^}]*\}\s*from\s*["']\.\/webGlPdfRenderer["']/s,
   "the established persistent WebGL renderer must remain the default"
 );
-assert.match(mainSource, /new\s+WebGlFloorplanRenderer\s*\(/);
-assert.match(mainSource, /\bWebGpuFloorplanRenderer\b/);
+assert.match(mainSource, /new\s+WebGlPdfRenderer\s*\(/);
+assert.match(mainSource, /\bWebGpuPdfRenderer\b/);
 assert.match(mainSource, /\bcreateCanvasInteractionController\b/);
 assert.match(mainSource, /\bcreateBackendSwitcher\b/);
 assert.match(mainSource, /\bcreateUiControlManager\b/);

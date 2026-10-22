@@ -20,8 +20,8 @@ try {
   const { planRasterTiles, rasterTilePixels, reportRasterTileDownscale, sameRasterTilePlan, isRasterTilePlanDownscaled } =
     await import("../src/rasterTiles.ts");
   ({ createEmptyVectorScene } = await import("../src/emptyVectorScene.ts"));
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
   const { ThreeMaterialRasterLayer } = await import("../src/threeMaterialRasterLayer.ts");
   const { applyThreePdfOverlayPaintOrder } = await import("../src/threePdfPaintOrder.ts");
   const { vectorDrawRunRenderOrder } = await import("../src/threeVectorDrawRuns.ts");
@@ -124,7 +124,7 @@ try {
   // Native WebGPU: tiles share the image's pipeline, clip and paint slot.
   {
     const device = makeDevice(64);
-    const renderer = new WebGpuFloorplanRenderer({}, device, { configure() {}, unconfigure() {} }, "rgba8unorm");
+    const renderer = new WebGpuPdfRenderer({}, device, { configure() {}, unconfigure() {} }, "rgba8unorm");
     const scene = sceneWith(image(150, 2, 3));
     renderer.scene = scene;
     renderer.requestFrame = () => {};
@@ -176,7 +176,7 @@ try {
       edges: Float32Array.of(0, 0, 100, 0, 100, 0, 100, 100, 100, 100, 0, 100, 0, 100, 0, 0) }];
     scene.drawRuns[0].clipIndex = 0;
     const device = makeDevice(64);
-    const renderer = new WebGpuFloorplanRenderer({}, device, { configure() {}, unconfigure() {} }, "rgba8unorm");
+    const renderer = new WebGpuPdfRenderer({}, device, { configure() {}, unconfigure() {} }, "rgba8unorm");
     renderer.scene = scene; renderer.requestFrame = () => {};
     renderer.vectorClipBindGroups = [{ clip: -2 }, { clip: -1 }, { clip: 0 }];
     renderer.configureRasterLayers(scene);
@@ -220,7 +220,7 @@ try {
 
     const limitedDevice = makeDevice(64);
     limitedDevice.limits.maxBufferSize = 240;
-    const limitedRenderer = new WebGpuFloorplanRenderer({}, limitedDevice, { configure() {}, unconfigure() {} }, "rgba8unorm");
+    const limitedRenderer = new WebGpuPdfRenderer({}, limitedDevice, { configure() {}, unconfigure() {} }, "rgba8unorm");
     limitedRenderer.scene = scene; limitedRenderer.requestFrame = () => {};
     limitedRenderer.vectorClipBindGroups = [{ clip: -2 }, { clip: -1 }, { clip: 0 }];
     limitedRenderer.configureRasterLayers(scene);
@@ -239,7 +239,7 @@ try {
       "disposing a chunked repeat releases every owned buffer once");
 
     const failedDevice = makeDevice(64);
-    const failedRenderer = new WebGpuFloorplanRenderer({}, failedDevice, { configure() {}, unconfigure() {} }, "rgba8unorm");
+    const failedRenderer = new WebGpuPdfRenderer({}, failedDevice, { configure() {}, unconfigure() {} }, "rgba8unorm");
     failedRenderer.scene = scene; failedRenderer.requestFrame = () => {};
     const write = failedDevice.queue.writeBuffer;
     failedDevice.queue.writeBuffer = (buffer, ...args) => {
@@ -334,7 +334,7 @@ try {
     Object.defineProperty(globalThis, "navigator", { configurable: true,
       value: { gpu: { requestAdapter: async () => adapter, getPreferredCanvasFormat: () => "rgba8unorm" } } });
     try {
-      const renderer = await WebGpuFloorplanRenderer.create({ getContext: () => ({ configure() {}, unconfigure() {} }) });
+      const renderer = await WebGpuPdfRenderer.create({ getContext: () => ({ configure() {}, unconfigure() {} }) });
       renderer.dispose();
     } finally {
       if (navigator) Object.defineProperty(globalThis, "navigator", navigator);
@@ -347,7 +347,7 @@ try {
   // Native WebGL: one texture and uniform rect per tile.
   {
     const { gl, calls } = mockGl(64);
-    const renderer = Object.assign(Object.create(WebGlFloorplanRenderer.prototype), {
+    const renderer = Object.assign(Object.create(WebGlPdfRenderer.prototype), {
       gl, isDisposed: false, rasterLayers: [], rasterStripBatches: new Map(), rasterLayerUpdates: new Map(),
       orderedTextureBindings: [], multiplyPass: null, frameDrawCalls: 0,
       uRasterOpacity: "uRasterOpacity", uRasterMatrixABCD: "uRasterMatrixABCD", uRasterMatrixEF: "uRasterMatrixEF",

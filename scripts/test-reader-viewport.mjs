@@ -11,8 +11,8 @@ const hooks = registerHooks({
   },
   load(url, context, next) {
     if (url.endsWith("/readerViewport.css")) return { format: "module", shortCircuit: true, source: "export {};" };
-    if (url.endsWith("/webGlFloorplanRenderer.ts")) return { format: "module", shortCircuit: true, source: `
-      export class WebGlFloorplanRenderer {
+    if (url.endsWith("/webGlPdfRenderer.ts")) return { format: "module", shortCircuit: true, source: `
+      export class WebGlPdfRenderer {
         constructor(canvas) { this.canvas=canvas; this.disposed=false; globalThis.__readerViewportGpu.instances.push(this); }
         setExternalFrameDriver(value) { this.external=value; }
         setVectorLodMode() {} setTextLodMode() {}

@@ -14,7 +14,7 @@ const warnings = [], warn = console.warn;
 console.warn = (...args) => warnings.push(args.join(" "));
 
 try {
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { automaticRasterMemoryBudget } = await import("../src/rasterMemoryBudget.ts");
   const { buildRasterStripBatches } = await import("../src/rasterStripBatches.ts");
@@ -22,7 +22,7 @@ try {
   const sceneWith = (...layers) => Object.assign(createEmptyVectorScene(), { rasterLayers: layers });
   const create = scene => {
     const device = makeDevice();
-    const renderer = new WebGpuFloorplanRenderer({}, device, { configure() {}, unconfigure() {} }, "rgba8unorm");
+    const renderer = new WebGpuPdfRenderer({}, device, { configure() {}, unconfigure() {} }, "rgba8unorm");
     renderer.scene = scene;
     renderer.requestFrame = () => {};
     return { device, renderer };

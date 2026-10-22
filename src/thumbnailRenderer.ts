@@ -4,7 +4,7 @@ import type { VectorScene } from "./pdfVectorExtractor";
 import { RetainedPageReplay } from "./retainedPageReplay";
 import { thumbnailSize, type ThumbnailPixels, type ThumbnailRenderOptions, type ThumbnailStageTiming } from "./thumbnailTypes";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
-import { WebGlFloorplanRenderer } from "./webGlFloorplanRenderer";
+import { WebGlPdfRenderer } from "./webGlPdfRenderer";
 
 type ThumbnailCanvas = HTMLCanvasElement | OffscreenCanvas;
 
@@ -20,7 +20,7 @@ export class ThumbnailWebGlUnavailableError extends Error {
 /** Reuses one static GPU context; scenes and their buffers remain caller-owned. */
 export class ThumbnailSceneRenderer {
   private canvas: ThumbnailCanvas | null = null;
-  private renderer: WebGlFloorplanRenderer | null = null;
+  private renderer: WebGlPdfRenderer | null = null;
   private readonly lifetime = new AbortController();
   private pending: Promise<void> = Promise.resolve();
 
@@ -44,8 +44,7 @@ export class ThumbnailSceneRenderer {
     const bounds = scene.pageBounds;
     const size = thumbnailSize(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY, options.maxDimension);
     if (!Number.isSafeInteger(size.width * size.height * 4)) throw new RangeError("Thumbnail pixel dimensions exceed safe integer limits.");
-    const pixelsPerPageUnit = Math.min(size.width / (bounds.maxX - bounds.minX), size.height / (bounds.maxY - bounds.minY));
-    const local = copyScene(scene, .5 / pixelsPerPageUnit);
+    const local = copyScene(scene);
     const visibility = thumbnailVisibility(local, options.optionalContent);
     const background = validateColor(options.background);
     const vector = validateColor(options.vectorOverride ?? [0, 0, 0, 0]);
@@ -112,7 +111,7 @@ export class ThumbnailSceneRenderer {
         continue;
       }
       try {
-        const renderer = new WebGlFloorplanRenderer(canvas, { thumbnail: true });
+        const renderer = new WebGlPdfRenderer(canvas, { thumbnail: true, minimumStrokeWidth: 1 });
         this.canvas = canvas; this.renderer = renderer;
         return;
       } catch (error) { releaseCanvas(canvas); throw error; }
@@ -134,7 +133,7 @@ export async function renderThumbnailScene(scene: VectorScene, options: Thumbnai
   finally { renderer.close(); }
 }
 
-function copyScene(scene: VectorScene, minHalfWidth: number): VectorScene {
+function copyScene(scene: VectorScene): VectorScene {
   const descriptors = Object.getOwnPropertyDescriptors(scene);
   descriptors.drawRuns = { enumerable: true, configurable: true, writable: true,
     value: scene.drawRuns ?? defaultVectorDrawRuns(scene) };
@@ -142,20 +141,6 @@ function copyScene(scene: VectorScene, minHalfWidth: number): VectorScene {
   // Static thumbnails draw the available content without that animation.
   descriptors.pendingPagePreviews = { enumerable: true, configurable: true, writable: true, value: undefined };
   const local = Object.defineProperties({}, descriptors) as VectorScene;
-  // Keep positive linework legible at overview resolution. The GPU scheduler
-  // and clip elision also read these local styles, so their overlap bounds
-  // include the wider strokes. Zero-width device hairlines stay shader-owned.
-  for (const key of ["styles", "gradientStrokeStyles"] as const) {
-    const styles = local[key]?.slice();
-    if (!styles) continue;
-    local[key] = styles;
-    for (let offset = 0; offset < styles.length; offset += 4) {
-      if (styles[offset] > 0 && styles[offset] < minHalfWidth) {
-        styles[offset] = minHalfWidth;
-        if (key === "styles") local.maxHalfWidth = Math.max(local.maxHalfWidth, styles[offset]);
-      }
-    }
-  }
   compactGlyphs(local);
   return local;
 }

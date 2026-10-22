@@ -94,7 +94,7 @@ for (const [name, shader] of variants) {
 // Both language exports and the Three.js node definitions come from the same
 // helper bodies. All consumers must actually call the geometry-aware filter.
 assert.equal(STROKE_AREA_COVERAGE_WGSL_FUNCTIONS.join("\n\n"), STROKE_AREA_COVERAGE_WGSL);
-for (const file of ["nativeWebGlCoreShaders.ts", "nativeGradientWebGlShaders.ts", "webGpuFloorplanRenderer.ts",
+for (const file of ["nativeWebGlCoreShaders.ts", "nativeGradientWebGlShaders.ts", "webGpuPdfRenderer.ts",
   "nativeGradientWebGpuShaders.ts", "threeWebGpuStrokeMaterial.ts", "threeWebGpuGradientMaterial.ts",
   "threeTriangleStrokeLayer.ts", "threeCompactedStrokeLayer.ts"]) {
   const source = await readFile(new URL(`../src/${file}`, import.meta.url), "utf8");

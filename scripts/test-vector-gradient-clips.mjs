@@ -14,9 +14,9 @@ const webGpu = await import("../src/threeWebGpuBackend.ts");
 try {
   const { validateVectorDrawRuns } = await import("../src/vectorDrawOrder.ts");
   const { VectorOrderedBatches } = await import("../src/vectorOrderedBatches.ts");
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
   const { RenderPerformanceProfiler } = await import("../src/renderPerformance.ts");
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const { ThreeMaterialGradientLayer } = await import("../src/threeMaterialGradientLayer.ts");
   const { GRADIENT_FILL_FRAGMENT_SHADER_SOURCE, GRADIENT_STROKE_FRAGMENT_SHADER_SOURCE } =
     await import("../src/nativeGradientWebGlShaders.ts");
@@ -75,7 +75,7 @@ try {
     uniform1f(name, value) { if (name === "uVectorClipIndex") clip = value; },
     drawArraysInstanced(_mode, first, _vertices, count) { calls.push([program, first, count, clip]); }
   }, { get(target, key) { return target[key] ?? (() => {}); } });
-  const gl = Object.assign(Object.create(WebGlFloorplanRenderer.prototype), flags, {
+  const gl = Object.assign(Object.create(WebGlPdfRenderer.prototype), flags, {
     gl: glApi, drawPageBackgrounds() {}, vectorClipUniforms: new Map(),
     paintShapeUniforms: new Map(), orderedUniformPrograms: new Set(), orderedPaintUniformStates: new Map(),
     gradientFillProgram: "fill", gradientStrokeProgram: "stroke",
@@ -183,7 +183,7 @@ try {
   gl.drawGradientStrokeRun(0, 100, 100, 50, 50, 1);
   assert.equal(profile.getReport().frames, 1);
   calls.length = 0;
-  const gpu = Object.assign(Object.create(WebGpuFloorplanRenderer.prototype), flags, {
+  const gpu = Object.assign(Object.create(WebGpuPdfRenderer.prototype), flags, {
     drawPageBackgroundContentIntoPass() {}, gradientFillPipeline: "fill", gradientStrokePipeline: "stroke",
     primitiveGradientColors: { bindGroup() { return {}; } },
     gradientFillBindGroup: {}, gradientStrokeBindGroup: {}, vectorClipBindGroups: [-2, -1, 0, 1]
@@ -198,7 +198,7 @@ try {
   // Native WebGPU carries each clip's chain bounds beside its index.
   const writes = [];
   globalThis.GPUBufferUsage ??= { UNIFORM: 64, COPY_DST: 8 };
-  const upload = Object.assign(Object.create(WebGpuFloorplanRenderer.prototype), {
+  const upload = Object.assign(Object.create(WebGpuPdfRenderer.prototype), {
     vectorClipBuffers: [], vectorClipBindGroups: [], orderedInstanceBuffer: {},
     gpuDevice: { createBuffer: descriptor => ({ size: descriptor.size, destroy() {} }), createBindGroup: value => value,
       queue: { writeBuffer: (buffer, _offset, data) => writes.push([buffer.size, [...data]]) } },

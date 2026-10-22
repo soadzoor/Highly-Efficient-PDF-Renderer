@@ -1893,6 +1893,10 @@ The standalone native viewer is a repository application. Its renderer classes
 are source modules, not named exports from the npm entry point. Use
 [main.ts](../src/main.ts) as the integration example and
 [RendererApi](../src/rendererTypes.ts) as the backend contract for
-[WebGL](../src/webGlFloorplanRenderer.ts) and [WebGPU](../src/webGpuFloorplanRenderer.ts).
+[WebGL](../src/webGlPdfRenderer.ts) and [WebGPU](../src/webGpuPdfRenderer.ts).
+The classes are named `WebGlPdfRenderer` and `WebGpuPdfRenderer`. The deprecated
+`WebGlFloorplanRenderer` / `WebGpuFloorplanRenderer` names and their old source
+module paths forward to the same classes for compatibility. WebGL's former
+`WebGlFloorplanRendererOptions` type aliases `WebGlPdfRendererOptions`.
 The exported `createCanvasInteractionController(getRenderer)` attaches native
 pan/zoom controls; its lifecycle is documented in [canvasInteractions.ts](../src/canvasInteractions.ts).

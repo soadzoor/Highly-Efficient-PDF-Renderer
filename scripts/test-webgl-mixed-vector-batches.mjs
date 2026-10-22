@@ -5,7 +5,7 @@ const hooks = registerHooks({ resolve(s, c, n) {
   return n(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? `${s}.ts` : s, c);
 } });
 try {
-  const { WebGlFloorplanRenderer: Renderer } = await import("../src/webGlFloorplanRenderer.ts");
+  const { WebGlPdfRenderer: Renderer } = await import("../src/webGlPdfRenderer.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const makeScene = () => ({ ...createEmptyVectorScene(), segmentCount: 4, fillPathCount: 4,
     textInstanceCount: 1, pageRects: Float32Array.of(0, 0, 100, 100),

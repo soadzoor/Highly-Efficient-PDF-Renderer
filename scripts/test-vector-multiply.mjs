@@ -17,8 +17,8 @@ try {
   const { validateVectorDrawRuns } = await import("../src/vectorDrawOrder.ts");
   const { VectorOrderedBatches } = await import("../src/vectorOrderedBatches.ts");
   const { multiplyBlendState, multiplyFragmentGlsl, multiplyFragmentWgsl } = await import("../src/vectorMultiply.ts");
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const { ThreeVectorDrawRuns } = await import("../src/threeVectorDrawRuns.ts");
   const { ThreeMaterialRasterLayer } = await import("../src/threeMaterialRasterLayer.ts");
   const { initializeThreeVectorClip, createThreeVectorClipTexture } = await import("../src/threeVectorClips.ts");
@@ -71,7 +71,7 @@ try {
   const flags = { scene: { drawRuns: runs }, fillRenderingEnabled: true, strokeRenderingEnabled: true,
     textRenderingEnabled: true, rasterRenderingEnabled: true };
   const calls = [];
-  const gl = Object.assign(Object.create(WebGlFloorplanRenderer.prototype), flags, {
+  const gl = Object.assign(Object.create(WebGlPdfRenderer.prototype), flags, {
     gl: { blendFuncSeparate() {} }, drawPageBackgrounds() {}, setMultiplyBlend() {},
     drawFilledPaths(_w, _h, _x, _y, _z, first, count) { calls.push(["fill", first, count, this.multiplyPass ?? null]); },
     drawRasterLayerAtIndex(index) { calls.push(["raster", index, 1, this.multiplyPass ?? null]); }
@@ -81,7 +81,7 @@ try {
     ["fill", 2, 1, null], ["raster", 0, 1, 0], ["raster", 0, 1, 1]];
   assert.deepEqual(calls, expected, "GL pairs both passes before overlapping next primitive");
   calls.length = 0;
-  const gpu = Object.assign(Object.create(WebGpuFloorplanRenderer.prototype), flags, {
+  const gpu = Object.assign(Object.create(WebGpuPdfRenderer.prototype), flags, {
     fillPipeline: ["fill", null], rasterPipeline: ["raster", null], fillBindGroup: {}, rasterLayerResources: [{ bindGroup: {} }],
     drawPageBackgroundContentIntoPass() {}, bindVectorClip() {}, multiplyPipeline(pipeline, pass) { return [pipeline[0], pass]; }
   });

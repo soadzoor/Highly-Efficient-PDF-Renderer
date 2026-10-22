@@ -15,7 +15,7 @@ console.warn = (...args) => warnings.push(args.join(" "));
 
 try {
   const { WebGpuRasterCompression } = await import("../src/webGpuRasterCompression.ts");
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { assessRasterCompression, estimateCompressedRasterBytes, rasterCompressionMipLayout } = await import("../src/rasterCompression.ts");
   const { automaticRasterMemoryBudget } = await import("../src/rasterMemoryBudget.ts");
@@ -33,7 +33,7 @@ try {
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: {
       deviceMemory: .25, gpu: { requestAdapter: async () => adapter, getPreferredCanvasFormat: () => "rgba8unorm" }
     } });
-    const renderer = await WebGpuFloorplanRenderer.create({ getContext: () => ({ configure() {}, unconfigure() {} }) });
+    const renderer = await WebGpuPdfRenderer.create({ getContext: () => ({ configure() {}, unconfigure() {} }) });
     renderer.scene = scene;
     renderer.requestFrame = () => {};
     return { renderer, device, requests };

@@ -1,5 +1,5 @@
 import "./readerViewport.css";
-import { WebGlFloorplanRenderer } from "./webGlFloorplanRenderer";
+import { WebGlPdfRenderer } from "./webGlPdfRenderer";
 import type { RendererApi } from "./rendererTypes";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { RetainedPageReplay } from "./retainedPageReplay";
@@ -107,7 +107,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   const thumbnailWanted = new Set<number>(), thumbnailCanvases = new Map<number, HTMLCanvasElement>();
   const thumbnailFailed = new Set<number>(), thumbnailJobs = new Map<number, AbortController>();
   const rows: HTMLButtonElement[] = [], rowTops: number[] = [];
-  let scratchCanvas: HTMLCanvasElement | null = null, scratchRenderer: WebGlFloorplanRenderer | null = null;
+  let scratchCanvas: HTMLCanvasElement | null = null, scratchRenderer: WebGlPdfRenderer | null = null;
   const pointers = new Map<number, { x: number; y: number }>();
   let pinch: { distance: number; zoom: number; x: number; y: number } | null = null;
   let pinched = false;
@@ -368,7 +368,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
           if (controller.signal.aborted || revision !== thumbnailRevision || !thumbnailWanted.has(page)) continue;
           scratchCanvas ??= document.createElement("canvas");
           scratchCanvas.width = width; scratchCanvas.height = height;
-          scratchRenderer ??= new WebGlFloorplanRenderer(scratchCanvas, { preserveDrawingBuffer: true });
+          scratchRenderer ??= new WebGlPdfRenderer(scratchCanvas, { preserveDrawingBuffer: true });
           scratchRenderer.setExternalFrameDriver(true);
           scratchRenderer.setScene(scene);
           options.configureThumbnailRenderer?.(scratchRenderer, scene);

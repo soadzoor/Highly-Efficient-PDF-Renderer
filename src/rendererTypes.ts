@@ -3,7 +3,7 @@ import type { PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
 import type { SearchHighlightSet } from "./searchHighlights";
 import type { PrimitiveColorUpdate, PrimitiveHighlightSet } from "./primitiveAppearance";
 import type { TextLodMode, TextLodStats } from "./textLodCore";
-import type { DrawStats, ProjectedFrameOptions, SceneStats, ViewState } from "./webGlFloorplanRenderer";
+import type { DrawStats, ProjectedFrameOptions, SceneStats, ViewState } from "./webGlPdfRenderer";
 import type { VectorLodMode, VectorStrokeLodStats } from "./vectorStrokeLodCore";
 import type { OptionalContentSnapshot } from "./optionalContent";
 

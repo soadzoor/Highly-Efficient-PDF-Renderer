@@ -15,7 +15,7 @@ try {
   const { vectorFillBandLoopWgsl } = await import("../src/vectorFillBandShaders.ts");
   const { MIN_VECTOR_INDEXED_PATH_SEGMENTS } = await import("../src/vectorFillBands.ts");
   assert.equal(MIN_VECTOR_INDEXED_PATH_SEGMENTS, 24, "the optimization keeps the existing index-builder threshold");
-  const nativeGpu = await readFile(new URL("../src/webGpuFloorplanRenderer.ts", import.meta.url), "utf8");
+  const nativeGpu = await readFile(new URL("../src/webGpuPdfRenderer.ts", import.meta.url), "utf8");
   const gpuFill = nativeGpu.slice(nativeGpu.indexOf("const FILL_SHADER_SOURCE"), nativeGpu.indexOf("const TEXT_SHADER_SOURCE"));
   // Expand the actual production band-loop template rather than reproducing it.
   const wgsl = functionSource(gpuFill, "heprFillIndexedWinding")

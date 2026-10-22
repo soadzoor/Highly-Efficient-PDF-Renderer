@@ -11,8 +11,8 @@ try {
   const { vectorFillDrawData, VectorFillDrawSelection, fillDrawColorTexels } = await import("../src/vectorFillDrawSelection.ts");
   const { VectorOrderedBatches } = await import("../src/vectorOrderedBatches.ts");
   const { primitiveColorTexels } = await import("../src/nativePrimitiveColors.ts");
-  const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
-  const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { WebGlPdfRenderer } = await import("../src/webGlPdfRenderer.ts");
+  const { WebGpuPdfRenderer } = await import("../src/webGpuPdfRenderer.ts");
   const { MixedVectorBatches } = await import("../src/mixedVectorBatches.ts");
   const polygon = points => points.map((p, i) => ({ p0: p, p1: p, p2: points[(i + 1) % points.length], curve: 0 }));
   const rect = (x, y, w, h, reverse = false) => polygon((reverse
@@ -150,7 +150,7 @@ try {
   assert.deepEqual(sparse,original);
 
   plan.update(sparse.drawRuns,1);
-  const renderer=Object.assign(Object.create(WebGlFloorplanRenderer.prototype),{fillDrawData:data,fillProgram:{},
+  const renderer=Object.assign(Object.create(WebGlPdfRenderer.prototype),{fillDrawData:data,fillProgram:{},
     vectorClipIndex:-2,lastFillDrawFirst:0,orderedBatches:plan});
   assert.deepEqual(renderer.describeDrawSource(renderer.fillProgram,plan.instanceCount).ids,[0,0],"GPU reports keep canonical source IDs");
   const mixed=new MixedVectorBatches();mixed.update(plan);
@@ -162,11 +162,11 @@ try {
   const gl={getParameter:()=>64,bindTexture(_target,texture){bound=texture;},texParameteri(){},
     texImage2D(...args){textures.set(bound,args[8].slice());},activeTexture(){},
     texSubImage2D(_target,_level,x,y,w,_h,_format,_type,pixels){uploads.push({texture:bound,index:y*8+x,count:w,pixels:pixels.slice()});}};
-  const uploader=Object.assign(Object.create(WebGlFloorplanRenderer.prototype),{gl,
+  const uploader=Object.assign(Object.create(WebGlPdfRenderer.prototype),{gl,
     fillPathMetaTextureA:"a",fillPathMetaTextureB:"b",fillPathMetaTextureC:"c",fillSegmentTextureA:"sa",fillSegmentTextureB:"sb"});
   uploader.uploadFillPaths(sparse);
   assert.deepEqual(textures.get("a").slice(0,data.pathCount*4),data.pathMetaA,"uploaded textures contain the additional contour records");
-  for(const Renderer of [WebGlFloorplanRenderer,WebGpuFloorplanRenderer]){
+  for(const Renderer of [WebGlPdfRenderer,WebGpuPdfRenderer]){
     uploads.length=0;
     const r=Object.assign(Object.create(Renderer.prototype),{scene:sparse,fillDrawData:data,fillCoverageMetadata:data,
       gl,gpuDevice:{queue:{writeTexture(target,pixels,_layout,size){uploads.push({texture:target.texture,index:target.origin[1]*8+target.origin[0],count:size[0],pixels:pixels.slice()});}}},
