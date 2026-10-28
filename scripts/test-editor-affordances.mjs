@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 import { sourceFunction } from "./lib/sourceFunction.mjs";
+import { editorFrameCorners, editorFrameCenter, editorFrameSize, editorFrameResizeMatrix, editorFrameScaleMatrix,
+  editorFrameClientGeometry } from "../src/editorSelectionGeometry.ts";
+
+const IDENTITY = [1, 0, 0, 1, 0, 0];
+const frameHelpers = { editorFrameCorners, editorFrameCenter, editorFrameSize, editorFrameResizeMatrix, editorFrameScaleMatrix, editorFrameClientGeometry, IDENTITY };
 
 const [source, css, nativeCss, threeHtml] = await Promise.all([
   readFile(new URL("../src/editorUi.ts", import.meta.url), "utf8"),
@@ -12,31 +17,37 @@ const [source, css, nativeCss, threeHtml] = await Promise.all([
 const nested = source.replace(/^ {2}/gm, "");
 const install = (context, ...names) => { for (const name of names) vm.runInContext(sourceFunction(nested, name), context); };
 const bounds = { minX: 10, minY: 20, maxX: 50, maxY: 60 };
+let geometryFrame = { bounds, transform: IDENTITY };
 const shapes = [], overlay = { dataset: {}, style: {} };
 const geometry = vm.createContext({
+  ...frameHelpers,
+  currentState: { revision: 0, selection: ["object"] }, presented: null, isSceneSettling: () => false,
   host: { getCanvas: () => ({ getBoundingClientRect: () => ({ left: 100, top: 50, width: 400, height: 300 }) }),
     sceneToClientPoint: (x, y) => ({ x: x + 100, y: y + 50 }) },
   overlay, graphic: { setAttribute() {}, replaceChildren() { shapes.length = 0; } },
-  session: { getSelectionBounds: () => bounds, sourceScene: { pageRects: [0, 0, 400, 300] } },
+  session: { getSelectionBounds: () => bounds, getSelectionFrame: () => geometryFrame, sourceScene: { pageRects: [0, 0, 400, 300] } },
   sceneBoundsToClient: value => ({ minX: value.minX + 100, minY: value.minY + 50, maxX: value.maxX + 100, maxY: value.maxY + 50 }),
-  svg: (tag, attributes) => { shapes.push({ tag, ...attributes }); }, fields: { querySelectorAll: () => [] },
+  svg: (tag, attributes) => { const element = { tag, ...attributes, style: {} }; shapes.push(element); return element; }, fields: { querySelectorAll: () => [] },
   pointer: null, pendingPick: null, polygon: null, activeText: null, running: false, tool: "select", latestScene: {},
   property: () => ({ value: "#123456" })
 });
-install(geometry, "updatePointerCursor", "updateGeometry");
+install(geometry, "displayedSelection", "updatePointerCursor", "updateGeometry");
 for (const tool of ["select", "pan", "form", "text", "rectangle", "ellipse", "line", "arrow", "polygon", "polyline", "ink", "signature", "image"]) {
   geometry.tool = tool; geometry.updateGeometry();
   const handles = shapes.filter(item => item["data-handle"]);
   assert.equal(handles.length, tool === "select" ? 5 : 0, `${tool}: transform handles are exclusive to Select`);
   assert.equal(shapes.some(item => item.class === "hepr-editor-selection"), tool === "select", `${tool}: selection frame follows the active tool`);
-  if (tool === "select") assert.deepEqual(handles.map(item => item["data-handle"]), ["nw", "ne", "sw", "se", "rotate"]);
+  assert.equal(shapes.some(item => item.class === "hepr-editor-selection-hit"), tool === "select", `${tool}: the move surface exists only for Select`);
+  if (tool === "select") assert.deepEqual(handles.map(item => item["data-handle"]), ["nw", "ne", "se", "sw", "rotate"]);
 }
 geometry.tool = "select"; geometry.running = true; geometry.updateGeometry();
 assert.equal(shapes.filter(item => item["data-handle"]).length, 0, "busy operations hide nonfunctional transform handles");
 assert.equal(shapes.some(item => item.class === "hepr-editor-selection"), false);
+assert.equal(shapes.some(item => item.class === "hepr-editor-selection-hit"), false, "busy operations remove the inactive move surface");
 geometry.running = false;
 geometry.activeText = { pageIndex: 0, x: 1, y: 2, width: 10, height: 10, transform: [1, 0, 0, 1, 0, 0], element: { style: {} } };
 geometry.updateGeometry(); assert.equal(shapes.filter(item => item["data-handle"]).length, 0, "an active textbox owns the editing affordance");
+assert.equal(shapes.some(item => item.class === "hepr-editor-selection-hit"), false);
 geometry.activeText = null;
 for (const [action, handle] of [["move", ""], ["rotate", ""], ["resize", "ne"], ["resize", "sw"], ["draw", ""], ["marquee", ""]]) {
   geometry.pointer = { action, handle }; geometry.updatePointerCursor();
@@ -48,11 +59,13 @@ assert.equal(overlay.dataset.gesture, ""); assert.equal(overlay.dataset.resizeHa
 geometry.running = false; geometry.updatePointerCursor(); assert.equal(overlay.dataset.busy, "false");
 
 const captures = new Set(), selected = [], previews = [], released = [], toolButtons = [];
-const gestureOverlay = { dataset: {}, setPointerCapture(id) { captures.add(id); }, hasPointerCapture: id => captures.has(id),
+const gestureOverlay = { dataset: {}, style: {}, setPointerCapture(id) { captures.add(id); }, hasPointerCapture: id => captures.has(id),
   releasePointerCapture(id) { captures.delete(id); released.push(id); } };
 for (const name of ["select", "pan", "form", "rectangle"]) toolButtons.push({ dataset: { tool: name }, attributes: {}, setAttribute(name, value) { this.attributes[name] = value; } });
 let finishPick, abortedPicks = 0;
 const gestures = vm.createContext({
+  ...frameHelpers,
+  isSceneSettling: () => false,
   active: true, running: false, structuralRunning: false, activeText: null, disposed: false, tool: "select", toolRequest: 0, textRequest: 0,
   pointer: null, pendingPick: null, picking: { abort() { abortedPicks++; } }, polygon: null,
   overlay: gestureOverlay, fields: { hidden: true }, toolbar: { querySelectorAll: () => toolButtons },
@@ -60,7 +73,7 @@ const gestures = vm.createContext({
   host: { clientToScenePoint: (x, y) => ({ x, y }) }, pageAt: () => 0,
   pick: () => new Promise(resolve => { finishPick = resolve; }), clearPreview: restore => previews.push(restore),
   interaction: { selectHit: id => selected.push(id), selectArea: () => assert.fail("unexpected area selection") },
-  session: { getSelectionBounds: () => bounds }, commit: () => assert.fail("cancelled gestures cannot commit changes")
+  session: { getSelectionBounds: () => bounds, getSelectionFrame: () => ({ bounds, transform: IDENTITY }) }, commit: () => assert.fail("cancelled gestures cannot commit changes")
 });
 install(gestures, "updatePointerCursor", "cancelPointerGesture", "setTool", "pointerDown", "pointerUp");
 let prevented = 0, stopped = 0;
@@ -217,8 +230,10 @@ const near = (actual, expected, label) => {
 };
 const nearMatrix = (actual, expected, label) => actual.forEach((value, index) => near(value, expected[index], `${label}, matrix ${index}`));
 const transformPoint = (matrix, point) => ({ x: matrix[0] * point.x + matrix[2] * point.y + matrix[4], y: matrix[1] * point.x + matrix[3] * point.y + matrix[5] });
+const composeMatrices = (a, b) => [a[0] * b[0] + a[2] * b[1], a[1] * b[0] + a[3] * b[1],
+  a[0] * b[2] + a[2] * b[3], a[1] * b[2] + a[3] * b[3], a[0] * b[4] + a[2] * b[5] + a[4], a[1] * b[4] + a[3] * b[5] + a[5]];
 const resizeBounds = { minX: 10, minY: 20, maxX: 110, maxY: 70 };
-const matrixHost = vm.createContext({}); install(matrixHost, "dragMatrix");
+const matrixHost = vm.createContext({ ...frameHelpers }); install(matrixHost, "dragMatrix");
 for (const [handle, start, fixed] of [
   ["nw", { x: 10, y: 70 }, { x: 110, y: 20 }], ["ne", { x: 110, y: 70 }, { x: 10, y: 20 }],
   ["sw", { x: 10, y: 20 }, { x: 110, y: 70 }], ["se", { x: 110, y: 20 }, { x: 10, y: 70 }]
@@ -254,13 +269,16 @@ nearMatrix(matrixHost.dragMatrix({ action: "resize", handle: "ne", freeResize: t
 
 const resizePreviews = [], resizeCommits = [], resizeUpdates = [], resizeRestores = [];
 let resizeSelection = ["first", "second"];
+let resizeFrame = { bounds: resizeBounds, transform: IDENTITY };
 const textModel = { id: "textbox", kind: "text", pageIndex: 0, x: 10, y: 20, width: 100, height: 50,
   fontSize: 12, text: "Wrapping text", transform: [1, 0, 0, 1, 0, 0] };
 const resizing = vm.createContext({ active: true, running: false, structuralRunning: false, activeText: null, disposed: false,
+  ...frameHelpers,
+  requestedPreview: null, isSceneSettling: () => false,
   tool: "select", textRequest: 0, pointer: null, pendingPick: null, polygon: null,
-  overlay: { dataset: {}, setPointerCapture() {}, releasePointerCapture() {} },
+  overlay: { dataset: {}, style: {}, setPointerCapture() {}, releasePointerCapture() {} },
   host: { clientToScenePoint: (x, y) => ({ x, y }) }, clearPreview: restore => resizeRestores.push(restore), queuePreview() {},
-  session: { getSelectionBounds: () => resizeBounds, getSelection: () => resizeSelection, getObject: () => textModel,
+  session: { getSelectionBounds: () => resizeBounds, getSelectionFrame: () => resizeFrame, getSelection: () => resizeSelection, getObject: () => textModel,
     sourceScene: { pageRects: [0, 0, 400, 300] }, updateObject: (id, patch) => resizeUpdates.push({ id, patch }) },
   interaction: { previewTransform: matrix => resizePreviews.push(Array.from(matrix)), applyTransform: matrix => resizeCommits.push(Array.from(matrix)) },
   commit: change => change()
@@ -339,9 +357,10 @@ const beforeSingularPreview = resizePreviews.length, beforeSingularCommit = resi
 resizing.resizeModifiers({ key: "Shift", shiftKey: false, altKey: false });
 assert.equal(resizePreviews.length, beforeSingularPreview); assert.equal(resizeRestores.at(-1), true, "singular uniform projection restores committed paint rather than retaining the prior preview");
 geometry.IDENTITY = [1, 0, 0, 1, 0, 0]; geometry.dragMatrix = matrixHost.dragMatrix; geometry.pointer = resizing.pointer;
+geometryFrame = resizing.pointer.frame; geometry.presented = null;
 geometry.updateGeometry();
-const restoredFrame = shapes.find(item => item.tag === "rect" && item.class === "hepr-editor-selection");
-assert.deepEqual([restoredFrame.x, restoredFrame.y, restoredFrame.width, restoredFrame.height], [10, 20, 100, 50], "a singular candidate keeps the outline on committed bounds");
+const restoredFrame = shapes.find(item => item.tag === "polygon" && item.class === "hepr-editor-selection");
+assert.equal(restoredFrame.points, "10,70 110,70 110,20 10,20", "a singular candidate keeps the outline on committed corners");
 resizing.pointerUp(resizeEvent(-40, 120)); assert.equal(resizeCommits.length, beforeSingularCommit, "singular release does not commit a collapsed transform");
 geometry.pointer = null;
 await resizing.pointerDown(resizeEvent(110, 70)); resizing.pointerMove(resizeEvent(-40, -5));
@@ -351,11 +370,175 @@ assert.equal(resizePreviews.length, reflectedPreviewCount); assert.equal(resizeR
 resizing.pointerUp(resizeEvent(-40, 120));
 for (const type of ["keydown", "keyup"]) assert.match(source, new RegExp(`window\\.addEventListener\\(["']${type}["'],\\s*resizeModifiers`));
 
+// The rendered frame retains its actual corners through preview and all
+// committed-selection states, instead of replacing them with an axis hull.
+const angle30 = Math.PI / 6, initialOrientedFrame = { bounds: resizeBounds,
+  transform: [Math.cos(angle30), Math.sin(angle30), -Math.sin(angle30), Math.cos(angle30), 200, 150] };
+geometryFrame = initialOrientedFrame; geometry.pointer = null; geometry.updateGeometry();
+const renderedCorners = () => shapes.find(item => item.tag === "polygon" && item.class === "hepr-editor-selection")?.points.split(" ").map(pair => {
+  const [x, y] = pair.split(",").map(Number); return { x, y };
+});
+const checkCornerSquares = corners => {
+  let dx = corners[1].x - corners[0].x, dy = corners[1].y - corners[0].y;
+  if (dx === 0 && dy === 0) { dx = corners[3].x - corners[0].x; dy = corners[3].y - corners[0].y; }
+  const expectedAngle = Math.atan2(dy, dx) * 180 / Math.PI;
+  const handles = shapes.filter(item => item.tag === "rect" && item["data-handle"]);
+  assert.equal(handles.length, 4);
+  handles.forEach((handle, index) => {
+    const transform = /^rotate\(([^)]+)\)$/.exec(handle.transform ?? ""); assert(transform, "each corner square rotates with the projected frame");
+    const [angle, x, y] = transform[1].trim().split(/[\s,]+/).map(Number);
+    near(angle, expectedAngle, "corner square angle"); near(x, corners[index].x, "corner rotation center X"); near(y, corners[index].y, "corner rotation center Y");
+    near(handle.x + 4, x, "square center X"); near(handle.y + 4, y, "square center Y");
+    assert.equal(handle.width, 8); assert.equal(handle.height, 8, "handle dimensions stay in CSS pixels");
+    if (geometry.pointer) assert.equal(handle.style.cursor, "inherit", "rotated squares retain the active gesture cursor");
+  });
+};
+const checkRenderedFrame = expected => {
+  renderedCorners().forEach((corner, index) => { near(corner.x, expected[index].x, "rendered frame X"); near(corner.y, expected[index].y, "rendered frame Y"); });
+  const hitIndex = shapes.findIndex(item => item.class === "hepr-editor-selection-hit"), outlineIndex = shapes.findIndex(item => item.tag === "polygon" && item.class === "hepr-editor-selection");
+  assert(hitIndex >= 0 && hitIndex < outlineIndex, "the move surface is below the frame and handles");
+  assert.equal(shapes[hitIndex].points, shapes[outlineIndex].points, "the move surface follows the exact oriented preview/frame polygon");
+  assert.equal(shapes[hitIndex]["data-selection-move"], "true");
+  assert(shapes.findIndex(item => item["data-handle"]) > outlineIndex, "corner and rotation handles remain above the move surface");
+  checkCornerSquares(expected);
+};
+checkRenderedFrame(editorFrameCorners(initialOrientedFrame));
+const center = editorFrameCenter(initialOrientedFrame), turn = Math.PI / 4;
+geometry.pointer = { action: "rotate", frame: initialOrientedFrame, bounds: resizeBounds,
+  start: { x: center.x + 40, y: center.y }, last: { x: center.x + Math.cos(turn) * 40, y: center.y + Math.sin(turn) * 40 } };
+const rotationDelta = geometry.dragMatrix(geometry.pointer, geometry.pointer.last), committedFrame = { ...initialOrientedFrame,
+  transform: composeMatrices(rotationDelta, initialOrientedFrame.transform) };
+geometry.updateGeometry(); checkRenderedFrame(editorFrameCorners(initialOrientedFrame));
+geometry.presented = { sourceScene: geometry.session.sourceScene, revision: 0, selection: new Set(["object"]), frame: initialOrientedFrame, delta: rotationDelta };
+geometry.updateGeometry(); checkRenderedFrame(editorFrameCorners(initialOrientedFrame, rotationDelta));
+assert(shapes.filter(item => item.tag === "rect" && item["data-handle"]).every(handle => handle.style.cursor === "inherit"),
+  "corner handles inherit the active rotation cursor instead of overriding it with idle resize cursors");
+geometryFrame = committedFrame; geometry.pointer = null;
+geometry.presented = { sourceScene: geometry.session.sourceScene, revision: 0, selection: new Set(["object"]), frame: committedFrame, delta: null };
+geometry.updateGeometry(); checkRenderedFrame(editorFrameCorners(committedFrame));
+geometryFrame = null; geometry.updateGeometry(); assert.equal(renderedCorners(), undefined);
+assert.equal(shapes.some(item => item.class === "hepr-editor-selection-hit"), false, "empty selection has no move hit area");
+geometryFrame = committedFrame; geometry.updateGeometry(); checkRenderedFrame(editorFrameCorners(committedFrame));
+geometryFrame = initialOrientedFrame; geometry.updateGeometry(); checkRenderedFrame(editorFrameCorners(initialOrientedFrame));
+geometryFrame = committedFrame; geometry.updateGeometry(); checkRenderedFrame(editorFrameCorners(committedFrame));
+const projectedFrame = editorFrameClientGeometry(committedFrame, point => ({ x: point.x + 100, y: point.y + 50 }));
+shapes.filter(item => item.tag === "rect" && item["data-handle"]).forEach((handle, index) => {
+  assert.equal(handle.style.cursor, projectedFrame.cursors[index], "each rendered corner gets its projected cursor family");
+  near(handle.x + 4, projectedFrame.corners[index].x - 100, "handle X"); near(handle.y + 4, projectedFrame.corners[index].y - 50, "handle Y");
+});
+const originalFrameProject = geometry.host.sceneToClientPoint;
+for (const zoom of [.25, 8]) {
+  const hostAngle = -35 * Math.PI / 180;
+  geometry.host.sceneToClientPoint = (x, y) => ({ x: 100 + zoom * (Math.cos(hostAngle) * x - Math.sin(hostAngle) * y),
+    y: 50 + zoom * (Math.sin(hostAngle) * x + Math.cos(hostAngle) * y) });
+  geometry.updateGeometry();
+  checkCornerSquares(editorFrameCorners(committedFrame).map(point => {
+    const client = geometry.host.sceneToClientPoint(point.x, point.y); return { x: client.x - 100, y: client.y - 50 };
+  }));
+}
+for (const degenerateBounds of [{ minX: 10, minY: 20, maxX: 10, maxY: 70 }, { minX: 10, minY: 20, maxX: 10, maxY: 20 }]) {
+  geometryFrame = { ...committedFrame, bounds: degenerateBounds }; geometry.updateGeometry();
+  checkCornerSquares(renderedCorners());
+}
+geometryFrame = committedFrame; geometry.host.sceneToClientPoint = originalFrameProject; geometry.updateGeometry();
+
+// A rotated textbox's Shift resize follows its own local axes and the same
+// preview transform, while keeping glyph size unchanged.
+const pageOrigin = { x: 40, y: 60 }, rotatedText = { ...textModel, transform: initialOrientedFrame.transform };
+resizeFrame = { bounds: resizeBounds, transform: [...rotatedText.transform] };
+resizeFrame.transform[4] += pageOrigin.x; resizeFrame.transform[5] += pageOrigin.y;
+resizing.session.sourceScene = { pageRects: [40, 60, 1040, 1060] }; resizing.session.getObject = () => rotatedText; resizeSelection = ["textbox"];
+const rotatedStart = editorFrameCorners(resizeFrame)[1], rotatedTarget = transformPoint(resizeFrame.transform, { x: 210, y: 45 });
+await resizing.pointerDown(resizeEvent(rotatedStart.x, rotatedStart.y));
+resizing.pointerMove(resizeEvent(rotatedTarget.x, rotatedTarget.y, { shiftKey: true }));
+const rotatedPreview = resizePreviews.at(-1); resizing.pointerUp(resizeEvent(rotatedTarget.x, rotatedTarget.y, { shiftKey: true }));
+const rotatedPatch = resizeUpdates.at(-1).patch, resizedRotatedText = { ...rotatedText, ...rotatedPatch };
+near(resizedRotatedText.width, 200, "rotated Shift textbox width"); near(resizedRotatedText.height, 25, "rotated Shift textbox height"); assert.equal(resizedRotatedText.fontSize, 12);
+const oldTextCorners = textCorners(rotatedText, pageOrigin), newTextCorners = textCorners(resizedRotatedText, pageOrigin);
+oldTextCorners.forEach((corner, index) => { const expected = transformPoint(rotatedPreview, corner); near(newTextCorners[index].x, expected.x, "rotated Shift preview/commit X"); near(newTextCorners[index].y, expected.y, "rotated Shift preview/commit Y"); });
+
+const forcedPageCalls = [];
+resizeFrame = { bounds: resizeBounds, transform: IDENTITY, pageIndex: 4 }; resizeSelection = ["first", "second"];
+resizing.host.clientToScenePoint = (x, y, pageIndex) => {
+  forcedPageCalls.push(pageIndex);
+  return pageIndex === 4 ? { x, y } : null;
+};
+await resizing.pointerDown(resizeEvent(110, 70));
+assert.equal(resizing.pointer.frame.pageIndex, 4, "a margin handle press uses the selected frame's page plane");
+resizing.pointerMove(resizeEvent(210, 45));
+assert.equal(resizing.pointer.last.x, 210, "moving beyond the selected page continues on its captured plane");
+resizing.pointerUp(resizeEvent(310, 70));
+assert.deepEqual(forcedPageCalls, [4, 4, 4], "handle press, movement and final release retain the selected page index");
+nearMatrix(resizeCommits.at(-1), [2.6, 0, 0, 2.6, -16, -32], "final handle release is reprojected on the captured page");
+
+let numericFrame = initialOrientedFrame;
+const numericMatrices = [], numericNudges = [];
+const numeric = vm.createContext({ ...frameHelpers, session: { getSelectionFrame: () => numericFrame,
+  getSelectionBounds() { const corners = editorFrameCorners(numericFrame); return { minX: Math.min(...corners.map(point => point.x)), minY: Math.min(...corners.map(point => point.y)), maxX: Math.max(...corners.map(point => point.x)), maxY: Math.max(...corners.map(point => point.y)) }; } },
+  commit: change => change(), interaction: { applyTransform(matrix) { numericMatrices.push(Array.from(matrix)); numericFrame = { ...numericFrame, transform: composeMatrices(matrix, numericFrame.transform) }; },
+    nudge(x, y) { numericNudges.push([x, y]); } } });
+install(numeric, "transformProperty");
+const initialSize = editorFrameSize(numericFrame), fixedSouthwest = editorFrameCorners(numericFrame)[3];
+numeric.transformProperty("width", initialSize.width * 2);
+near(editorFrameSize(numericFrame).width, initialSize.width * 2, "numeric rotated local width"); near(editorFrameSize(numericFrame).height, initialSize.height, "numeric width retains local height");
+near(editorFrameCorners(numericFrame)[3].x, fixedSouthwest.x, "numeric southwest X"); near(editorFrameCorners(numericFrame)[3].y, fixedSouthwest.y, "numeric southwest Y");
+numeric.transformProperty("height", initialSize.height * 1.5); near(editorFrameSize(numericFrame).height, initialSize.height * 1.5, "numeric rotated local height");
+const beforeNumericRotation = numericFrame, numericCenter = editorFrameCenter(numericFrame);
+numeric.transformProperty("rotation", 30); const numericRotation = numericMatrices.at(-1);
+near(transformPoint(numericRotation, numericCenter).x, numericCenter.x, "numeric rotation fixes frame center X"); near(transformPoint(numericRotation, numericCenter).y, numericCenter.y, "numeric rotation fixes frame center Y");
+const dragRotation = matrixHost.dragMatrix({ action: "rotate", frame: beforeNumericRotation, bounds: resizeBounds,
+  start: { x: numericCenter.x + 50, y: numericCenter.y } }, { x: numericCenter.x + Math.cos(angle30) * 50, y: numericCenter.y + Math.sin(angle30) * 50 });
+nearMatrix(numericRotation, dragRotation, "numeric and drag rotation use the same center");
+const worldBounds = numeric.session.getSelectionBounds(); numeric.transformProperty("x", worldBounds.minX + 17); numeric.transformProperty("y", worldBounds.minY - 9);
+assert.deepEqual(numericNudges, [[17, 0], [0, -9]], "numeric positions retain their world-axis placement contract");
+const transformsBeforeInvalidProperty = numericMatrices.length; numeric.transformProperty("width", 0); numeric.transformProperty("rotation", NaN);
+assert.equal(numericMatrices.length, transformsBeforeInvalidProperty);
+
+const surfaceSelection = ["first", "second"], surfaceModifiers = [], surfacePlanes = [], surfaceTransforms = [], surfaceText = [];
+let surfacePicks = 0;
+const surfaceFrame = { bounds: resizeBounds, transform: IDENTITY, pageIndex: 5 };
+const surface = vm.createContext({ ...frameHelpers, active: true, running: false, disposed: false, activeText: null,
+  isSceneSettling: () => false,
+  tool: "select", textRequest: 0, pointer: null, pendingPick: null, picking: null, polygon: null,
+  host: { clientToScenePoint(x, y, pageIndex) { surfacePlanes.push(pageIndex); return pageIndex === 5 ? { x, y } : null; } },
+  overlay: { dataset: {}, style: {}, setPointerCapture() {}, releasePointerCapture() {} }, clearPreview() {}, queuePreview() {},
+  session: { getSelectionBounds: () => resizeBounds, getSelectionFrame: () => surfaceFrame, getSelection: () => surfaceSelection,
+    getObject: id => ({ id, kind: "text" }) },
+  pick: async () => { surfacePicks++; return "picked-object"; }, startText: async (point, object) => surfaceText.push({ point, object }),
+  interaction: { selectHit(id, modifiers) { surfaceModifiers.push({ id, ctrl: Boolean(modifiers.ctrlKey), cmd: Boolean(modifiers.metaKey), shift: Boolean(modifiers.shiftKey) }); },
+    previewTransform() {}, applyTransform: matrix => surfaceTransforms.push(Array.from(matrix)) }, commit: change => change()
+});
+install(surface, "updatePointerCursor", "cancelPointerGesture", "dragMatrix", "pointerDown", "pointerMove", "pointerUp", "doubleClick");
+const surfaceEvent = (x, y, modifiers = {}) => ({ ...event(40), clientX: x, clientY: y, ...modifiers,
+  target: { closest: () => null, getAttribute: name => name === "data-selection-move" ? "true" : null } });
+await surface.pointerDown(surfaceEvent(50, 50));
+assert.equal(surface.pointer.action, "move"); assert.equal(surface.pointer.frame, surfaceFrame);
+assert.equal(surfacePicks, 0); assert.deepEqual(surfaceModifiers, [], "plain selection-surface presses keep the current multiselection without picking again");
+assert.deepEqual(surfaceSelection, ["first", "second"]);
+surface.pointerMove(surfaceEvent(80, 70)); surface.pointerUp(surfaceEvent(80, 70));
+nearMatrix(surfaceTransforms[0], [1, 0, 0, 1, 30, 20], "selection-surface drag moves the entire selection");
+assert.deepEqual(surfacePlanes, [5, 5], "selection-surface press and drag use the selected frame's page plane");
+surface.host.clientToScenePoint = (x, y) => ({ x, y });
+for (const modifiers of [{ ctrlKey: true }, { metaKey: true }, { shiftKey: true }]) await surface.pointerDown(surfaceEvent(50, 50, modifiers));
+assert.equal(surfacePicks, 3); assert.equal(surface.pointer, null);
+assert.deepEqual(surfaceModifiers, [{ id: "picked-object", ctrl: true, cmd: false, shift: false },
+  { id: "picked-object", ctrl: false, cmd: true, shift: false }, { id: "picked-object", ctrl: false, cmd: false, shift: true }], "surface modifiers retain ordinary object picking and selection semantics");
+surface.host.clientToScenePoint = (x, y, pageIndex) => { assert.equal(pageIndex, 5); return { x, y }; };
+await surface.doubleClick(surfaceEvent(50, 50)); assert.equal(surfaceText.length, 1);
+assert.equal(surfaceText[0].object.id, "picked-object", "double-click text editing on the selection surface retains its forced page plane");
+
 assert.match(source, /tool:\s*Tool\s*=\s*["']select["']/);
 assert.match(source, /overlay\.dataset\.tool\s*=\s*tool/);
 assert.match(source, /fields\.hidden\s*=\s*true/);
 const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map(match => ({ selector: match[1].trim(), declarations: match[2] }));
 const rule = (selector, declaration) => rules.some(value => selector.test(value.selector) && declaration.test(value.declarations));
+assert(rule(/^\.hepr-editor-selection-hit$/, /cursor\s*:\s*move/));
+assert(rule(/^\.hepr-editor-selection-hit$/, /fill\s*:\s*transparent/));
+assert(rule(/^\.hepr-editor-selection-hit$/, /pointer-events\s*:\s*all/), "the whole selection interior accepts movement");
+assert(rule(/data-gesture[^{}]*hepr-editor-selection-hit/, /cursor\s*:\s*inherit/), "the move surface cannot replace an active resize or rotation cursor");
+for (const selector of [/not\(\[data-tool=select\]\)[^{}]*hepr-editor-selection-hit/, /data-busy=true[^{}]*hepr-editor-selection-hit/]) {
+  assert(rule(selector, /display\s*:\s*none/)); assert(rule(selector, /pointer-events\s*:\s*none/));
+}
 assert.match(css, /--hepr-editor-rotate-cursor\s*:\s*url\([^;]+,\s*crosshair/, "rotation defines an SVG cursor with a fallback");
 for (const attribute of ["handle", "gesture"]) assert(rule(new RegExp(`data-${attribute}\\s*=\\s*["']?rotate`), /cursor\s*:\s*var\(--hepr-editor-rotate-cursor\)/), "hover and active rotation both use the dedicated cursor");
 for (const corner of ["ne", "sw"]) assert(rule(new RegExp(`data-(?:handle|resize-handle)\\s*=\\s*["']?${corner}["']?\\]`), /cursor\s*:\s*nesw-resize/), `${corner}: resize direction follows its screen diagonal`);

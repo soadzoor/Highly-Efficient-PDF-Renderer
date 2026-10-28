@@ -2271,18 +2271,26 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
    * Intersect a client-space (CSS px) point with the PDF page plane through
    * the given camera and return PDF scene coordinates — the same space as the
    * text index and `searchText` bounds. Returns `null` when the point misses
-   * the page plane.
+   * the page plane. An explicit page index keeps that page's plane active
+   * outside its bounds, for gestures that extend into margins or other pages.
    */
   clientToScenePoint(
     camera: THREE.Camera,
     clientX: number,
     clientY: number,
-    domElement: HTMLElement
+    domElement: HTMLElement,
+    pageIndex?: number
   ): { x: number; y: number } | null {
     if (this.isDisposed) {
       return null;
     }
-    if (this.pageViews) return this.pageHits(camera, clientX, clientY, domElement)[0]?.point ?? null;
+    if (this.pageViews) {
+      if (pageIndex !== undefined) {
+        const page = this.pageViews[pageIndex]?.object;
+        return page?.visible && !page.isDisposed ? page.clientToScenePoint(camera, clientX, clientY, domElement) : null;
+      }
+      return this.pageHits(camera, clientX, clientY, domElement)[0]?.point ?? null;
+    }
     const rect = domElement.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) {
       return null;

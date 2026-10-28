@@ -1,7 +1,9 @@
 import type { EditorFieldValue, EditorObject, EditorSessionOptions, EditorTextObject } from "./editorTypes";
 import type { VectorScene } from "./pdfVectorExtractor";
-import { composeOverlappingVectorScenes } from "./pdfVectorExtractor";
+import { composeOverlappingVectorScenes, nativeVectorMissingFontResolver } from "./pdfVectorExtractor";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
+import type { NativeMissingFontResolver } from "./pdf/nativeFont";
+import { createBundledStandardFontResolver } from "./standardFontResolver";
 import { createEditorFontRegistry } from "./editorFonts";
 import { editorTextPdf } from "./editorText";
 import { compileEditorObjectGeometry } from "./editorSceneObjects";
@@ -46,6 +48,12 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
       return new Uint8Array(await readFile(assetUrl));
     }
   } : undefined) });
+  let missingFontResolver: Promise<NativeMissingFontResolver> | undefined;
+  const getMissingFontResolver = () => missingFontResolver ??= options.loadFontAsset
+    ? Promise.resolve(createBundledStandardFontResolver({ loadAsset: async (asset, signal) => {
+      signal?.throwIfAborted(); return options.loadFontAsset!(asset.url);
+    } }))
+    : nativeVectorMissingFontResolver();
   let disposed = false;
   const sourceServices = new Set<EditorAppServices>();
   const diagnostic = (message: string) => options.onDiagnostic?.({ code: "editor.appearance-regenerated", severity: "warning", message });
@@ -70,7 +78,9 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
       let bytes: Uint8Array;
       try { const writer = new NativePdfWriter(document); await applyEditorPdfFields(writer, values, fonts, { signal, onWarning: diagnostic }); bytes = await writer.save(signal); }
       finally { await document.close(); }
-      parser = await openPdf({ kind: "bytes", bytes }, { password: options.password, signal }) as NativeVectorPdfSession;
+      // Regenerated appearances can still reference nonembedded source fonts.
+      parser = await openPdf({ kind: "bytes", bytes }, { password: options.password, signal,
+        missingFontResolver: await getMissingFontResolver(), onDiagnostic: options.onDiagnostic }) as NativeVectorPdfSession;
     }
     try {
       for (let index = 0; index < pages.length; index++) {

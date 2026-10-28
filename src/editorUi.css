@@ -13,9 +13,10 @@
 .hepr-editor-overlay[data-tool=ink]{cursor:var(--hepr-editor-pencil-cursor)}
 .hepr-editor-overlay[data-tool=pan]{pointer-events:none;cursor:grab}
 .hepr-editor-overlay[data-tool=pan] .hepr-editor-graphic,.hepr-editor-overlay[data-tool=form] .hepr-editor-graphic{display:none}
-.hepr-editor-overlay:not([data-tool=select]) .hepr-editor-handle{display:none;pointer-events:none}
+.hepr-editor-overlay:not([data-tool=select]) .hepr-editor-handle,.hepr-editor-overlay:not([data-tool=select]) .hepr-editor-selection-hit{display:none;pointer-events:none}
 .hepr-editor-graphic{width:100%;height:100%;overflow:visible;position:absolute;inset:0;pointer-events:none}
 .hepr-editor-selection{fill:none;stroke:#1765d7;stroke-width:1;vector-effect:non-scaling-stroke}
+.hepr-editor-selection-hit{fill:transparent;stroke:none;pointer-events:all;cursor:move}
 .hepr-editor-handle{fill:#fff;stroke:#1765d7;stroke-width:1;pointer-events:auto;cursor:nwse-resize}
 .hepr-editor-handle[data-handle=ne],.hepr-editor-handle[data-handle=sw]{cursor:nesw-resize}
 .hepr-editor-handle[data-handle=rotate]{cursor:var(--hepr-editor-rotate-cursor)}
@@ -24,9 +25,10 @@
 .hepr-editor-overlay[data-gesture=resize]{cursor:nwse-resize}
 .hepr-editor-overlay[data-gesture=resize][data-resize-handle=ne],.hepr-editor-overlay[data-gesture=resize][data-resize-handle=sw]{cursor:nesw-resize}
 .hepr-editor-overlay[data-gesture=rotate]{cursor:var(--hepr-editor-rotate-cursor)}
-.hepr-editor-overlay[data-gesture]:not([data-gesture=""]) .hepr-editor-handle{cursor:inherit}
-.hepr-editor-overlay[data-gesture=pick],.hepr-editor-overlay[data-busy=true]{cursor:progress}
-.hepr-editor-overlay[data-busy=true] .hepr-editor-handle{display:none;pointer-events:none}
+.hepr-editor-overlay[data-gesture]:not([data-gesture=""]) .hepr-editor-handle,.hepr-editor-overlay[data-gesture]:not([data-gesture=""]) .hepr-editor-selection-hit{cursor:inherit}
+.hepr-editor-overlay[data-gesture=pick],.hepr-editor-overlay[data-busy=true],.hepr-editor-overlay[data-settling=true]{cursor:progress}
+.hepr-editor-overlay[data-busy=true] .hepr-editor-handle,.hepr-editor-overlay[data-busy=true] .hepr-editor-selection-hit,.hepr-editor-overlay[data-settling=true] .hepr-editor-handle{display:none;pointer-events:none}
+.hepr-editor-overlay[data-settling=true] .hepr-editor-selection-hit{cursor:inherit}
 .hepr-editor-marquee{fill:#2879f51a;stroke:#1765d7;stroke-width:1;stroke-dasharray:4 3}
 .hepr-editor-field{position:absolute;box-sizing:border-box;min-width:8px;min-height:8px;padding:1px;background:#eff6ffcf;color:#111;border:1px solid #3979cf;pointer-events:auto;font:inherit}
 input.hepr-editor-field,textarea.hepr-editor-field{cursor:text}select.hepr-editor-field{cursor:default}input.hepr-editor-field[type=checkbox],input.hepr-editor-field[type=radio]{cursor:pointer}
@@ -37,6 +39,5 @@ input.hepr-editor-field,textarea.hepr-editor-field{cursor:text}select.hepr-edito
 .hepr-editor-password-dialog{border:1px solid #b6c3d4;border-radius:10px;padding:18px;max-width:min(480px,90vw);font:14px system-ui,sans-serif;color:#172333}.hepr-editor-password-dialog::backdrop{background:#17233366}
 .hepr-editor-password-dialog h2{margin:0 0 14px;font-size:20px}.hepr-editor-password-dialog label{display:block;margin:10px 0}.hepr-editor-password-dialog input,.hepr-editor-password-dialog select{box-sizing:border-box;width:100%;margin-top:4px;font:inherit;padding:5px}.hepr-editor-password-dialog button{margin-right:8px;padding:5px 10px;font:inherit}.hepr-editor-password-dialog [role=alert]{color:#a21b1b}
 .hepr-editor-pages-dialog{border:1px solid #b6c3d4;border-radius:10px;padding:18px;width:min(620px,90vw);max-height:85vh;overflow:auto;font:14px system-ui,sans-serif;color:#172333}.hepr-editor-pages-dialog::backdrop{background:#17233366}.hepr-editor-pages-dialog h2{margin:0 0 14px;font-size:20px}.hepr-editor-pages-dialog button{margin:3px;padding:5px 8px;font:inherit}.hepr-editor-pages-dialog input,.hepr-editor-pages-dialog select{font:inherit}.hepr-editor-pages-dialog input[type=number]{width:60px}.hepr-editor-pages-dialog>label{display:block;margin:8px 0}.hepr-editor-pages-list{max-height:32vh;overflow:auto;margin:10px 0;border:1px solid #c6ced9;padding:6px}.hepr-editor-pages-list label{display:flex;align-items:center;gap:8px;padding:3px}.hepr-editor-pages-actions{display:flex;flex-wrap:wrap;gap:4px}
-.hepr-editor-print-frame{position:fixed;width:1px;height:1px;left:-10000px;top:0;border:0}
 @media(max-width:700px){.hepr-editor-toolbar{font-size:11px;max-height:42vh;left:2px;right:2px}.hepr-editor-toolbar button{padding:4px}.hepr-editor-help{display:none}.hepr-editor-transform [data-status]{max-width:100%}}
 @media print{.hepr-editor-toolbar,.hepr-editor-overlay{display:none!important}}

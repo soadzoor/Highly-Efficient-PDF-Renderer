@@ -169,27 +169,101 @@ try {
       assert(annotations.some(annotation => annotation.subtype === "Square"), "new shapes save alongside filled forms");
     } finally { await final.close(); }
   } finally { session?.dispose(); services.dispose(); await parser.close(); }
+  // Browser font delivery lets appearance synthesis retain an original Type1
+  // DA font. The editor must supply the same resolver when recompiling it.
+  const { createBundledStandardFontResolver } = await import("../src/standardFontResolver.ts");
+  const { writeScenePdf } = await import("../src/editorPdfWriter.ts");
+  const type1Bytes = formFixture({ standardType1: true }), type1Original = type1Bytes.slice(), customAssetLoads = [], type1Diagnostics = [];
+  const loadFontAsset = async input => { const url = new URL(input); url.search = ""; customAssetLoads.push(url.pathname); return new Uint8Array(await readFile(url)); };
+  const missingFontResolver = createBundledStandardFontResolver({ loadAsset: asset => loadFontAsset(asset.url) });
+  const originalFetch = globalThis.fetch; let browserAssetReads = 0, type1Services, type1Session, type1Parser;
+  globalThis.fetch = async (input, options) => {
+    const url = new URL(input instanceof URL ? input.href : typeof input === "string" ? input : input.url);
+    if (url.protocol === "file:" && url.pathname.includes("/assets/standard-fonts/")) {
+      options?.signal?.throwIfAborted(); url.search = ""; browserAssetReads++;
+      return new Response(new Uint8Array(await readFile(url)), { status: 200 });
+    }
+    return originalFetch(input, options);
+  };
+  try {
+    type1Parser = await openPdf({ kind: "bytes", bytes: type1Bytes }, { missingFontResolver });
+    const initial = await type1Parser.compileVectorPage(0, { optimization: "none" });
+    assert(initial.textIndex.pages[0].text.includes("Original Helvetica"));
+    type1Services = await createEditorAppServices({ sourcePdf: type1Bytes, loadFontAsset, onDiagnostic: diagnostic => type1Diagnostics.push(diagnostic) });
+    type1Session = await openEditorSession(initial, type1Services.sessionOptions);
+    type1Session.setFieldValue("Text", "B");
+    const modified = await type1Session.getScene();
+    assert(browserAssetReads > 0, "browser-style standard font delivery exercises source Type1 AP synthesis instead of its embedded fallback");
+    assert(customAssetLoads.some(path => path.endsWith("LiberationSans-Regular.ttf")) && customAssetLoads.some(path => path.endsWith("LiberationSerif-Regular.ttf")),
+      "the custom asset loader supplies both original body and regenerated field substitutes");
+    for (const baseFont of ["Helvetica", "Times-Roman"]) assert(type1Diagnostics.some(diagnostic => diagnostic.code === "font.missing-substituted" && diagnostic.details?.baseFont === baseFont),
+      `${baseFont} substitution diagnostics remain visible during edited appearance compilation`);
+    const assertType1Geometry = scene => {
+      const text = scene.textIndex.pages[0].text;
+      assert(text.includes("Original Helvetica"), "original body text stays searchable"); assert(text.includes("B"), "updated field text stays searchable");
+      assert(scene.textInstanceCount > 1 || scene.fillPathCount > 1, "body and field text retain vector glyph instances or Type3 outline paths"); assert.equal(scene.rasterLayers.length, 0);
+    };
+    assertType1Geometry(modified);
+    const editable = new Uint8Array(await (await type1Session.savePdf()).arrayBuffer());
+    assert.deepEqual(type1Bytes, type1Original, "Type1 field editing retains caller-owned source bytes");
+    const beforeType1 = await NativePdfDocument.open({ kind: "bytes", bytes: type1Bytes });
+    const afterType1 = await NativePdfDocument.open({ kind: "bytes", bytes: editable }, { repair: "off" });
+    try {
+      const ref = number => ({ kind: "ref", objectNumber: number, generation: 0 });
+      assert.deepEqual(await afterType1.decodeStream(await afterType1.resolveObject(ref(4))), await beforeType1.decodeStream(await beforeType1.resolveObject(ref(4))),
+        "editing a field leaves original Type1 page-body operators unchanged");
+      for (const number of [33, 34]) assert.deepEqual(await afterType1.resolveObject(ref(number)), await beforeType1.resolveObject(ref(number)),
+        "preservation saves retain original nonembedded Type1 font dictionaries");
+      const registry = new NativePdfFormAppearanceRegistry(afterType1), annotations = await registry.listPageAnnotations(0);
+      const field = annotations.find(annotation => annotation.widget.fullyQualifiedName === "Text");
+      assert.equal(decodePdfString(field.widget.value, 0, field.annotationIndex), "B");
+      const appearance = await registry.resolveAnnotationAppearance(field); assert(appearance);
+      const appearanceFonts = [], appearanceContents = [new TextDecoder().decode(await registry.decodeFormContent(appearance.normalAppearance.form))], visited = new Set();
+      async function inspectResources(resources) {
+        if (!resources || visited.has(resources)) return; visited.add(resources);
+        const fonts = await afterType1.resolveValue(resources.get("Font"));
+        if (fonts instanceof Map) for (const value of fonts.values()) appearanceFonts.push(await afterType1.resolveDictionary(value));
+        const xobjects = await afterType1.resolveValue(resources.get("XObject"));
+        if (xobjects instanceof Map) for (const value of xobjects.values()) {
+          const stream = await afterType1.resolveValue(value);
+          if (stream?.kind !== "stream" || stream.dictionary.get("Subtype")?.value !== "Form") continue;
+          appearanceContents.push(new TextDecoder().decode(await afterType1.decodeStream(stream)));
+          await inspectResources(await afterType1.resolveValue(stream.dictionary.get("Resources")));
+        }
+      }
+      await inspectResources(appearance.normalAppearance.form.resources);
+      assert(appearanceFonts.some(font => font.get("Subtype")?.value === "Type1" && font.get("BaseFont")?.value === "Times-Roman"),
+        "the updated AP keeps the original nonembedded Times-Roman resource");
+      assert.match(appearanceContents.join("\n"), /<42>\s*Tj|\(B\)\s*Tj/, "the retained Type1 AP explicitly paints the updated value");
+    } finally { await beforeType1.close(); await afterType1.close(); }
+    for (const output of [editable, new Uint8Array(await (await type1Session.savePdf({ flatten: true })).arrayBuffer()),
+      new Uint8Array(await (await writeScenePdf(modified)).arrayBuffer())]) {
+      const reopened = await openPdf({ kind: "bytes", bytes: output }, { missingFontResolver });
+      try { assertType1Geometry(await reopened.compileVectorPage(0, { optimization: "none" })); }
+      finally { await reopened.close(); }
+    }
+  } finally { globalThis.fetch = originalFetch; type1Session?.dispose(); type1Services?.dispose(); await type1Parser?.close(); }
   console.log("PDF fields: values, choices, radios, shared/direct widgets, appearances, validation and integrated save/reopen passed.");
 } finally { hooks.deregister(); }
 
-function formFixture({ directAcro = false, indirectArrays = false, decoratedText = false } = {}) {
+function formFixture({ directAcro = false, indirectArrays = false, decoratedText = false, standardType1 = false } = {}) {
   const ap = "/AP << /N 8 0 R >>", button = "/AP << /N << /Off 8 0 R /Yes 9 0 R >> >>";
   const direct = `<< /Type /Annot /Subtype /Widget /FT /Btn /T (Direct) /V /Off /AS /Off /Rect [75 10 95 30] ${button} >>`;
   const fields = "[11 0 R 12 0 R 13 0 R 14 0 R 15 0 R 18 0 R 22 0 R 23 0 R 24 0 R 25 0 R 29 0 R]";
   const order = "[11 0 R 15 0 R 18 0 R 25 0 R 29 0 R 30 0 R]";
-  const acro = `<< /Fields ${indirectArrays ? "21 0 R" : fields} /CO ${indirectArrays ? "28 0 R" : order} /NeedAppearances true /DR << /Font << /F 5 0 R >> >> /DA (/F 10 Tf 0 g) >>`;
+  const acro = `<< /Fields ${indirectArrays ? "21 0 R" : fields} /CO ${indirectArrays ? "28 0 R" : order} /NeedAppearances true /DR << /Font << /F 5 0 R ${standardType1 ? "/TiRo 33 0 R" : ""} >> >> /DA (/F 10 Tf 0 g) >>`;
   return writeTinyPdf({ objects: [
     { number: 1, body: `<< /Type /Catalog /Pages 2 0 R /AcroForm ${directAcro ? acro : "10 0 R"} >>` },
     { number: 2, body: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>" },
-    { number: 3, body: `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R /Resources << /Font << /F 5 0 R >> >> /Annots [11 0 R 12 0 R 13 0 R 14 0 R 16 0 R 17 0 R 19 0 R 20 0 R ${direct} 22 0 R 23 0 R 24 0 R 26 0 R 27 0 R 31 0 R] >>` },
-    { number: 4, body: tinyPdfStream("", "1 1 1 rg 0 0 100 100 re f") },
+    { number: 3, body: `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R /Resources << /Font << /F 5 0 R ${standardType1 ? "/Body 34 0 R" : ""} >> >> /Annots [11 0 R 12 0 R 13 0 R 14 0 R 16 0 R 17 0 R 19 0 R 20 0 R ${direct} 22 0 R 23 0 R 24 0 R 26 0 R 27 0 R 31 0 R] >>` },
+    { number: 4, body: tinyPdfStream("", `1 1 1 rg 0 0 100 100 re f${standardType1 ? " BT /Body 6 Tf 0 g 1 0 0 1 5 94 Tm (Original Helvetica) Tj ET" : ""}`) },
     { number: 5, body: "<< /Type /Font /Subtype /TrueType /BaseFont /Tiny /FirstChar 65 /LastChar 66 /Widths [600 700] /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>" },
     { number: 6, body: "<< /Type /FontDescriptor /FontName /Tiny /Flags 32 /FontBBox [0 -200 1000 800] /ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 /FontFile2 7 0 R >>" },
     { number: 7, body: tinyPdfStream("", buildTinySfnt()) },
     { number: 8, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 20 20] /Resources << >>", "") },
     { number: 9, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 20 20] /Resources << >>", "0 0 0 rg 3 3 14 14 re f") },
     { number: 10, body: acro },
-    { number: 11, body: `<< /Type /Annot /Subtype /Widget /FT /Tx /T (Text) /V (A) /MaxLen 2 /Rect [10 70 50 90] ${decoratedText ? "/AP << /N 32 0 R >>" : ap} >>` },
+    { number: 11, body: `<< /Type /Annot /Subtype /Widget /FT /Tx /T (Text) /V (A) /MaxLen 2 /Rect [10 70 50 90] ${standardType1 ? "/DA (/TiRo 10 Tf 0 g)" : ""} ${decoratedText ? "/AP << /N 32 0 R >>" : ap} >>` },
     { number: 12, body: `<< /Type /Annot /Subtype /Widget /FT /Tx /T (ReadOnly) /Ff 1 /V (A) /Rect [55 70 95 90] ${ap} >>` },
     { number: 13, body: `<< /Type /Annot /Subtype /Widget /FT /Ch /T (Choice) /Opt [[(A) (A)] [(B) (B)]] /V (A) /I [0] /Rect [10 40 50 60] ${ap} >>` },
     { number: 14, body: `<< /Type /Annot /Subtype /Widget /FT /Btn /T (Check) /V /Off /AS /Off /Rect [55 40 75 60] ${button} >>` },
@@ -211,6 +285,8 @@ function formFixture({ directAcro = false, indirectArrays = false, decoratedText
     { number: 30, body: "<< /FT /Tx /T (Leaf) /V (A) /Parent 29 0 R /Kids [31 0 R] >>" },
     { number: 31, body: `<< /Type /Annot /Subtype /Widget /Parent 30 0 R /Rect [35 3 45 13] ${ap} >>` },
     { number: 32, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 40 20] /Resources << /Font << /F 5 0 R >> >>",
-      ".75 .875 1 rg 0 0 40 20 re f 0 0 1 RG .5 w .25 .25 39.5 19.5 re S /Tx << /ActualText (A) >> BDC BT /F 10 Tf 1 0 0 1 3 7 Tm (A) Tj ET EMC") }
+      ".75 .875 1 rg 0 0 40 20 re f 0 0 1 RG .5 w .25 .25 39.5 19.5 re S /Tx << /ActualText (A) >> BDC BT /F 10 Tf 1 0 0 1 3 7 Tm (A) Tj ET EMC") },
+    ...(standardType1 ? [{ number: 33, body: "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman /Encoding /WinAnsiEncoding >>" },
+      { number: 34, body: "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>" }] : [])
   ] });
 }

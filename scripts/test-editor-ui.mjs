@@ -289,7 +289,7 @@ try {
   const structuralEvents = [], structuralWarnings = [], structuralStatuses = []; let finishPageChange;
   const structuralHost = vm.createContext({ running: false, structuralRunning: false, fieldDrafts: new Map(), hasPendingEditorFields: () => false,
     flushEditorFieldDrafts: () => structuralEvents.push("fields"), activeText: {}, finishText: async () => structuralEvents.push("text"),
-    toolbar: { inert: false }, overlay: { inert: false, dataset: {} }, pointer: {}, polygon: {}, textRequest: 0, picking: { abort: () => structuralEvents.push("cancel pick") }, pendingPick: { canceled: false },
+    toolbar: { inert: false }, overlay: { inert: false, dataset: {}, style: {} }, host: {}, isSceneSettling: () => false, pointer: {}, polygon: {}, textRequest: 0, picking: { abort: () => structuralEvents.push("cancel pick") }, pendingPick: { canceled: false },
     clearPreview: () => structuralEvents.push("cancel gesture"), operation: null, lifetime: new AbortController(), AbortController, AbortSignal, LoadProgressReporter,
     query: () => ({ hidden: false }), setStatus: text => structuralStatuses.push(text), disposed: false,
     refreshScene: async signal => { assert.equal(signal.aborted, false); structuralEvents.push("refresh"); },
@@ -316,8 +316,9 @@ try {
   const focusedDocument = { activeElement: focusedField }; let finishCompile;
   const compilePending = new Promise(resolve => { finishCompile = resolve; });
   const refreshHost = vm.createContext({ renderRevision: 0, operation: null, AbortController, disposed: false, tool: "form", latestScene: { id: "before" },
+    scenePreparation: null, sceneApplication: null, lifetime: new AbortController(), AbortSignal, active: false, requestedPreview: null, presented: null, updatePointerCursor() {},
     synchronizeDocumentSource: async () => {},
-    session: { getScene: () => compilePending }, host: { applyScene: async () => {} },
+    session: { getState: () => ({ revision: 0, selection: [], previewing: false }), getSelectionFrame: () => null, getScene: () => compilePending }, host: { applyScene: async () => {} },
     renderFields: () => assert.fail("an async compile must not replace another field's focused draft"), report: error => assert.fail(String(error)) });
   vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), "refreshScene"), refreshHost);
   const refreshing = refreshHost.refreshScene(); focusedField.value = "typed while another field compiles"; finishCompile({ id: "after" }); await refreshing;
@@ -410,7 +411,7 @@ try {
   const saveHost = vm.createContext({ activeText: null, running: false, structuralRunning: false, operation: null, AbortController, fieldDrafts, flushEditorFieldDrafts, hasPendingEditorFields, LoadProgressReporter,
     pdfProtection: savedProtection, passwordDialog: null, hasUnsavedChanges: () => savedProtection.hasChanges(),
     query: () => cancellationButton, setStatus: value => statuses.push(value), source: { label: "sample.pdf" },
-    sourceFunction, finishText: async () => {}, pointer: null, pendingPick: null, picking: null, overlay: { dataset: {} }, clearPreview() {},
+    sourceFunction, finishText: async () => {}, host: {}, pointer: null, pendingPick: null, picking: null, overlay: { dataset: {}, style: {} }, isSceneSettling: () => false, clearPreview() {},
     session: { getState: () => ({ previewing: false }), async savePdf(options) { pdfSaveOptions.push(options); assert.equal(draftCommits.at(-1), "Bob", "saving flushes the focused field before creating PDF output"); options.onWarning("Preserved export warning"); return new Blob(["PDF"], { type: "application/pdf" }); },
       async saveHep() { return new Blob(["HEP"]); }, markSaved: () => assert.fail("UI must not clear a newer revision's unsaved state") },
     formatPdfDownloadFilename: label => label, triggerBrowserDownload: (blob, name) => downloads.push(name),
@@ -437,23 +438,12 @@ try {
   saveHost.passwordDialog = { apply: () => false }; const downloadsBeforeInvalidPassword = downloads.length;
   await saveHost.save("pdf"); assert.equal(downloads.length, downloadsBeforeInvalidPassword, "invalid dialog passwords prevent export");
   saveHost.passwordDialog = null;
-  const printDownloads = [], printFrames = [], revoked = [];
-  const printHost = vm.createContext({ URL: { createObjectURL: () => "blob:print", revokeObjectURL: url => revoked.push(url) },
-    window: new EventTarget(), triggerBrowserDownload: (blob, name) => printDownloads.push([blob, name]) });
-  vm.runInContext(sourceFunction(uiSource, "printPdfBlob"), printHost);
-  let nextPrintWindow = null;
-  const printDocument = { body: { append() {} }, createElement() {
-    const frame = new EventTarget(); Object.assign(frame, { contentWindow: nextPrintWindow, setAttribute() {}, remove() { frame.removed = true; } });
-    printFrames.push(frame); return frame;
-  } };
-  const printBlob = new Blob(["PDF"], { type: "application/pdf" });
-  printHost.printPdfBlob(printBlob, printDocument); printFrames.at(-1).dispatchEvent(new Event("load"));
-  assert.deepEqual(printDownloads, [[printBlob, "edited-print.pdf"]], "unavailable native printing downloads the vector PDF");
-  assert.equal(printFrames.at(-1).removed, true); assert.deepEqual(revoked, ["blob:print"]);
-  let printed = 0;
-  nextPrintWindow = Object.assign(new EventTarget(), { focus() {}, print() { printed++; } });
-  printHost.printPdfBlob(printBlob, printDocument); printFrames.at(-1).dispatchEvent(new Event("load"));
-  assert.equal(printed, 1); assert.equal(printDownloads.length, 1, "available printing uses the embedded PDF viewer");
-  nextPrintWindow.dispatchEvent(new Event("afterprint")); assert.equal(printFrames.at(-1).removed, true);
+  const viewStatuses = [], viewStatus = { textContent: "" }, statusHost = vm.createContext({ active: false, status: viewStatus,
+    host: { onStatus: text => viewStatuses.push(text) } });
+  vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), "setStatus"), statusHost);
+  statusHost.setStatus("Preparing print…"); statusHost.setStatus("Print failed");
+  assert.deepEqual(viewStatuses, ["Preparing print…", "Print failed"], "View-mode operations expose progress and failures outside the hidden editor toolbar");
+  statusHost.active = true; statusHost.setStatus("Editing text");
+  assert.equal(viewStatus.textContent, "Editing text"); assert.equal(viewStatuses.length, 2);
   console.log("Editor form controls and rich text tests passed.");
 } finally { hooks.deregister(); }

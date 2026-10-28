@@ -38,6 +38,7 @@ const nativeLoadEvents = [];
 // Missing choices keep both LOD defaults enabled. null is Cancel.
 let hepLodChoice = {};
 const context = vm.createContext({
+  viewerPrintAction: null, editorSceneApplicationActive: false,
   pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
   performance, AbortController, Uint8Array, console: { log: noop, warn: noop },
   waitForLoad, createLoadProgressReporter, resolveHepLodOptions, hasSelectedHepLod,
@@ -362,6 +363,7 @@ async function testNativeSupersededSceneLoadTokens() {
     const statuses = [];
     let replacementLoad, replacementSourceToken, replacementSceneToken;
     const host = vm.createContext({
+      viewerPrintAction: null,
   pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
       performance, AbortController, Uint8Array, waitForLoad,
       loadToken: 0, activeSceneLoadToken: null, pendingSourceLoadCount: 0, sourceLoadSerial: 0,
@@ -572,6 +574,7 @@ async function testScanCompressionPreferences() {
   const pdf = { kind: "pdf", bytes: Uint8Array.of(1), label: "scans.pdf" };
   const hep = { kind: "hep", bytes: Uint8Array.of(2), label: "scans.hep" };
   const host = vm.createContext({
+    viewerPrintAction: null, editorSceneApplicationActive: false,
   pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     AbortController, loadedOcrTextOnly: false, loadedPageStreaming: false,
     loadedCompressScans: false, loadedCompressScansPreference: true,
@@ -683,6 +686,7 @@ async function testScanCompressionPreferences() {
 
   const threeSource = await readFile(new URL("../src/three-example.ts", import.meta.url), "utf8");
   const three = vm.createContext({
+    viewerPrintAction: null,
   pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     currentPdfObject: null, loadedCompressScansPreference: true, lastNativeDrawStats: null,
     activePageLayout: "grid", readerDocumentIdentity: null, readerPageRects: new Float32Array(),
@@ -1064,7 +1068,7 @@ async function testThreeHepExports() {
         return cancel === "dialog" ? null
           : mode === "eager" ? { withVectorLod: true, vectorLodPrecision: "compact" } : {};
       },
-      setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop, setLoadControlsEnabled: noop,
+      setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop, setLoadControlsEnabled: noop, updateThreeBackendSelectDisabledState: noop,
       backendSelectElement: {}, vectorLodSelectElement: {}, textLodSelectElement: {},
       setLoadingProgress: (visible, label) => {
         if (visible && label?.endsWith("Building HEP")) progress.push(Number.parseFloat(label) / 100);
@@ -1123,7 +1127,7 @@ async function testThreeHepExports() {
     resolveHepLodOptions, hasSelectedHepLod,
     activeHepExportController: null, lastDownloadablePdf: null,
     promptForHepLod: async () => ({}),
-    setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop, setLoadControlsEnabled: noop,
+    setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop, setLoadControlsEnabled: noop, updateThreeBackendSelectDisabledState: noop,
     backendSelectElement: {}, vectorLodSelectElement: {}, textLodSelectElement: {},
     setLoadingProgress: noop, formatLoadProgressStage: String, yieldToBrowserPaint: async () => {},
     setStatus: noop, buildHep: async input => { built.push(input); return { size: 1 }; },
@@ -1619,6 +1623,7 @@ async function testThreeBackendReplacement() {
     const failed = ["renderer", "layers", "compile", "cancel", "reader-layout"].includes(failure);
     const layout = failure === "reader-layout" ? "reader" : "sphere";
     const host = demoHost();
+    host.editorSceneApplicationActive = false;
     const canonicalScene = scene("same artifact");
     const previous = host.currentPdfObject;
     previous.sourceBytes = Uint8Array.of(75);
@@ -1856,6 +1861,7 @@ async function testThreeBackendReplacement() {
 
 function demoHost() {
   return {
+    updateThreeBackendSelectDisabledState: noop,
     performance, AbortController, waitForLoad, URLSearchParams,
     window: { location: { search: "" } }, canvasElement: { width: 800, height: 600 },
     filenameFromUrl: (source) => source,

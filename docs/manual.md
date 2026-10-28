@@ -40,7 +40,8 @@ editor overlay and its frame work. New visible content still has its ordinary
 rendering cost. Browser/GPU performance must be verified on your documents.
 
 Use Select to move, resize or rotate objects. Ctrl/Cmd-click toggles membership
-in a selection; Shift-click adds. Drag an empty area to select every visible
+in a selection; Shift-click adds. Drag anywhere inside the selection frame to
+move the entire selection. Drag an empty area outside it to select every visible
 object fully contained in the rectangle. Selection handles and numeric controls
 apply to the entire selection. Corner resizing keeps proportions by default;
 hold Shift to resize width and height independently. Textbox handles change
@@ -48,6 +49,11 @@ wrapping while preserving the frame's proportions; hold Alt to scale the textbox
 appearance instead, or Alt+Shift to scale it freely. Modifiers can be changed
 during a drag. Use undo/redo, duplicate, delete, grouping,
 and arrow-key nudging from the editing tools and shortcuts.
+The selection frame and handles follow the object's rotation and transform.
+Resize along the visible frame's axes; numeric W/H controls use its edge lengths.
+During a transform, the objects and selection frame advance together with each
+rendered preview. New pointer positions are coalesced while a preview prepares;
+the previous displayed pose remains together until the next one is drawn.
 Transform handles appear only in Select. Rotation and resize cursors remain
 visible throughout a drag; Text and Pencil use their own cursors. Switching
 tools or pressing Escape cancels the current gesture.
@@ -81,6 +87,12 @@ and source document resources are preserved. A flattened PDF copy and PDF-based
 printing are also available. If direct printing is unavailable, download the PDF
 and print it with your preferred PDF viewer.
 
+**Print** is also available in the main toolbar in View mode, for PDF and HEP
+documents. It includes modifications retained after leaving Edit mode. Unedited
+PDFs print from their original resources; HEP content is rebuilt as a vector PDF.
+The loaded page selection is respected, and an already supplied PDF password is
+used to prepare a temporary printable copy without changing the source file.
+
 **PDF password** opens the output protection settings. Keep the existing
 protection, remove it, or set/replace the opening password and confirm it. Open a
 protected source with its current password first; it does not need to be entered
@@ -113,7 +125,20 @@ flattened PDF and HEP, reopen each, inspect text search and appearance, and prin
 using your browser and an independent PDF reader. Compare matched performance
 captures in default View mode and after editing; offline Canvas2D checks do not
 prove browser or GPU behavior.
+Before entering Edit, print a PDF and a HEP from the main toolbar. Print a
+protected PDF using its existing unlock password, and check selected-page scope.
+After editing, return to View and print again; verify the retained changes are
+included and printing leaves the unsaved-change indicator intact.
 Check all four resize corners and rotation while dragging beyond the handles.
+Rotate objects and groups, release the handle, reselect them, and check undo/redo.
+Rotate a multi-selection and check its frame during the drag and after committing.
+Check that corner cursors follow the frame's angle and the rotation grip remains
+outside its top edge at different zooms.
+Drag handles beyond a page border and across Reader gaps; they should stay tied
+to the selected page rather than stop or jump to an adjacent page.
+Move, resize and rotate selections quickly, then release or cancel while a
+preview is preparing. Check that objects, frame and handles stay aligned until
+the final or restored pose appears, including after switching renderer backends.
 Resize images, shapes, signatures and multi-selections with and without Shift;
 press and release Shift during the drag and check both preview and final size.
 Check textbox wrapping with plain/Shift resizing and appearance scaling with

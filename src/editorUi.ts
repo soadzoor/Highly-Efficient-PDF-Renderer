@@ -1,6 +1,6 @@
 import "./editorUi.css";
 import { openEditorSession } from "./editorSession";
-import type { EditorColor, EditorMatrix, EditorObject, EditorObjectInput, EditorSession, EditorState, EditorTextObject } from "./editorTypes";
+import type { EditorColor, EditorMatrix, EditorObject, EditorObjectInput, EditorSelectionFrame, EditorSession, EditorState, EditorTextObject } from "./editorTypes";
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import { ScenePrimitivePicker, getSceneAnnotationRuns, type PrimitivePoint } from "./scenePrimitives";
 import { createEditorAppServices } from "./editorAppServices";
@@ -17,22 +17,28 @@ import { createEditorPdfProtectionState, showEditorPdfPasswordDialog, type Edito
 import { insertEditorPdfFiles, showEditorPagesDialog, type EditorPagesDialog } from "./editorPagesUi";
 import type { LoadProgressCallback } from "./loadProgress";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
+import { editorFrameCenter, editorFrameClientGeometry, editorFrameResizeMatrix, editorFrameScaleMatrix, editorFrameSize } from "./editorSelectionGeometry";
+import { printPdfBlob } from "./pdfPrint";
 
 export interface EditorUiHost {
   getCanvas(): HTMLCanvasElement;
   getScene(): VectorScene | null;
   prepareScene(signal: AbortSignal): Promise<VectorScene>;
-  applyScene(scene: VectorScene, signal: AbortSignal): void | Promise<void>;
+  /** Acknowledge the matching draw before resolving, so selection chrome can follow the submitted scene. */
+  applyScene(scene: VectorScene, signal: AbortSignal, onPresented?: () => void): void | Promise<void>;
   documentChanged?(scene: VectorScene, source: { pdf?: Uint8Array; password?: string; label: string }): void | Promise<void>;
   getSource(): { pdf?: Uint8Array; password?: string; label: string };
-  clientToScenePoint(x: number, y: number): PrimitivePoint | null;
+  clientToScenePoint(x: number, y: number, pageIndex?: number): PrimitivePoint | null;
   sceneToClientPoint(x: number, y: number, pageIndex?: number): PrimitivePoint | null;
   setEditing(active: boolean): void;
   onModeChange?(active: boolean): void;
+  onStatus?(message: string): void;
+  onBusyChange?(busy: boolean): void;
 }
 export interface EditorUi {
   setEditing(active: boolean): Promise<void>;
   isEditing(): boolean;
+  isBusy?(): boolean;
   isDirty(): boolean;
   confirmDocumentChange(): boolean;
   save(kind: "pdf" | "flatten" | "hep" | "print"): Promise<void>;
@@ -40,7 +46,14 @@ export interface EditorUi {
 }
 
 type Tool = "select" | "pan" | "form" | "text" | "rectangle" | "ellipse" | "line" | "arrow" | "polygon" | "polyline" | "ink" | "signature" | "image";
-type PointerGesture = { id: number; start: PrimitivePoint; startClient: PrimitivePoint; last: PrimitivePoint; points: [number, number][]; bounds: Bounds | null; action: "draw" | "marquee" | "move" | "resize" | "rotate"; additive: boolean; handle?: string; freeResize?: boolean; scaleText?: boolean };
+type PointerGesture = { id: number; start: PrimitivePoint; startClient: PrimitivePoint; last: PrimitivePoint; points: [number, number][]; bounds: Bounds | null; frame?: EditorSelectionFrame; action: "draw" | "marquee" | "move" | "resize" | "rotate"; additive: boolean; handle?: string; freeResize?: boolean; scaleText?: boolean };
+interface PresentedScene {
+  sourceScene: VectorScene;
+  revision: number;
+  selection: ReadonlySet<string>;
+  frame: EditorSelectionFrame | null;
+  delta: EditorMatrix | null;
+}
 const IDENTITY: EditorMatrix = [1, 0, 0, 1, 0, 0];
 const SVG_NS = "http://www.w3.org/2000/svg";
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
@@ -72,6 +85,9 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   let pagesDialog: EditorPagesDialog | null = null, structuralRunning = false;
   let currentSourceScene = session.sourceScene;
   let latestScene = session.sourceScene;
+  let currentState = session.getState(), presented: PresentedScene | null = null;
+  let requestedPreview: EditorMatrix | null = null;
+  let scenePreparation: AbortController | null = null, sceneApplication: Promise<void> | null = null;
   const document = host.getCanvas().ownerDocument, window = document.defaultView!;
   let active = false, disposed = false, tool: Tool = "select", toolRequest = 0, frame = 0;
   let objectOpacity = 1;
@@ -117,7 +133,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   const query = <T extends HTMLElement>(selector: string): T => toolbar.querySelector<T>(selector)!;
   const property = (name: string): HTMLInputElement => query(`[data-prop="${name}"]`);
   const status = query<HTMLSpanElement>("[data-status]");
-  const setStatus = (text: string): void => { status.textContent = text; };
+  function setStatus(text: string): void { status.textContent = text; if (!active) host.onStatus?.(text); }
   const report = (error: unknown): void => { if (!(error instanceof DOMException && error.name === "AbortError")) setStatus(message(error)); };
   const styleEnabled = (name: string): boolean => query(`[data-style="${name}"]`).getAttribute("aria-pressed") === "true";
   function pageAt(point: PrimitivePoint): number {
@@ -138,30 +154,44 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     for (const [name, value] of Object.entries(attributes)) element.setAttribute(name, String(value));
     graphic.append(element); return element;
   }
+  function displayedSelection(): { frame: EditorSelectionFrame | null; delta?: EditorMatrix } {
+    const display = presented;
+    if (!display) return { frame: session.getSelectionFrame() };
+    if (display.sourceScene !== session.sourceScene) return { frame: null };
+    if (display.revision === currentState.revision && !display.delta) return { frame: session.getSelectionFrame() };
+    if (currentState.selection.length !== display.selection.size || currentState.selection.some(id => !display.selection.has(id))) return { frame: null };
+    return { frame: display.frame, delta: display.delta ?? undefined };
+  }
+  function isSceneSettling(): boolean {
+    return !pointer && (sceneApplication !== null || presented !== null &&
+      (presented.sourceScene !== session.sourceScene || presented.revision !== currentState.revision || presented.delta !== null));
+  }
   function updateGeometry(): void {
     const canvas = host.getCanvas(), rect = canvas.getBoundingClientRect();
     overlay.style.left = `${rect.left}px`; overlay.style.top = `${rect.top}px`;
     overlay.style.width = `${rect.width}px`; overlay.style.height = `${rect.height}px`;
     graphic.setAttribute("viewBox", `0 0 ${rect.width} ${rect.height}`);
     graphic.replaceChildren();
-    let selection = pointer?.bounds ?? session.getSelectionBounds();
-    if (selection && pointer?.bounds && ["move", "resize", "rotate"].includes(pointer.action)) {
-      const candidate = dragMatrix(pointer, pointer.last);
-      const [a, b, c, d, e, f] = candidate[0] * candidate[3] - candidate[1] * candidate[2] === 0 ? IDENTITY : candidate;
-      const corners = [[selection.minX, selection.minY], [selection.maxX, selection.minY], [selection.maxX, selection.maxY], [selection.minX, selection.maxY]]
-        .map(([x, y]) => ({ x: a * x + c * y + e, y: b * x + d * y + f }));
-      selection = { minX: Math.min(...corners.map(p => p.x)), minY: Math.min(...corners.map(p => p.y)), maxX: Math.max(...corners.map(p => p.x)), maxY: Math.max(...corners.map(p => p.y)) };
-    }
+    const display = displayedSelection(), selection = display.frame;
     if (selection && tool === "select" && !running && !activeText) {
-      const b = sceneBoundsToClient(selection);
-      if (b) {
-        const x = b.minX - rect.left, y = b.minY - rect.top, width = b.maxX - b.minX, height = b.maxY - b.minY;
-        svg("rect", { x, y, width, height, class: "hepr-editor-selection" });
-        for (const [name, hx, hy] of [["nw", x, y], ["ne", x + width, y], ["sw", x, y + height], ["se", x + width, y + height]] as const) {
-          svg("rect", { x: hx - 4, y: hy - 4, width: 8, height: 8, "data-handle": name, class: "hepr-editor-handle" });
+      const geometry = editorFrameClientGeometry(selection, point => host.sceneToClientPoint(point.x, point.y, selection.pageIndex), display.delta);
+      if (geometry) {
+        const corners = geometry.corners.map(point => ({ x: point.x - rect.left, y: point.y - rect.top }));
+        const dx = corners[1].x - corners[0].x, dy = corners[1].y - corners[0].y;
+        const handleAngle = (dx !== 0 || dy !== 0 ? Math.atan2(dy, dx)
+          : Math.atan2(corners[3].y - corners[0].y, corners[3].x - corners[0].x)) * 180 / Math.PI;
+        const framePoints = corners.map(point => `${point.x},${point.y}`).join(" ");
+        svg("polygon", { points: framePoints, class: "hepr-editor-selection-hit", "data-selection-move": "true" });
+        svg("polygon", { points: framePoints, class: "hepr-editor-selection" });
+        for (const [index, name] of ["nw", "ne", "se", "sw"].entries()) {
+          const point = corners[index], handle = svg("rect", { x: point.x - 4, y: point.y - 4, width: 8, height: 8,
+            transform: `rotate(${handleAngle} ${point.x} ${point.y})`, "data-handle": name, class: "hepr-editor-handle" });
+          handle.style.cursor = pointer ? "inherit" : geometry.cursors[index];
+          if (pointer?.action === "resize" && pointer.handle === name) overlay.style.cursor = geometry.cursors[index];
         }
-        svg("line", { x1: x + width / 2, y1: y, x2: x + width / 2, y2: y - 22, class: "hepr-editor-selection" });
-        svg("circle", { cx: x + width / 2, cy: y - 22, r: 5, "data-handle": "rotate", class: "hepr-editor-handle" });
+        svg("line", { x1: geometry.rotationBase.x - rect.left, y1: geometry.rotationBase.y - rect.top,
+          x2: geometry.rotation.x - rect.left, y2: geometry.rotation.y - rect.top, class: "hepr-editor-selection" });
+        svg("circle", { cx: geometry.rotation.x - rect.left, cy: geometry.rotation.y - rect.top, r: 5, "data-handle": "rotate", class: "hepr-editor-handle" });
       }
     }
     if (pointer) {
@@ -202,12 +232,14 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   function tick(): void { if (active && !disposed) { updateGeometry(); frame = window.requestAnimationFrame(tick); } }
   function updateState(state: EditorState): void {
+    currentState = state;
+    updatePointerCursor();
     query<HTMLButtonElement>('[data-action="undo"]').disabled = !state.canUndo;
     query<HTMLButtonElement>('[data-action="redo"]').disabled = !state.canRedo;
     query("[data-selection]").textContent = state.selection.length ? `${state.selection.length} selected` : "No selection";
     for (const action of ["duplicate", "delete", "group", "ungroup"]) query<HTMLButtonElement>(`[data-action="${action}"]`).disabled = state.selection.length === 0;
-    const bounds = session.getSelectionBounds();
-    for (const [name, value] of Object.entries({ x: bounds?.minX, y: bounds?.minY, width: bounds && bounds.maxX - bounds.minX, height: bounds && bounds.maxY - bounds.minY })) {
+    const bounds = session.getSelectionBounds(), frame = session.getSelectionFrame(), size = frame && editorFrameSize(frame);
+    for (const [name, value] of Object.entries({ x: bounds?.minX, y: bounds?.minY, width: size?.width, height: size?.height })) {
       const input = query<HTMLInputElement>(`[data-transform="${name}"]`); input.disabled = !bounds;
       if (document.activeElement !== input) input.value = value == null ? "" : Number(value.toFixed(3)).toString();
     }
@@ -228,21 +260,44 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     await host.documentChanged?.(currentSourceScene, { pdf: session.sourcePdf, password: source.password, label: source.label });
     if (tool === "form") renderFields(); pagesDialog?.refresh();
   }
-  async function refreshScene(externalSignal?: AbortSignal): Promise<void> {
+  async function refreshScene(externalSignal?: AbortSignal, preview = false): Promise<void> {
     const revision = ++renderRevision, abort = new AbortController();
-    if (!externalSignal) { operation?.abort(); operation = abort; }
-    const signal = externalSignal ?? abort.signal;
+    scenePreparation?.abort(); scenePreparation = abort;
+    const signal = AbortSignal.any([lifetime.signal, abort.signal, ...(externalSignal ? [externalSignal] : [])]);
     try {
       await synchronizeDocumentSource(); signal.throwIfAborted();
-      const scene = await session.getScene({ signal });
       if (disposed || revision !== renderRevision) return;
-      await host.applyScene(scene, signal);
-      signal.throwIfAborted();
-      // Field controls may already contain another field's uncommitted typing.
-      // Geometry reads latestScene directly; async display refresh must retain their DOM.
-      latestScene = scene;
+      const state = session.getState(), snapshot: PresentedScene = { sourceScene: session.sourceScene, revision: state.revision,
+        selection: new Set(state.selection), frame: session.getSelectionFrame(), delta: preview && state.previewing ? requestedPreview : null };
+      const scene = await session.getScene({ signal, preview });
+      if (disposed || revision !== renderRevision) return;
+      // Preparing a newer pose can supersede older preparation. Once host
+      // publication starts, finish its matching draw before applying another.
+      while (sceneApplication) {
+        await sceneApplication; signal.throwIfAborted();
+        if (disposed || revision !== renderRevision) return;
+      }
+      if (scenePreparation === abort) scenePreparation = null;
+      let finish: (() => void) | undefined;
+      const application = new Promise<void>(resolve => { finish = resolve; }); sceneApplication = application;
+      let acknowledged = false;
+      const publish = (): void => {
+        if (acknowledged || disposed || signal.aborted || sceneApplication !== application) return;
+        acknowledged = true; latestScene = scene; presented = snapshot; updatePointerCursor();
+        // Preserve focused field drafts; only reposition existing controls.
+        if (active) updateGeometry();
+      };
+      try {
+        await host.applyScene(scene, signal, publish); signal.throwIfAborted();
+        // A synchronous host may finish its draw before returning.
+        if (!acknowledged) publish();
+      } finally {
+        if (sceneApplication === application) sceneApplication = null;
+        finish?.();
+        if (!disposed) { updatePointerCursor(); if (active) updateGeometry(); }
+      }
     } catch (error) { report(error); }
-    finally { if (operation === abort) operation = null; }
+    finally { if (scenePreparation === abort) scenePreparation = null; }
   }
   function commit(change: () => void): void {
     if (structuralRunning) return;
@@ -252,17 +307,22 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   function changeHistory(redo: boolean): void {
     commit(() => { if (redo) session.redo(); else session.undo(); if (tool === "form") renderFields(); });
   }
+  function runPreview(): void {
+    previewFrame = 0; if (!pointer || !active || disposed) return;
+    previewPending = false; previewRunning = true;
+    void refreshScene(undefined, true).finally(() => {
+      previewRunning = false;
+      if (previewPending && pointer && active && !disposed) runPreview();
+    });
+  }
   function queuePreview(): void {
     previewPending = true;
     if (previewRunning || previewFrame) return;
-    previewFrame = window.requestAnimationFrame(() => {
-      previewFrame = 0; if (!pointer || !active || disposed) return;
-      previewPending = false; previewRunning = true;
-      void refreshScene().finally(() => { previewRunning = false; if (previewPending && pointer && active) queuePreview(); });
-    });
+    previewFrame = window.requestAnimationFrame(runPreview);
   }
   function clearPreview(restore = false): void {
     window.cancelAnimationFrame(previewFrame); previewFrame = 0; previewPending = false;
+    requestedPreview = null;
     const wasPreviewing = session.getState().previewing; interaction.cancelTransform();
     if (restore && wasPreviewing) void refreshScene();
   }
@@ -270,6 +330,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     overlay.dataset.gesture = pointer?.action ?? (pendingPick ? "pick" : "");
     overlay.dataset.resizeHandle = pointer?.action === "resize" ? pointer.handle ?? "" : "";
     overlay.dataset.busy = String(running);
+    overlay.dataset.settling = String(isSceneSettling());
+    if (pointer?.action !== "resize") overlay.style.cursor = "";
   }
   function cancelPointerGesture(restore = true): void {
     const id = pointer?.id ?? pendingPick?.id;
@@ -332,46 +394,54 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     } finally { if (picking === controller) picking = null; }
   }
   function dragMatrix(p: PointerGesture, point: PrimitivePoint): EditorMatrix {
-    const bounds = p.bounds!;
     if (p.action === "move") return [1, 0, 0, 1, point.x - p.start.x, point.y - p.start.y];
-    const cx = (bounds.minX + bounds.maxX) / 2, cy = (bounds.minY + bounds.maxY) / 2;
+    const frame = p.frame ?? { bounds: p.bounds!, transform: IDENTITY };
     if (p.action === "rotate") {
+      const { x: cx, y: cy } = editorFrameCenter(frame);
       const angle = Math.atan2(point.y - cy, point.x - cx) - Math.atan2(p.start.y - cy, p.start.x - cx), c = Math.cos(angle), s = Math.sin(angle);
       return [c, s, -s, c, cx - c * cx + s * cy, cy - s * cx - c * cy];
     }
-    const left = p.handle?.includes("w"), top = p.handle?.includes("n"), px = left ? bounds.maxX : bounds.minX, py = top ? bounds.minY : bounds.maxY;
-    const dx = p.start.x - px, dy = p.start.y - py;
-    if (!p.freeResize) {
-      const length = Math.hypot(dx, dy);
-      const scale = length === 0 ? 1 : ((point.x - px) * (dx / length) + (point.y - py) * (dy / length)) / length;
-      return [scale, 0, 0, scale, px * (1 - scale), py * (1 - scale)];
-    }
-    const sx = Math.abs(dx) < 1e-9 ? 1 : (point.x - px) / dx, sy = Math.abs(dy) < 1e-9 ? 1 : (point.y - py) / dy;
-    return [sx, 0, 0, sy, px * (1 - sx), py * (1 - sy)];
+    return editorFrameResizeMatrix(frame, p.start, point, p.handle ?? "se", p.freeResize);
   }
   function resizeTextBox(p: PointerGesture, object: EditorTextObject, matrix: EditorMatrix): Partial<EditorTextObject> | null {
     const [a, b, c, d, e, f] = object.transform, determinant = a * d - b * c;
     if (determinant === 0) return null;
-    if (!p.freeResize) {
-      const scale = matrix[0], pageX = session.sourceScene.pageRects[object.pageIndex * 4], pageY = session.sourceScene.pageRects[object.pageIndex * 4 + 1];
-      const worldX = pageX + a * object.x + c * object.y + e, worldY = pageY + b * object.x + d * object.y + f;
-      const x = scale * worldX + matrix[4] - pageX - e, y = scale * worldY + matrix[5] - pageY - f;
-      return { x: (d * x - c * y) / determinant, y: (-b * x + a * y) / determinant, width: object.width * scale, height: object.height * scale };
+    const pageX = session.sourceScene.pageRects[object.pageIndex * 4], pageY = session.sourceScene.pageRects[object.pageIndex * 4 + 1];
+    const worldX = pageX + a * object.x + c * object.y + e, worldY = pageY + b * object.x + d * object.y + f;
+    const x = matrix[0] * worldX + matrix[2] * worldY + matrix[4] - pageX - e;
+    const y = matrix[1] * worldX + matrix[3] * worldY + matrix[5] - pageY - f;
+    const sx = (d * (matrix[0] * a + matrix[2] * b) - c * (matrix[1] * a + matrix[3] * b)) / determinant;
+    const sy = (-b * (matrix[0] * c + matrix[2] * d) + a * (matrix[1] * c + matrix[3] * d)) / determinant;
+    const width = object.width * sx, height = object.height * sy;
+    return width > 0 && height > 0 ? { x: (d * x - c * y) / determinant, y: (-b * x + a * y) / determinant, width, height } : null;
+  }
+  function transformProperty(name: string, value: number): void {
+    const bounds = session.getSelectionBounds(), frame = session.getSelectionFrame();
+    if (!bounds || !frame || !Number.isFinite(value)) return;
+    const { x: cx, y: cy } = editorFrameCenter(frame);
+    if (name === "rotation") {
+      const angle = value * Math.PI / 180, c = Math.cos(angle), s = Math.sin(angle);
+      commit(() => interaction.applyTransform([c, s, -s, c, cx - c * cx + s * cy, cy - s * cx - c * cy]));
+    } else if (name === "x" || name === "y") {
+      commit(() => interaction.nudge(name === "x" ? value - bounds.minX : 0, name === "y" ? value - bounds.minY : 0));
+    } else if (name === "width" || name === "height") {
+      const size = editorFrameSize(frame), old = size[name]; if (old <= 0 || value <= 0) return;
+      const matrix = editorFrameScaleMatrix(frame, name === "width" ? value / old : 1, name === "height" ? value / old : 1);
+      commit(() => interaction.applyTransform(matrix));
     }
-    const dx = p.last.x - p.start.x, dy = p.last.y - p.start.y;
-    const lx = (d * dx - c * dy) / determinant, ly = (-b * dx + a * dy) / determinant;
-    const west = p.handle?.includes("w"), north = p.handle?.includes("n");
-    const width = object.width + (west ? -lx : lx), height = object.height + (north ? ly : -ly);
-    return width > 0 && height > 0 ? { x: object.x + (west ? lx : 0), y: object.y + (north ? 0 : ly), width, height } : null;
   }
   async function pointerDown(event: PointerEvent): Promise<void> {
-    if (!active || running || activeText || pointer || pendingPick || tool === "pan" || tool === "form" || event.button !== 0 || (event.target as Element).closest(".hepr-editor-field")) return;
+    if (!active || running || activeText || pointer || pendingPick || isSceneSettling() || tool === "pan" || tool === "form" || event.button !== 0 || (event.target as Element).closest(".hepr-editor-field")) return;
     textRequest++;
-    const point = host.clientToScenePoint(event.clientX, event.clientY); if (!point || tool !== "select" && pageAt(point) < 0) return;
+    const targetHandle = tool === "select" ? (event.target as Element).getAttribute("data-handle") : null;
+    const handleFrame = targetHandle && ["nw", "ne", "sw", "se", "rotate"].includes(targetHandle) ? session.getSelectionFrame() : null;
+    const moveFrame = tool === "select" && !event.ctrlKey && !event.metaKey && !event.shiftKey &&
+      (event.target as Element).getAttribute("data-selection-move") === "true" ? session.getSelectionFrame() : null;
+    const gestureFrame = handleFrame ?? moveFrame;
+    const point = host.clientToScenePoint(event.clientX, event.clientY, gestureFrame?.pageIndex); if (!point || tool !== "select" && pageAt(point) < 0) return;
     event.preventDefault(); event.stopPropagation();
     const client = { x: event.clientX, y: event.clientY }, toggle = event.ctrlKey || event.metaKey, additive = toggle || event.shiftKey;
-    const targetHandle = tool === "select" ? (event.target as Element).getAttribute("data-handle") : null;
-    const handle = targetHandle && ["nw", "ne", "sw", "se", "rotate"].includes(targetHandle) && session.getSelectionBounds() ? targetHandle : null;
+    const handle = handleFrame ? targetHandle : null;
     if (tool === "polygon" || tool === "polyline") {
       polygon ??= { pageIndex: pageAt(point), points: [] };
       if (polygon.pageIndex === pageAt(point)) polygon.points.push([point.x, point.y]);
@@ -383,6 +453,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     let action: PointerGesture["action"] = "draw";
     if (tool === "select") {
       if (handle) action = handle === "rotate" ? "rotate" : "resize";
+      else if (moveFrame) action = "move";
       else {
         const request = { id: event.pointerId, point, client, lastClient: client, released: false, canceled: false };
         pendingPick = request;
@@ -399,7 +470,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
           action = "move";
         } else { interaction.selectHit(null, event); action = "marquee"; }
         if (request.released) {
-          const last = host.clientToScenePoint(request.lastClient.x, request.lastClient.y);
+          const last = host.clientToScenePoint(request.lastClient.x, request.lastClient.y, id ? session.getSelectionFrame()?.pageIndex : undefined);
           if (last && Math.hypot(request.lastClient.x - client.x, request.lastClient.y - client.y) > 2) {
             if (id) commit(() => interaction.applyTransform([1, 0, 0, 1, last.x - point.x, last.y - point.y]));
             else interaction.selectArea({ minX: Math.min(point.x, last.x), minY: Math.min(point.y, last.y), maxX: Math.max(point.x, last.x), maxY: Math.max(point.y, last.y) }, { shiftKey: additive });
@@ -408,7 +479,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         }
       }
     }
-    pointer = { id: event.pointerId, start: point, startClient: client, last: point, points: [[point.x, point.y]], bounds: session.getSelectionBounds(), action, additive, handle: handle ?? undefined,
+    pointer = { id: event.pointerId, start: point, startClient: client, last: point, points: [[point.x, point.y]], bounds: session.getSelectionBounds(), frame: gestureFrame ?? session.getSelectionFrame() ?? undefined, action, additive, handle: handle ?? undefined,
       freeResize: event.shiftKey, scaleText: event.altKey };
     updatePointerCursor();
     overlay.setPointerCapture?.(event.pointerId);
@@ -416,7 +487,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   function pointerMove(event: PointerEvent): void {
     if (pendingPick?.id === event.pointerId) pendingPick.lastClient = { x: event.clientX, y: event.clientY };
     if (!pointer || event.pointerId !== pointer.id) return;
-    const point = host.clientToScenePoint(event.clientX, event.clientY); if (!point) return;
+    const point = host.clientToScenePoint(event.clientX, event.clientY, pointer.action !== "draw" && pointer.action !== "marquee" ? pointer.frame?.pageIndex : undefined); if (!point) return;
     pointer.last = point; pointer.freeResize = event.shiftKey; pointer.scaleText = event.altKey;
     if (pointer.action === "draw" && tool === "ink") {
       for (const sample of event.getCoalescedEvents?.() ?? [event]) {
@@ -424,7 +495,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       }
     } else if (pointer.bounds && ["move", "resize", "rotate"].includes(pointer.action)) {
       const matrix = dragMatrix(pointer, point);
-      if (matrix[0] * matrix[3] - matrix[1] * matrix[2] !== 0) { interaction.previewTransform(matrix); queuePreview(); }
+      if (matrix[0] * matrix[3] - matrix[1] * matrix[2] !== 0) { interaction.previewTransform(matrix); requestedPreview = matrix; queuePreview(); }
       else clearPreview(true);
     }
     event.preventDefault();
@@ -433,14 +504,14 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (!active || running || event.isComposing || !pointer?.bounds || pointer.action !== "resize" || event.key !== "Shift" && event.key !== "Alt") return;
     pointer.freeResize = event.shiftKey; pointer.scaleText = event.altKey;
     const matrix = dragMatrix(pointer, pointer.last);
-    if (matrix[0] * matrix[3] - matrix[1] * matrix[2] !== 0) { interaction.previewTransform(matrix); queuePreview(); }
+    if (matrix[0] * matrix[3] - matrix[1] * matrix[2] !== 0) { interaction.previewTransform(matrix); requestedPreview = matrix; queuePreview(); }
     else clearPreview(true);
   }
   function pointerUp(event: PointerEvent): void {
     if (pendingPick?.id === event.pointerId) { pendingPick.released = true; pendingPick.lastClient = { x: event.clientX, y: event.clientY }; overlay.releasePointerCapture?.(event.pointerId); }
     const p = pointer; if (!p || event.pointerId !== p.id) return; pointer = null; updatePointerCursor();
     if (p.action === "resize") {
-      p.last = host.clientToScenePoint(event.clientX, event.clientY) ?? p.last;
+      p.last = host.clientToScenePoint(event.clientX, event.clientY, p.frame?.pageIndex) ?? p.last;
       p.freeResize = event.shiftKey; p.scaleText = event.altKey;
     }
     clearPreview(true);
@@ -453,9 +524,10 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         const selection = session.getSelection(), object = selection.length === 1 ? session.getObject(selection[0]) : null;
         const matrix = dragMatrix(p, p.last);
         if (matrix[0] * matrix[3] - matrix[1] * matrix[2] === 0) return;
-        if (p.action === "resize" && object?.kind === "text" && !p.scaleText && (p.freeResize || matrix[0] > 0)) {
+        if (p.action === "resize" && object?.kind === "text" && !p.scaleText) {
           const patch = resizeTextBox(p, object, matrix);
           if (patch) commit(() => session.updateObject(object.id, patch));
+          else commit(() => interaction.applyTransform(matrix));
         } else commit(() => interaction.applyTransform(matrix));
       }
     } else if (moved) {
@@ -600,12 +672,12 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (structuralRunning) return;
     if ((kind === "pdf" || kind === "flatten") && passwordDialog && !passwordDialog.apply()) return;
     flushEditorFieldDrafts(fieldDrafts);
-    if (hasPendingEditorFields(fieldDrafts)) return;
+    if (hasPendingEditorFields(fieldDrafts)) { setStatus("Check the pending form value before saving or printing."); return; }
     if (activeText) await finishText();
     if (running) return;
     const protection = kind === "pdf" || kind === "flatten" ? pdfProtection.get() : undefined;
     const wasPreviewing = session.getState().previewing;
-    cancelPointerGesture(false); running = true; updatePointerCursor();
+    cancelPointerGesture(false); running = true; updatePointerCursor(); host.onBusyChange?.(true);
     operation?.abort(); const abort = new AbortController(); operation = abort;
     query('[data-action="cancel-operation"]').hidden = false; setStatus(`Preparing ${kind === "hep" ? "HEP" : "PDF"}…`);
     try {
@@ -620,12 +692,12 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       } else blob = kind === "hep" ? await session.saveHep({ signal: abort.signal, onProgress: progress.toCallback() })
         : await session.savePdf({ signal: abort.signal, flatten: kind === "flatten", protection, onWarning, onProgress: progress.toCallback() });
       abort.signal.throwIfAborted();
-      if (kind === "print") printPdfBlob(blob, document);
+      if (kind === "print") printPdfBlob(blob, document, { filename: "edited-print.pdf", title: "Print edited PDF" });
       else { const base = formatPdfDownloadFilename(source.label).replace(/\.pdf$/i, ""); triggerBrowserDownload(blob, `${base}${kind === "hep" ? "-edited.hep" : kind === "flatten" ? "-flattened.pdf" : "-edited.pdf"}`); }
       if (protection) pdfProtection.markSaved(protection);
       setStatus(warnings.length ? warnings.join(" ") : kind === "print" ? "Print-ready PDF opened" : hasUnsavedChanges() ? "Unsaved changes" : "Saved");
     } catch (error) { report(error); }
-    finally { if (operation === abort) operation = null; running = false; updatePointerCursor(); query('[data-action="cancel-operation"]').hidden = true; }
+    finally { if (operation === abort) operation = null; running = false; updatePointerCursor(); query('[data-action="cancel-operation"]').hidden = true; host.onBusyChange?.(false); }
   }
   async function runPageOperation(change: (options: { signal: AbortSignal; onProgress: LoadProgressCallback; onDiagnostic: (diagnostic: PdfDiagnostic) => void }) => Promise<void>): Promise<void> {
     if (running || structuralRunning) throw new Error("Wait for the current operation to finish.");
@@ -634,6 +706,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (activeText) await finishText();
     if (running || structuralRunning) throw new Error("Wait for the current operation to finish.");
     structuralRunning = running = true; toolbar.inert = overlay.inert = true;
+    host.onBusyChange?.(true);
     polygon = null; textRequest++; cancelPointerGesture(false);
     operation?.abort(); const abort = new AbortController(); operation = abort;
     const signal = AbortSignal.any([lifetime.signal, abort.signal]);
@@ -653,6 +726,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if (!disposed) await refreshScene(lifetime.signal);
       if (operation === abort) operation = null;
       structuralRunning = running = false; toolbar.inert = overlay.inert = false;
+      host.onBusyChange?.(false);
       updatePointerCursor();
       query('[data-action="cancel-operation"]').hidden = true;
       if (!disposed) { pagesDialog?.refresh(); updateState(session.getState()); if (warnings.length) setStatus(warnings.join(" ")); }
@@ -706,13 +780,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       return;
     }
     if (input.dataset.transform) {
-      const bounds = session.getSelectionBounds(), value = Number(input.value); if (!bounds || !Number.isFinite(value)) return;
-      const name = input.dataset.transform, cx = (bounds.minX + bounds.maxX) / 2, cy = (bounds.minY + bounds.maxY) / 2;
-      if (name === "rotation") { const angle = value * Math.PI / 180, c = Math.cos(angle), s = Math.sin(angle); commit(() => interaction.applyTransform([c, s, -s, c, cx - c * cx + s * cy, cy - s * cx - c * cy])); input.value = "0"; }
-      else if (name === "x" || name === "y") commit(() => interaction.nudge(name === "x" ? value - bounds.minX : 0, name === "y" ? value - bounds.minY : 0));
-      else { const old = name === "width" ? bounds.maxX - bounds.minX : bounds.maxY - bounds.minY; if (old <= 0 || value <= 0) return;
-        const sx = name === "width" ? value / old : 1, sy = name === "height" ? value / old : 1;
-        commit(() => interaction.applyTransform([sx, 0, 0, sy, bounds.minX * (1 - sx), bounds.minY * (1 - sy)])); }
+      transformProperty(input.dataset.transform, Number(input.value));
+      if (input.dataset.transform === "rotation") input.value = "0";
     } else if (activeText) {
       activeText.element.focus();
       if (input.dataset.prop === "color") document.execCommand("foreColor", false, input.value);
@@ -748,10 +817,11 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       deltaX: event.deltaX, deltaY: event.deltaY, deltaZ: event.deltaZ, deltaMode: event.deltaMode, ctrlKey: event.ctrlKey, metaKey: event.metaKey, shiftKey: event.shiftKey }));
   }, { passive: false });
   async function doubleClick(event: MouseEvent): Promise<void> {
-    if (!active || running) return;
+    if (!active || running || isSceneSettling()) return;
     if (tool === "polygon" || tool === "polyline") { completePolygon(); return; }
     if (tool !== "select" || activeText) return;
-    const point = host.clientToScenePoint(event.clientX, event.clientY); if (!point) return;
+    const pageIndex = (event.target as Element).getAttribute("data-selection-move") === "true" ? session.getSelectionFrame()?.pageIndex : undefined;
+    const point = host.clientToScenePoint(event.clientX, event.clientY, pageIndex); if (!point) return;
     cancelPointerGesture();
     const request = ++textRequest;
     const id = await pick(point, { x: event.clientX, y: event.clientY });
@@ -811,9 +881,9 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       host.setEditing(value); host.onModeChange?.(value);
       if (value) { await refreshScene(); tick(); } else window.cancelAnimationFrame(frame);
     },
-    isEditing: () => active, isDirty: hasUnsavedChanges, save, confirmDocumentChange,
+    isEditing: () => active, isBusy: () => running || structuralRunning, isDirty: hasUnsavedChanges, save, confirmDocumentChange,
     dispose() {
-      if (disposed) return; disposed = true; active = false; cancelPointerGesture(false); lifetime.abort(); operation?.abort(); window.cancelAnimationFrame(frame); window.cancelAnimationFrame(previewFrame);
+      if (disposed) return; disposed = true; active = false; cancelPointerGesture(false); lifetime.abort(); scenePreparation?.abort(); operation?.abort(); window.cancelAnimationFrame(frame); window.cancelAnimationFrame(previewFrame);
       passwordDialog?.close(); pagesDialog?.close(true); pdfProtection.dispose();
       unsubscribe(); picker?.dispose(); interaction.dispose(); session.dispose(); editorServices.dispose(); toolbar.remove(); overlay.remove();
       for (const face of fontFaces.values()) document.fonts.delete(face); fontFaces.clear();
@@ -827,24 +897,6 @@ function applySelectionCss(document: Document, property: string, value: string):
   const range = selection.getRangeAt(0), span = document.createElement("span");
   (span.style as unknown as Record<string, string>)[property] = value;
   span.append(range.extractContents()); range.insertNode(span); range.selectNodeContents(span); selection.removeAllRanges(); selection.addRange(range);
-}
-
-function printPdfBlob(blob: Blob, document: Document): void {
-  const url = URL.createObjectURL(blob), frame = document.createElement("iframe"); frame.className = "hepr-editor-print-frame"; frame.src = url;
-  frame.setAttribute("title", "Print edited PDF"); document.body.append(frame);
-  const cleanup = (): void => { frame.remove(); URL.revokeObjectURL(url); };
-  let downloaded = false;
-  const fallback = (): void => { if (downloaded) return; downloaded = true; triggerBrowserDownload(blob, "edited-print.pdf"); cleanup(); };
-  frame.addEventListener("load", () => {
-    try {
-      const target = frame.contentWindow;
-      if (!target || typeof target.print !== "function") { fallback(); return; }
-      target.addEventListener("afterprint", cleanup, { once: true }); target.focus(); target.print();
-    } catch { fallback(); }
-  }, { once: true });
-  frame.addEventListener("error", fallback, { once: true });
-  window.addEventListener("afterprint", cleanup, { once: true });
-  // Keep the print document alive while the native PDF viewer owns it.
 }
 
 function showSignatureDialog(document: Document, onChoose: (signature: EditorSignature) => void, onError: (error: unknown) => void): void {

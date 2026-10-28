@@ -8,6 +8,14 @@ export type { PdfOutputProtection } from "./pdf/pdfProtection";
 
 /** Affine [a,b,c,d,e,f], with X right and Y up. */
 export type EditorMatrix = readonly [number, number, number, number, number, number];
+export interface EditorSelectionFrame {
+  /** Rectangle in the frame's local axes, before transform. */
+  bounds: Bounds;
+  /** Frame coordinates to composed scene coordinates. Retains shear/reflection. */
+  transform: EditorMatrix;
+  /** Present when every selected object belongs to the same page. */
+  pageIndex?: number;
+}
 export type EditorColor = string | number | readonly [number, number, number];
 export type EditorFieldValue = string | number | boolean | null | readonly string[];
 
@@ -77,6 +85,7 @@ export interface EditorSourceObject extends EditorObjectBase {
   bounds: Bounds;
   annotationId?: string;
 }
+/** Child transforms already include group operations; transform retains the group's selection axes. */
 export interface EditorGroupObject extends EditorObjectBase { kind: "group"; children: readonly string[] }
 export type EditorObject = EditorTextObject | EditorShapeObject | EditorInkObject | EditorImageObject | EditorSourceObject | EditorGroupObject;
 export interface EditorSourceEdit { ref: PrimitiveRef; transform: EditorMatrix; deleted: boolean }
@@ -152,6 +161,8 @@ export interface EditorSession {
   getObjectBounds(id: string): Bounds;
   getSelection(): readonly string[];
   getSelectionBounds(): Bounds | null;
+  /** Committed oriented frame. Apply a gesture preview separately when drawing it. */
+  getSelectionFrame(): EditorSelectionFrame | null;
   select(ids: readonly string[], options?: { additive?: boolean; toggle?: boolean }): void;
   selectPrimitives(refs: readonly PrimitiveRef[], options?: { additive?: boolean }): void;
   selectAnnotations(ids: readonly string[], options?: { additive?: boolean; toggle?: boolean }): void;

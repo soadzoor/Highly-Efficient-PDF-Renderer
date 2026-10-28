@@ -136,6 +136,7 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
     getObjectBounds: id => { assertLive(); return current.version.session.getObjectBounds(id); },
     getSelection: () => { assertLive(); return current.version.session.getSelection(); },
     getSelectionBounds: () => { assertLive(); return current.version.session.getSelectionBounds(); },
+    getSelectionFrame: () => { assertLive(); return current.version.session.getSelectionFrame(); },
     select: (ids, options) => { assertLive(); current.version.session.select(ids, options); },
     selectPrimitives: (refs, options) => { assertLive(); current.version.session.selectPrimitives(refs, options); },
     selectAnnotations: (ids, options) => { assertLive(); current.version.session.selectAnnotations(ids, options); },
@@ -262,7 +263,7 @@ function reseedAuthoredObjects(previous: EditorSession, next: EditorSession, ope
       visiting.add(id); const children = group.children.every(child => ids.has(child) || restoreGroup(child)); visiting.delete(id);
       if (!children) return false;
       const restored = next.addObject({ ...group, id: reserved.has(id) ? undefined : id, pageIndex: target,
-        children: group.children.map(child => ids.get(child)!) });
+        children: group.children.map(child => ids.get(child)!), transform: multiplyEditorMatrices(delta(group.pageIndex, target), group.transform) });
       ids.set(id, restored); reserved.add(restored); return true;
     };
     for (const id of groups.keys()) restoreGroup(id);

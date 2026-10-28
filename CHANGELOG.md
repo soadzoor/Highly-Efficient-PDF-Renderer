@@ -35,6 +35,10 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Changed
 
+- Expose Print in the main native and Three.js toolbars in View as well as Edit.
+  Preserve retained edits and loaded page selections; print unedited PDFs from
+  their original resources and HEPs through the vector PDF writer. Reuse supplied
+  passwords for temporary printable copies, with a PDF-download fallback.
 - Preserve proportions during corner resizing by default; hold Shift for free
   resizing, including while dragging. Textbox frames retain wrapping and their
   proportions; Alt scales their appearance, with Alt+Shift allowing free scaling.
@@ -43,10 +47,25 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
+- Reuse deterministic substitute fonts when recompiling edited form appearances,
+  so PDFs with nonembedded Type1 fonts can be saved and printed after filling.
+  Preserve source font resources and honor custom font-asset loaders.
+- Synchronize transform selection frames with the matching rendered preview in
+  native and Three.js viewers, including release and cancellation. Coalesce new
+  pointer positions and serialize scene publication so older asynchronous updates
+  cannot overtake newer content or leave the frame ahead of the objects.
+- Keep selection frames and handles aligned with rotated or transformed content,
+  including rotated corner squares after committing, reselecting and undo/redo.
+  Keep corner squares at a constant screen size as the viewport zooms. Resize and
+  numeric W/H controls follow the frame's axes, and corner cursors follow its angle.
+  Keep handle drags on their page plane across Reader margins. Expose committed
+  frame geometry through `EditorSession.getSelectionFrame()`.
 - Keep editor cursors and handles aligned with the active tool: show transforms
   only in Select, use rotation, diagonal resize, text and pencil cursors, and
-  retain gesture cursors while dragging. Cancel stale gestures and pending picks
-  on tool changes so later clicks cannot trigger the previous action.
+  show a move cursor throughout the selected frame before dragging. Dragging its
+  interior moves the entire selection, while modifier clicks retain selection
+  behavior. Retain gesture cursors while dragging. Cancel stale gestures and
+  pending picks on tool changes so later clicks cannot trigger the previous action.
 - Resolve indirect crypt-filter selectors before decrypting PDF streams,
   including encrypted object streams and exempt metadata, so supported protected
   PDFs can be opened and have their protection changed consistently.

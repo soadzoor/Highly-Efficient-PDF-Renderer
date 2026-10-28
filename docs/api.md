@@ -79,7 +79,23 @@ identity. `transformSelection(matrix)` takes a delta in composed scene coordinat
 so a shared gesture can transform a multi-object selection about one pivot.
 Reader/Grid and camera presentation must be converted by the host adapter.
 
-The session exposes `getObjects`, `getObjectBounds`, `getSelectionBounds`,
+`getSelectionFrame()` returns committed `{ bounds, transform, pageIndex? }` data
+for drawing transform handles. The bounds use the frame's local axes; transform
+its four corners with the supplied matrix to obtain composed scene coordinates.
+The frame follows rotation, shear and reflection; `pageIndex` is available when
+the selection belongs to one page. Apply the preview delta captured for the
+displayed scene once when drawing a gesture. `getSelectionBounds()` continues to
+return axis-aligned scene
+bounds for spatial queries. Frame data is detached from the session and does not
+add authoring metadata to PDF or HEP output.
+Groups contain independently transformed children. A group's `transform`
+records its selection axes; its children already include group operations, so
+do not apply the group's matrix a second time when rendering those children.
+For page-plane picking in a Three.js Reader layout,
+`clientToScenePoint(camera, x, y, element, pageIndex?)` can target the frame's
+page explicitly, keeping handle drags usable outside that page's border.
+
+The session exposes `getObjects`, `getObjectBounds`, `getSelectionBounds`, `getSelectionFrame`,
 `select`, `selectPrimitives`, `selectAnnotations`, `selectArea`, `addObject`, `updateObject`,
 `transformSelection`, `cloneSelection`, `deleteSelection`, `groupSelection`,
 `ungroupSelection`, `setFieldValue`, `transaction`, `undo`, `redo`, `subscribe`,
@@ -138,6 +154,10 @@ Pass `{ pdf: editor.sourcePdf, password }` as `source` after page operations.
 scene installation, canvas and bidirectional client/scene coordinate conversion,
 plus edit-mode notifications. Instantiate it only when editing is requested;
 `setEditing(false)` removes editor frame work while retaining the session.
+`save("print")` also works while those controls are hidden and does not mark the
+document saved. Optional host `onStatus` and `onBusyChange` callbacks let a View
+toolbar expose inactive-editor progress/errors and coordinate its controls;
+the stock UI also exposes `isBusy()`.
 Hosts can instead build their own interface around `EditorSession`.
 
 `await createEditorInteractionController(editor)` supplies the same DOM-free
