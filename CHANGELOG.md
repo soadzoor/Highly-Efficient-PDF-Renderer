@@ -35,11 +35,18 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Changed
 
+- Preserve proportions during corner resizing by default; hold Shift for free
+  resizing, including while dragging. Textbox frames retain wrapping and their
+  proportions; Alt scales their appearance, with Alt+Shift allowing free scaling.
 - Discover choice options, button states, alignment and text limits on entering
   Edit mode so fields can be validated and displayed consistently.
 
 ### Fixed
 
+- Keep editor cursors and handles aligned with the active tool: show transforms
+  only in Select, use rotation, diagonal resize, text and pencil cursors, and
+  retain gesture cursors while dragging. Cancel stale gestures and pending picks
+  on tool changes so later clicks cannot trigger the previous action.
 - Resolve indirect crypt-filter selectors before decrypting PDF streams,
   including encrypted object streams and exempt metadata, so supported protected
   PDFs can be opened and have their protection changed consistently.

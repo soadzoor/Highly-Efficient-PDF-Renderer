@@ -289,13 +289,13 @@ try {
   const structuralEvents = [], structuralWarnings = [], structuralStatuses = []; let finishPageChange;
   const structuralHost = vm.createContext({ running: false, structuralRunning: false, fieldDrafts: new Map(), hasPendingEditorFields: () => false,
     flushEditorFieldDrafts: () => structuralEvents.push("fields"), activeText: {}, finishText: async () => structuralEvents.push("text"),
-    toolbar: { inert: false }, overlay: { inert: false }, pointer: {}, polygon: {}, textRequest: 0, picking: { abort: () => structuralEvents.push("cancel pick") }, pendingPick: { canceled: false },
+    toolbar: { inert: false }, overlay: { inert: false, dataset: {} }, pointer: {}, polygon: {}, textRequest: 0, picking: { abort: () => structuralEvents.push("cancel pick") }, pendingPick: { canceled: false },
     clearPreview: () => structuralEvents.push("cancel gesture"), operation: null, lifetime: new AbortController(), AbortController, AbortSignal, LoadProgressReporter,
     query: () => ({ hidden: false }), setStatus: text => structuralStatuses.push(text), disposed: false,
     refreshScene: async signal => { assert.equal(signal.aborted, false); structuralEvents.push("refresh"); },
     pagesDialog: { refresh: () => structuralEvents.push("pages"), setWarnings: values => structuralWarnings.push([...values]), setStatus() {} }, updateState: () => structuralEvents.push("state"), session: { getState: () => ({}) },
     report: error => assert.fail(String(error)) });
-  for (const name of ["runPageOperation", "commit"]) vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), name), structuralHost);
+  for (const name of ["updatePointerCursor", "cancelPointerGesture", "runPageOperation", "commit"]) vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), name), structuralHost);
   const structuralPending = structuralHost.runPageOperation(async options => {
     structuralEvents.push("change"); assert.equal(options.signal.aborted, false);
     options.onDiagnostic({ code: "pages.navigation-detached", severity: "warning", message: "An imported named destination was detached." });
@@ -378,7 +378,7 @@ try {
   keyHost.keydown({ key: "s", ctrlKey: true, preventDefault() {} }); keyHost.keydown({ key: "Escape", preventDefault() {} });
   assert.equal(cancelledStructure, 1); assert.deepEqual(savedFromFocus, ["pdf", "pdf"], "structural work blocks keyboard exports and allows cancellation");
   const created = [], creationHost = vm.createContext({ objectOpacity: .375, tool: "rectangle", pendingPick: null, pointer: null,
-    Math, clearPreview() {}, overlay: { releasePointerCapture() {} }, property: name => ({ value: name === "color" ? "#123456" : "2", checked: false }),
+    Math, clearPreview() {}, updatePointerCursor() {}, overlay: { releasePointerCapture() {} }, property: name => ({ value: name === "color" ? "#123456" : "2", checked: false }),
     pageAt: () => 0, pageLocal: point => [point.x, point.y], setTool() {}, commit: apply => apply(),
     signature: { width: 20, height: 10, paths: [[0, 0, 10, 10, 20, 0]] },
     pendingImage: { kind: "image", imageWidth: 1, imageHeight: 1, data: Uint8Array.of(1, 2, 3, 255) },
@@ -410,13 +410,13 @@ try {
   const saveHost = vm.createContext({ activeText: null, running: false, structuralRunning: false, operation: null, AbortController, fieldDrafts, flushEditorFieldDrafts, hasPendingEditorFields, LoadProgressReporter,
     pdfProtection: savedProtection, passwordDialog: null, hasUnsavedChanges: () => savedProtection.hasChanges(),
     query: () => cancellationButton, setStatus: value => statuses.push(value), source: { label: "sample.pdf" },
-    sourceFunction, finishText: async () => {},
-    session: { async savePdf(options) { pdfSaveOptions.push(options); assert.equal(draftCommits.at(-1), "Bob", "saving flushes the focused field before creating PDF output"); options.onWarning("Preserved export warning"); return new Blob(["PDF"], { type: "application/pdf" }); },
+    sourceFunction, finishText: async () => {}, pointer: null, pendingPick: null, picking: null, overlay: { dataset: {} }, clearPreview() {},
+    session: { getState: () => ({ previewing: false }), async savePdf(options) { pdfSaveOptions.push(options); assert.equal(draftCommits.at(-1), "Bob", "saving flushes the focused field before creating PDF output"); options.onWarning("Preserved export warning"); return new Blob(["PDF"], { type: "application/pdf" }); },
       async saveHep() { return new Blob(["HEP"]); }, markSaved: () => assert.fail("UI must not clear a newer revision's unsaved state") },
     formatPdfDownloadFilename: label => label, triggerBrowserDownload: (blob, name) => downloads.push(name),
     report: error => assert.fail(String(error)), printPdfBlob: () => assert.fail("Save must not print"), document: {}
   });
-  vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), "save"), saveHost);
+  for (const name of ["updatePointerCursor", "cancelPointerGesture", "save"]) vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), name), saveHost);
   await saveHost.save("pdf");
   assert.deepEqual(downloads, ["sample-edited.pdf"]);
   assert.equal(statuses.at(-1), "Preserved export warning", "successful download retains fidelity diagnostics");

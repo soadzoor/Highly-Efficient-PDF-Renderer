@@ -42,9 +42,15 @@ rendering cost. Browser/GPU performance must be verified on your documents.
 Use Select to move, resize or rotate objects. Ctrl/Cmd-click toggles membership
 in a selection; Shift-click adds. Drag an empty area to select every visible
 object fully contained in the rectangle. Selection handles and numeric controls
-apply to the entire selection. Textbox handles change wrapping; hold Alt to
-scale the textbox appearance instead. Use undo/redo, duplicate, delete, grouping,
+apply to the entire selection. Corner resizing keeps proportions by default;
+hold Shift to resize width and height independently. Textbox handles change
+wrapping while preserving the frame's proportions; hold Alt to scale the textbox
+appearance instead, or Alt+Shift to scale it freely. Modifiers can be changed
+during a drag. Use undo/redo, duplicate, delete, grouping,
 and arrow-key nudging from the editing tools and shortcuts.
+Transform handles appear only in Select. Rotation and resize cursors remain
+visible throughout a drag; Text and Pencil use their own cursors. Switching
+tools or pressing Escape cancels the current gesture.
 
 Source annotations and inseparable mask/compositing groups select together.
 Other source content can select as individual strokes, glyphs, fills or images;
@@ -107,6 +113,14 @@ flattened PDF and HEP, reopen each, inspect text search and appearance, and prin
 using your browser and an independent PDF reader. Compare matched performance
 captures in default View mode and after editing; offline Canvas2D checks do not
 prove browser or GPU behavior.
+Check all four resize corners and rotation while dragging beyond the handles.
+Resize images, shapes, signatures and multi-selections with and without Shift;
+press and release Shift during the drag and check both preview and final size.
+Check textbox wrapping with plain/Shift resizing and appearance scaling with
+Alt/Alt+Shift, including textboxes on rotated pages.
+Switch to each drawing, placement, form and Pan tool with objects selected;
+confirm that transform handles disappear and the cursor matches the action.
+Cancel drags with Escape and switch tools during a pending selection.
 Also save protected editable/flattened PDFs, reopen them with the new password,
 then remove or replace protection and verify that old passwords stop working.
 Rotate cropped pages, remove pages, and insert multiple PDFs, including protected

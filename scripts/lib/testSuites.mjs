@@ -10,6 +10,7 @@ export const fastTests = [
   "changelog",
   "editor-session",
   "editor-ui",
+  "editor-affordances",
   "editor-text",
   "editor-text-annotations",
   "editor-pdf-writer",
