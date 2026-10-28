@@ -64,6 +64,8 @@ export interface EditorShapeObject extends EditorObjectBase {
 }
 interface EditorInkData extends EditorObjectBase {
   paths: readonly (readonly (readonly [number, number])[])[];
+  /** Maximum centerline deviation in local page units. Zero preserves captured polylines. */
+  smoothing?: number;
   color?: EditorColor;
   fill?: EditorColor | null;
   strokeWidth?: number;

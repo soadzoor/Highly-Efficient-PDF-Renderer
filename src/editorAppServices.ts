@@ -19,6 +19,7 @@ import { NativePdfAnnotationMetadataRegistry } from "./pdf/nativeAnnotations";
 import { createNativeOptionalContentRegistry } from "./pdf/nativeOptionalContent";
 import { AnnotationLayerBuilder } from "./annotationLayers";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
+import { createEditorFieldAppearanceReader } from "./editorFormAppearance";
 
 export interface EditorAppServicesOptions {
   sourcePdf?: Uint8Array;
@@ -147,7 +148,14 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
         const registry = new NativePdfAnnotationMetadataRegistry(document, forms, optional, options.onDiagnostic ?? (() => {}), true);
         const fields = new Map<string, NonNullable<NonNullable<VectorScene["annotations"]>[number]["field"]>>();
         const sourcePages = new Set(scene.annotations.filter(annotation => annotation.field).map(annotation => annotation.sourcePageIndex));
-        for (const page of sourcePages) for (const annotation of await registry.getPageAnnotations(page, signal)) if (annotation.field) fields.set(annotation.id, annotation.field);
+        const styles = createEditorFieldAppearanceReader(document, fonts, await getMissingFontResolver(), options.onDiagnostic);
+        for (const page of sourcePages) {
+          for (const annotation of await registry.getPageAnnotations(page, signal)) if (annotation.field) fields.set(annotation.id, annotation.field);
+          for (const annotation of await forms.listPageAnnotations(page, signal)) {
+            const field = fields.get(annotation.id), textStyle = field && await styles.read(annotation, signal);
+            if (field && textStyle) fields.set(annotation.id, { ...field, textStyle });
+          }
+        }
         return { ...scene, annotations: scene.annotations.map(annotation => fields.has(annotation.id)
           ? { ...annotation, field: fields.get(annotation.id) } : annotation) };
       } finally { await document.close(); }

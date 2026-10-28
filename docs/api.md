@@ -145,6 +145,10 @@ and `fonts.list` manage portable font bytes. `register` accepts complete TTF/OTF
 data. Font records are read-only and their byte buffers must not be modified.
 Default services support Node font loading; `loadFontAsset` can override it.
 The optional `prepareScene` hook enriches form controls only during editor setup.
+`AnnotationField.textStyle` then supplies the typing font family, point size
+(zero means automatic), weight/style, RGB color, em-based ascent/descent and
+the field's content inset when available.
+Source font bytes remain in the editor registry; typing styles are omitted from HEP.
 `readTextAnnotation(id, scene, signal?, source?)` restores HEPR-authored PDF textboxes and
 their embedded fonts for a custom text-editing interface.
 Pass `{ pdf: editor.sourcePdf, password }` as `source` after page operations.
@@ -245,6 +249,12 @@ new editor persistence schema or application-defined object count limit.
 adapter and exposes `list`, `save`, and `remove`. `normalizeEditorSignature`
 normalizes flat handwriting coordinate paths without rasterization. Browser
 storage errors propagate, leaving the existing stored library intact.
+`normalizeEditorSignature(paths, name, id, smoothing = 0)` can record a maximum
+centerline fitting error in template coordinates without altering its samples.
+The optional `smoothing` on ink/signature objects uses local page units; zero
+retains the original polylines. SVG previews, compiled curves and explicit PDF
+appearances share the fitted geometry; PDF `InkList` samples follow those curves.
+HEP stores ordinary line/quadratic geometry without the capture or smoothing model.
 
 ## `renderPdfThumbnail(source, options?)`
 

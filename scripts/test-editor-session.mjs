@@ -8,7 +8,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 try {
   const { openEditorSession } = await import("../src/editorSession.ts");
   const { buildStrokeScene } = await import("../src/strokeSceneBuilder.ts");
-  const { bakeEditorSourceScene, composeEditorPage, compactEditorScene, getEditorAnnotationTransform } = await import("../src/editorScene.ts");
+  const { bakeEditorSourceScene, composeEditorPage, compactEditorScene, getEditorAnnotationTransform, editorTransformBounds } = await import("../src/editorScene.ts");
   const { compileEditorObjectGeometry } = await import("../src/editorSceneObjects.ts");
   const { getScenePrimitive } = await import("../src/scenePrimitives.ts");
   const { composeOverlappingVectorScenes } = await import("../src/pdfVectorExtractor.ts");
@@ -262,7 +262,17 @@ try {
   const arrowBounds=paintedBounds.getObjectBounds(arrow);assert.equal(arrowBounds.minX,-1);assert.equal(arrowBounds.maxX,21);
   assert(Math.abs(arrowBounds.minY+4)<1e-8&&Math.abs(arrowBounds.maxY-4)<1e-8,"arrowhead bounds include the entire filled triangle");
   const ink=paintedBounds.addObject({kind:"ink",pageIndex:0,paths:[[[10,20],[40,20]]],strokeWidth:4});
-  assert.deepEqual(paintedBounds.getObjectBounds(ink),paintedBounds.getObjectBounds(horizontal),"line and ink round-cap extents agree");paintedBounds.dispose();
+  assert.deepEqual(paintedBounds.getObjectBounds(ink),paintedBounds.getObjectBounds(horizontal),"line and ink round-cap extents agree");
+  const smoothInk={kind:"ink",pageIndex:0,paths:[[[10,20],[40,20]]],strokeWidth:4,smoothing:.5};
+  const smooth=paintedBounds.addObject(smoothInk),smoothBounds={minX:7.5,minY:17.5,maxX:42.5,maxY:22.5};
+  assert.deepEqual(paintedBounds.getObjectBounds(smooth),smoothBounds,"ink bounds conservatively cover fitted centerline error and the pen");
+  const inkMatrix=[2,.25,.1,.7,5,-3];paintedBounds.transformSelection(inkMatrix);
+  assert.deepEqual(paintedBounds.getObjectBounds(smooth),editorTransformBounds(smoothBounds,inkMatrix),"nonuniform ink bounds transform with the full selection");
+  paintedBounds.undo();assert.deepEqual(paintedBounds.getObjectBounds(smooth),smoothBounds);paintedBounds.redo();
+  assert.equal(paintedBounds.getObject(smooth).smoothing,.5);
+  for(const smoothing of [-1,NaN,Infinity,".5"])assert.throws(()=>paintedBounds.addObject({...smoothInk,smoothing}),/Ink smoothing/);
+  for(const paths of [[null],[[null]],[[[0]]],[[[0,Infinity]]]])assert.throws(()=>paintedBounds.addObject({...smoothInk,paths}),/Ink/);
+  paintedBounds.dispose();
 
   const reporting=await openEditorSession(scene,{savePdf:async(_scene,_owner,options)=>{
     options.onProgress?.({value:0,stage:"pdf-page",sourceType:"scene"});

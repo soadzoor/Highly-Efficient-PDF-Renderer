@@ -8,6 +8,10 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Added
 
+- Show reusable signatures as selectable vector previews beside their names.
+  Add gentle quadratic fitting for new signatures and pencil drawings, keeping
+  endpoints, corners, pen lifts and loops. Preserve raw template compatibility
+  and use the same curves for previews, rendering and PDF/HEP output.
 - Add an on-demand Edit mode to the native and Three.js viewers, with AcroForm
   filling, mixed-format textboxes and portable fonts, vector shapes and ink,
   reusable local handwritten signatures, image import, multi-selection,
@@ -35,6 +39,8 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Changed
 
+- Use compact vector icons for editor tools and common actions, with descriptive
+  hover titles, accessible labels and visible keyboard focus.
 - Expose Print in the main native and Three.js toolbars in View as well as Edit.
   Preserve retained edits and loaded page selections; print unedited PDFs from
   their original resources and HEPs through the vector PDF writer. Reuse supplied
@@ -47,6 +53,13 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
+- Retain the final pen position, empty-coalesced-event samples, closed pencil
+  loops and taps. Keep signature capture proportions consistent with its preview.
+- Match form input fonts to their PDF family, weight, color and point size,
+  retaining document zoom and using PDFium-style automatic text sizes. Preserve
+  original check/radio appearances without duplicate browser marks or doubled
+  text; keep declared text sizes when saved field content overflows. Share font
+  loading between widgets and omit typing styles from compact HEP exports.
 - Reuse deterministic substitute fonts when recompiling edited form appearances,
   so PDFs with nonembedded Type1 fonts can be saved and printed after filling.
   Preserve source font resources and honor custom font-asset loaders.

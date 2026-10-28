@@ -38,6 +38,20 @@ export interface AnnotationBorder {
   verticalRadius?: number;
 }
 
+/** Detached display style in PDF user-space units; metrics are fractions of one em. */
+export interface AnnotationFieldTextStyle {
+  fontFamily: string;
+  /** A zero point size requests automatic field text fitting. */
+  fontSize: number;
+  fontWeight: number;
+  fontStyle: "normal" | "italic";
+  color: readonly number[];
+  ascent: number;
+  descent: number;
+  /** Effective appearance inset in PDF user-space units. */
+  contentInset?: number;
+}
+
 export interface AnnotationField {
   type?: string;
   name?: string;
@@ -49,6 +63,7 @@ export interface AnnotationField {
   options?: readonly { value: string; label: string }[];
   selectedIndices?: readonly number[];
   alignment?: 0 | 1 | 2;
+  textStyle?: AnnotationFieldTextStyle;
   onValue?: string;
   appearanceState?: string;
 }
@@ -272,6 +287,17 @@ export function validateAnnotations(value: unknown, options: {
       for (const key of ["onValue", "appearanceState"]) if (field[key] !== undefined) string(field[key]);
       if (field.maxLength !== undefined && (!integer(field.maxLength) || field.maxLength === 0)) fail();
       if (field.alignment !== undefined && ![0, 1, 2].includes(field.alignment as number)) fail();
+      if (field.textStyle !== undefined) {
+        const style = record(field.textStyle); string(style.fontFamily);
+        if (!style.fontFamily || typeof style.fontSize !== "number" || !Number.isFinite(style.fontSize) || style.fontSize < 0 ||
+          typeof style.fontWeight !== "number" || !Number.isFinite(style.fontWeight) || style.fontWeight < 1 || style.fontWeight > 1000 ||
+          !["normal", "italic"].includes(style.fontStyle as string) ||
+          typeof style.ascent !== "number" || !Number.isFinite(style.ascent) ||
+          typeof style.descent !== "number" || !Number.isFinite(style.descent) || style.ascent <= style.descent) fail();
+        array(style.color, 3);
+        if ((style.color as number[]).length !== 3 || (style.color as number[]).some(n => n < 0 || n > 1)) fail();
+        if (style.contentInset !== undefined && (typeof style.contentInset !== "number" || !Number.isFinite(style.contentInset) || style.contentInset < 0)) fail();
+      }
       if (field.options !== undefined) {
         if (!Array.isArray(field.options)) fail();
         for (const option of field.options as unknown[]) { const o = record(option); string(o.value); string(o.label); }

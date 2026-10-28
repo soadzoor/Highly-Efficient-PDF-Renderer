@@ -23,6 +23,7 @@ import { validatePdfOutputProtection } from "./pdf/pdfProtection";
 import { scanDensePdfResourceReferences } from "./pdf/nativeContentCompiler";
 import { prepareNativeInlineImages } from "./pdf/nativeInlineImage";
 import { normalizePrimitiveColor } from "./colorInput";
+import { fitEditorInkPaths, flattenEditorInkPaths } from "./editorInkGeometry";
 
 /** Import reachable resources with copy-on-write identities, including cycles. */
 export async function importEditorPdfValue(value: PdfValue, source: NativePdfDocument, writer: NativePdfWriter,
@@ -819,8 +820,14 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
       const bytes = object.kind === "text" ? await editorTextPdf(object, services.fonts, options.signal)
         : new Uint8Array(await (await writeScenePdf(objectScene!, work.options)).arrayBuffer());
       const imported = await importEditorPdfPage(bytes, writer, options.signal);
-      const bounds = object.kind === "text" ? { minX: object.x, minY: object.y, maxX: object.x + object.width, maxY: object.y + object.height }
+      let bounds = object.kind === "text" ? { minX: object.x, minY: object.y, maxX: object.x + object.width, maxY: object.y + object.height }
         : objectScene!.pageBounds;
+      if ((object.kind === "ink" || object.kind === "signature") && (object.smoothing ?? 0) > 0) {
+        // The appearance writer normalizes its page using these Float32 bounds.
+        // Matching its BBox avoids a scale-dependent annotation placement drift.
+        const box = objectScene!.pageRects;
+        bounds = { minX: Math.min(box[0], box[2]), minY: Math.min(box[1], box[3]), maxX: Math.max(box[0], box[2]), maxY: Math.max(box[1], box[3]) };
+      }
       const rect = editorTransformBounds(bounds, localToPdf);
       if (object.kind === "text") imported.form.set("BBox", [bounds.minX, bounds.minY, bounds.maxX, bounds.maxY]);
       imported.form.set("Matrix", [...localToPdf]);
@@ -851,7 +858,20 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
           const decoration = [run.underline ?? object.underline ? "underline" : "", run.strikethrough ?? object.strikethrough ? "line-through" : ""].filter(Boolean).join(" ");
           return `<span style="font-family:${escape(run.fontFamily ?? (run.fontId ? services.fonts.get(run.fontId).family : undefined) ?? object.fontFamily ?? "Liberation Sans")};font-size:${run.fontSize ?? object.fontSize}pt;font-weight:${run.fontWeight ?? object.fontWeight ?? 400};font-style:${run.fontStyle ?? object.fontStyle ?? "normal"};color:#${color};text-decoration:${decoration || "none"}">${escape(run.text)}</span>`;
         }).join("")}</p></body>`));
-      } else if (object.kind === "ink" || object.kind === "signature") annotation.set("InkList", object.paths.map(path => path.flatMap(point => editorPoint(localToPdf, point[0], point[1]))));
+      } else if (object.kind === "ink" || object.kind === "signature") {
+        const smoothing = object.smoothing ?? 0;
+        if (smoothing > 0) {
+          // Match the Float32 centerlines stored in the appearance, then bound
+          // fallback sampling error after the full PDF-space affine transform.
+          const toPdf = (point: readonly [number, number]): [number, number] => editorPoint(localToPdf, Math.fround(point[0]), Math.fround(point[1]));
+          const curves = fitEditorInkPaths(object.paths, smoothing, options.signal).map(path => path.map(segment => ({
+            start: toPdf(segment.start), end: toPdf(segment.end), ...(segment.control ? { control: toPdf(segment.control) } : {})
+          })));
+          const scale = Math.hypot(...localToPdf.slice(0, 4));
+          const paths = flattenEditorInkPaths(curves, Math.max(Number.MIN_VALUE, Math.min(smoothing * scale / 4, .05)), options.signal, "float64");
+          annotation.set("InkList", paths.map(path => path.flat()));
+        } else annotation.set("InkList", object.paths.map(path => path.flatMap(point => editorPoint(localToPdf, point[0], point[1]))));
+      }
       const dictionary = pageDictionary(sourceIndex);
       const previous = await document.resolveValue(dictionary.get("Annots"), options.signal);
       dictionary.set("Annots", [...(Array.isArray(previous) ? previous : []), writer.add(annotation)]);

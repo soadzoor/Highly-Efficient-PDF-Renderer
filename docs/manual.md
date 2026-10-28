@@ -64,8 +64,11 @@ use multi-selection and grouping when the original document has no useful
 object boundaries. An existing raster island moves as a whole image.
 
 The Fill tool shows controls for ordinary AcroForm text, checkbox, radio and
-choice fields, respecting read-only flags and text limits. PDF actions and
-JavaScript are not executed. Textboxes support mixed formatting, sizes, colors,
+choice fields, respecting read-only flags and text limits. Typing uses the PDF's
+font and point size, with automatic sizing similar to Chrome/PDFium. Unfocused
+controls retain the document's appearance, including checkmarks in radio groups;
+keyboard focus remains visible. PDF actions and JavaScript are not executed.
+Textboxes support mixed formatting, sizes, colors,
 underline, strikethrough and alignment. Choose bundled fonts, import TTF/OTF
 files, or request installed fonts in a browser that supports local font access.
 Font bytes are used for committed rendering and PDF output.
@@ -75,7 +78,11 @@ rich formatting and embedded fonts. Ordinary existing page text is transform-onl
 Use shapes, polygon/polyline and pencil tools for vector markup, with stroke
 width, color, opacity and optional closed-area fill. The signature library saves
 drawn vector handwriting in this browser's `localStorage`; placed copies can
-have independent size, stroke thickness and color. There is no application count
+have independent size, stroke thickness and color. Saved signatures show clickable
+vector previews with their names. New signatures offer **Smooth strokes**;
+pencil strokes use gentle curve fitting at release. Endpoints, pen lifts, loops
+and dots are retained, and stored captures are never repeatedly smoothed.
+Existing saved signatures remain usable. There is no application count
 limit, but browser storage capacity and privacy settings still apply. General
 PNG/JPEG/WebP images use the separate image-import tool.
 

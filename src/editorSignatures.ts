@@ -5,6 +5,8 @@ export interface EditorSignature {
   paths: number[][];
   width: number;
   height: number;
+  /** Maximum centerline fitting error in template coordinates; omitted for legacy captures. */
+  smoothing?: number;
 }
 
 const STORAGE_KEY = "hepr.signatures.v1";
@@ -14,6 +16,7 @@ export function validateEditorSignature(value: unknown): value is EditorSignatur
   const item = value as EditorSignature;
   return typeof item.id === "string" && item.id.length > 0 && typeof item.name === "string" &&
     Number.isFinite(item.width) && item.width > 0 && Number.isFinite(item.height) && item.height > 0 &&
+    (item.smoothing === undefined || Number.isFinite(item.smoothing) && item.smoothing >= 0) &&
     Array.isArray(item.paths) && item.paths.length > 0 && item.paths.every(path =>
       Array.isArray(path) && path.length >= 4 && path.length % 2 === 0 && path.every(Number.isFinite));
 }
@@ -46,8 +49,10 @@ export function createEditorSignatureLibrary(storage: Pick<Storage, "getItem" | 
 }
 
 /** Normalize captured screen points without discarding their original shape. */
-export function normalizeEditorSignature(paths: readonly (readonly number[])[], name: string, id: string): EditorSignature {
-  const valid = paths.filter(path => path.length >= 4);
+export function normalizeEditorSignature(paths: readonly (readonly number[])[], name: string, id: string, smoothing = 0): EditorSignature {
+  if (!Number.isFinite(smoothing) || smoothing < 0) throw new TypeError("Invalid signature smoothing.");
+  if (!Array.isArray(paths) || paths.some(path => !Array.isArray(path) || path.length % 2 !== 0)) throw new TypeError("Invalid signature path.");
+  const valid: readonly (readonly number[])[] = paths.filter(path => path.length >= 4);
   if (!valid.length) throw new Error("Draw a signature before saving it.");
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const path of valid) for (let i = 0; i < path.length; i += 2) {
@@ -56,5 +61,6 @@ export function normalizeEditorSignature(paths: readonly (readonly number[])[], 
     minY = Math.min(minY, path[i + 1]); maxY = Math.max(maxY, path[i + 1]);
   }
   return { id, name: name.trim() || "Signature", width: Math.max(maxX - minX, 1), height: Math.max(maxY - minY, 1),
+    ...(smoothing > 0 ? { smoothing } : {}),
     paths: valid.map(path => path.map((value, index) => value - (index % 2 ? minY : minX))) };
 }

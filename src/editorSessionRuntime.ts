@@ -48,7 +48,14 @@ function validateObject(object: EditorObject, pageCount: number): void {
   } else if (object.kind === "ink" || object.kind === "signature") {
     if (!Array.isArray(object.paths)) throw new TypeError("Ink requires paths.");
     if (object.strokeWidth !== undefined) finite(object.strokeWidth, "Stroke width", 0);
-    for (const path of object.paths) for (const point of path) { if (point.length !== 2) throw new TypeError("Ink points must have X and Y."); point.forEach((value: number) => finite(value, "Ink coordinate")); }
+    if (object.smoothing !== undefined) finite(object.smoothing, "Ink smoothing", 0);
+    for (const path of object.paths) {
+      if (!Array.isArray(path)) throw new TypeError("Ink paths must contain point arrays.");
+      for (const point of path) {
+        if (!Array.isArray(point) || point.length !== 2) throw new TypeError("Ink points must have X and Y.");
+        point.forEach((value: number) => finite(value, "Ink coordinate"));
+      }
+    }
   } else if (object.kind !== "source" && object.kind !== "group") throw new TypeError("Unknown editor object kind.");
 }
 
@@ -134,7 +141,9 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     if (object.kind === "ink" || object.kind === "signature") {
       let points: Bounds | null = null;
       for (const path of object.paths) for (const [x, y] of path) points = editorUnionBounds(points, { minX: x, minY: y, maxX: x, maxY: y });
-      const width = (object.strokeWidth ?? 1) / 2, p = points ?? { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+      // Fitting stays within this error of the captured centerline. Conservative
+      // bounds avoid refitting handwriting while dragging selection handles.
+      const width = (object.strokeWidth ?? 1) / 2 + (object.smoothing ?? 0), p = points ?? { minX: 0, minY: 0, maxX: 0, maxY: 0 };
       box = { minX: p.minX - width, minY: p.minY - width, maxX: p.maxX + width, maxY: p.maxY + width };
     } else if (object.kind === "shape") {
       const usePoints = object.shape === "polygon" || object.shape === "polyline" ||
@@ -641,7 +650,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       saveOptions.signal?.throwIfAborted();
       // Extra form controls are editor state, not an expansion of HEP's
       // established compact field metadata schema.
-      const exportScene: VectorScene = scene.annotations?.some(annotation => annotation.field && ["maxLength", "options", "selectedIndices", "alignment", "onValue", "appearanceState"].some(key => key in annotation.field!))
+      const exportScene: VectorScene = scene.annotations?.some(annotation => annotation.field && ["maxLength", "options", "selectedIndices", "alignment", "textStyle", "onValue", "appearanceState"].some(key => key in annotation.field!))
         ? { ...scene, annotations: scene.annotations.map(annotation => {
           if (!annotation.field) return annotation;
           const { type, name, flags, value, defaultValue } = annotation.field;

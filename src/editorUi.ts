@@ -5,10 +5,13 @@ import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import { ScenePrimitivePicker, getSceneAnnotationRuns, type PrimitivePoint } from "./scenePrimitives";
 import { createEditorAppServices } from "./editorAppServices";
 import { triggerBrowserDownload, formatPdfDownloadFilename } from "./downloadUtils";
-import { createEditorSignatureLibrary, normalizeEditorSignature, type EditorSignature } from "./editorSignatures";
+import type { EditorSignature } from "./editorSignatures";
+import { showSignatureDialog } from "./editorSignatureUi";
+import { appendEditorInkSamples, editorInkCaptureTolerance } from "./editorInkCapture";
 import { commitEditorText, hasPendingEditorTextChanges, normalizeEditorTextColor, readRichTextRuns, type EditorTextDraftBaseline } from "./editorRichText";
 import type { EditorFont } from "./editorFonts";
-import { createEditorFieldControl, createEditorFieldOptions, editorFieldDraftSignature, flushEditorFieldDrafts, hasPendingEditorFields, setEditorFieldControlValue, type EditorFieldControl } from "./editorFormControls";
+import { editorIconButton } from "./editorToolbarIcons";
+import { createEditorFieldControl, createEditorFieldOptions, editorFieldDraftSignature, flushEditorFieldDrafts, hasPendingEditorFields, setEditorFieldControlValue, styleEditorFieldControl, type EditorFieldControl } from "./editorFormControls";
 import { editorBoundsClickHit, editorFieldClientGeometry, pickEditorMetadataAnnotation, transformEditorAnnotationText } from "./editorCoordinates";
 import { applyEditorOpacity, editorStyledSelection, validateEditorOpacity } from "./editorProperties";
 import { createEditorInteractionController } from "./editorInteraction";
@@ -96,6 +99,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   let picker: ScenePrimitivePicker | null = null;
   let picking: AbortController | null = null;
   const fontFaces = new Map<string, FontFace>();
+  const fontFaceLoads = new Map<string, Promise<void>>();
   let signature: EditorSignature | null = null, pendingImage: Omit<Extract<EditorObjectInput, { kind: "image" }>, "pageIndex" | "x" | "y" | "width" | "height"> | null = null;
   let activeText: { element: HTMLDivElement; objectId?: string; sourceAnnotationId?: string; pageIndex: number; x: number; y: number; width: number; height: number; transform: EditorMatrix; opacity?: number; lineHeight?: number; baseline: EditorTextDraftBaseline } | null = null;
   let textRequest = 0;
@@ -104,26 +108,39 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   let polygon: { pageIndex: number; points: [number, number][] } | null = null;
   const toolbar = document.createElement("div"); toolbar.className = "hepr-editor-toolbar"; toolbar.setAttribute("role", "toolbar"); toolbar.setAttribute("aria-label", "PDF editing tools");
   toolbar.innerHTML = `<div class="hepr-editor-tools">
-    <button type="button" data-tool="select" aria-pressed="true">Select</button><button type="button" data-tool="pan">Pan</button><button type="button" data-tool="form">Fill fields</button>
-    <button type="button" data-tool="text">Text</button><button type="button" data-tool="rectangle">Rectangle</button><button type="button" data-tool="ellipse">Ellipse</button>
-    <button type="button" data-tool="line">Line</button><button type="button" data-tool="arrow">Arrow</button><button type="button" data-tool="polygon">Polygon</button><button type="button" data-tool="polyline">Polyline</button><button type="button" data-tool="ink">Pencil</button>
-    <button type="button" data-action="signatures">Signatures</button><button type="button" data-action="image">Image</button>
-    <button type="button" data-action="undo" aria-label="Undo (Ctrl/Cmd+Z)">Undo</button><button type="button" data-action="redo">Redo</button>
-    <button type="button" data-action="duplicate">Duplicate</button><button type="button" data-action="delete">Delete</button><button type="button" data-action="group">Group</button><button type="button" data-action="ungroup">Ungroup</button>
+    ${editorIconButton("tool", "select", "Select, move, resize or rotate objects")}
+    ${editorIconButton("tool", "pan", "Pan the document")}
+    ${editorIconButton("tool", "form", "Fill PDF form fields")}
+    ${editorIconButton("tool", "text", "Add a text box")}
+    ${editorIconButton("tool", "rectangle", "Draw a rectangle")}
+    ${editorIconButton("tool", "ellipse", "Draw an ellipse")}
+    ${editorIconButton("tool", "line", "Draw a line")}
+    ${editorIconButton("tool", "arrow", "Draw an arrow")}
+    ${editorIconButton("tool", "polygon", "Draw a polygon (double-click to finish)")}
+    ${editorIconButton("tool", "polyline", "Draw a polyline (double-click to finish)")}
+    ${editorIconButton("tool", "ink", "Draw with the pencil")}
+    ${editorIconButton("action", "signatures", "Create or reuse a handwritten signature")}
+    ${editorIconButton("action", "image", "Import an image (PNG, JPEG or WebP)")}
+    ${editorIconButton("action", "undo", "Undo (Ctrl/Cmd+Z)")}
+    ${editorIconButton("action", "redo", "Redo (Ctrl/Cmd+Shift+Z)")}
+    ${editorIconButton("action", "duplicate", "Duplicate selected objects")}
+    ${editorIconButton("action", "delete", "Delete selected objects")}
+    ${editorIconButton("action", "group", "Group selected objects")}
+    ${editorIconButton("action", "ungroup", "Ungroup selected objects")}
   </div><div class="hepr-editor-properties">
     <label>Color <input data-prop="color" type="color" value="#111111"></label><label>Opacity <input data-prop="opacity" type="number" value="1" min="0" max="1" step="any" aria-label="Object opacity"></label><label>Width <input data-prop="stroke" type="number" value="2" min="0" step="any"></label>
     <label><input data-prop="fill-enabled" type="checkbox"> Fill</label><input data-prop="fill" type="color" value="#ffff00" aria-label="Fill color">
-    <label>Font <select data-prop="font" aria-label="Font family"><option value="">Liberation Sans</option><option value="bundled:serif">Liberation Serif</option><option value="bundled:mono">Liberation Mono</option></select></label><button type="button" data-action="font">Import font</button><button type="button" data-action="local-fonts">Local fonts</button>
+    <label>Font <select data-prop="font" aria-label="Font family"><option value="">Liberation Sans</option><option value="bundled:serif">Liberation Serif</option><option value="bundled:mono">Liberation Mono</option></select></label>${editorIconButton("action", "font", "Import a TTF or OTF font")}${editorIconButton("action", "local-fonts", "Choose installed fonts")}
     <label>Size <input data-prop="font-size" type="number" value="12" min="0.1" step="any"></label>
-    <button type="button" data-style="bold" aria-pressed="false"><b>B</b></button><button type="button" data-style="italic" aria-pressed="false"><i>I</i></button>
-    <button type="button" data-style="underline" aria-pressed="false"><u>U</u></button><button type="button" data-style="strikethrough" aria-pressed="false"><s>S</s></button>
+    <button type="button" data-style="bold" aria-pressed="false" title="Bold" aria-label="Bold"><b>B</b></button><button type="button" data-style="italic" aria-pressed="false" title="Italic" aria-label="Italic"><i>I</i></button>
+    <button type="button" data-style="underline" aria-pressed="false" title="Underline" aria-label="Underline"><u>U</u></button><button type="button" data-style="strikethrough" aria-pressed="false" title="Strikethrough" aria-label="Strikethrough"><s>S</s></button>
     <label>Align <select data-prop="align"><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></label>
-    <button type="button" data-action="apply-text" hidden>Apply text</button><button type="button" data-action="cancel-text" hidden>Cancel text</button>
+    <button type="button" data-action="apply-text" title="Apply text changes" hidden>Apply text</button><button type="button" data-action="cancel-text" title="Discard text changes" hidden>Cancel text</button>
   </div><div class="hepr-editor-transform">
     <span data-selection>No selection</span><label>X <input data-transform="x" type="number" step="any"></label><label>Y <input data-transform="y" type="number" step="any"></label>
     <label>W <input data-transform="width" type="number" min="0.001" step="any"></label><label>H <input data-transform="height" type="number" min="0.001" step="any"></label><label>Rotate ° <input data-transform="rotation" type="number" step="any" value="0"></label>
-    <button type="button" data-action="pages">Pages</button><button type="button" data-action="pdf-password">PDF password</button><button type="button" data-action="save-pdf">Save PDF</button><button type="button" data-action="flatten">Flattened PDF</button><button type="button" data-action="save-hep">Save HEP</button><button type="button" data-action="print">Print</button>
-    <button type="button" data-action="cancel-operation" hidden>Cancel</button><span data-status role="status" aria-live="polite"></span>
+    <button type="button" data-action="pages" title="Rotate, remove or insert PDF pages">Pages</button><button type="button" data-action="pdf-password" title="Keep, remove or change PDF password protection">PDF password</button><button type="button" data-action="save-pdf" title="Save an editable PDF (Ctrl/Cmd+S)">Save PDF</button><button type="button" data-action="flatten" title="Save a flattened PDF copy">Flattened PDF</button><button type="button" data-action="save-hep" title="Save the edited document as HEP">Save HEP</button><button type="button" data-action="print" title="Print the edited document">Print</button>
+    <button type="button" data-action="cancel-operation" title="Cancel the current operation" hidden>Cancel</button><span data-status role="status" aria-live="polite"></span>
   </div><div class="hepr-editor-help">Ctrl/Cmd + click toggles objects; Shift + click adds them. Drag empty space to select fully contained objects. Corner resizing keeps proportions; hold Shift to resize freely. Double-click a new textbox to edit it; resizing changes wrapping, Alt + resize scales text. Escape cancels.</div>`;
   const overlay = document.createElement("div"); overlay.className = "hepr-editor-overlay"; overlay.dataset.tool = tool;
   const graphic = document.createElementNS(SVG_NS, "svg"); graphic.classList.add("hepr-editor-graphic");
@@ -284,6 +301,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       const publish = (): void => {
         if (acknowledged || disposed || signal.aborted || sceneApplication !== application) return;
         acknowledged = true; latestScene = scene; presented = snapshot; updatePointerCursor();
+        if (tool === "form") updateFieldPaint();
         // Preserve focused field drafts; only reposition existing controls.
         if (active) updateGeometry();
       };
@@ -354,6 +372,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   function renderFields(): void {
     fields.replaceChildren(); fieldDrafts.clear();
+    const appearances = getSceneAnnotationRuns(latestScene);
     for (const annotation of latestScene.annotations ?? []) {
       const name = annotation.field?.name;
       const input = createEditorFieldControl(document, annotation, name ? session.getFieldValues().get(name) : undefined,
@@ -364,11 +383,24 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
             if (!sibling || sibling.field?.name !== name) continue;
             setEditorFieldControlValue(control, sibling, value); fieldDrafts.set(control, editorFieldDraftSignature(control));
           }
-        }));
+        }), { usePdfAppearance: annotation.hasAppearance || Boolean(appearances.get(annotation.id)?.length) });
       if (input) {
         fieldDrafts.set(input, editorFieldDraftSignature(input)); fields.append(input);
         const choices = createEditorFieldOptions(document, annotation, input); if (choices) fields.append(choices);
+        if (annotation.field?.textStyle) void editorServices.fonts.resolve(annotation.field.textStyle).then(async font => {
+          await activateFont(font);
+          if (input.parentElement === fields) styleEditorFieldControl(input, annotation, JSON.stringify(font.id));
+        }).catch(report);
       }
+    }
+  }
+  function updateFieldPaint(): void {
+    const annotations = new Map(latestScene.annotations?.map(annotation => [annotation.id, annotation]));
+    const appearances = getSceneAnnotationRuns(latestScene);
+    for (const [control] of fieldDrafts) {
+      const annotation = annotations.get(control.dataset.fieldId!);
+      if (annotation?.hasAppearance || appearances.get(control.dataset.fieldId!)?.length) control.dataset.pdfAppearance = "true";
+      else delete control.dataset.pdfAppearance;
     }
   }
   async function pick(point: PrimitivePoint, client: PrimitivePoint): Promise<string | null> {
@@ -490,9 +522,10 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     const point = host.clientToScenePoint(event.clientX, event.clientY, pointer.action !== "draw" && pointer.action !== "marquee" ? pointer.frame?.pageIndex : undefined); if (!point) return;
     pointer.last = point; pointer.freeResize = event.shiftKey; pointer.scaleText = event.altKey;
     if (pointer.action === "draw" && tool === "ink") {
-      for (const sample of event.getCoalescedEvents?.() ?? [event]) {
-        const p = host.clientToScenePoint(sample.clientX, sample.clientY); if (p) pointer.points.push([p.x, p.y]);
-      }
+      const pageIndex = pageAt(pointer.start);
+      appendEditorInkSamples(pointer.points, event, sample => {
+        const p = host.clientToScenePoint(sample.clientX, sample.clientY, pageIndex); return p ? [p.x, p.y] : null;
+      });
     } else if (pointer.bounds && ["move", "resize", "rotate"].includes(pointer.action)) {
       const matrix = dragMatrix(pointer, point);
       if (matrix[0] * matrix[3] - matrix[1] * matrix[2] !== 0) { interaction.previewTransform(matrix); requestedPreview = matrix; queuePreview(); }
@@ -510,6 +543,12 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   function pointerUp(event: PointerEvent): void {
     if (pendingPick?.id === event.pointerId) { pendingPick.released = true; pendingPick.lastClient = { x: event.clientX, y: event.clientY }; overlay.releasePointerCapture?.(event.pointerId); }
     const p = pointer; if (!p || event.pointerId !== p.id) return; pointer = null; updatePointerCursor();
+    if (p.action === "draw" && tool === "ink") {
+      const pageIndex = pageAt(p.start);
+      appendEditorInkSamples(p.points, event, sample => {
+        const point = host.clientToScenePoint(sample.clientX, sample.clientY, pageIndex); return point ? [point.x, point.y] : null;
+      });
+    }
     if (p.action === "resize") {
       p.last = host.clientToScenePoint(event.clientX, event.clientY, p.frame?.pageIndex) ?? p.last;
       p.freeResize = event.shiftKey; p.scaleText = event.altKey;
@@ -530,10 +569,13 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
           else commit(() => interaction.applyTransform(matrix));
         } else commit(() => interaction.applyTransform(matrix));
       }
-    } else if (moved) {
+    } else if (moved || tool === "ink") {
       const pageIndex = pageAt(p.start), [x, y] = pageLocal({ x: Math.min(p.start.x, p.last.x), y: Math.min(p.start.y, p.last.y) }, pageIndex);
+      if (pageIndex < 0) return;
       let object: EditorObjectInput;
-      if (tool === "ink") object = { kind: "ink", pageIndex, opacity: objectOpacity, paths: [p.points.map(([px, py]) => pageLocal({ x: px, y: py }, pageIndex))], color: property("color").value, strokeWidth: Number(property("stroke").value), fill: property("fill-enabled").checked ? property("fill").value : null };
+      if (tool === "ink") object = { kind: "ink", pageIndex, opacity: objectOpacity, paths: [p.points.map(([px, py]) => pageLocal({ x: px, y: py }, pageIndex))],
+        smoothing: editorInkCaptureTolerance(p.start, point => host.sceneToClientPoint(point.x, point.y, pageIndex)),
+        color: property("color").value, strokeWidth: Number(property("stroke").value), fill: property("fill-enabled").checked ? property("fill").value : null };
       else object = { kind: "shape", pageIndex, shape: tool as "rectangle" | "ellipse" | "line" | "arrow", x, y,
         width: Math.abs(p.last.x - p.start.x), height: Math.abs(p.last.y - p.start.y),
         points: tool === "line" || tool === "arrow" ? [pageLocal(p.start, pageIndex), pageLocal(p.last, pageIndex)] : undefined,
@@ -553,9 +595,16 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   async function activateFont(font: EditorFont): Promise<void> {
     if (fontFaces.has(font.id)) return;
-    const face = new FontFace(font.id, font.bytes.slice().buffer, { weight: String(font.fontWeight), style: font.fontStyle });
-    await face.load(); if (disposed) throw new DOMException("Editor closed.", "AbortError");
-    if (fontFaces.has(font.id)) return; document.fonts.add(face); fontFaces.set(font.id, face);
+    let pending = fontFaceLoads.get(font.id);
+    if (!pending) {
+      pending = (async () => {
+        const face = new FontFace(font.id, font.bytes.slice().buffer, { weight: String(font.fontWeight), style: font.fontStyle });
+        await face.load(); if (disposed) throw new DOMException("Editor closed.", "AbortError");
+        document.fonts.add(face); fontFaces.set(font.id, face);
+      })();
+      fontFaceLoads.set(font.id, pending);
+    }
+    try { await pending; } finally { if (fontFaceLoads.get(font.id) === pending) fontFaceLoads.delete(font.id); }
   }
   async function selectedFont(id = query<HTMLSelectElement>('[data-prop="font"]').value): Promise<EditorFont> {
     return id && !id.startsWith("bundled:") ? editorServices.fonts.get(id) : editorServices.fonts.loadBundled(id === "bundled:serif" ? "Liberation Serif" : id === "bundled:mono" ? "Liberation Mono" : "Liberation Sans");
@@ -666,6 +715,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     const width = Math.min(180, (session.sourceScene.pageRects[pageIndex * 4 + 2] - session.sourceScene.pageRects[pageIndex * 4]) * 0.4), scale = width / asset.width;
     commit(() => { const id = session.addObject({ kind: "signature", pageIndex, opacity: objectOpacity,
       paths: asset.paths.map(path => Array.from({ length: path.length / 2 }, (_, index) => [x + path[index * 2] * scale, y - path[index * 2 + 1] * scale] as [number, number])),
+      ...(asset.smoothing !== undefined ? { smoothing: asset.smoothing * Math.abs(scale) } : {}),
       color: property("color").value, strokeWidth: Number(property("stroke").value) }); session.select([id]); });
   }
   async function save(kind: "pdf" | "flatten" | "hep" | "print"): Promise<void> {
@@ -897,51 +947,4 @@ function applySelectionCss(document: Document, property: string, value: string):
   const range = selection.getRangeAt(0), span = document.createElement("span");
   (span.style as unknown as Record<string, string>)[property] = value;
   span.append(range.extractContents()); range.insertNode(span); range.selectNodeContents(span); selection.removeAllRanges(); selection.addRange(range);
-}
-
-function showSignatureDialog(document: Document, onChoose: (signature: EditorSignature) => void, onError: (error: unknown) => void): void {
-  const dialog = document.createElement("dialog"); dialog.className = "hepr-editor-signature-dialog";
-  dialog.innerHTML = `<h2>Handwritten signatures</h2><div class="hepr-editor-signature-library"></div><label>Name <input data-signature-name value="Signature"></label>
-    <canvas width="720" height="240" aria-label="Draw your signature"></canvas><p>Draw with your mouse, pen, or finger. Signatures are stored in this browser.</p>
-    <div><button type="button" data-signature-action="clear">Clear drawing</button><button type="button" data-signature-action="save">Save and use</button><button type="button" data-signature-action="use">Use without saving</button><button type="button" data-signature-action="close">Close</button></div><p data-signature-status role="status"></p>`;
-  document.body.append(dialog);
-  const canvas = dialog.querySelector("canvas")!, context = canvas.getContext("2d")!, paths: number[][] = [];
-  let current: number[] | null = null;
-  const status = dialog.querySelector<HTMLElement>("[data-signature-status]")!;
-  let library: ReturnType<typeof createEditorSignatureLibrary> | undefined;
-  try { library = createEditorSignatureLibrary(document.defaultView!.localStorage); } catch (error) { status.textContent = message(error); }
-  function redraw(): void {
-    context.clearRect(0, 0, canvas.width, canvas.height); context.lineWidth = 3; context.lineCap = "round"; context.lineJoin = "round";
-    for (const path of paths) { context.beginPath(); context.moveTo(path[0], path[1]); for (let i = 2; i < path.length; i += 2) context.lineTo(path[i], path[i + 1]); context.stroke(); }
-  }
-  function showLibrary(): void {
-    const container = dialog.querySelector<HTMLElement>(".hepr-editor-signature-library")!; container.replaceChildren();
-    try {
-      for (const item of library?.list() ?? []) {
-        const row = document.createElement("div"), use = document.createElement("button"), remove = document.createElement("button");
-        use.type = remove.type = "button"; use.textContent = item.name; remove.textContent = "Delete"; remove.setAttribute("aria-label", `Delete ${item.name}`);
-        use.addEventListener("click", () => { onChoose(item); dialog.close(); });
-        remove.addEventListener("click", () => { try { library?.remove(item.id); showLibrary(); } catch (error) { status.textContent = message(error); } });
-        row.append(use, remove); container.append(row);
-      }
-    } catch (error) { status.textContent = message(error); }
-  }
-  const point = (event: PointerEvent): [number, number] => { const rect = canvas.getBoundingClientRect(); return [(event.clientX - rect.left) * canvas.width / rect.width, (event.clientY - rect.top) * canvas.height / rect.height]; };
-  canvas.addEventListener("pointerdown", event => { event.preventDefault(); current = point(event); paths.push(current); canvas.setPointerCapture(event.pointerId); });
-  canvas.addEventListener("pointermove", event => { if (!current) return; for (const sample of event.getCoalescedEvents?.() ?? [event]) current.push(...point(sample)); redraw(); });
-  canvas.addEventListener("pointerup", event => { if (current?.length === 2) current.push(current[0] + 0.01, current[1]); current = null; canvas.releasePointerCapture(event.pointerId); redraw(); });
-  canvas.addEventListener("pointercancel", () => { current = null; });
-  dialog.addEventListener("click", event => {
-    const action = (event.target as HTMLElement).closest<HTMLElement>("[data-signature-action]")?.dataset.signatureAction;
-    if (action === "clear") { paths.length = 0; redraw(); }
-    if (action === "close") dialog.close();
-    if (action === "save" || action === "use") {
-      try {
-        const item = normalizeEditorSignature(paths, dialog.querySelector<HTMLInputElement>("[data-signature-name]")!.value, crypto.randomUUID());
-        if (action === "save") { if (!library) throw new Error("Browser signature storage is unavailable. Use without saving instead."); library.save(item); }
-        onChoose(item); dialog.close();
-      } catch (error) { status.textContent = message(error); onError(error); }
-    }
-  });
-  dialog.addEventListener("close", () => dialog.remove(), { once: true }); showLibrary(); dialog.showModal();
 }
