@@ -49,6 +49,17 @@ export { buildStrokeScene } from "./strokeSceneBuilder";
 export { renderPdfThumbnail } from "./pdfThumbnail";
 export type { PdfThumbnailOptions, PdfThumbnailResult, PdfThumbnailTiming } from "./pdfThumbnail";
 export { openDocumentSession } from "./documentSession";
+export { openEditorSession } from "./editorSession";
+export { createEditorAppServices, createEditorUi, createEditorInteractionController, writeScenePdf, changePdfProtection, manipulatePdfPages } from "./editorApi";
+export type { PdfProtectionChangeOptions } from "./editorPdfProtection";
+export type { PdfPageOperation, PdfPageOperationOptions } from "./editorPdfPages";
+export type { EditorInteractionController, EditorSelectionModifiers } from "./editorInteraction";
+export { createEditorSignatureLibrary, normalizeEditorSignature, validateEditorSignature } from "./editorSignatures";
+export type * from "./editorTypes";
+export type { EditorFont, EditorFontRegistry, EditorFontOptions } from "./editorFonts";
+export type { EditorAppServices, EditorAppServicesOptions } from "./editorAppServices";
+export type { EditorUi, EditorUiHost } from "./editorUi";
+export type { EditorSignature } from "./editorSignatures";
 export type { DocumentSession, DocumentSessionInfo, DocumentSessionOpenOptions, DocumentSessionHepOptions } from "./documentSession";
 export type { StrokeScenePoint, StrokeSceneStyle, StrokeScenePolyline } from "./strokeSceneBuilder";
 

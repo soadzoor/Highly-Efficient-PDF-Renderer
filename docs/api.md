@@ -48,6 +48,184 @@ Shader comments are removed only from build output; TypeScript sources keep thei
 comments and indentation. Shader code whitespace remains intact for exact source
 patches. Vite builds requesting source maps retain the original strings and mappings.
 
+## Editing APIs
+
+`openEditorSession(scene, options?)` opens an immutable compiled `VectorScene`
+for editing and returns `Promise<EditorSession>`. It does not start a renderer or
+change the supplied scene. The same compiled results work with the native and
+Three.js WebGL/WebGPU renderers. Editing/font/writer runtimes load on demand.
+
+```ts
+import { openEditorSession } from "@soadzoor/hepr/bundler";
+
+const editor = await openEditorSession(scene, { sourcePdf: originalPdfBytes });
+const id = editor.addObject({
+  kind: "text", pageIndex: 0, x: 24, y: 120, width: 240, height: 80,
+  text: "Hello PDF", fontSize: 18,
+  runs: [{ text: "Hello ", fontFamily: "Liberation Sans" },
+    { text: "PDF", fontWeight: "bold", color: "#cc0000" }]
+});
+editor.select([id]);
+editor.transformSelection([1, 0, 0, 1, 12, 0]);
+const modifiedScene = await editor.getScene({ signal });
+const pdf = await editor.savePdf({ signal });
+const hep = await editor.saveHep({ signal });
+editor.dispose();
+```
+
+Objects use displayed page-local coordinates, X right/Y up, with the lower-left
+page corner at `(0, 0)`. Their six-component affine `transform` defaults to the
+identity. `transformSelection(matrix)` takes a delta in composed scene coordinates
+so a shared gesture can transform a multi-object selection about one pivot.
+Reader/Grid and camera presentation must be converted by the host adapter.
+
+The session exposes `getObjects`, `getObjectBounds`, `getSelectionBounds`,
+`select`, `selectPrimitives`, `selectAnnotations`, `selectArea`, `addObject`, `updateObject`,
+`transformSelection`, `cloneSelection`, `deleteSelection`, `groupSelection`,
+`ungroupSelection`, `setFieldValue`, `transaction`, `undo`, `redo`, `subscribe`,
+`getScene`, `savePdf`, and `saveHep`. Transactions roll back on failure.
+`getState()` reports revision, selection, undo/redo availability and dirty state.
+Compilation and saving accept `signal` cancellation and `onProgress` callbacks
+with normalized `value` and `stage`; failed saves do not clear dirty state.
+`setPreviewTransform(matrix | null)` previews a gesture without adding history or
+dirty state; saves exclude previews. `getScene({ includeObjects: false, preview:
+false })` returns only the edited original content and filled fields.
+
+`getPages()` returns current page indexes, displayed dimensions and
+rotation. Page indexes are zero-based. `rotatePages(indexes, degrees, options?)`
+accepts clockwise multiples of 90 degrees; `removePages(indexes, options?)`
+keeps at least one page. `insertPdf(bytes, { at?, pages?, password?, signal?,
+onProgress?, onDiagnostic? })` inserts selected pages from another PDF before
+`at`, or appends when `at` is omitted. Omit `pages` to import the whole PDF.
+The inserted page indexes follow their supplied order. The foreign password is
+independent of the primary document's password.
+Source-backed sessions require all source pages in their original order for page
+management; partial or reordered source scenes reject the operation before
+changing the document. Open the complete PDF, or use the direct native API for
+physical source-page operations.
+
+```ts
+await editor.rotatePages([0, 1], 90, { signal });
+await editor.removePages([2], { signal });
+await editor.insertPdf(otherPdfBytes, { at: 1, password: otherPassword, signal });
+// Repeat insertion to merge additional PDFs.
+```
+
+Page changes share undo/redo with object and field edits. They retain the current
+authoring state in memory and commit only after the new document is ready;
+cancelled, failed or stale operations leave the active document unchanged.
+`sourceScene` and `sourcePdf` can change after page operations and undo/redo.
+Hosts must refresh picking and page-coordinate adapters when `sourceScene`
+changes. The stock UI calls `EditorUiHost.documentChanged(scene, source)` before
+installing the replacement scene. Source-specific field/font services can be
+recreated with `EditorSessionOptions.createSourceOptions`; its `disposeSource`
+hook releases source-owned resources while retained history keeps them usable.
+
+`createEditorAppServices({ sourcePdf?, password?, loadFontAsset?, onDiagnostic? })`
+returns `{ sessionOptions, fonts, dispose }`. Pass its `sessionOptions` to
+`openEditorSession` when sharing a font registry with a custom interface.
+`fonts.loadBundled`, `fonts.register`, `fonts.requestLocalFonts`, `fonts.resolve`
+and `fonts.list` manage portable font bytes. `register` accepts complete TTF/OTF
+data. Font records are read-only and their byte buffers must not be modified.
+Default services support Node font loading; `loadFontAsset` can override it.
+The optional `prepareScene` hook enriches form controls only during editor setup.
+`readTextAnnotation(id, scene, signal?, source?)` restores HEPR-authored PDF textboxes and
+their embedded fonts for a custom text-editing interface.
+Pass `{ pdf: editor.sourcePdf, password }` as `source` after page operations.
+
+`createEditorUi(host, signal?)` supplies optional shared browser controls. Its
+`EditorUiHost` supplies the current scene/source, full-quality preparation,
+scene installation, canvas and bidirectional client/scene coordinate conversion,
+plus edit-mode notifications. Instantiate it only when editing is requested;
+`setEditing(false)` removes editor frame work while retaining the session.
+Hosts can instead build their own interface around `EditorSession`.
+
+`await createEditorInteractionController(editor)` supplies the same DOM-free
+selection and affine-transform gestures used by the stock toolbar. Feed picked
+object IDs to `selectHit(id, { ctrlKey?, metaKey?, shiftKey? })`; Ctrl/Cmd toggles
+and Shift adds. `selectArea(bounds, modifiers?)` selects only fully contained
+objects. `previewTransform(matrix)`, `applyTransform(matrix?)`,
+`cancelTransform()` and `nudge(x, y)` share the session's preview and undo model.
+Hosts render `editor.getScene()` themselves. Dispose the controller before its
+caller-owned session. The factory and its types are also available from `/node`.
+
+`writeScenePdf(scene, options?)` rebuilds a PDF from rendering data alone. It
+supports HEP-only input, source-order vector paths and outline glyphs, searchable
+Unicode text where mappings exist, images, clips, gradients and transparency.
+PDF layer conditions, defaults and shared identities are retained; `flatten:
+true` bakes their default visibility into the output.
+Existing raster fallback islands remain images. It cannot recover discarded
+source fonts, original text-authoring structure or form semantics.
+
+Newly authored objects remain editable PDF annotations even with HEP-only input.
+When `sourcePdf` is supplied, `savePdf` preserves the source document and writes
+editable annotations/forms with explicit appearances. Generic source-content
+transforms may rebuild the affected page's drawing content; `onWarning` reports
+the resulting authoring-structure limitation. `{ flatten: true }` requests a
+rendering-data PDF. Existing supported password encryption is preserved by
+default, including flattened copies. No cryptographic signing or PDF script
+execution occurs.
+
+PDF saves accept `protection: { mode: "preserve" }` (the default), `{ mode:
+"remove" }`, or `{ mode: "password", password, ownerPassword? }`. Set the existing
+source `password` when opening the editor; the output password is separate.
+New protection uses AES-256 with the Standard revision-6 handler. Opening and
+explicit owner passwords must be nonempty and fit 127 UTF-8 bytes after SASLprep
+Unicode preparation; prohibited characters and invalid bidirectional combinations
+are rejected. The owner password defaults to the opening password. Password
+changes rewrite the final object graph, discarding previous revisions and old
+encryption data. They retain document objects and resources without rendering.
+Creating new protection requires WebCrypto (HTTPS or localhost in browsers).
+
+```ts
+const unlocked = await editor.savePdf({ protection: { mode: "remove" } });
+const protectedCopy = await editor.savePdf({
+  protection: { mode: "password", password: newPassword }
+});
+```
+
+`changePdfProtection(bytes, protection, { password?, signal?, onProgress?,
+onDiagnostic? })` changes protection directly without creating an editor or
+compiling page geometry. It is exported from the root, bundler and Node entries:
+
+```ts
+import { changePdfProtection } from "@soadzoor/hepr/node";
+
+const unlocked = await changePdfProtection(pdfBytes, { mode: "remove" }, {
+  password: existingPassword
+});
+```
+
+Password settings remain in memory. HEP has no encryption or password field;
+HEP exports contain the decrypted rendering data.
+
+`manipulatePdfPages(bytes, operation, options?)` provides native page operations
+without an editor or page rendering. Operations are `{ kind: "rotate", pages,
+degrees }`, `{ kind: "remove", pages }`, or `{ kind: "insert", at, bytes,
+pages?, password? }`. Options accept the primary `password`, `signal`,
+`onProgress`, and `onDiagnostic`. The root, bundler and Node entries export it.
+It preserves primary encryption, native page resources and editable fields and
+annotations. Imported field names receive a namespace when they collide with
+existing names. Imported document bookmarks are not merged. Diagnostics identify
+omitted bookmarks and navigation or structure that cannot refer to retained
+pages; the stock Pages dialog displays these warnings.
+
+```ts
+const merged = await manipulatePdfPages(primaryBytes, {
+  kind: "insert", at: 1, bytes: otherPdfBytes, pages: [0, 2],
+  password: otherPassword
+}, { password: primaryPassword, signal });
+```
+
+HEP saves bake current geometry and update searchable text, annotations, clipping
+and LOD. They contain no source PDF/font/editor-history sections. There is no
+new editor persistence schema or application-defined object count limit.
+
+`createEditorSignatureLibrary(storage)` accepts a `getItem`/`setItem` storage
+adapter and exposes `list`, `save`, and `remove`. `normalizeEditorSignature`
+normalizes flat handwriting coordinate paths without rasterization. Browser
+storage errors propagate, leaving the existing stored library intact.
+
 ## `renderPdfThumbnail(source, options?)`
 
 Returns `Promise<{ blob, width, height }>` for a fast, single-page overview.

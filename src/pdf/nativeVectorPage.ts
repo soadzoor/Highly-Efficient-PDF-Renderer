@@ -1519,6 +1519,9 @@ export class VectorPageTextIndexBuilder {
   private prevEndX = 0;
 
   private prevEndY = 0;
+  private prevStartX = 0;
+  private prevStartY = 0;
+  private prevRtl = false;
 
   private prevEmHeight = 0;
 
@@ -1555,8 +1558,14 @@ export class VectorPageTextIndexBuilder {
       this.separatorPending = true;
       return;
     }
+    // Logical RTL text can paint glyphs at decreasing baseline positions while
+    // PDF widths remain positive. Test both adjacent pen edges for such runs;
+    // measuring only previous-end to next-start invents spaces between letters.
+    const rtl = unicode.length > 0 && unicode.charCodeAt(0) >= 0x0590 &&
+      /[\p{Script=Hebrew}\p{Script=Arabic}\p{Script=Syriac}\p{Script=Thaana}\p{Script=Nko}\p{Script=Adlam}]/u.test(unicode);
     if (this.hasPrev && !this.separatorPending) {
-      const gap = Math.hypot(penStartX - this.prevEndX, penStartY - this.prevEndY);
+      let gap = Math.hypot(penStartX - this.prevEndX, penStartY - this.prevEndY);
+      if (rtl && this.prevRtl) gap = Math.min(gap, Math.hypot(penEndX - this.prevStartX, penEndY - this.prevStartY));
       if (gap > TEXT_INDEX_GAP_EM_FACTOR * Math.max(
         emHeight,
         this.prevEmHeight,
@@ -1571,6 +1580,7 @@ export class VectorPageTextIndexBuilder {
       this.conditions.push(-1);
     }
     this.separatorPending = false;
+    this.prevStartX = penStartX; this.prevStartY = penStartY; this.prevRtl = rtl;
     for (let index = 0; index < unicode.length; index += 1) {
       this.chars.push(unicode[index]);
       this.conditions.push(condition);

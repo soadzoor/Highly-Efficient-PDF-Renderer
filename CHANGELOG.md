@@ -6,6 +6,44 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Added
+
+- Add an on-demand Edit mode to the native and Three.js viewers, with AcroForm
+  filling, mixed-format textboxes and portable fonts, vector shapes and ink,
+  reusable local handwritten signatures, image import, multi-selection,
+  transforms, undo/redo, PDF/HEP saving and PDF printing. View remains the default.
+- Expose reusable editor sessions, shared interaction controls, font/form
+  services and a vector-first scene-to-PDF writer with cancellation and progress
+  reporting. PDF saves preserve source forms, annotations and supported
+  encryption; transformed page content may be rebuilt as vectors with a
+  diagnostic about changed authoring structure.
+- Bake edits into ordinary HEP rendering data without embedding the original
+  PDF, source font files or editor history. HEP-only documents can be transformed
+  and rebuilt as PDFs with searchable outline text and layers; original
+  authoring semantics are not reconstructed.
+- Add PDF output password controls and a direct `changePdfProtection` API to
+  preserve, remove or replace protection. New passwords use AES-256; changing
+  protection rewrites the final object graph without retaining old revisions.
+  Editable and flattened PDF copies support the same settings; HEP remains
+  unencrypted and passwords are kept in memory only.
+- Add undoable page management: rotate pages in 90-degree increments, remove
+  pages, and insert or merge PDFs with independent input passwords. Expose
+  matching editor methods and native `manipulatePdfPages` APIs; preserve page
+  resources, editable fields/annotations and destination protection, and
+  namespace colliding imported fields. Retain authored object models through
+  page changes and refresh viewer layouts, picking, thumbnails and search.
+
+### Changed
+
+- Discover choice options, button states, alignment and text limits on entering
+  Edit mode so fields can be validated and displayed consistently.
+
+### Fixed
+
+- Resolve indirect crypt-filter selectors before decrypting PDF streams,
+  including encrypted object streams and exempt metadata, so supported protected
+  PDFs can be opened and have their protection changed consistently.
+
 ## [0.1.71] - 2026-10-22
 
 ### Changed

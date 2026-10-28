@@ -16,9 +16,11 @@ export class NativePdfAnnotationMetadataRegistry {
   private readonly forms: NativePdfFormAppearanceRegistry;
   private readonly optionalContent: NativeOptionalContentRegistry;
   private readonly onDiagnostic: (diagnostic: PdfDiagnostic) => void;
+  private readonly editingMetadata: boolean;
   constructor(document: NativePdfDocument, forms: NativePdfFormAppearanceRegistry,
-    optionalContent: NativeOptionalContentRegistry, onDiagnostic: (diagnostic: PdfDiagnostic) => void) {
+    optionalContent: NativeOptionalContentRegistry, onDiagnostic: (diagnostic: PdfDiagnostic) => void, editingMetadata = false) {
     this.document = document; this.forms = forms; this.optionalContent = optionalContent; this.onDiagnostic = onDiagnostic;
+    this.editingMetadata = editingMetadata;
   }
 
   async getPageAnnotations(pageIndex: number, signal?: AbortSignal): Promise<readonly PdfAnnotation[]> {
@@ -27,7 +29,7 @@ export class NativePdfAnnotationMetadataRegistry {
     if (cached) return cached;
     const source = await this.forms.listPageAnnotations(pageIndex, signal, true);
     if (source.length > ANNOTATION_LIMITS.count) throw new PdfError("resource-limit", "Too many annotation records.", { pageIndex });
-    const reader = new AnnotationReader(this.document, this.optionalContent, source, this.onDiagnostic, signal);
+    const reader = new AnnotationReader(this.document, this.optionalContent, source, this.onDiagnostic, signal, this.editingMetadata);
     const { pageMatrix } = computeNativePdfPageGeometry(this.document.getPage(pageIndex));
     const result: PdfAnnotation[] = [];
     for (const annotation of source) {
@@ -52,11 +54,13 @@ class AnnotationReader {
   private readonly optionalContent: NativeOptionalContentRegistry;
   private readonly onDiagnostic: (diagnostic: PdfDiagnostic) => void;
   private readonly signal?: AbortSignal;
+  private readonly editingMetadata: boolean;
   constructor(document: NativePdfDocument, optionalContent: NativeOptionalContentRegistry,
     source: readonly NativePdfAnnotationAppearance[], onDiagnostic: (diagnostic: PdfDiagnostic) => void,
-    signal?: AbortSignal) {
+    signal?: AbortSignal, editingMetadata = false) {
     this.document = document; this.optionalContent = optionalContent;
     this.onDiagnostic = onDiagnostic; this.signal = signal;
+    this.editingMetadata = editingMetadata;
     for (const annotation of source) this.ids.set(annotation.dictionary, annotation.id);
   }
 
@@ -154,6 +158,45 @@ class AnnotationReader {
         name: await this.optional("T", () => this.fieldName(d)),
         value: await this.optional("V", () => this.fieldEntry(d, "V").then(value => this.fieldValue(value))),
         defaultValue: await this.optional("DV", () => this.fieldEntry(d, "DV").then(value => this.fieldValue(value))) };
+      // Rich form discovery is editor-only: ordinary viewing must not traverse
+      // /Opt and appearance dictionaries merely to expose editing controls.
+      if (this.editingMetadata) {
+        const widget = annotation.widget;
+        if (widget?.maxLength !== undefined) result.field.maxLength = widget.maxLength;
+        if (widget?.quadding !== undefined) result.field.alignment = widget.quadding;
+        if (widget?.choiceOptions) result.field.options = widget.choiceOptions.map(option => ({
+          value: decodePdfString(option.exportValue, annotation.pageIndex, annotation.annotationIndex),
+          label: decodePdfString(option.displayValue, annotation.pageIndex, annotation.annotationIndex)
+        }));
+        if (widget?.selectedChoiceIndices) result.field.selectedIndices = [...widget.selectedChoiceIndices];
+        if (annotation.appearanceState !== undefined) result.field.appearanceState = annotation.appearanceState;
+        const maxLength = await this.optional("MaxLen", () => this.fieldEntry(d, "MaxLen"));
+        if (typeof maxLength === "number" && Number.isSafeInteger(maxLength) && maxLength > 0) result.field.maxLength = maxLength;
+        const alignment = await this.optional("Q", () => this.fieldEntry(d, "Q"));
+        if (alignment === 0 || alignment === 1 || alignment === 2) result.field.alignment = alignment;
+        const opts = await this.optional("Opt", async () => {
+          const raw = await this.fieldEntry(d, "Opt");
+          if (!Array.isArray(raw)) return undefined;
+          return await Promise.all(raw.map(async option => {
+            const value = await this.resolve(option);
+            if (Array.isArray(value)) return { value: await this.text(value[0]) ?? "", label: await this.text(value[1]) ?? "" };
+            const text = await this.text(value) ?? "";
+            return { value: text, label: text };
+          }));
+        });
+        if (opts) result.field.options = opts;
+        const state = await this.optional("AS", () => this.text(d.get("AS"), true));
+        if (state !== undefined) result.field.appearanceState = state;
+        const appearances = await this.optional("AP", async () => {
+          const ap = await this.resolve(d.get("AP"));
+          if (!isPdfDictionary(ap)) return undefined;
+          const normal = await this.resolve(ap.get("N"));
+          return isPdfDictionary(normal) ? [...normal.keys()].find(key => key !== "Off") : undefined;
+        });
+        result.field.onValue = appearances ?? (result.field.appearanceState && result.field.appearanceState !== "Off" ? result.field.appearanceState
+          : result.field.type === "Btn" && ((result.field.flags & (1 << 15)) !== 0)
+            ? `Choice${annotation.pageIndex + 1}_${annotation.annotationIndex + 1}` : result.field.type === "Btn" ? "Yes" : undefined);
+      }
       if (result.tooltip === undefined) result.tooltip = await this.optional("TU", async () => this.text(await this.fieldEntry(d, "TU")));
     }
     const open = await this.optional("Open", async () => {

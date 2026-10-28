@@ -30,7 +30,8 @@ try {
   const installed = resolve(fixture, "node_modules/@soadzoor/hepr");
   await mkdir(installed, { recursive: true });
   await execFileAsync("tar", ["-xzf", resolve(fixture, archives[0]), "--strip-components=1", "-C", installed]);
-  for (const dependency of ["three", "vite"]) {
+  const sourceManifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  for (const dependency of ["three", "vite", ...Object.keys(sourceManifest.dependencies ?? {})]) {
     await symlink(resolve(root, "node_modules", dependency), resolve(fixture, "node_modules", dependency), "junction");
   }
   await mkdir(resolve(fixture, "node_modules/.bin"));

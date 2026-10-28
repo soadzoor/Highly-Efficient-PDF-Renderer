@@ -31,6 +31,101 @@ Compressed HEP exports require `CompressionStream("deflate")`; reading them
 requires `DecompressionStream("deflate")`. See [HEP files](#hep-files) for an
 uncompressed option and [Node conversion](#node-conversion) for server requirements.
 
+## Editing documents
+
+Both viewers start in **View** mode. Choose **Edit** to prepare full-quality
+editing data and show editing tools. Preparation can take longer and use more
+memory than viewing. Returning to View keeps the modifications and removes the
+editor overlay and its frame work. New visible content still has its ordinary
+rendering cost. Browser/GPU performance must be verified on your documents.
+
+Use Select to move, resize or rotate objects. Ctrl/Cmd-click toggles membership
+in a selection; Shift-click adds. Drag an empty area to select every visible
+object fully contained in the rectangle. Selection handles and numeric controls
+apply to the entire selection. Textbox handles change wrapping; hold Alt to
+scale the textbox appearance instead. Use undo/redo, duplicate, delete, grouping,
+and arrow-key nudging from the editing tools and shortcuts.
+
+Source annotations and inseparable mask/compositing groups select together.
+Other source content can select as individual strokes, glyphs, fills or images;
+use multi-selection and grouping when the original document has no useful
+object boundaries. An existing raster island moves as a whole image.
+
+The Fill tool shows controls for ordinary AcroForm text, checkbox, radio and
+choice fields, respecting read-only flags and text limits. PDF actions and
+JavaScript are not executed. Textboxes support mixed formatting, sizes, colors,
+underline, strikethrough and alignment. Choose bundled fonts, import TTF/OTF
+files, or request installed fonts in a browser that supports local font access.
+Font bytes are used for committed rendering and PDF output.
+Double-click a textbox created and saved by HEPR to edit it again, including its
+rich formatting and embedded fonts. Ordinary existing page text is transform-only.
+
+Use shapes, polygon/polyline and pencil tools for vector markup, with stroke
+width, color, opacity and optional closed-area fill. The signature library saves
+drawn vector handwriting in this browser's `localStorage`; placed copies can
+have independent size, stroke thickness and color. There is no application count
+limit, but browser storage capacity and privacy settings still apply. General
+PNG/JPEG/WebP images use the separate image-import tool.
+
+**Save PDF** retains editable newly added annotations, including when starting
+from a HEP. Existing forms are preserved when the original source PDF is
+available. Source content transforms can rebuild the affected page's drawing
+content as vectors, reporting changes to its authoring structure. Unrelated pages
+and source document resources are preserved. A flattened PDF copy and PDF-based
+printing are also available. If direct printing is unavailable, download the PDF
+and print it with your preferred PDF viewer.
+
+**PDF password** opens the output protection settings. Keep the existing
+protection, remove it, or set/replace the opening password and confirm it. Open a
+protected source with its current password first; it does not need to be entered
+again in the editor. These settings apply to both editable and flattened PDF
+saves. New protection uses AES-256. Passwords stay in memory and are not stored
+in `localStorage`. Protection changes remain unsaved until a PDF export succeeds;
+saving HEP or printing does not save these settings. HEP files remain unencrypted.
+
+**Pages** opens page management. Select pages using checkboxes or page ranges,
+rotate them left/right by 90 degrees or by 180 degrees, or remove them. A document
+must retain at least one page. Choose PDFs to insert before/after a chosen page
+or at the end; selecting multiple files merges their pages in file order. Enter
+each imported PDF's password when prompted. Page operations support progress,
+cancellation, undo and redo alongside other edits. The destination keeps its
+existing PDF protection; the PDF password settings control exported copies.
+
+**Save HEP** stores the current appearance as ordinary compact scene data. It
+does not embed the original PDF, source font files or editing history. Reopening
+allows geometry transforms, but does not promise rich-text or form-authoring
+semantics. PDF export from a HEP rebuilds the document from the geometry, glyph
+outlines, Unicode mappings and images that remain; it needs no original PDF.
+
+### Manual editing verification
+
+Run the viewer yourself, open a PDF with forms, switch to Edit, change multiple
+field types, add mixed-font text/shapes/ink/a signature/an image, and transform a
+selection made with both modifier clicks and area selection. Verify undo/redo,
+View/Edit switching, Reader/Grid layouts, and WebGL/WebGPU switching. Save PDF,
+flattened PDF and HEP, reopen each, inspect text search and appearance, and print
+using your browser and an independent PDF reader. Compare matched performance
+captures in default View mode and after editing; offline Canvas2D checks do not
+prove browser or GPU behavior.
+Also save protected editable/flattened PDFs, reopen them with the new password,
+then remove or replace protection and verify that old passwords stop working.
+Rotate cropped pages, remove pages, and insert multiple PDFs, including protected
+ones and forms with overlapping field names. Check page order, Reader thumbnails,
+search, field editing, undo/redo and PDF/HEP round trips after each operation.
+
+Optional offline comparisons use small synthetic technical/form, book-text, and
+image-heavy fixtures. Install the independent pdf.js reference outside the repo,
+then generate before/after PDF, baked HEP, rebuilt PDF, and comparison PNGs:
+
+```sh
+npm install --prefix /tmp/hepr-editor-reference --no-audit --no-fund --ignore-scripts pdfjs-dist@6.4.299
+node scripts/check-editor-visuals.mjs /tmp/hepr-editor-validation
+```
+
+The output includes `overview.png`, `book-overview.png`, `image-overview.png`,
+and JSON reports. These compare HEPR Canvas2D with pdf.js; they do not measure
+browser interaction or GPU rendering.
+
 ## Loading documents
 
 `pdfObjectGenerator(source, options, backend)` accepts:

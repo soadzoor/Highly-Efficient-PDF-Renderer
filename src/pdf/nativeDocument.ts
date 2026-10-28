@@ -405,6 +405,22 @@ export class NativePdfDocument {
     return await this.resolveObjectInternal(ref, new Set(), this.operationSignal(signal));
   }
 
+  /** @internal Writer-only structural snapshot; no key material escapes the security handler. */
+  getWriterState(): {
+    xref: NativeXrefResult;
+    readSource: (signal?: AbortSignal) => Promise<Uint8Array>;
+    encrypt: (value: PdfValue, ref: PdfRef) => PdfValue;
+    protection?: { dictionary: PdfDictionary; fileId: Uint8Array; encrypt: (value: PdfValue, ref: PdfRef) => PdfValue };
+  } {
+    if (this.closed) throw new Error("PDF document is closed.");
+    return {
+      xref: this.xref,
+      readSource: signal => this.reader.read(0, this.reader.byteLength, signal),
+      encrypt: (value, ref) => this.security?.encryptObject(value, ref) ?? value,
+      protection: this.security?.outputProtection()
+    };
+  }
+
   /** Resolve a reference or return a direct value unchanged. */
   async resolveValue(value: PdfValue | undefined, signal?: AbortSignal): Promise<PdfValue | undefined> {
     this.assertOpen();
@@ -621,7 +637,16 @@ export class NativePdfDocument {
       }
       // Compressed objects need no decryption: their object stream was
       // decrypted when it was loaded through this branch.
-      return this.security ? this.security.decryptObject(indirect.value, ref) : indirect.value;
+      if (!this.security) return indirect.value;
+      const value = indirect.value;
+      const firstFilter = isPdfStream(value) ? value.dictionary.get("Filter") : undefined;
+      const leading = Array.isArray(firstFilter) ? firstFilter[0] : firstFilter;
+      const parameterValue = isPdfStream(value) ? value.dictionary.get("DecodeParms") ?? value.dictionary.get("DP") : undefined;
+      const firstParameter = Array.isArray(parameterValue) ? parameterValue[0] : parameterValue;
+      const indirectCrypt = isPdfRef(leading) || isPdfName(leading, "Crypt") && (isPdfRef(firstParameter) ||
+        isPdfDictionary(firstParameter) && isPdfRef(firstParameter.get("Name")));
+      return this.security.decryptObject(value, ref, indirectCrypt
+        ? dictionary => this.resolveCryptFilterDictionary(dictionary, stack, signal) : undefined);
     }
     const parsed = await this.resolveObjectStream(entry.objectStreamNumber, stack, signal);
     if (parsed.objectNumbersByIndex[entry.objectStreamIndex] !== ref.objectNumber) {
@@ -636,6 +661,25 @@ export class NativePdfDocument {
       });
     }
     return value;
+  }
+
+  /** Resolve crypt selectors after dictionary decryption, preserving each object's string key. */
+  private async resolveCryptFilterDictionary(dictionary: PdfDictionary, stack: Set<string>, signal: AbortSignal): Promise<PdfDictionary> {
+    const resolve = async (value: PdfValue | undefined) => isPdfRef(value) ? await this.resolveObjectInternal(value, stack, signal) : value;
+    const filters = await resolve(dictionary.get("Filter"));
+    const leading = await resolve(Array.isArray(filters) ? filters[0] : filters);
+    if (!isPdfName(leading, "Crypt")) return dictionary;
+    const result = new Map(dictionary);
+    result.set("Filter", Array.isArray(filters) ? [leading, ...filters.slice(1)] : leading);
+    const key = dictionary.has("DecodeParms") ? "DecodeParms" : "DP";
+    const parameters = await resolve(dictionary.get(key));
+    const first = await resolve(Array.isArray(parameters) ? parameters[0] : parameters);
+    if (isPdfDictionary(first)) {
+      const parameter = new Map(first);
+      if (parameter.has("Name")) parameter.set("Name", (await resolve(parameter.get("Name"))) ?? null);
+      result.set(key, Array.isArray(parameters) ? [parameter, ...parameters.slice(1)] : parameter);
+    } else if (parameters !== undefined) result.set(key, parameters);
+    return result;
   }
 
   private resolveObjectStream(

@@ -351,6 +351,9 @@ const textSelection = createTextSelectionController({
 });
 
 let lastLoadedSource: File | string | null = null;
+let pdfEditor: import("./editorUi").EditorUi | null = null;
+let editorInitialization: AbortController | null = null;
+const editorModeButton = document.querySelector<HTMLButtonElement>("#editor-mode")!;
 let lastDownloadablePdf: PdfDownloadSource | null = null;
 let animationFrameId = 0;
 let needsRender = false;
@@ -519,6 +522,79 @@ const reader = createReaderViewport({
   onFind: () => { setPanelCollapsed(false); textSearchInputElement.focus(); },
   onSettings: () => setPanelCollapsed(!panelElement.classList.contains("collapsed"))
 });
+document.querySelector(".reader-primary-controls")?.append(editorModeButton);
+editorModeButton.addEventListener("click", () => { void togglePdfEditing(); });
+
+function setThreeEditing(active: boolean): void {
+  if (active) { drawingSelection.disable(); textSelection.disable(); annotationOverlay.hide(); }
+  else if (textSelectionCheckboxElement.checked) textSelection.enable();
+  annotationInteraction?.setInteractionEnabled(!active); textSelectionCheckboxElement.disabled = active;
+  for (const control of [ocrTextCheckboxElement, pageStreamingCheckboxElement, compressScansCheckboxElement]) control.disabled = active || Boolean(pdfEditor) || currentPdfObject?.sourceKind !== "pdf";
+  const layout = document.querySelector<HTMLSelectElement>(".reader-layout"); if (layout) layout.disabled = active;
+  for (const button of pageLayoutButtons) button.disabled = active;
+  editorModeButton.textContent = active ? "View PDF" : "Edit PDF"; editorModeButton.setAttribute("aria-pressed", String(active));
+}
+
+async function togglePdfEditing(): Promise<void> {
+  if (editorInitialization) { editorInitialization.abort(); return; }
+  if (sourceLoadController || pageLayoutWarmingUp) { setStatus("Wait for the document or renderer change to finish before entering Edit mode."); return; }
+  if (!currentPdfObject) { setStatus("Open a PDF or HEP before entering Edit mode."); return; }
+  editorModeButton.textContent = "Cancel editing setup"; editorModeButton.setAttribute("aria-busy", "true");
+  const controller = editorInitialization = new AbortController();
+  try {
+    if (!pdfEditor) {
+      setStatus("Preparing full-quality editing data…");
+      const { createEditorUi } = await import("./editorUi"); controller.signal.throwIfAborted();
+      const originalSource = { sourceKind: currentPdfObject.sourceKind, sourceBytes: currentPdfObject.sourceBytes,
+        sourceOptions: currentPdfObject.sourceOptions };
+      let editedSource: typeof originalSource | null = null;
+      pdfEditor = await createEditorUi({
+        getCanvas: () => canvasElement, getScene: () => currentPdfObject?.sceneData ?? null,
+        getSource: () => ({ pdf: currentPdfObject?.sourceKind === "pdf" ? currentPdfObject.sourceBytes : undefined,
+          password: currentPdfObject?.sourceOptions?.password, label: currentPdfObject?.sourceLabel ?? "document" }),
+        async prepareScene(signal) {
+          const object = currentPdfObject!; object.pausePageLoading();
+          if (object.sourceKind !== "pdf" || !object.sourceBytes) return object.sceneData;
+          const { loadPdfSceneFromSource } = await import("./pdfObjectGenerator");
+          return (await loadPdfSceneFromSource(object.sourceBytes, { ...object.sourceOptions,
+            compressScans: false, ocrTextOnly: false, segmentMerge: false, invisibleCull: false, pageLoading: "eager",
+            onProgress: progress => { if (!signal.aborted && currentPdfObject === object) setStatus(`Preparing editing data: ${Math.round(progress.value * 100)}%`); }
+          }, signal)).scene;
+        },
+        documentChanged(_scene, source) {
+          editedSource = source.pdf ? { sourceKind: "pdf", sourceBytes: source.pdf,
+            sourceOptions: { ...originalSource.sourceOptions, password: source.password,
+              ocrTextOnly: false, compressScans: false, pageLoading: "eager" } } : originalSource;
+        },
+        async applyScene(sceneData, signal) {
+          const previous = currentPdfObject; if (!previous) throw new DOMException("Document closed.", "AbortError");
+          const snapshot = captureCameraSnapshot();
+          const source = editedSource ?? previous;
+          const next = await createThreePdfObject({ scene: sceneData, sourceKind: source.sourceKind, sourceLabel: previous.sourceLabel,
+            sourceBytes: source.sourceBytes, sourceOptions: source.sourceOptions }, readThreeObjectOptions(), signal);
+          try {
+            signal.throwIfAborted(); next.position.copy(previous.position); next.quaternion.copy(previous.quaternion); next.scale.copy(previous.scale);
+            const layout = await preparePageLayoutReplacement(next, signal); signal.throwIfAborted();
+            replacePdfObject(next, { fitCamera: false, pageLayoutView: layout, layout: activePageLayout });
+            restoreCameraSnapshot(snapshot); updateSceneMetrics(next); reader.invalidateThumbnails(); requestRender();
+          } catch (error) { if (currentPdfObject !== next) next.dispose(); throw error; }
+        },
+        clientToScenePoint: (x, y) => currentPdfObject?.clientToScenePoint(camera, x, y, canvasElement) ?? null,
+        sceneToClientPoint: (x, y, pageIndex) => currentPdfObject?.sceneToClientPoint(camera, x, y, canvasElement, pageIndex) ?? null,
+        setEditing: setThreeEditing
+      }, controller.signal);
+    }
+    await pdfEditor.setEditing(!pdfEditor.isEditing()); clearLoadedStatus();
+  } catch (error) {
+    if (!controller.signal.aborted) setStatus(`Could not enter Edit mode: ${error instanceof Error ? error.message : String(error)}`);
+  } finally { if (editorInitialization === controller) editorInitialization = null; editorModeButton.removeAttribute("aria-busy");
+    editorModeButton.textContent = pdfEditor?.isEditing() ? "View PDF" : "Edit PDF"; if (!pdfEditor) currentPdfObject?.resumePageLoading(); }
+}
+
+function discardThreeEditor(): boolean {
+  if (pdfEditor && !pdfEditor.confirmDocumentChange()) return false;
+  editorInitialization?.abort(); editorInitialization = null; pdfEditor?.dispose(); pdfEditor = null; setThreeEditing(false); return true;
+}
 
 setPanelCollapsed(false);
 setDownloadDataButtonState(false);
@@ -1732,6 +1808,7 @@ async function loadSource(
   source: File | string,
   options: { pdfDownloadHint?: PdfDownloadSource | null } = {}
 ): Promise<void> {
+  if (!discardThreeEditor()) return;
   cancelActiveHepExport();
   const activeLoadToken = ++loadToken;
   sourceLoadController?.abort();
@@ -2282,13 +2359,13 @@ function setPanelCollapsed(collapsed: boolean): void {
 }
 
 function setLoadControlsEnabled(enabled: boolean): void {
-  ocrTextCheckboxElement.disabled = !enabled || currentPdfObject?.sourceKind === "hep";
+  ocrTextCheckboxElement.disabled = !enabled || Boolean(pdfEditor) || currentPdfObject?.sourceKind === "hep";
   if (enabled && currentPdfObject) ocrTextCheckboxElement.checked = currentPdfObject.sourceOptions?.ocrTextOnly === true;
-  compressScansCheckboxElement.disabled = !enabled || currentPdfObject?.sourceKind === "hep";
+  compressScansCheckboxElement.disabled = !enabled || Boolean(pdfEditor) || currentPdfObject?.sourceKind === "hep";
   if (enabled && currentPdfObject) {
     compressScansCheckboxElement.checked = loadedCompressScansPreference && !ocrTextCheckboxElement.checked;
   }
-  pageStreamingCheckboxElement.disabled = !enabled || currentPdfObject?.sourceKind === "hep";
+  pageStreamingCheckboxElement.disabled = !enabled || Boolean(pdfEditor) || currentPdfObject?.sourceKind === "hep";
   if (enabled && currentPdfObject) {
     pageStreamingCheckboxElement.checked = currentPdfObject.sourceOptions?.pageLoading === "auto" && !compressScansCheckboxElement.checked;
   }
@@ -2296,7 +2373,7 @@ function setLoadControlsEnabled(enabled: boolean): void {
   fileInputElement.disabled = !enabled;
   exampleDropdown.setDisabled(!enabled);
   for (const button of pageLayoutButtons) {
-    button.disabled = !enabled;
+    button.disabled = !enabled || (pdfEditor?.isEditing() ?? false);
   }
 }
 
@@ -2374,6 +2451,7 @@ function updateSceneMetrics(pdfObject: HeprThreePdfObject): void {
 }
 
 async function downloadHep(): Promise<boolean> {
+  if (pdfEditor) { await pdfEditor.save("hep"); return true; }
   const pdfObject = currentPdfObject;
   if (!pdfObject) {
     setStatus("No parsed floorplan data available to export.");
@@ -2501,6 +2579,7 @@ function yieldToBrowserPaint(): Promise<void> {
 }
 
 async function downloadSourcePdf(): Promise<boolean> {
+  if (pdfEditor) { await pdfEditor.save("pdf"); return true; }
   if (!lastDownloadablePdf) {
     setStatus("No source PDF is available for the current file.");
     return false;

@@ -44,6 +44,13 @@ export interface AnnotationField {
   flags: number;
   value?: string | number | boolean | null | readonly string[];
   defaultValue?: string | number | boolean | null | readonly string[];
+  /** Detached AcroForm editing metadata. Older HEP files may omit these. */
+  maxLength?: number;
+  options?: readonly { value: string; label: string }[];
+  selectedIndices?: readonly number[];
+  alignment?: 0 | 1 | 2;
+  onValue?: string;
+  appearanceState?: string;
 }
 
 /** A detached, clone-safe annotation; no live PDF dictionaries or appearance bytes. */
@@ -262,6 +269,15 @@ export function validateAnnotations(value: unknown, options: {
       const field = record(a.field);
       if (!integer(field.flags) || field.flags > 0xffff_ffff) fail();
       for (const key of ["type", "name"]) if (field[key] !== undefined) string(field[key]);
+      for (const key of ["onValue", "appearanceState"]) if (field[key] !== undefined) string(field[key]);
+      if (field.maxLength !== undefined && (!integer(field.maxLength) || field.maxLength === 0)) fail();
+      if (field.alignment !== undefined && ![0, 1, 2].includes(field.alignment as number)) fail();
+      if (field.options !== undefined) {
+        if (!Array.isArray(field.options)) fail();
+        for (const option of field.options as unknown[]) { const o = record(option); string(o.value); string(o.label); }
+      }
+      if (field.selectedIndices !== undefined && (!Array.isArray(field.selectedIndices) ||
+        field.selectedIndices.some(index => !integer(index)))) fail();
       for (const key of ["value", "defaultValue"]) {
         const v = field[key];
         if (typeof v === "string") string(v);

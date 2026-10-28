@@ -11,6 +11,7 @@ import { readMinimumStrokeWidthValue } from "../src/uiControls.ts";
 const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
 const lodPromptSource = await readFile(new URL("../src/hepLodPrompt.ts", import.meta.url), "utf8");
 const lodFilenameHost = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
   resolveHepLodOptions, getCachedTextLod: () => null,
   shouldBuildTextLod: scene => scene.textInstanceCount > 0
 });
@@ -37,6 +38,7 @@ const nativeLoadEvents = [];
 // Missing choices keep both LOD defaults enabled. null is Cancel.
 let hepLodChoice = {};
 const context = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
   performance, AbortController, Uint8Array, console: { log: noop, warn: noop },
   waitForLoad, createLoadProgressReporter, resolveHepLodOptions, hasSelectedHepLod,
   loadToken: 0, activeSceneLoadToken: null, pendingSourceLoadCount: 0, sourceLoadSerial: 0,
@@ -140,6 +142,11 @@ for (const name of [
 
 await testNativeVectorLodProgress();
 await testNativeTextLodProgress();
+context.discardNativeEditor = () => false;
+await context.loadPdfFile({ name: "cancelled.pdf", arrayBuffer: () => assert.fail("declining editor discard must not read a PDF") });
+await context.loadHepFile({ name: "cancelled.hep", arrayBuffer: () => assert.fail("declining editor discard must not read a HEP") });
+assert.equal(context.pendingSourceLoadCount, 0, "retaining unsaved edits does not start a new source load");
+context.discardNativeEditor = () => true;
 await context.loadPdfFile(file("A.pdf", 65));
 assertDocument(65, "A.pdf");
 const originalCache = context.parsedPdfPageCache;
@@ -355,6 +362,7 @@ async function testNativeSupersededSceneLoadTokens() {
     const statuses = [];
     let replacementLoad, replacementSourceToken, replacementSceneToken;
     const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
       performance, AbortController, Uint8Array, waitForLoad,
       loadToken: 0, activeSceneLoadToken: null, pendingSourceLoadCount: 0, sourceLoadSerial: 0,
       sourceLoadController: null, lastParsedScene: previousScene, lastLoadedSource: previousSource,
@@ -415,6 +423,7 @@ async function testNativeSupersededSceneLoadTokens() {
 
 function testNativePerformanceStatus() {
   const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     lastParsedScene: scene(77), lastParsedSceneLabel: "loaded.hep",
     loadToken: 8, activeSceneLoadToken: null, pendingSourceLoadCount: 0,
     sourceLoadController: null, layoutChangeRunning: false,
@@ -458,6 +467,7 @@ async function testNativeVectorLodProgress() {
   const events = [], builds = [];
   let mode = "auto", backend = "webgl", stored = false, resets = 0, consumes = 0;
   const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     shouldUseVectorStrokeLod, loadToken: 7,
     uiControlManager: { readVectorLodModeInput: () => mode },
     backendSwitcher: { getActiveBackend: () => backend },
@@ -514,6 +524,7 @@ async function testNativeTextLodProgress() {
   const value = { textInstanceCount: 1000 };
   let cached = null, mode = "auto";
   const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     loadToken: 7,
     getCachedTextLod: scene => { assert.equal(scene, value); return cached; },
     uiControlManager: { readTextLodModeInput: () => mode },
@@ -561,6 +572,7 @@ async function testScanCompressionPreferences() {
   const pdf = { kind: "pdf", bytes: Uint8Array.of(1), label: "scans.pdf" };
   const hep = { kind: "hep", bytes: Uint8Array.of(2), label: "scans.hep" };
   const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     AbortController, loadedOcrTextOnly: false, loadedPageStreaming: false,
     loadedCompressScans: false, loadedCompressScansPreference: true,
     ocrTextCheckbox: { checked: false }, pageStreamingCheckbox: { checked: false },
@@ -671,6 +683,7 @@ async function testScanCompressionPreferences() {
 
   const threeSource = await readFile(new URL("../src/three-example.ts", import.meta.url), "utf8");
   const three = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     currentPdfObject: null, loadedCompressScansPreference: true, lastNativeDrawStats: null,
     activePageLayout: "grid", readerDocumentIdentity: null, readerPageRects: new Float32Array(),
     readerNavigationSource: null, readerNavigationScene: null, reader: threeReaderMock(),
@@ -790,6 +803,7 @@ function testNativePageDemandFrames() {
   let zoom = .4;
   const views = [];
   const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     performance: { now: () => now }, activePdfPageLoader: { update: view => views.push(view) },
     lastParsedScene: { pageRects: Float32Array.of(0, 0, 600, 800) },
     activeSceneLoadToken: null, pendingSourceLoadCount: 0, activeHepExportController: null, layoutChangeRunning: false,
@@ -901,6 +915,7 @@ async function testNativeReaderExports() {
     const controls = { snapshot: () => readerState, restore: state => restored.push(state), setLayout: noop,
       goToPage: () => assert.fail("returning to Reader must restore its saved scroll and fit state") };
     const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
       lastParsedScene: reader, lastCanonicalScene: canonical, documentPageScenes: [scene(94), scene(94)],
       lastLoadedSource: { bytes: Uint8Array.of(94) }, lastParsedSceneLabel: "reader-book.hep", nativeLayout: "reader",
       layoutChangeRunning: false, activeSceneLoadToken: null, pendingSourceLoadCount: 0, activeHepExportController: null,
@@ -1038,6 +1053,7 @@ async function testThreeHepExports() {
     object.pageCount = 1;
     object.sourceLabel = "scans.pdf";
     const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
       AbortController, console: { log: noop }, currentPdfObject: object,
       resolveHepLodOptions, hasSelectedHepLod,
       loadToken: 0, sourceLoadController: null, activeHepExportController: null,
@@ -1102,6 +1118,7 @@ async function testThreeHepExports() {
   object.isPageDemandLoaded = true;
   object.resumePageLoading = () => { resumes++; };
   const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     AbortController, console: { log: noop }, currentPdfObject: object,
     resolveHepLodOptions, hasSelectedHepLod,
     activeHepExportController: null, lastDownloadablePdf: null,
@@ -1143,6 +1160,7 @@ async function testHepLodPrompt() {
     focus() {}
   }
   const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     AbortController, resolveHepLodOptions,
     getCachedTextLod: () => null, shouldBuildTextLod: value => value.textInstanceCount > 0,
     document: { body: new Element("body"), createTextNode: text => ({ textContent: text }),
@@ -1229,6 +1247,7 @@ async function testNativeBackendLoading() {
     constructor(canvas) { this.canvas = canvas; }
   }
   const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     webGpuRendererClass: null,
     initializeRendererCommon: renderer => initialized.push(renderer),
     loadWebGpuModule: async () => {
@@ -1258,6 +1277,7 @@ async function testNativeBackendLoading() {
   const previousRenderer = {}, provisionalRenderer = {};
   let attachedCanvas = replacementCanvas;
   const rollbackHost = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     canvasElement: replacementCanvas, canvasResizeObserver: { disconnect: noop, observe: noop },
     readerViewport: { canvasChanged: () => { attachedCanvas = rollbackHost.canvasElement; } }
   });
@@ -1349,6 +1369,7 @@ async function testThreeDocumentReplacement() {
     formatLoadTiming: () => "timing",
     updateSceneMetrics: object => loadEvents.push({ event: "metrics", id: object.id })
   });
+  Object.assign(host, { pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true });
   vm.createContext(host);
   vm.runInContext(sourceFunction(source, "loadSource"), host);
   const previous = host.currentPdfObject;
@@ -1572,6 +1593,7 @@ async function testRoomDocumentReplacement() {
       return { id: file.name };
     }
   });
+  Object.assign(host, { pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true });
   vm.createContext(host);
   for (const name of ["loadSceneSource", "clearCurrentPdfObject"]) vm.runInContext(sourceFunction(source, name), host);
   assert.equal(await host.loadSceneSource({ name: "B" }), false);
@@ -1792,7 +1814,8 @@ async function testThreeBackendReplacement() {
         arrangedPages.push({ pages, targets });
       }
     });
-    vm.createContext(host);
+    Object.assign(host, { pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true });
+  vm.createContext(host);
     for (const name of [
       "reloadSourceWithBackend", "replacePdfObject", "releasePdfObject", "disposeCurrentObject",
       "preparePageLayoutReplacement", "resetPageLayout", "syncPageLayoutControls"

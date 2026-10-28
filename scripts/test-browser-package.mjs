@@ -7,8 +7,8 @@ import { build } from "vite";
 const root = fileURLToPath(new URL("../", import.meta.url));
 const libDir = fileURLToPath(new URL("../dist/lib/", import.meta.url));
 const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-assert.deepEqual(Object.keys(manifest.dependencies ?? {}), [],
-  "HEPR must have no regular runtime dependencies");
+assert.deepEqual(Object.keys(manifest.dependencies ?? {}).sort(), ["bidi-js", "harfbuzzjs"],
+  "Only the lazy editor shaping and bidi dependencies belong in the runtime manifest");
 assert.equal(manifest.dependencies?.["@napi-rs/canvas"], undefined);
 assert.ok(manifest.optionalDependencies?.["@napi-rs/canvas"],
   "the CLI canvas backend must be optional so browser consumers can omit its installation");
@@ -98,7 +98,7 @@ const workerStaticChunks = collectReachableChunks(false, pdfWorkerEntry);
 const workerReachableChunks = collectReachableChunks(true, pdfWorkerEntry);
 // The pixel codec can be coalesced into the encoder chunk or worker asset.
 // Check the dynamic implementation boundaries, not a forced codec chunk name.
-for (const moduleName of ["documentSessionRuntime", "thumbnailEncoder", "thumbnailRenderer"]) {
+for (const moduleName of ["documentSessionRuntime", "thumbnailEncoder", "thumbnailRenderer", "editorSessionRuntime", "editorAppServices", "editorUi"]) {
   const implementationChunks = chunks.filter(chunk => Object.keys(chunk.modules).some(id =>
     new RegExp(`/${moduleName}(?:-[^/]+)?\\.js$`).test(id)));
   assert(implementationChunks.length > 0, `${moduleName} remains reachable as a lazy implementation`);
@@ -111,6 +111,7 @@ for (const moduleName of ["documentSessionRuntime", "thumbnailEncoder", "thumbna
 }
 for (const name of [...staticChunks, ...workerStaticChunks]) {
   assert(!chunksByName.get(name).code.includes("libwebp-3757b8a"), "thumbnail codec assets must stay out of both initial module graphs");
+  assert(!chunksByName.get(name).code.includes("harfbuzz.wasm"), "editor shaping assets must stay out of both initial module graphs");
 }
 for (const engine of ["Lcms", "Qcms"]) {
   const engineChunks = chunks.filter(chunk => Object.keys(chunk.modules).some(id =>

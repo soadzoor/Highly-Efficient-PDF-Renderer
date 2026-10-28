@@ -28,7 +28,9 @@ export default defineConfig(({ mode }) => {
         outDir: "dist/lib",
         emptyOutDir: false,
         rollupOptions: {
-          external: (id) => id === "three" || id.startsWith("three/")
+          // HarfBuzz's Node loader reads its own WASM file. Preserve the lazy
+          // dependency so library inlining cannot turn that file into a data URL.
+          external: (id) => id === "three" || id.startsWith("three/") || id === "harfbuzzjs"
         }
       }
     };

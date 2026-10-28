@@ -40,6 +40,7 @@ function fixture(layout, backend) {
   };
   const cameraPart = { copy: noop };
   const context = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     performance, AbortController, URLSearchParams, console: { warn: noop }, ViewerLoadDiagnostics,
     document: { querySelector: selector => controls[selector.slice(1)] },
     window: Object.assign(new Control(), {
