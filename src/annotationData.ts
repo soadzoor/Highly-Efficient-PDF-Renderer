@@ -64,6 +64,8 @@ export interface AnnotationField {
   selectedIndices?: readonly number[];
   alignment?: 0 | 1 | 2;
   textStyle?: AnnotationFieldTextStyle;
+  /** Editor-only preview hint from a standard Widget /MK /CA mark caption. */
+  buttonMark?: "check" | "circle" | "cross" | "diamond" | "square" | "star";
   onValue?: string;
   appearanceState?: string;
 }
@@ -287,6 +289,7 @@ export function validateAnnotations(value: unknown, options: {
       for (const key of ["onValue", "appearanceState"]) if (field[key] !== undefined) string(field[key]);
       if (field.maxLength !== undefined && (!integer(field.maxLength) || field.maxLength === 0)) fail();
       if (field.alignment !== undefined && ![0, 1, 2].includes(field.alignment as number)) fail();
+      if (field.buttonMark !== undefined && !["check", "circle", "cross", "diamond", "square", "star"].includes(field.buttonMark as string)) fail();
       if (field.textStyle !== undefined) {
         const style = record(field.textStyle); string(style.fontFamily);
         if (!style.fontFamily || typeof style.fontSize !== "number" || !Number.isFinite(style.fontSize) || style.fontSize < 0 ||

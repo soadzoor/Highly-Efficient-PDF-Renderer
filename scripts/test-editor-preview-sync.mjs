@@ -15,9 +15,11 @@ function harness() {
   let activeApplications = 0, maximumApplications = 0, displayedScene = null, picks = 0;
   const initialSource = { name: "source" };
   const context = vm.createContext({ AbortController, AbortSignal, Set, active: true, disposed: false, running: false, structuralRunning: false,
+    pendingDrawings: { capture() {}, acknowledge() {} },
     currentState: state, presented: null, requestedPreview: null, scenePreparation: null, sceneApplication: null,
     renderRevision: 0, latestScene: initialSource, lifetime: new AbortController(), pointer: null, pendingPick: null, picking: null,
-    polygon: null, activeText: null, textRequest: 0, tool: "select", previewFrame: 0, previewRunning: false, previewPending: false,
+    polygon: null, activeText: null, textRequest: 0, tool: "select", previewGeneration: 0, previewQueued: false, previewRunning: false, previewPending: false,
+    queueMicrotask,
     overlay: { dataset: {}, style: {}, setPointerCapture() {}, releasePointerCapture() {}, hasPointerCapture: () => false },
     window: { requestAnimationFrame(callback) { const id = ++rafId; raf.set(id, callback); return id; }, cancelAnimationFrame: id => raf.delete(id) },
     synchronizeDocumentSource: async () => {}, report: error => { if (error.name !== "AbortError") errors.push(error); },
@@ -30,10 +32,10 @@ function harness() {
           frame: canonicalFrame, delta, preview: options.preview };
         preparations.push({ ...result, options, scene }); return result.promise;
       } },
-    host: { clientToScenePoint: (x, y) => ({ x, y }), applyScene(scene, signal, onPresented) {
+    host: { clientToScenePoint: (x, y) => ({ x, y }), applyScene(scene, signal, onPresented, options) {
       signal.throwIfAborted(); const result = deferred(); activeApplications++; maximumApplications = Math.max(maximumApplications, activeApplications);
       let finished = false;
-      applications.push({ scene, signal, onPresented,
+      applications.push({ scene, signal, onPresented, options,
         acknowledge() { displayedScene = scene; onPresented(); },
         finish() { assert(!finished); finished = true; activeApplications--; displayedScene = scene; result.resolve(); },
         fail(error) { assert(!finished); finished = true; activeApplications--; result.reject(error); } });
@@ -43,7 +45,7 @@ function harness() {
     interaction: { cancelTransform() { state = { ...state, previewing: false }; context.currentState = state; } },
     pick: async () => { picks++; return "object"; }, startText: async () => {}
   });
-  for (const name of ["displayedSelection", "isSceneSettling", "updatePointerCursor", "refreshScene", "runPreview", "queuePreview", "clearPreview", "cancelPointerGesture", "pointerDown", "doubleClick"])
+  for (const name of ["displayedSelection", "isSceneSettling", "updatePointerCursor", "refreshScene", "runPreview", "queuePreview", "clearPreview", "cancelPointerGesture", "updateShapeGesture", "pointerDown", "doubleClick"])
     vm.runInContext(sourceFunction(source, name), context);
   return { context, preparations, applications, draws, errors, raf,
     preview(x) { state = { ...state, previewing: true }; context.currentState = state; context.requestedPreview = translation(x); },
@@ -66,7 +68,7 @@ function harness() {
 {
   const h = harness(), c = h.context;
   c.pointer = { id: 1, action: "move", frame: c.session.getSelectionFrame() };
-  h.preview(10); c.queuePreview(); h.runRaf(); await tick();
+  h.preview(10); c.queuePreview(); await tick();
   assert.equal(h.preparations.length, 1); assert.equal(h.preparations[0].scene.delta[4], 10);
   h.preview(20); c.queuePreview(); h.preview(30); c.queuePreview();
   assert.equal(h.raf.size, 0); assert.equal(c.displayedSelection().delta, undefined, "raw moves do not advance the displayed frame during compilation");
@@ -107,6 +109,7 @@ function harness() {
   assert.equal(c.pointer, null); assert.equal(h.picks, 0, "new gestures wait for the canonical pose to be shown");
   h.applications[0].acknowledge(); assert.equal(c.displayedSelection().delta[4], 10, "release holds the acknowledged preview instead of jumping to committed bounds");
   h.applications[0].finish(); await preview; await tick(); assert.equal(h.applications.length, 2);
+  assert.equal(h.applications[1].options.preview, false, "committed publications are distinguished from transient transforms");
   assert.equal(c.presented.delta[4], 10); h.applications[1].acknowledge();
   assert.equal(c.presented.delta, null); assert.equal(c.presented.frame.transform[4], 30); assert.equal(c.isSceneSettling(), true, "the host application still owns its publication gate");
   h.applications[1].finish(); await committed; assert.equal(c.isSceneSettling(), false);
@@ -151,4 +154,101 @@ function harness() {
   assert.equal(c.presented, savedPresentation); assert.equal(c.latestScene, savedScene); assert.equal(h.draws.length, drawCount);
   assert.equal(c.sceneApplication, null, "disposed applications still release the serialization gate");
 }
-console.log("Editor preview synchronization: acknowledged frames, coalescing, cancellation, serialized publication, settling guards and disposal passed.");
+// A zero-cost host can draw the first coalesced pose on the upcoming frame.
+// The editor must not spend that frame merely scheduling another renderer RAF.
+{
+  const h = harness(), c = h.context, poses = [], options = [];
+  let displayed, applications = 0, maximum = 0, compilations = 0;
+  c.pointer = { id: 1, action: "move" };
+  c.session.getScene = async input => { compilations++; return { delta: [...c.requestedPreview], preview: input.preview }; };
+  c.updateGeometry = () => { if (c.presented) assert.equal(c.presented.delta[4], displayed.delta[4], "chrome follows the acknowledged pose"); };
+  c.host.applyScene = (scene, signal, publish, input) => {
+    options.push(input); applications++; maximum = Math.max(maximum, applications);
+    return new Promise(resolve => c.window.requestAnimationFrame(() => {
+      signal.throwIfAborted(); displayed = scene; poses.push(scene.delta[4]); publish(); applications--; resolve();
+    }));
+  };
+  const drawFrame = async () => {
+    const callbacks = [...h.raf.keys()];
+    for (const id of callbacks) {
+      const callback = h.raf.get(id); if (!callback) continue;
+      h.raf.delete(id); callback(); await tick();
+    }
+  };
+  h.preview(10); c.queuePreview(); h.preview(20); c.queuePreview();
+  assert.equal(h.raf.size, 0, "input does not request a separate editor RAF"); await tick();
+  assert.equal(compilations, 1, "synchronous input bursts coalesce before preparation"); assert.equal(h.raf.size, 1);
+  await drawFrame(); assert.deepEqual(poses, [20], "the upcoming renderer frame presents the latest input");
+  for (const pose of [30, 40, 50]) {
+    h.preview(pose); c.queuePreview(); await tick(); await drawFrame();
+  }
+  assert.deepEqual(poses, [20, 30, 40, 50]); assert.equal(maximum, 1);
+  assert(options.every(input => input.preview === true), "hosts can distinguish transient transform publications");
+  assert.equal(c.previewRunning, false); assert.equal(c.previewQueued, false);
+}
+
+// Generation guards prevent cancelled microtasks from starting work, including
+// an old callback that runs after a new gesture has already queued its kickoff.
+for (const boundary of ["cancel", "view", "dispose"]) {
+  const h = harness(), c = h.context; c.pointer = { id: 1, action: "move" };
+  h.preview(10); c.queuePreview(); c.cancelPointerGesture(false);
+  if (boundary === "view") c.active = false;
+  if (boundary === "dispose") { c.disposed = true; c.lifetime.abort(); }
+  await tick(); assert.equal(h.preparations.length, 0, `${boundary}: stale kickoff cannot compile or publish`);
+  assert.equal(c.previewQueued, false); assert.equal(h.raf.size, 0);
+}
+{
+  const h = harness(), c = h.context; c.pointer = { id: 1, action: "move" };
+  h.preview(10); c.queuePreview(); c.cancelPointerGesture(false);
+  c.pointer = { id: 2, action: "move" }; h.preview(20); c.queuePreview(); await tick();
+  assert.equal(h.preparations.length, 1); assert.equal(h.preparations[0].scene.delta[4], 20);
+  c.cancelPointerGesture(false); h.resolve(0); await tick();
+}
+
+// Modifier changes still schedule a new snapped/free rotation pose while the
+// pointer remains stationary; they use the same coalescing and ACK boundary.
+{
+  const h = harness(), c = h.context;
+  c.pointer = { id: 1, action: "rotate", bounds: frame(0).bounds, last: { x: 10, y: 20 } };
+  c.dragMatrix = gesture => translation(gesture.freeRotation ? 13 : 45);
+  c.interaction.previewTransform = matrix => h.preview(matrix[4]);
+  vm.runInContext(sourceFunction(source, "transformModifiers"), c);
+  c.transformModifiers({ key: "Alt", altKey: true, shiftKey: false, isComposing: false }); await tick();
+  assert.equal(h.preparations[0].scene.delta[4], 13);
+  c.transformModifiers({ key: "Alt", altKey: false, shiftKey: false, isComposing: false });
+  h.resolve(0); await tick(); h.applications[0].acknowledge(); h.applications[0].finish(); await tick();
+  assert.equal(h.preparations[1].scene.delta[4], 45, "releasing Alt updates the queued pose without pointer movement");
+  h.resolve(1); await tick(); h.applications[1].acknowledge(); h.applications[1].finish(); await tick();
+  assert.equal(c.presented.delta[4], 45);
+}
+
+// Preview notifications do not change committed dimensions or toolbar state.
+// Cancellation and actual state/source/selection changes still refresh them.
+{
+  const initial = { revision: 2, dirty: true, canUndo: true, canRedo: false, selection: ["object"], previewing: false };
+  const scene = {}, nodes = new Map(), counts = { bounds: 0, frames: 0, queries: 0, opacity: 0, mode: 0, reconcile: 0, cursors: 0 }, statuses = [];
+  const c = vm.createContext({ currentState: initial, currentSourceScene: scene, active: true, running: false, document: { activeElement: null },
+    contextMenu: { close() {} }, pendingDrawings: { reconcile() { counts.reconcile++; } },
+    updatePointerCursor() { counts.cursors++; }, setStatus: value => statuses.push(value), hasUnsavedChanges: () => true,
+    query(selector) { counts.queries++; if (!nodes.has(selector)) nodes.set(selector, {}); return nodes.get(selector); },
+    editorFrameSize: () => ({ width: 100, height: 50 }), updateRotationValue() {}, updateOpacityControls() { counts.opacity++; },
+    session: { sourceScene: scene, getSelectionBounds() { counts.bounds++; return frame(0).bounds; }, getSelectionFrame() { counts.frames++; return frame(0); } },
+    host: { onModeChange() { counts.mode++; } }
+  });
+  vm.runInContext(sourceFunction(source, "updateState"), c);
+  const first = { ...initial, selection: [...initial.selection], previewing: true }; c.updateState(first);
+  assert.equal(c.currentState, first, "the first preview preserves current state identities for captured publications");
+  for (let index = 0; index < 100; index++) c.updateState({ ...first, selection: [...first.selection] });
+  assert.deepEqual(counts, { bounds: 0, frames: 0, queries: 0, opacity: 0, mode: 0, reconcile: 0, cursors: 101 });
+  assert.deepEqual(statuses, ["Transform preview"]);
+  c.updateState({ ...initial }); assert.equal(counts.bounds, 1); assert.equal(counts.frames, 1);
+  assert.equal(counts.opacity, 1); assert.equal(counts.mode, 1, "cancellation restores committed controls");
+  assert(counts.queries > 0);
+  for (const change of [{ revision: 3 }, { selection: ["other"] }, { canRedo: true }, { dirty: false }]) {
+    const before = counts.bounds; c.currentState = first; c.updateState({ ...first, ...change });
+    assert.equal(counts.bounds, before + 1, "meaningful changes cannot take the preview-only shortcut");
+  }
+  c.currentState = first; c.session.sourceScene = {}; const before = counts.bounds;
+  c.updateState({ ...first }); assert.equal(counts.bounds, before + 1, "source replacement refreshes controls even at the same revision");
+}
+console.log("Editor preview synchronization: frame-phase kickoff, lightweight state notifications, acknowledged frames, coalescing, cancellation, modifiers and serialized publication passed.");

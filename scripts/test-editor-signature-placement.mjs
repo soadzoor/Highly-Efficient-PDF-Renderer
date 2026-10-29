@@ -61,6 +61,8 @@ try {
     };
     const overlay = { dataset: {}, style: {}, addEventListener(name, listener) { listeners.set(name, listener); }, hasPointerCapture: () => false };
     const context = vm.createContext({
+      AbortSignal, lifetime: new AbortController(),
+      pendingDrawings: { add: noop, visible: () => [], capture: () => undefined }, updateRotationValue: noop,
       editorSignaturePlacement, signature, signatureHover: null, objectOpacity: .6,
       host, overlay, toolbar: { style: {}, querySelectorAll: () => buttons },
       graphic: { setAttribute: noop, replaceChildren() { shapes.length = 0; } },
@@ -83,13 +85,13 @@ try {
       releaseFrameListener: null, frame: 0,
       document: { body: { classList: { toggle: noop } } }, window: { cancelAnimationFrame: noop }, tick: noop, pointerUp: noop
     });
-    for (const name of ["pageAt", "signaturePlacementAt", "drawSignatureGhost", "updatePointerCursor", "cancelPointerGesture", "updateGeometry", "setTool", "commit", "placeSignature", "pointerDown", "pointerMove"])
+    for (const name of ["pageAt", "signaturePlacementAt", "drawSignatureGhost", "updatePolygonPreview", "updatePointerCursor", "cancelPointerGesture", "updateGeometry", "setTool", "commit", "placeSignature", "pointerDown", "pointerMove"])
       vm.runInContext(sourceFunction(nested, name), context);
     for (const name of ["pointermove", "pointerenter", "pointerleave", "pointercancel"]) {
       const registration = source.match(new RegExp(`^  overlay\\.addEventListener\\("${name}"[^\\n]+$`, "m"))?.[0];
       assert(registration, `${name}: exercise the real overlay registration`); vm.runInContext(registration.trim(), context);
     }
-    const lifecycleStart = source.indexOf("    async setEditing(value) {"), lifecycleEnd = source.indexOf("\n    isEditing:", lifecycleStart);
+    const lifecycleStart = source.indexOf("    async setEditing(value, externalSignal) {"), lifecycleEnd = source.indexOf("\n    isEditing:", lifecycleStart);
     assert(lifecycleStart >= 0 && lifecycleEnd > lifecycleStart);
     vm.runInContext(stripTypeScriptTypes(`globalThis.lifecycle = {${source.slice(lifecycleStart, lifecycleEnd)}};`), context);
     context.setTool("signature");
@@ -167,11 +169,16 @@ try {
   hidden.setView(1, 0, [1000, 250]); hidden.hover(420, 360); assert.equal(hidden.ghost(), undefined, "page gaps cannot preview signatures");
   await hidden.context.pointerDown(hidden.event(420, 360)); assert.equal(hidden.objects.length, 0, "page gaps cannot stamp signatures");
   hidden.setView(1, 0); hidden.hover(420, 360);
-  for (const flag of ["running", "settling"]) {
-    hidden.context[flag] = true; hidden.context.updateGeometry(); assert.equal(hidden.ghost(), undefined, `${flag}: no inactive preview`);
-    await hidden.context.pointerDown(hidden.event(420, 360)); assert.equal(hidden.objects.length, 0);
-    hidden.context[flag] = false;
-  }
+  hidden.context.running = true; hidden.context.updateGeometry(); assert.equal(hidden.ghost(), undefined, "busy operations hide inactive previews");
+  await hidden.context.pointerDown(hidden.event(420, 360)); assert.equal(hidden.objects.length, 0);
+  hidden.context.running = false;
+  const preparing = harness(); preparing.setView(1, 0); preparing.hover(420, 360);
+  preparing.context.settling = true; preparing.context.presented = { sourceScene: preparing.context.session.sourceScene };
+  preparing.context.updateGeometry(); assert(preparing.ghost(), "same-source preparation keeps the active signature placement preview");
+  await preparing.context.pointerDown(preparing.event(420, 360)); assert.equal(preparing.objects.length, 1, "same-source preparation still allows repeated signature stamping");
+  preparing.context.presented = { sourceScene: {} }; preparing.context.updateGeometry();
+  assert.equal(preparing.ghost(), undefined, "a stale source cannot preview signatures on new document coordinates");
+  await preparing.context.pointerDown(preparing.event(420, 360)); assert.equal(preparing.objects.length, 1, "stale-source preparation cannot stamp onto the wrong document");
   hidden.listeners.get("pointerleave")(); hidden.context.updateGeometry(); assert.equal(hidden.ghost(), undefined); assert.equal(hidden.context.signatureHover, null);
   hidden.hover(420, 360, "touch"); assert.equal(hidden.ghost(), undefined, "touch entry does not create a floating mouse preview");
   hidden.hover(420, 360); hidden.hover(420, 360, "touch");

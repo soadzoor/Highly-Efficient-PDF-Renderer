@@ -6,6 +6,38 @@ export type EditorFieldControl = HTMLInputElement | HTMLTextAreaElement | HTMLSe
 let nextChoiceList = 0;
 const measureContexts = new WeakMap<Document, CanvasRenderingContext2D | null>();
 
+/** Match the native appearance synthesizer's PDF-local mark proportions. */
+function styleEditorButtonControl(control: HTMLInputElement, annotation: SceneAnnotation): void {
+  const mark = annotation.field?.buttonMark ?? (control.type === "radio" ? "circle" : "check");
+  control.dataset.buttonMark = mark;
+  if (!control.checked) { control.style.backgroundImage = "none"; return; }
+  const rect = annotation.pdfGeometry?.rect, bounds = annotation.bounds;
+  const width = rect ? Math.abs(rect[2] - rect[0]) : bounds ? bounds.maxX - bounds.minX : 14;
+  const height = rect ? Math.abs(rect[3] - rect[1]) : bounds ? bounds.maxY - bounds.minY : 14;
+  if (!(width > 0 && height > 0 && Number.isFinite(width) && Number.isFinite(height))) { control.style.backgroundImage = "none"; return; }
+  const border = annotation.border?.width ?? 0, inset = Math.max(border + 1, Math.min(width, height) * .18);
+  const left = inset, right = width - inset, top = inset, bottom = height - inset;
+  if (!(right > left && bottom > top)) { control.style.backgroundImage = "none"; return; }
+  const stroke = `fill="none" stroke="#000" stroke-width="${Math.max(1, Math.min(width, height) * .1)}" stroke-linecap="round" stroke-linejoin="round"`;
+  let shape: string;
+  if (mark === "check") shape = `<path d="M${left} ${bottom - (bottom - top) * .45}L${left + (right - left) * .35} ${bottom}L${right} ${top}" ${stroke}/>`;
+  else if (mark === "cross") shape = `<path d="M${left} ${top}L${right} ${bottom}M${left} ${bottom}L${right} ${top}" ${stroke}/>`;
+  else if (mark === "circle") {
+    const rx = control.type === "radio" ? Math.max(0, (width - border * 2) * .25) : (right - left) / 2;
+    const ry = control.type === "radio" ? Math.max(0, (height - border * 2) * .25) : (bottom - top) / 2;
+    shape = `<ellipse cx="${width / 2}" cy="${height / 2}" rx="${rx}" ry="${ry}" fill="#000"/>`;
+  } else if (mark === "diamond") shape = `<path d="M${width / 2} ${top}L${right} ${height / 2}L${width / 2} ${bottom}L${left} ${height / 2}Z" fill="#000"/>`;
+  else if (mark === "square") shape = `<rect x="${left}" y="${top}" width="${right - left}" height="${bottom - top}" fill="#000"/>`;
+  else {
+    const points = Array.from({ length: 10 }, (_, index) => {
+      const angle = index * Math.PI / 5 - Math.PI / 2, radius = index % 2 ? .45 : 1;
+      return `${width / 2 + Math.cos(angle) * (right - left) / 2 * radius},${height / 2 + Math.sin(angle) * (bottom - top) / 2 * radius}`;
+    });
+    shape = `<polygon points="${points.join(" ")}" fill="#000"/>`;
+  }
+  control.style.backgroundImage = `url("data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">${shape}</svg>`)}")`;
+}
+
 /** The widgets supported by the shared Fill controls; PDF actions stay inert. */
 export function canEditEditorField(annotation: SceneAnnotation): boolean {
   const field = annotation.field;
@@ -15,7 +47,9 @@ export function canEditEditorField(annotation: SceneAnnotation): boolean {
 
 /** Sizes are PDF-local units: the existing field matrix supplies zoom and UserUnit. */
 export function styleEditorFieldControl(control: EditorFieldControl, annotation: SceneAnnotation, fontFamily?: string): void {
-  if (control.tagName === "INPUT" && /^(checkbox|radio)$/.test((control as HTMLInputElement).type)) return;
+  if (control.tagName === "INPUT" && /^(checkbox|radio)$/.test((control as HTMLInputElement).type)) {
+    styleEditorButtonControl(control as HTMLInputElement, annotation); return;
+  }
   const field = annotation.field, style = field?.textStyle;
   const family = fontFamily ?? JSON.stringify(style?.fontFamily ?? "Liberation Sans");
   const weight = style?.fontWeight ?? 400, italic = style?.fontStyle ?? "normal";
@@ -99,6 +133,34 @@ export function editorFieldDraftSignature(control: EditorFieldControl): string {
   return control.value;
 }
 
+/** Hand control paint back to the PDF only when its presented widget value matches. */
+export function updateEditorFieldControlAppearance(control: EditorFieldControl, annotation: SceneAnnotation | undefined,
+  usePdfAppearance: boolean): void {
+  if (usePdfAppearance) control.dataset.pdfAppearance = "true";
+  else delete control.dataset.pdfAppearance;
+  const value = annotation?.field?.value;
+  let matches: boolean;
+  if (control.tagName === "SELECT") {
+    const select = control as HTMLSelectElement;
+    if (select.multiple) {
+      const available = new Set(Array.from(select.options, option => option.value));
+      const expected = new Set((Array.isArray(value) ? value : [String(value ?? "")]).filter(item => available.has(item)));
+      const selected = new Set(Array.from(select.selectedOptions, option => option.value));
+      matches = selected.size === expected.size && [...selected].every(item => expected.has(item));
+    } else {
+      const text = Array.isArray(value) ? value[0] ?? "" : String(value ?? "");
+      matches = select.value === (Array.from(select.options).some(option => option.value === text) ? text : "");
+    }
+  } else if (control.tagName === "INPUT" && /^(checkbox|radio)$/.test((control as HTMLInputElement).type)) {
+    matches = (control as HTMLInputElement).checked === (value === true || value === (annotation?.field?.onValue ?? "Yes"));
+  } else {
+    const normalize = (text: string): string => control.tagName === "TEXTAREA" ? text.replace(/\r\n?/g, "\n") : text.replace(/[\r\n]/g, "");
+    matches = normalize(String(control.value ?? "")) === normalize(String(value ?? ""));
+  }
+  if (usePdfAppearance && !matches) control.dataset.pdfPending = "true";
+  else delete control.dataset.pdfPending;
+}
+
 export function hasPendingEditorFields(drafts: ReadonlyMap<EditorFieldControl, string>): boolean {
   for (const [control, baseline] of drafts) if (editorFieldDraftSignature(control) !== baseline) return true;
   return false;
@@ -124,7 +186,7 @@ export function createEditorFieldControl(document: Document, annotation: SceneAn
   const field = annotation.field;
   if (!field?.name || !canEditEditorField(annotation)) return null;
   let input: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
-  const current = value ?? field.value;
+  const current = value === undefined ? field.value : value;
   let getValue: () => EditorFieldValue;
   if (field.type === "Tx") {
     const text = document.createElement(field.flags & 4096 ? "textarea" : "input");
@@ -141,6 +203,7 @@ export function createEditorFieldControl(document: Document, annotation: SceneAn
         const item = document.createElement("option"); item.value = option.value; item.textContent = option.label;
         item.selected = Array.isArray(current) ? current.includes(option.value) : String(current ?? "") === option.value; select.append(item);
       }
+      if (!select.multiple) select.value = Array.isArray(current) ? current[0] ?? "" : String(current ?? "");
       input = select; getValue = () => select.multiple ? Array.from(select.selectedOptions, item => item.value) : select.value;
     }
   } else if (field.type === "Btn" && !(field.flags & 65536)) {
@@ -154,6 +217,6 @@ export function createEditorFieldControl(document: Document, annotation: SceneAn
   if (options.usePdfAppearance) input.dataset.pdfAppearance = "true";
   styleEditorFieldControl(input, annotation);
   input.addEventListener("input", () => styleEditorFieldControl(input, annotation, input.style.fontFamily));
-  input.addEventListener("change", () => onChange(getValue()));
+  input.addEventListener("change", () => { styleEditorFieldControl(input, annotation, input.style.fontFamily); onChange(getValue()); });
   return input;
 }

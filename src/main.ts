@@ -19,6 +19,8 @@ import type { ThumbnailSceneRenderer } from "./thumbnailRenderer";
 import { createViewerPrintAction, type ViewerPrintAction, type ViewerPrintDocument } from "./viewerPrint";
 import { createViewerFileDropController } from "./viewerFileDrop";
 import { initializeToolbarIcons, setToolbarIconButton, toolbarIconMarkup } from "./toolbarIcons";
+import { createEditorSetupLoading, type EditorSetupLoadingHandle } from "./editorSetupLoading";
+import "./editorSetupLoading.css";
 
 import { WebGlPdfRenderer, type DrawStats, type SceneStats, type ViewState } from "./webGlPdfRenderer";
 import {
@@ -247,6 +249,8 @@ let lastParsedScene: VectorScene | null = null;
 let pdfEditor: import("./editorUi").EditorUi | null = null;
 let editorFrameListener: (() => void) | null = null;
 let editorInitialization: AbortController | null = null;
+const editorSetupLoading = createEditorSetupLoading(() => canvasElement);
+let activeEditorSetup: EditorSetupLoadingHandle | null = null;
 const editorModeButton = document.querySelector<HTMLButtonElement>("#editor-mode")!;
 const printPdfButton = document.querySelector<HTMLButtonElement>("#print-pdf")!;
 let viewerPrintAction: ViewerPrintAction | null = null;
@@ -693,33 +697,47 @@ editorModeButton.addEventListener("click", () => { void togglePdfEditing(); });
 function setNativeEditing(active: boolean): void {
   if (active) { drawingSelection.disable(); textSelection.disable(); annotationOverlay.hide(); }
   else if (textSelectionCheckbox!.checked) textSelection.enable();
+  if (!active) activePdfPageLoader?.resume();
   annotationInteraction?.setInteractionEnabled(!active);
   textSelectionCheckbox!.disabled = active;
   for (const control of [ocrTextCheckbox!, pageStreamingCheckbox!, compressScansCheckbox!]) control.disabled = active || Boolean(pdfEditor) || lastLoadedSource?.kind !== "pdf";
   const layout = document.querySelector<HTMLSelectElement>(".reader-layout"); if (layout) layout.disabled = active;
-  setToolbarIconButton(editorModeButton, active ? "view" : "edit", active ? "View PDF" : "Edit PDF");
+  setToolbarIconButton(editorModeButton, editorInitialization ? "cancel" : active ? "view" : "edit",
+    editorInitialization ? "Cancel editing setup" : active ? "View PDF" : "Edit PDF");
   editorModeButton.setAttribute("aria-pressed", String(active));
   viewerPrintAction?.refresh();
 }
 
 async function togglePdfEditing(): Promise<void> {
   if (editorInitialization) { editorInitialization.abort(); return; }
+  let setup: EditorSetupLoadingHandle | undefined, controller: AbortController | undefined;
   try {
-    const editor = await ensureNativeEditor();
-    const controller = editorInitialization = new AbortController();
-    try { await editor.setEditing(!editor.isEditing()); clearLoadedStatus(); }
-    finally { if (editorInitialization === controller) editorInitialization = null; viewerPrintAction?.refresh(); }
+    if (!pdfEditor?.isEditing()) activeEditorSetup = setup = editorSetupLoading.begin({ stage: pdfEditor ? "display" : "loading" });
+    const editor = await ensureNativeEditor(undefined, setup);
+    controller = editorInitialization = new AbortController();
+    setToolbarIconButton(editorModeButton, "cancel", "Cancel editing setup"); editorModeButton.setAttribute("aria-busy", "true");
+    if (setup) { setup.report({ stage: "display" }); await yieldAfterPaint(controller.signal); }
+    await editor.setEditing(!editor.isEditing(), controller.signal);
+    controller.signal.throwIfAborted(); clearLoadedStatus();
   } catch (error) {
     if (!(error instanceof DOMException && error.name === "AbortError")) setStatus(`Could not enter Edit mode: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    if (controller && editorInitialization === controller) {
+      editorInitialization = null; editorModeButton.removeAttribute("aria-busy");
+      setToolbarIconButton(editorModeButton, pdfEditor?.isEditing() ? "view" : "edit", pdfEditor?.isEditing() ? "View PDF" : "Edit PDF");
+    }
+    setup?.finish(); if (activeEditorSetup === setup) activeEditorSetup = null;
+    viewerPrintAction?.refresh();
   }
 }
 
-async function ensureNativeEditor(signal?: AbortSignal): Promise<import("./editorUi").EditorUi> {
+async function ensureNativeEditor(signal?: AbortSignal, setup?: EditorSetupLoadingHandle): Promise<import("./editorUi").EditorUi> {
   signal?.throwIfAborted();
   if (editorInitialization || pendingSourceLoadCount > 0 || activeSceneLoadToken !== null || layoutChangeRunning || backendSwitcher?.isSwitchInFlight())
     throw new Error("Wait for the document or renderer change to finish before editing the document.");
   if (!lastParsedScene || !lastLoadedSource) throw new Error("Open a PDF or HEP before editing the document.");
   if (pdfEditor) return pdfEditor;
+  const loading = setup ?? editorSetupLoading.begin({ stage: "loading" }); activeEditorSetup = loading;
   setToolbarIconButton(editorModeButton, "cancel", "Cancel editing setup"); editorModeButton.setAttribute("aria-busy", "true");
   const controller = editorInitialization = new AbortController();
   const abort = (): void => controller.abort(signal?.reason);
@@ -727,6 +745,7 @@ async function ensureNativeEditor(signal?: AbortSignal): Promise<import("./edito
   try {
     if (!pdfEditor) {
       setStatus("Preparing full-quality editing data…");
+      loading.report({ stage: "loading" }); await yieldAfterPaint(controller.signal);
       const { createEditorUi } = await import("./editorUi");
       const { remapEditorPagePoint } = await import("./editorCoordinates");
       const { waitForEditorScenePresentation } = await import("./editorPresentation");
@@ -745,14 +764,16 @@ async function ensureNativeEditor(signal?: AbortSignal): Promise<import("./edito
         getCanvas: () => canvasElement, getScene: () => lastParsedScene,
         getSource: () => ({ pdf: lastLoadedSource?.kind === "pdf" ? lastLoadedSource.bytes : undefined,
           password: lastLoadedPdfPassword, label: lastLoadedSource?.label ?? "document" }),
-        async prepareScene(signal) {
+        async prepareScene(signal, onProgress) {
           const source = lastLoadedSource!;
           activePdfPageLoader?.pause();
           if (source.kind !== "pdf") return initialEditScene = editSourceScene = lastParsedScene!;
           const pages = await extractPdfPageScenes(createParseBuffer(source.bytes), {
             ...getExtractionOptions(), password: lastLoadedPdfPassword, compressScans: false, ocrTextOnly: false,
             enableSegmentMerge: false, enableInvisibleCull: false,
-            onProgress: progress => { if (!signal.aborted && lastLoadedSource === source) setStatus(`Preparing editing data: ${Math.round(progress.value * 100)}%`); }
+            onProgress: progress => { if (!signal.aborted && lastLoadedSource === source) {
+              onProgress?.(progress); setStatus(`Preparing editing data: ${Math.round(progress.value * 100)}%`);
+            } }
           }, signal, "transfer");
           signal.throwIfAborted();
           return initialEditScene = editSourceScene = nativeLayout === "reader" ? composeVectorScenesInColumn(pages) : composeVectorScenesInGrid(pages, canonicalPagesPerRow);
@@ -764,20 +785,27 @@ async function ensureNativeEditor(signal?: AbortSignal): Promise<import("./edito
           editSourceLayout = scene.pageRects === initialEditScene?.pageRects ? originalLayout : "grid";
           pendingEditorSource = source;
         },
-        async applyScene(scene, signal, onPresented) {
+        async applyScene(scene, signal, onPresented, options) {
           signal.throwIfAborted();
           editorSceneApplicationActive = true; updateBackendSelectDisabledState();
           try {
             await waitForLoad(backendSwitcher!.runWhenIdle(() => undefined), signal); signal.throwIfAborted();
-            const partition = new ScenePageViews(scene), pages = Array.from({ length: partition.pageCount }, (_, index) => partition.extract(index).scene);
+            const transient = options?.preview && !pendingEditorSource && sourcePlacementMatches();
+            const partition = transient ? null : new ScenePageViews(scene), pages = partition
+              ? Array.from({ length: partition.pageCount }, (_, index) => partition.extract(index).scene) : documentPageScenes ?? [];
             const displayedScene = sourcePlacementMatches() ? scene : nativeLayout === "reader" ? composeVectorScenesInColumn(pages) : composeVectorScenesInGrid(pages, canonicalPagesPerRow);
             const structural = pendingEditorSource, readerState = structural ? readerViewport?.snapshot() : undefined;
             const view = renderer.getViewState();
-            renderer.setScene(displayedScene, { preserveRasterResolution: true }); renderer.setViewState(view);
-            lastParsedScene = displayedScene; documentPageScenes = pages;
-            lastCanonicalScene = nativeLayout === "grid" ? displayedScene : composeVectorScenesInGrid(pages, canonicalPagesPerRow);
-            const previousLoader = activePdfPageLoader; activePdfPageLoader = null;
-            void previousLoader?.close(); parsedPdfPageCache = null;
+            if (!transient || !renderer.updateEditorPreviewScene?.(displayedScene)) {
+              renderer.setScene(displayedScene, { preserveRasterResolution: true }); renderer.setViewState(view);
+            }
+            lastParsedScene = displayedScene;
+            if (!transient) {
+              documentPageScenes = pages;
+              lastCanonicalScene = nativeLayout === "grid" ? displayedScene : composeVectorScenesInGrid(pages, canonicalPagesPerRow);
+              const previousLoader = activePdfPageLoader; activePdfPageLoader = null;
+              void previousLoader?.close(); parsedPdfPageCache = null;
+            }
             if (structural) {
               lastLoadedSource = structural.pdf ? { kind: "pdf", bytes: structural.pdf, label: structural.label } : originalSource;
               lastLoadedPdfPassword = structural.pdf ? structural.password : originalPassword;
@@ -788,7 +816,8 @@ async function ensureNativeEditor(signal?: AbortSignal): Promise<import("./edito
               else renderer.setViewState(view);
               setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
             }
-            applyTextSearchScene(displayedScene); readerViewport?.invalidateThumbnails();
+            if (transient) textSearchController.setScene(displayedScene);
+            else { applyTextSearchScene(displayedScene); readerViewport?.invalidateThumbnails(); }
             if (onPresented) {
               const target = renderer;
               await waitForEditorScenePresentation({ signal, onPresented,
@@ -815,17 +844,27 @@ async function ensureNativeEditor(signal?: AbortSignal): Promise<import("./edito
           return () => { if (editorFrameListener === listener) editorFrameListener = null; };
         },
         requestFrame: () => renderer.requestFrame?.(),
-        setEditing: setNativeEditing, onStatus: setStatus, onBusyChange: () => viewerPrintAction?.refresh()
+        setEditing: setNativeEditing, onStatus: setStatus, onBusyChange: () => viewerPrintAction?.refresh(),
+        onSetupProgress: progress => { if (!controller.signal.aborted) loading.report(progress); }
       }, controller.signal);
     }
     controller.signal.throwIfAborted(); return pdfEditor;
-  } finally { signal?.removeEventListener("abort", abort); if (editorInitialization === controller) editorInitialization = null; editorModeButton.removeAttribute("aria-busy");
-    setToolbarIconButton(editorModeButton, pdfEditor?.isEditing() ? "view" : "edit", pdfEditor?.isEditing() ? "View PDF" : "Edit PDF"); if (!pdfEditor) activePdfPageLoader?.resume(); viewerPrintAction?.refresh(); }
+  } finally {
+    signal?.removeEventListener("abort", abort);
+    if (!setup) { loading.finish(); if (activeEditorSetup === loading) activeEditorSetup = null; }
+    if (editorInitialization === controller) {
+      editorInitialization = null; editorModeButton.removeAttribute("aria-busy");
+      setToolbarIconButton(editorModeButton, pdfEditor?.isEditing() ? "view" : "edit", pdfEditor?.isEditing() ? "View PDF" : "Edit PDF");
+      if (!pdfEditor) activePdfPageLoader?.resume();
+    }
+    viewerPrintAction?.refresh();
+  }
 }
 
 function discardNativeEditor(): boolean {
   if (pdfEditor && !pdfEditor.confirmDocumentChange()) return false;
   editorInitialization?.abort(); editorInitialization = null;
+  activeEditorSetup?.finish(); activeEditorSetup = null;
   pdfEditor?.dispose(); pdfEditor = null; setNativeEditing(false); return true;
 }
 

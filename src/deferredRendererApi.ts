@@ -3,6 +3,7 @@ import type { RendererApi, SceneUpdateOptions } from "./rendererTypes";
 import type { SceneStats } from "./webGlPdfRenderer";
 import { createEmptyVectorScene } from "./emptyVectorScene";
 import { validateRasterLayerUpdates } from "./rasterLayerUpdates";
+import { prepareEditorPreviewSceneUpdate } from "./editorPreviewSceneUpdate";
 import type { RasterLayer } from "./pdfVectorExtractor";
 
 /**
@@ -108,6 +109,12 @@ export function deferRendererSceneUpload(
       if (property === "setScene") {
         return setScene;
       }
+      if (property === "updateEditorPreviewScene") return (scene: VectorScene): boolean => {
+        if (disposed || !prepareEditorPreviewSceneUpdate(pendingScene, scene)) return false;
+        if (sceneUploaded && !renderer.updateEditorPreviewScene?.(scene)) return false;
+        pendingScene = scene;
+        return true;
+      };
       if (property === "replaceDeferredScene") {
         return (scene: VectorScene, options?: SceneUpdateOptions): void => {
           if (disposed) throw new Error("Cannot replace a disposed renderer scene.");

@@ -17,7 +17,6 @@
 .hepr-editor-overlay[data-tool=text]{cursor:text}
 .hepr-editor-overlay[data-tool=ink]{cursor:var(--hepr-editor-pencil-cursor)}
 .hepr-editor-overlay[data-tool=pan]{pointer-events:none;cursor:grab}
-.hepr-editor-overlay[data-tool=pan] .hepr-editor-graphic,.hepr-editor-overlay[data-tool=form] .hepr-editor-graphic{display:none}
 .hepr-editor-overlay:not([data-tool=select]) .hepr-editor-handle,.hepr-editor-overlay:not([data-tool=select]) .hepr-editor-selection-hit{display:none;pointer-events:none}
 .hepr-editor-graphic{width:100%;height:100%;overflow:visible;position:absolute;inset:0;pointer-events:none}
 .hepr-editor-selection{fill:none;stroke:#1765d7;stroke-width:1;vector-effect:non-scaling-stroke}
@@ -31,17 +30,19 @@
 .hepr-editor-overlay[data-gesture=resize][data-resize-handle=ne],.hepr-editor-overlay[data-gesture=resize][data-resize-handle=sw]{cursor:nesw-resize}
 .hepr-editor-overlay[data-gesture=rotate]{cursor:var(--hepr-editor-rotate-cursor)}
 .hepr-editor-overlay[data-gesture]:not([data-gesture=""]) .hepr-editor-handle,.hepr-editor-overlay[data-gesture]:not([data-gesture=""]) .hepr-editor-selection-hit{cursor:inherit}
-.hepr-editor-overlay[data-gesture=pick],.hepr-editor-overlay[data-busy=true],.hepr-editor-overlay[data-settling=true]{cursor:progress}
+.hepr-editor-overlay[data-gesture=pick],.hepr-editor-overlay[data-busy=true],.hepr-editor-overlay[data-settling=true]:is([data-tool=select],[data-tool=text],[data-tool=image]){cursor:progress}
 .hepr-editor-overlay[data-busy=true] .hepr-editor-handle,.hepr-editor-overlay[data-busy=true] .hepr-editor-selection-hit,.hepr-editor-overlay[data-settling=true] .hepr-editor-handle{display:none;pointer-events:none}
 .hepr-editor-overlay[data-settling=true] .hepr-editor-selection-hit{cursor:inherit}
 .hepr-editor-marquee{fill:#2879f51a;stroke:#1765d7;stroke-width:1;stroke-dasharray:4 3}
 .hepr-editor-signature-ghost{pointer-events:none}
 .hepr-editor-form-export-dialog{border:1px solid #b6c3d4;border-radius:10px;padding:18px;max-width:min(540px,90vw);max-height:85vh;overflow:auto;font:14px system-ui,sans-serif;color:#172333}.hepr-editor-form-export-dialog::backdrop{background:#17233366}.hepr-editor-form-export-dialog h2{margin:0 0 14px;font-size:20px}.hepr-editor-form-export-dialog p{line-height:1.5}.hepr-editor-form-export-dialog>div{display:flex;flex-wrap:wrap;gap:8px}.hepr-editor-form-export-dialog button{font:inherit;padding:6px 10px;cursor:pointer}
 .hepr-editor-field{position:absolute;box-sizing:border-box;min-width:0;min-height:0;margin:0;padding:1px;background:#eff6ff;color:#111;border:0;border-radius:0;outline:1px solid #3979cf88;outline-offset:-1px;pointer-events:auto;font:400 12px sans-serif;appearance:none;resize:none}
-.hepr-editor-field[data-pdf-appearance=true]:not(:focus){background:#3979cf14;color:transparent!important;-webkit-text-fill-color:transparent}
+.hepr-editor-field[data-pdf-appearance=true]:not([data-pdf-pending=true]):not(:focus){background:#3979cf14;color:transparent!important;-webkit-text-fill-color:transparent}
+.hepr-editor-field[data-pdf-pending=true]{background:#eff6ff;-webkit-text-fill-color:currentColor}
 .hepr-editor-field:focus{background:#eff6ff;outline:1px solid #1765d7;-webkit-text-fill-color:currentColor}
-input.hepr-editor-field[type=checkbox],input.hepr-editor-field[type=radio]{padding:0;background:transparent;outline:none;appearance:auto}
-input.hepr-editor-field[data-pdf-appearance=true][type=checkbox],input.hepr-editor-field[data-pdf-appearance=true][type=radio]{appearance:none;background:transparent}
+input.hepr-editor-field[type=checkbox],input.hepr-editor-field[type=radio]{padding:0;background-color:#eff6ff;background-position:center;background-repeat:no-repeat;background-size:100% 100%;outline:1px solid #3979cf88;appearance:none}
+input.hepr-editor-field[data-pdf-appearance=true]:not([data-pdf-pending=true])[type=checkbox],input.hepr-editor-field[data-pdf-appearance=true]:not([data-pdf-pending=true])[type=radio]{background-color:transparent;background-image:none!important;outline:none}
+input.hepr-editor-field[data-pdf-pending=true][type=checkbox],input.hepr-editor-field[data-pdf-pending=true][type=radio]{background-color:#eff6ff}
 input.hepr-editor-field[type=checkbox]:focus-visible,input.hepr-editor-field[type=radio]:focus-visible{outline:1px solid #1765d7;outline-offset:1px}
 input.hepr-editor-field,textarea.hepr-editor-field{cursor:text}select.hepr-editor-field{cursor:default}input.hepr-editor-field[type=checkbox],input.hepr-editor-field[type=radio]{cursor:pointer}
 .hepr-editor-text-input{position:absolute;box-sizing:border-box;background:#fffffff0;border:1px solid #1765d7;color:#111;outline:none;padding:2px;transform-origin:top left;overflow:visible;cursor:text;pointer-events:auto;line-height:1.2}

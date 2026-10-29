@@ -45,7 +45,9 @@ import { RetainedPageReplay } from "./retainedPageReplay";
 import { ThreeMaterialRasterLayer } from "./threeMaterialRasterLayer";
 import { ThreeMaterialStrokeLayer } from "./threeMaterialStrokeLayer";
 import { ThreeMaterialTextLayer } from "./threeMaterialTextLayer";
-import { prepareThreeVectorClipTexture } from "./threeVectorClips";
+import { prepareThreeVectorClipTexture, prepareThreeEditorClipUpdate } from "./threeVectorClips";
+import { prepareEditorPreviewSceneUpdate } from "./editorPreviewSceneUpdate";
+import { threeEditorPreviewTexels } from "./threeEditorPreview";
 import { getThreeRenderPerformance } from "./threeRenderPerformance";
 import { compileThreeMaterialRoots, type ThreeShaderCompileHost } from "./threeShaderPreparation";
 import { ThreeTextLodLayer } from "./textLodLayer";
@@ -56,7 +58,7 @@ import {
 } from "./threeLayerOrder";
 import { applyThreePdfOverlayPaintOrder } from "./threePdfPaintOrder";
 import { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
-import type { Bounds } from "./pdfVectorExtractor";
+import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import {
   createSceneTextSearcher,
   flattenSearchMatchHighlightBounds,
@@ -320,7 +322,7 @@ interface RendererConfig {
 
 export interface HeprThreePdfObjectEventMap extends THREE.Object3DEventMap {
   /** Request another frame for asynchronous content, overlays or visible loading animation. */
-  change: { reason: "primitive-highlights-ready" | "pages-loaded" | "raster-ready" | "page-loading-animation" |
+  change: { reason: "primitive-highlights-ready" | "pages-loaded" | "raster-ready" | "page-loading-animation" | "editor-preview" |
     "mixed-vector-batching" | "mixed-vector-ready" | "fill-rendering" | "stroke-rendering" };
 }
 
@@ -871,7 +873,33 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
 
   /** Parsed scene data backing this three.js object. Treat as read-only. */
   private currentScene!: LoadedPdfScene["scene"];
+  private editorClipSource: Pick<VectorScene, "clipPaths"> | null = null;
   get sceneData(): LoadedPdfScene["scene"] { return this.currentScene; }
+
+  /** Reuse an editor's prepared translation generation; other changes use normal replacement. */
+  updateEditorPreviewScene(scene: VectorScene): boolean {
+    if (this.isDisposed || this.pageViews || this.pageTransforms || this.deferredMaterials || !this.hasCompleteMaterialLayers() ||
+        this.pendingLayerUpdate || this.shaderPreparations || this.primitiveAppearance.hasAnyOverrides() || this.primitiveAppearance.getHighlights() ||
+        this.searchHighlightGroup?.visible || this.textSelectionHighlightGroup?.visible ||
+        this.vectorLodStrokeLayer || this.compactedStrokeLayer || this.triangleStrokeLayer || this.textLodLayer?.hasCombinedPayload()) return false;
+    const update = prepareEditorPreviewSceneUpdate(this.currentScene, scene);
+    if (!update || !this.fillMaterialLayer.canUpdateEditorPreview(update)) return false;
+    const clipSource = this.editorClipSource ?? { clipPaths: this.currentScene.clipPaths };
+    const clips = prepareThreeEditorClipUpdate(clipSource, scene, update); if (!clips) return false;
+    if (!this.renderer.updateEditorPreviewScene?.(scene)) return false;
+    const patches = threeEditorPreviewTexels(scene, update);
+    this.drawPlan?.setGeometryPreviewEnabled(true);
+    this.strokeMaterialLayer?.updateEditorPreview(update, patches);
+    this.fillMaterialLayer.updateEditorPreview(scene, update, patches);
+    this.textMaterialLayer.updateEditorPreview(update, patches);
+    clips(); this.currentScene = scene; this.editorClipSource = clipSource;
+    this.previewPagePartition = null; this.primitivePicker?.dispose(); this.primitivePicker = null;
+    this.annotationIndex?.dispose(); this.annotationIndex = null;
+    this.textSearcher = null;
+    this.syncVectorDrawPlanOrder();
+    this.dispatchEvent({ type: "change", reason: "editor-preview" });
+    return true;
+  }
   readonly sourceBytes: Uint8Array | undefined;
   readonly sourceOptions: LoadedPdfScene["sourceOptions"];
   private readonly pageDemand: PdfPageDemandLoader | undefined;
@@ -1082,7 +1110,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     this.deferredMaterials = deferredMaterials ?? null;
     this.pageTransforms = pageTransforms;
     this.webGpu = webGpu;
-    this.currentScene = loadedScene.scene;
+    this.currentScene = loadedScene.scene; this.editorClipSource = null;
     this.paintVisibility = new ScenePaintVisibility(this.sceneData);
     this.renderer = renderer;
     this.renderer.setMixedVectorBatchingEnabled?.(this.mixedVectorBatchingEnabled);

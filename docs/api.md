@@ -113,6 +113,15 @@ with normalized `value` and `stage`; failed saves do not clear dirty state.
 dirty state; saves exclude previews. `getScene({ includeObjects: false, preview:
 false })` returns only the edited original content and filled fields.
 
+Translation previews prepare the current compiled scene and selection once, then
+update selected text, fills and strokes without recompiling fields, fonts, layers
+or authored objects on each pointer move. Geometry, annotation frames and search
+references remain current; paint order and compatible clipping are preserved.
+Prepared geometry is immutable, selection/document changes invalidate it, and
+preview hints stay in memory only. Rotation/resizing, selected raster/gradient
+content, compositing effects, shared paths and legacy text/hard-clip metadata use
+the general compilation path. Saving still excludes every transient pose.
+
 Layer authoring uses the existing PDF optional-content model. `getLayers()` lists
 user OCGs (`id`, `name`, `defaultVisible`, `locked`, `usedInView`), excluding internal
 annotation groups; `getLayerOrder()` returns its nested group/label hierarchy.
@@ -235,6 +244,45 @@ Pass `{ pdf: editor.sourcePdf, password }` as `source` after page operations.
 scene installation, canvas and bidirectional client/scene coordinate conversion,
 plus edit-mode notifications. Instantiate it when editing or attachment is requested;
 `setEditing(false)` removes editor frame work while retaining the session.
+`applyScene(scene, signal, onPresented?, { preview? }?)` receives an optional fourth
+argument identifying gesture previews. Existing three-argument hosts remain
+compatible. A host may try its native renderer's optional
+`updateEditorPreviewScene(scene): boolean`, or the matching Three object method,
+before using its normal scene replacement. These methods accept only compatible,
+privately hinted editor scenes; `false` requests the normal path. The first pose
+of a prepared generation also requires normal installation. For example:
+
+```ts
+async applyScene(scene, signal, onPresented, options) {
+  signal.throwIfAborted();
+  if (!(options?.preview && display.updateEditorPreviewScene?.(scene))) {
+    await replaceScene(scene, signal);
+  }
+  await drawMatchingFrame(signal);
+  signal.throwIfAborted();
+  onPresented?.();
+}
+```
+
+Here `replaceScene` and `drawMatchingFrame` are the host's upload and presentation
+routines. Returning `true` from the preview update means resources were updated,
+not that the frame was drawn. Call `onPresented` only for that scene's actual
+draw/submission, or resolve `applyScene` after it, so selection frames and field
+controls cannot advance ahead of their content. Native WebGL/WebGPU patch only
+changed geometry/clip texels when compatible; unsupported content, active LOD or
+renderer state retains ordinary installation and its existing fidelity.
+The stock UI coalesces pointer poses before the upcoming frame and skips unchanged
+toolbar/hidden-form work. Stock hosts avoid rebuilding page, search and thumbnail
+UI for transient poses. Commit, cancellation and View use the normal document
+update path; preview caches and hints are absent from PDF/HEP output.
+`EditorUiHost.onSetupProgress` receives `EditorSetupProgress` with a `stage`
+(`loading`, `document`, `fields`, `session`, or `display`) and an optional
+0–1 `value` for that stage. Omitted values indicate indeterminate work.
+Forward the optional progress callback from `prepareScene(signal, onProgress)`
+to your document loader. `EditorAppServicesOptions.onPrepareProgress` reports
+form preparation separately. `setEditing(true, signal?)` observes cancellation
+through the first editable frame and returns to View if activation fails;
+the existing session and its edits remain available for retry.
 For frame-aligned form controls, supply `subscribeToFrames(listener)` and return
 an unsubscribe function. Invoke the listener synchronously after drawing or
 submitting each document frame, including camera-only frames, while coordinate
@@ -837,6 +885,15 @@ For demand-loaded PDFs this is the viewing window; `loadCompleteScene({ signal, 
 reuses the active PDF session and cached full pages, then extracts the remaining
 complete content for analysis or export. `sourceLabel`, `sourceKind`, and
 `rendererType` describe the loaded source and backend.
+
+`updateEditorPreviewScene(scene): boolean` reuses compatible prepared editor
+translation scenes and patches existing material textures. It supports an
+ordinary document object, including Grid and single-page Reader viewing, on both
+backends. Independently prepared page views, including multi-page Reader views
+retained after returning to Grid, use normal replacement. Compositing, active LOD,
+highlights and other incompatible material state also return `false`. Hosts must
+fall back to their existing scene-replacement flow and still schedule a draw;
+this method does not acknowledge presentation or change saved document state.
 
 Transforms apply to the **whole loaded object**, including all pages, backgrounds
 and content:

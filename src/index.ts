@@ -59,6 +59,7 @@ export type * from "./editorTypes";
 export type { EditorFont, EditorFontRegistry, EditorFontOptions } from "./editorFonts";
 export type { EditorAppServices, EditorAppServicesOptions } from "./editorAppServices";
 export type { EditorUi, EditorUiHost } from "./editorUi";
+export type { EditorSetupProgress } from "./editorSetupLoading";
 export type { EditorSignature } from "./editorSignatures";
 export type { DocumentSession, DocumentSessionInfo, DocumentSessionOpenOptions, DocumentSessionHepOptions } from "./documentSession";
 export type { StrokeScenePoint, StrokeSceneStyle, StrokeScenePolyline } from "./strokeSceneBuilder";

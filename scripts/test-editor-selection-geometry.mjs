@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { editorFrameCorners, editorFrameCenter, editorFrameSize, editorFrameResizeMatrix,
-  editorFrameScaleMatrix, editorFrameClientGeometry } from "../src/editorSelectionGeometry.ts";
+  editorFrameScaleMatrix, editorFrameClientGeometry, editorFrameRotation, editorFrameRotationMatrix,
+  editorFrameRotationDragMatrix } from "../src/editorSelectionGeometry.ts";
 
 const identity = [1, 0, 0, 1, 0, 0];
 const point = (matrix, p) => ({ x: matrix[0] * p.x + matrix[2] * p.y + matrix[4], y: matrix[1] * p.x + matrix[3] * p.y + matrix[5] });
@@ -82,4 +83,83 @@ for (const [bounds, start, target, expected] of [
   const client = editorFrameClientGeometry({ bounds, transform: identity }, project);
   assert(client); assert(Number.isFinite(client.rotation.x)); assert(Number.isFinite(client.rotation.y));
 }
-console.log("Editor selection geometry: oriented corners, local resizing, fixed anchors, projected cursors and rotation grips passed.");
+const rotatedFrame = (frame, delta) => ({ ...frame, transform: multiply(delta, frame.transform) });
+const direction = (center, degrees, radius = 100) => ({ x: center.x + radius * Math.cos(degrees * Math.PI / 180),
+  y: center.y + radius * Math.sin(degrees * Math.PI / 180) });
+const determinant = transform => transform[0] * transform[3] - transform[1] * transform[2];
+const normalized = degrees => ((degrees + 180) % 360 + 360) % 360 - 180;
+for (const [degrees, expected] of [[0, 0], [45, 45], [180, -180], [-180, -180], [270, -90], [360, 0], [-405, -45]]) {
+  near(editorFrameRotation({ bounds, transform: rotation(degrees) }), expected, "normalized current rotation");
+}
+for (const transform of [rotation(17), rotation(179), [1.8, .5, .4, 1.3, -17, 42], [-1, .2, .3, 1, 9, 13]]) {
+  const frame = { bounds, transform }, center = editorFrameCenter(frame), size = editorFrameSize(frame);
+  const shear = transform[0] * transform[2] + transform[1] * transform[3];
+  for (const target of [0, 90, -90, 180, 270, 450, -540, 1080, 12.345]) {
+    const delta = editorFrameRotationMatrix(frame, target), next = rotatedFrame(frame, delta);
+    const expected = ((target + 180) % 360 + 360) % 360 - 180;
+    near(editorFrameRotation(next), expected, "absolute numeric rotation");
+    near(editorFrameRotation(frame, delta), editorFrameRotation(next), "preview orientation matches commit");
+    nearPoint(editorFrameCenter(next), center, "absolute rotation preserves center");
+    const nextSize = editorFrameSize(next);
+    near(nextSize.width, size.width, "rotation preserves width"); near(nextSize.height, size.height, "rotation preserves height");
+    near(determinant(next.transform), determinant(transform), "rotation preserves signed area and reflection");
+    near(next.transform[0] * next.transform[2] + next.transform[1] * next.transform[3], shear, "rotation preserves shear");
+    assert.deepEqual(editorFrameRotationMatrix(next, target), identity, "setting the same absolute angle twice is a no-op");
+  }
+  const initial = editorFrameRotation(frame), start = direction(center, 33);
+  for (const movement of [-350, -100, -31, 0, 16, 88, 340]) {
+    const target = direction(center, 33 + movement), free = editorFrameRotationDragMatrix(frame, start, target, true);
+    const snapped = editorFrameRotationDragMatrix(frame, start, target);
+    const expectedFree = ((initial + movement + 180) % 360 + 360) % 360 - 180;
+    near(editorFrameRotation(frame, free), expectedFree, "free rotation follows pointer angle");
+    const snappedAngle = editorFrameRotation(frame, snapped), nearest = Math.round(expectedFree / 45) * 45;
+    const expected = Math.abs(expectedFree - nearest) <= 5 ? normalized(nearest) : expectedFree;
+    near(normalized(snappedAngle - expected), 0, "default drag only snaps near an absolute 45-degree angle");
+    nearPoint(point(free, center), center, "free drag keeps center fixed");
+    nearPoint(point(snapped, center), center, "snapped drag keeps center fixed");
+  }
+}
+const arbitrary = { bounds, transform: rotation(17) }, center = editorFrameCenter(arbitrary);
+const start = direction(center, 10), target = direction(center, 40);
+near(editorFrameRotation(arbitrary, editorFrameRotationDragMatrix(arbitrary, start, target)), 45, "17 + 30 snaps to absolute 45 rather than relative 62");
+near(editorFrameRotation(arbitrary, editorFrameRotationDragMatrix(arbitrary, start, target, true)), 47, "Alt bypass retains unsnapped orientation");
+near(editorFrameRotation(arbitrary, editorFrameRotationDragMatrix(arbitrary, start, direction(center, 50))), 57,
+  "17 + 40 remains free outside the absolute snap window");
+for (let grid = -720; grid <= 720; grid += 45) {
+  for (const offset of [-5.0000001, -5, -4.9999999, -1, 0, 1, 4.9999999, 5, 5.0000001]) {
+    for (const initial of [-179, -17, 0, 17, 179]) {
+      const frame = { bounds, transform: rotation(initial) }, center = editorFrameCenter(frame), absolute = grid + offset;
+      const start = direction(center, 137), target = direction(center, 137 + absolute - initial);
+      const snapped = editorFrameRotation(frame, editorFrameRotationDragMatrix(frame, start, target));
+      const free = editorFrameRotation(frame, editorFrameRotationDragMatrix(frame, start, target, true));
+      const expected = normalized(Math.abs(offset) <= 5 ? grid : absolute);
+      near(normalized(snapped - expected), 0, `grid ${grid}, offset ${offset}, initial ${initial}: inclusive five-degree boundary`);
+      near(normalized(free - absolute), 0, `grid ${grid}, offset ${offset}: Alt bypasses every proximity window`);
+    }
+  }
+}
+for (const [absolute, expected] of [[359, 0], [-359, 0], [355, 0], [-355, 0], [354.9999999, -5.0000001],
+  [-354.9999999, 5.0000001], [175, -180], [185, -180], [-175, -180], [-185, -180], [174.9999999, 174.9999999],
+  [-174.9999999, -174.9999999], [22.5, 22.5], [-22.5, -22.5], [67.5, 67.5]]) {
+  const delta = editorFrameRotationDragMatrix(arbitrary, start, direction(center, 10 + absolute - 17));
+  near(normalized(editorFrameRotation(arbitrary, delta) - expected), 0, `absolute ${absolute}: negative/zero/180 wrap and free midpoints`);
+}
+const nearWrap = { bounds, transform: rotation(179) };
+const wrapDelta = editorFrameRotationMatrix(nearWrap, -179);
+near(wrapDelta[0], Math.cos(2 * Math.PI / 180)); near(wrapDelta[1], Math.sin(2 * Math.PI / 180), "absolute angle wrap uses shortest delta");
+const acrossWrap = { bounds, transform: rotation(170) }, wrapCenter = editorFrameCenter(acrossWrap);
+near(editorFrameRotation(acrossWrap, editorFrameRotationDragMatrix(acrossWrap, direction(wrapCenter, 179), direction(wrapCenter, -166))), -180,
+  "pointer crossing atan2 boundary still snaps to absolute 180");
+for (const invalidFrame of [{ bounds, transform: [0, 0, 0, 0, 0, 0] }, { bounds, transform: [NaN, 0, 0, 1, 0, 0] },
+  { bounds: { ...bounds, maxX: Infinity }, transform: identity }]) {
+  assert.equal(editorFrameRotation(invalidFrame), 0);
+  assert.deepEqual(editorFrameRotationMatrix(invalidFrame, 45), identity);
+  assert.deepEqual(editorFrameRotationDragMatrix(invalidFrame, start, target), identity);
+}
+assert.deepEqual(editorFrameRotationMatrix(arbitrary, Infinity), identity);
+assert.deepEqual(editorFrameRotationMatrix(arbitrary, NaN), identity);
+assert.deepEqual(editorFrameRotationDragMatrix(arbitrary, center, target), identity);
+assert.deepEqual(editorFrameRotationDragMatrix(arbitrary, start, center), identity);
+assert.deepEqual(editorFrameRotationDragMatrix(arbitrary, start, { x: NaN, y: 0 }), identity);
+near(editorFrameRotation(arbitrary, [0, 0, 0, 0, 1, 2]), 17, "invalid preview keeps committed orientation");
+console.log("Editor selection geometry: oriented corners, local resizing, absolute rotation, proximity-only 45-degree snapping, fixed anchors, projected cursors and rotation grips passed.");

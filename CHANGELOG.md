@@ -45,6 +45,11 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   filling, mixed-format textboxes and portable fonts, vector shapes and ink,
   reusable local handwritten signatures, image import, multi-selection,
   transforms, undo/redo, PDF/HEP saving and PDF printing. View remains the default.
+  Show a canvas-bounded loading card before tools load and through the first
+  editable frame, including re-entry and with Settings closed. Report setup
+  stages with a spinner, measured page/field progress or an indeterminate bar.
+  Cancel from the mode button; failed or cancelled setup restores View, retains
+  earlier edits and removes setup UI and listeners without stale updates.
 - Expose reusable editor sessions, shared interaction controls, font/form
   services and a vector-first scene-to-PDF writer with cancellation and progress
   reporting. PDF saves preserve source forms, annotations and supported
@@ -71,6 +76,8 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 - Dock Settings to the right of the document in the native, Three.js and room
   detection demos, reserving canvas space instead of covering it. Closing
   Settings restores document width; editing tools stay within the canvas column.
+  Keep opacity sliders compact and let their control rows shrink or wrap inside
+  the dock, preventing horizontal overflow in the native and Three.js viewers.
 - Share compact vector icons across View and Edit controls, including page and
   password actions, PDF/HEP saves, flattening, printing, navigation, zoom, search
   and downloads. Retain descriptive hover titles, accessible labels and keyboard
@@ -83,11 +90,20 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 - Preserve proportions during corner resizing by default; hold Shift for free
   resizing, including while dragging. Textbox frames retain wrapping and their
   proportions; Alt scales their appearance, with Alt+Shift allowing free scaling.
+  Snap rotation drags to the nearest absolute multiple of 45 degrees, including
+  zero, only within 5 degrees (inclusive); other angles rotate freely. Hold
+  Alt/Option to bypass snapping, including modifier changes without pointer
+  movement and on release.
+  Display the current angle with the rendered frame and make numeric Rotate set
+  its absolute signed angle, so repeating a value does not rotate it again.
 - Discover choice options, button states, alignment and text limits on entering
   Edit mode so fields can be validated and displayed consistently.
 
 ### Fixed
 
+- Open saved PDFs whose layer identifiers collide with internal form/annotation
+  visibility controls. Allocate distinct controls without changing PDF layers,
+  and keep field visibility independent in document rendering and thumbnails.
 - Detect artwork that may overlap PDF form fields and offer editable or flattened
   copies at save time. Explain Chrome's separate form-field rendering pass;
   flattened copies keep artwork above fields, while editable copies retain fields
@@ -112,20 +128,45 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 - Align editable form controls with each document draw in native and Three.js
   viewers so borders stay synchronized during zoom and pan. Preserve focused
   inputs and drafts, and detach frame notifications in View mode.
+  Keep current field values visible after blur until their matching regenerated
+  appearances are drawn, avoiding stale-value flashes for shared widgets, rapid
+  edits and cleared fields. Retain drafts when regeneration fails or is superseded.
 - Retain the final pen position, empty-coalesced-event samples, closed pencil
   loops and taps. Keep signature capture proportions consistent with its preview.
+  Match pencil and shape previews to committed curves/outlines, document-scaled
+  widths, colors, fills, arrowheads and separate opacities. Preview rectangles,
+  ellipses, lines, arrows, polygons and polylines; follow the next polygon segment
+  on its original page, retain first-click styles and finish only clicked vertices.
+  Keep pending drawings and signature copies independently until their matching
+  rendered frames take over. Allow another drawing on the same document during
+  compilation and wait for preview handoff before returning to View.
 - Match form input fonts to their PDF family, weight, color and point size,
   retaining document zoom and using PDFium-style automatic text sizes. Preserve
   original check/radio appearances without duplicate browser marks or doubled
   text; keep declared text sizes when saved field content overflows. Share font
   loading between widgets and omit typing styles from compact HEP exports.
+  Use black vector marks following standard PDF button captions during pending
+  updates, preserving check-styled radio fields and native keyboard/group behavior.
 - Reuse deterministic substitute fonts when recompiling edited form appearances,
   so PDFs with nonembedded Type1 fonts can be saved and printed after filling.
   Preserve source font resources and honor custom font-asset loaders.
+  Reuse canonical PDF field appearances across transforms when source, values
+  and target widgets match, retaining current geometry, clips and paint slots.
+  Cancel obsolete preparation without consumers while preserving reusable work
+  and active save snapshots; retain only the current cache per source session.
 - Synchronize transform selection frames with the matching rendered preview in
   native and Three.js viewers, including release and cancellation. Coalesce new
   pointer positions and serialize scene publication so older asynchronous updates
   cannot overtake newer content or leave the frame ahead of the objects.
+  Reuse identical glyph-store resources across authored moves so the existing
+  text-atlas cache survives, while instance and search geometry remain current.
+  Prepare supported translations once and update selected text/path/field geometry
+  without repeating field, layer or page compilation. Reuse native WebGL/WebGPU
+  buffers and Three.js material textures for compatible poses, preserving private
+  antialiased clips and paint order; independent Reader page views and unsupported
+  transforms/content keep the regular path. Coalesce poses before the next frame,
+  avoid redundant toolbar/hidden-field and page/search/thumbnail work, and retain
+  normal LOD, commit/cancel/View updates and matching-frame acknowledgments.
 - Keep selection frames and handles aligned with rotated or transformed content,
   including rotated corner squares after committing, reselecting and undo/redo.
   Keep corner squares at a constant screen size as the viewport zooms. Resize and

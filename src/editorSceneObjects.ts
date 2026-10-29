@@ -5,16 +5,10 @@ import { composeEditorPage, editorUnionBounds } from "./editorScene";
 import type { EditorObject, EditorShapeObject } from "./editorTypes";
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import { editorInkBounds, fitEditorInkPaths, type EditorInkSegment } from "./editorInkGeometry";
+import { editorShapeGeometry, type EditorShapeGeometry } from "./editorShapeGeometry";
+export { editorArrowHeadPoints } from "./editorShapeGeometry";
 
 type Point = readonly [number, number];
-/** The same local arrowhead is used for rendering and interaction bounds. */
-export function editorArrowHeadPoints(object: EditorShapeObject): readonly Point[] {
-  const endpoints = object.points?.length === 2 ? object.points : [[object.x, object.y], [object.x + object.width, object.y + object.height]];
-  const start = endpoints[0], end = endpoints[1], [x, y] = end;
-  const angle = Math.atan2(end[1] - start[1], end[0] - start[0]), size = Math.max((object.strokeWidth ?? 1) * 4, 8);
-  return [[x, y], [x - size * Math.cos(angle - Math.PI / 6), y - size * Math.sin(angle - Math.PI / 6)],
-    [x - size * Math.cos(angle + Math.PI / 6), y - size * Math.sin(angle + Math.PI / 6)]];
-}
 function page(scene: VectorScene, bounds: Bounds): VectorScene {
   scene.pageCount = 1; scene.pagesPerRow = 1;
   scene.pageRects = Float32Array.of(bounds.minX, bounds.minY, bounds.maxX === bounds.minX ? bounds.maxX + 1 : bounds.maxX,
@@ -88,27 +82,11 @@ export async function compileEditorObjectGeometry(object: EditorObject, signal?:
     scene.rasterLayerWidth = object.imageWidth; scene.rasterLayerHeight = object.imageHeight; scene.rasterLayerData = object.data; scene.rasterLayerMatrix = scene.rasterLayers[0].matrix;
     scene.drawRuns = [{ kind: "raster", first: 0, count: 1 }]; return page(scene, bounds);
   }
-  let paths: readonly (readonly Point[])[], curves: EditorInkSegment[][] | undefined, closed = false;
+  let paths: readonly (readonly Point[])[], curves: EditorInkSegment[][] | undefined, shape: EditorShapeGeometry | undefined, closed = false;
   if (object.kind === "ink" || object.kind === "signature") {
     paths = object.paths; curves = fitEditorInkPaths(paths, object.smoothing ?? 0, signal);
   }
-  else {
-    const { x, y, width, height } = object;
-    if (object.shape === "ellipse") {
-      // Bound centerline error in page points, independent of the number of marks.
-      const radius = Math.max(width, height) / 2;
-      // Subdivision below Float32 coordinate precision cannot improve the
-      // canonical contour and would make very large valid coordinates stall.
-      const tolerance = Math.max(0.002, radius * 2 ** -22), ratio = tolerance / Math.max(radius, tolerance);
-      const angle = ratio < 1e-6 ? Math.sqrt(2 * ratio) : Math.acos(Math.max(-1, 1 - ratio));
-      const count = Math.max(16, Math.ceil(Math.PI / angle));
-      const points: Point[] = [];
-      for (let i = 0; i < count; i++) { signal?.throwIfAborted(); const angle = i / count * Math.PI * 2; points.push([x + width / 2 * (1 + Math.cos(angle)), y + height / 2 * (1 + Math.sin(angle))]); }
-      paths = [points]; closed = true;
-    } else if (object.shape === "rectangle") { paths = [[[x, y], [x + width, y], [x + width, y + height], [x, y + height]]]; closed = true; }
-    else if (object.shape === "polygon" || object.shape === "polyline") { paths = [object.points ?? []]; closed = object.shape === "polygon"; }
-    else { paths = [object.points?.length === 2 ? object.points : [[x, y], [x + width, y + height]]]; }
-  }
+  else { shape = editorShapeGeometry(object, signal); paths = shape.paths; closed = shape.closed; }
   const color = object.color ?? 0x000000, width = object.strokeWidth ?? 1;
   const fillOpacity = object.fillOpacity ?? opacity;
   const stroke = curves ? inkStroke(curves, color, width, signal) : buildStrokeScene(paths.map(points => ({ points, closed, color, width })));
@@ -119,9 +97,7 @@ export async function compileEditorObjectGeometry(object: EditorObject, signal?:
   const fills = object.fill !== null && object.fill !== undefined ? curves
     ? curves.flatMap((path, index) => paths[index].length >= 3 && path.length ? [inkFill(path, object.fill, fillOpacity, signal)] : [])
     : paths.filter(points => points.length >= 3).map(points => polygon(points, object.fill, fillOpacity)) : [];
-  if (object.kind === "shape" && object.shape === "arrow") {
-    fills.push(polygon(editorArrowHeadPoints(object), color, opacity));
-  }
+  if (shape?.arrowhead) fills.push(polygon(shape.arrowhead, color, opacity));
   if (!fills.length) return stroke;
   const first = fills.shift()!;
   const bounds = [first, ...fills, stroke].reduce<Bounds | null>((bounds, part) => part.pageCount ? editorUnionBounds(bounds, part.bounds) : bounds, null)!;

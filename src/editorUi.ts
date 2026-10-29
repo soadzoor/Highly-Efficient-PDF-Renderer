@@ -13,10 +13,13 @@ import { editorSignaturePlacement } from "./editorSignaturePlacement";
 import { findEditorPdfFormOverlaps } from "./editorPdfFormOverlap";
 import { chooseEditorPdfFormExport } from "./editorPdfFormExportUi";
 import { appendEditorInkSamples, editorInkCaptureTolerance } from "./editorInkCapture";
+import { createEditorInkPreviewCache, editorInkPreviewTransform } from "./editorInkPreview";
+import { createEditorShapePreviewCache } from "./editorShapePreview";
+import { createEditorPendingDrawings, type EditorPendingDrawingFrame } from "./editorPendingDrawings";
 import { commitEditorText, hasPendingEditorTextChanges, normalizeEditorTextColor, readRichTextRuns, type EditorTextDraftBaseline } from "./editorRichText";
 import type { EditorFont } from "./editorFonts";
 import { editorIconButton } from "./editorToolbarIcons";
-import { canEditEditorField, createEditorFieldControl, createEditorFieldOptions, editorFieldDraftSignature, flushEditorFieldDrafts, hasPendingEditorFields, setEditorFieldControlValue, styleEditorFieldControl, type EditorFieldControl } from "./editorFormControls";
+import { canEditEditorField, createEditorFieldControl, createEditorFieldOptions, editorFieldDraftSignature, flushEditorFieldDrafts, hasPendingEditorFields, setEditorFieldControlValue, styleEditorFieldControl, updateEditorFieldControlAppearance, type EditorFieldControl } from "./editorFormControls";
 import { editorBoundsClickHit, editorFieldClientGeometry, pickEditorMetadataAnnotation, transformEditorAnnotationText } from "./editorCoordinates";
 import { applyEditorFillOpacity, applyEditorOpacity, editorFillSelection, editorStyledSelection, validateEditorOpacity } from "./editorProperties";
 import { createEditorInteractionController } from "./editorInteraction";
@@ -25,20 +28,21 @@ import { createEditorPdfProtectionState, showEditorPdfPasswordDialog, type Edito
 import { insertEditorDocumentFiles, insertEditorPdfFiles, showEditorPagesDialog, type EditorPagesDialog } from "./editorPagesUi";
 import type { LoadProgressCallback } from "./loadProgress";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
-import { editorFrameCenter, editorFrameClientGeometry, editorFrameResizeMatrix, editorFrameScaleMatrix, editorFrameSize } from "./editorSelectionGeometry";
+import { editorFrameCenter, editorFrameClientGeometry, editorFrameResizeMatrix, editorFrameRotation, editorFrameRotationDragMatrix, editorFrameRotationMatrix, editorFrameScaleMatrix, editorFrameSize } from "./editorSelectionGeometry";
 import { printPdfBlob } from "./pdfPrint";
 import { getEditorAnnotationFrameTransform, getEditorAnnotationSource } from "./editorScene";
 import { droppedFileKind } from "./documentDropFiles";
-import { waitForLoad } from "./loadCancellation";
+import { waitForLoad, yieldAfterPaint } from "./loadCancellation";
+import type { EditorSetupProgress } from "./editorSetupLoading";
 import { createEditorLayerControls } from "./editorLayerControls";
 import { createEditorContextMenu } from "./editorContextMenu";
 
 export interface EditorUiHost {
   getCanvas(): HTMLCanvasElement;
   getScene(): VectorScene | null;
-  prepareScene(signal: AbortSignal): Promise<VectorScene>;
+  prepareScene(signal: AbortSignal, onProgress?: LoadProgressCallback): Promise<VectorScene>;
   /** Acknowledge the matching draw before resolving, so selection chrome can follow the submitted scene. */
-  applyScene(scene: VectorScene, signal: AbortSignal, onPresented?: () => void): void | Promise<void>;
+  applyScene(scene: VectorScene, signal: AbortSignal, onPresented?: () => void, options?: { preview?: boolean }): void | Promise<void>;
   documentChanged?(scene: VectorScene, source: { pdf?: Uint8Array; password?: string; label: string }): void | Promise<void>;
   getSource(): { pdf?: Uint8Array; password?: string; label: string };
   clientToScenePoint(x: number, y: number, pageIndex?: number): PrimitivePoint | null;
@@ -54,9 +58,10 @@ export interface EditorUiHost {
   onModeChange?(active: boolean): void;
   onStatus?(message: string): void;
   onBusyChange?(busy: boolean): void;
+  onSetupProgress?(progress: EditorSetupProgress): void;
 }
 export interface EditorUi {
-  setEditing(active: boolean): Promise<void>;
+  setEditing(active: boolean, signal?: AbortSignal): Promise<void>;
   isEditing(): boolean;
   isBusy?(): boolean;
   isDirty(): boolean;
@@ -69,13 +74,18 @@ export interface EditorUi {
 
 type Tool = "select" | "pan" | "form" | "text" | "rectangle" | "ellipse" | "line" | "arrow" | "polygon" | "polyline" | "ink" | "signature" | "image";
 type EditorImageData = Omit<Extract<EditorObjectInput, { kind: "image" }>, "pageIndex" | "x" | "y" | "width" | "height">;
-type PointerGesture = { id: number; start: PrimitivePoint; startClient: PrimitivePoint; last: PrimitivePoint; points: [number, number][]; bounds: Bounds | null; frame?: EditorSelectionFrame; action: "draw" | "marquee" | "move" | "resize" | "rotate"; additive: boolean; handle?: string; freeResize?: boolean; scaleText?: boolean };
+type EditorInkInput = Extract<EditorObjectInput, { kind: "ink" }>;
+type EditorShapeInput = Extract<EditorObjectInput, { kind: "shape" }>;
+type EditorDrawingInput = Extract<EditorObjectInput, { kind: "shape" | "ink" | "signature" }>;
+type EditorDrawingCache = ReturnType<typeof createEditorInkPreviewCache> | ReturnType<typeof createEditorShapePreviewCache>;
+type PointerGesture = { id: number; start: PrimitivePoint; startClient: PrimitivePoint; last: PrimitivePoint; points: [number, number][]; bounds: Bounds | null; frame?: EditorSelectionFrame; action: "draw" | "marquee" | "move" | "resize" | "rotate"; additive: boolean; handle?: string; freeResize?: boolean; scaleText?: boolean; freeRotation?: boolean; ink?: EditorInkInput; shape?: EditorShapeInput };
 interface PresentedScene {
   sourceScene: VectorScene;
   revision: number;
   selection: ReadonlySet<string>;
   frame: EditorSelectionFrame | null;
   delta: EditorMatrix | null;
+  drawings?: EditorPendingDrawingFrame;
 }
 const IDENTITY: EditorMatrix = [1, 0, 0, 1, 0, 0];
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -93,13 +103,23 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   signal?.addEventListener("abort", abortInitialization, { once: true });
   let services: Awaited<ReturnType<typeof createEditorAppServices>> | undefined;
   let session: EditorSession;
+  let initializedSession: EditorSession | undefined;
   try {
-    const scene = await host.prepareScene(lifetime.signal);
+    host.onSetupProgress?.({ stage: "document" });
+    if (host.onSetupProgress) await yieldAfterPaint(lifetime.signal);
+    const scene = await host.prepareScene(lifetime.signal, host.onSetupProgress
+      ? progress => { if (!lifetime.signal.aborted) host.onSetupProgress?.({ stage: "document", value: progress.value }); } : undefined);
     lifetime.signal.throwIfAborted();
-    services = await createEditorAppServices({ sourcePdf: source.pdf, password: source.password });
+    host.onSetupProgress?.({ stage: "fields" });
+    if (host.onSetupProgress) await yieldAfterPaint(lifetime.signal);
+    services = await createEditorAppServices({ sourcePdf: source.pdf, password: source.password,
+      onPrepareProgress: host.onSetupProgress ? value => { if (!lifetime.signal.aborted) host.onSetupProgress?.({ stage: "fields", value }); } : undefined });
     lifetime.signal.throwIfAborted();
     session = await openEditorSession(scene, { ...services.sessionOptions, signal: lifetime.signal, sourcePdf: source.pdf, sourceLabel: source.label });
-  } catch (error) { lifetime.abort(); services?.dispose(); throw error; }
+    initializedSession = session;
+    host.onSetupProgress?.({ stage: "session" });
+    if (host.onSetupProgress) await yieldAfterPaint(lifetime.signal);
+  } catch (error) { lifetime.abort(); initializedSession?.dispose(); services?.dispose(); throw error; }
   finally { signal?.removeEventListener("abort", abortInitialization); }
   const editorServices = services;
   const interaction = createEditorInteractionController(session);
@@ -117,8 +137,9 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   let releaseFrameListener: (() => void) | null = null;
   let objectOpacity = 1, fillOpacity = 1;
   let opacityControlSelection = "";
+  let rotationDraft: { selection: readonly string[]; sourceScene: VectorScene } | null = null;
   let renderRevision = 0, operation: AbortController | null = null, running = false;
-  let previewFrame = 0, previewRunning = false, previewPending = false;
+  let previewGeneration = 0, previewQueued = false, previewRunning = false, previewPending = false;
   let picker: ScenePrimitivePicker | null = null;
   let picking: AbortController | null = null;
   const fontFaces = new Map<string, FontFace>();
@@ -131,7 +152,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   let textRequest = 0;
   let pointer: PointerGesture | null = null;
   let pendingPick: { id: number; point: PrimitivePoint; client: PrimitivePoint; lastClient: PrimitivePoint; released: boolean; canceled: boolean } | null = null;
-  let polygon: { pageIndex: number; points: [number, number][] } | null = null;
+  let polygon: { pageIndex: number; points: [number, number][]; object: EditorShapeInput; preview: EditorShapeInput; previousPointCount?: number } | null = null;
   const toolbar = document.createElement("div"); toolbar.className = "hepr-editor-toolbar"; toolbar.setAttribute("role", "toolbar"); toolbar.setAttribute("aria-label", "PDF editing tools");
   toolbar.innerHTML = `<div class="hepr-editor-tools">
     ${editorIconButton("tool", "select", "Select, move, resize or rotate objects")}
@@ -165,14 +186,17 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     ${editorIconButton("action", "apply-text", "Apply text changes", "hidden")}${editorIconButton("action", "cancel-text", "Discard text changes", "hidden")}
   </div><div class="hepr-editor-transform">
     <span data-selection>No selection</span><label>X <input data-transform="x" type="number" step="any"></label><label>Y <input data-transform="y" type="number" step="any"></label>
-    <label>W <input data-transform="width" type="number" min="0.001" step="any"></label><label>H <input data-transform="height" type="number" min="0.001" step="any"></label><label>Rotate ° <input data-transform="rotation" type="number" step="any" value="0"></label>
+    <label>W <input data-transform="width" type="number" min="0.001" step="any"></label><label>H <input data-transform="height" type="number" min="0.001" step="any"></label><label>Rotate ° <input data-transform="rotation" type="number" step="any" title="Selection angle in degrees. Drag rotation snaps within 5° of multiples of 45°, including 0°. Hold Alt/Option to disable snapping."></label>
     ${editorIconButton("action", "layers", "Add, edit, reorder or remove PDF layers")}${editorIconButton("action", "pages", "Rotate, remove or insert PDF pages")}${editorIconButton("action", "pdf-password", "Keep, remove or change PDF password protection")}${editorIconButton("action", "save-pdf", "Save an editable PDF (Ctrl/Cmd+S)")}${editorIconButton("action", "flatten", "Save a flattened PDF copy")}${editorIconButton("action", "save-hep", "Save the edited document as HEP")}${editorIconButton("action", "print", "Print the edited document")}
     ${editorIconButton("action", "cancel-operation", "Cancel the current operation", "hidden")}<span data-status role="status" aria-live="polite"></span>
-  </div><div class="hepr-editor-help">Ctrl/Cmd + click toggles objects; Shift + click adds them. Drag empty space to select fully contained objects. Corner resizing keeps proportions; hold Shift to resize freely. Double-click a new textbox to edit it; resizing changes wrapping, Alt + resize scales text. Escape cancels.</div>`;
+  </div><div class="hepr-editor-help">Ctrl/Cmd + click toggles objects; Shift + click adds them. Drag empty space to select fully contained objects. Corner resizing keeps proportions; hold Shift to resize freely. Rotation snaps within 5° of multiples of 45°, including 0°; hold Alt/Option to disable snapping. Double-click a new textbox to edit it; resizing changes wrapping, Alt + resize scales text. Escape cancels.</div>`;
   const overlay = document.createElement("div"); overlay.className = "hepr-editor-overlay"; overlay.dataset.tool = tool;
   const graphic = document.createElementNS(SVG_NS, "svg"); graphic.classList.add("hepr-editor-graphic");
   const fields = document.createElement("div"); fields.className = "hepr-editor-fields"; fields.hidden = true;
   const fieldDrafts = new Map<EditorFieldControl, string>();
+  const pendingDrawings = createEditorPendingDrawings(session), inkPreview = createEditorInkPreviewCache(), shapePreview = createEditorShapePreviewCache();
+  let fieldPaintCache: { scene: VectorScene; annotations: Map<string, NonNullable<VectorScene["annotations"]>[number]>;
+    appearances: ReturnType<typeof getSceneAnnotationRuns> } | null = null;
   overlay.append(graphic, fields); document.body.append(toolbar, overlay);
   const query = <T extends HTMLElement>(selector: string): T => toolbar.querySelector<T>(selector)!;
   const property = (name: string): HTMLInputElement => query(`[data-prop="${name}"]`);
@@ -300,6 +324,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     graphic.setAttribute("viewBox", `0 0 ${rect.width} ${rect.height}`);
     graphic.replaceChildren();
     const display = displayedSelection(), selection = display.frame;
+    updateRotationValue(selection, display.delta);
     if (selection && tool === "select" && !running && !activeText) {
       const geometry = editorFrameClientGeometry(selection, point => host.sceneToClientPoint(point.x, point.y, selection.pageIndex), display.delta);
       if (geometry) {
@@ -321,24 +346,23 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         svg("circle", { cx: geometry.rotation.x - rect.left, cy: geometry.rotation.y - rect.top, r: 5, "data-handle": "rotate", class: "hepr-editor-handle" });
       }
     }
+    for (const entry of pendingDrawings.visible()) drawDrawingPreview(entry.object, entry.geometry, rect);
     if (pointer) {
       if (pointer.action === "draw" && tool === "ink") {
-        const points = pointer.points.map(([x, y]) => host.sceneToClientPoint(x, y)).filter((p): p is PrimitivePoint => p !== null);
-        svg("polyline", { points: points.map(p => `${p.x - rect.left},${p.y - rect.top}`).join(" "), fill: "none", stroke: property("color").value, "stroke-width": 2 });
-      } else if (pointer.action === "draw" || pointer.action === "marquee") {
+        if (pointer.ink) drawDrawingPreview(pointer.ink, inkPreview, rect);
+      } else if (pointer.action === "draw" && pointer.shape) {
+        drawDrawingPreview(pointer.shape, shapePreview, rect);
+      } else if (pointer.action === "marquee") {
         const p = host.sceneToClientPoint(pointer.last.x, pointer.last.y);
         if (p) svg("rect", { x: Math.min(pointer.startClient.x, p.x) - rect.left, y: Math.min(pointer.startClient.y, p.y) - rect.top,
           width: Math.abs(p.x - pointer.startClient.x), height: Math.abs(p.y - pointer.startClient.y), class: "hepr-editor-marquee" });
       }
     }
-    if (polygon) {
-      const points = polygon.points.map(([x, y]) => host.sceneToClientPoint(x, y, polygon!.pageIndex)).filter((p): p is PrimitivePoint => p !== null);
-      svg("polyline", { points: points.map(p => `${p.x - rect.left},${p.y - rect.top}`).join(" "), fill: "none", stroke: property("color").value, "stroke-width": 2 });
-    }
-    if (tool === "signature" && signature && signatureHover && !running && !isSceneSettling()) drawSignatureGhost(rect);
+    if (polygon) drawDrawingPreview(polygon.preview, shapePreview, rect);
+    if (tool === "signature" && signature && signatureHover && !running && (!presented || presented.sourceScene === session.sourceScene)) drawSignatureGhost(rect);
     // A camera may already have its next requested pose between document draws.
     // Gesture chrome keeps its RAF, but field controls only follow a drawn pose.
-    if (!host.subscribeToFrames || fromFrame) for (const element of fields.querySelectorAll<HTMLElement>("[data-field-id]")) {
+    if (tool === "form" && !fields.hidden && (!host.subscribeToFrames || fromFrame)) for (const element of fields.querySelectorAll<HTMLElement>("[data-field-id]")) {
       const annotation = latestScene.annotations?.find(item => item.id === element.dataset.fieldId);
       const source = annotation && (getEditorAnnotationSource(latestScene, annotation.id) ?? annotation);
       const sourcePresented = !presented || presented.sourceScene === session.sourceScene;
@@ -406,9 +430,41 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       opacity: objectOpacity * .45, class: "hepr-editor-signature-ghost", "aria-hidden": "true",
       transform: `matrix(${x.x - origin.x} ${x.y - origin.y} ${y.x - origin.x} ${y.y - origin.y} ${origin.x - rect.left} ${origin.y - rect.top})` });
   }
+  function drawDrawingPreview(object: EditorDrawingInput, geometry: EditorDrawingCache, rect: DOMRect): void {
+    const pages = session.sourceScene.pageRects, offset = object.pageIndex * 4;
+    const matrix = editorInkPreviewTransform(object.transform ?? IDENTITY, [pages[offset], pages[offset + 1]],
+      (x, y) => host.sceneToClientPoint(x, y, object.pageIndex), { x: rect.left, y: rect.top });
+    if (!matrix) return;
+    const hairline = 1 / (window.devicePixelRatio || 1), preview = object.kind === "shape"
+      ? (geometry as ReturnType<typeof createEditorShapePreviewCache>).get(object, hairline)
+      : (geometry as ReturnType<typeof createEditorInkPreviewCache>).get(object, hairline);
+    for (const path of preview.paths) svg("path", { ...path,
+      transform: `matrix(${matrix.join(",")})`, "pointer-events": "none", "aria-hidden": "true",
+      class: object.kind === "shape" ? "hepr-editor-shape-preview" : "hepr-editor-ink-preview" });
+  }
+  function updateRotationValue(selection: EditorSelectionFrame | null, delta?: EditorMatrix, force = false): void {
+    const input = query<HTMLInputElement>('[data-transform="rotation"]');
+    input.disabled = !selection || activeText !== null;
+    if (rotationDraft && (force || !selection || document.activeElement !== input || pointer !== null ||
+        rotationDraft.sourceScene !== session.sourceScene || rotationDraft.selection.length !== currentState.selection.length ||
+        rotationDraft.selection.some((id, index) => id !== currentState.selection[index]))) rotationDraft = null;
+    if (!rotationDraft) {
+      const value = selection ? Number(editorFrameRotation(selection, delta).toFixed(3)).toString() : "";
+      if (input.value !== value) input.value = value;
+    }
+  }
   function updateState(state: EditorState): void {
     contextMenu.close();
+    const previous = currentState;
     currentState = state;
+    if (state.previewing && currentSourceScene === session.sourceScene && state.revision === previous.revision &&
+        state.dirty === previous.dirty && state.canUndo === previous.canUndo && state.canRedo === previous.canRedo &&
+        state.selection.length === previous.selection.length && state.selection.every((id, index) => id === previous.selection[index])) {
+      updatePointerCursor();
+      if (!running && !previous.previewing) setStatus("Transform preview");
+      return;
+    }
+    pendingDrawings.reconcile();
     updatePointerCursor();
     query<HTMLButtonElement>('[data-action="undo"]').disabled = !state.canUndo;
     query<HTMLButtonElement>('[data-action="redo"]').disabled = !state.canRedo;
@@ -419,6 +475,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       const input = query<HTMLInputElement>(`[data-transform="${name}"]`); input.disabled = !bounds;
       if (document.activeElement !== input) input.value = value == null ? "" : Number(value.toFixed(3)).toString();
     }
+    if (!state.previewing) updateRotationValue(frame);
     if (!state.previewing) updateOpacityControls(state);
     if (!running) setStatus(state.previewing ? "Transform preview" : hasUnsavedChanges() ? "Unsaved changes" : "Saved");
     host.onModeChange?.(active);
@@ -426,13 +483,13 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   const unsubscribe = session.subscribe(updateState);
   async function synchronizeDocumentSource(): Promise<void> {
     if (currentSourceScene === session.sourceScene) return;
-    pendingFieldFocus = null;
+    pendingFieldFocus = null; polygon = null;
     currentSourceScene = session.sourceScene; latestScene = currentSourceScene;
     picking?.abort(); picker?.dispose(); picker = null;
     await host.documentChanged?.(currentSourceScene, { pdf: session.sourcePdf, password: source.password, label: source.label });
     if (tool === "form") renderFields(); pagesDialog?.refresh();
   }
-  async function refreshScene(externalSignal?: AbortSignal, preview = false): Promise<void> {
+  async function refreshScene(externalSignal?: AbortSignal, preview = false, propagateError = false): Promise<void> {
     const revision = ++renderRevision, abort = new AbortController();
     scenePreparation?.abort(); scenePreparation = abort;
     const signal = AbortSignal.any([lifetime.signal, abort.signal, ...(externalSignal ? [externalSignal] : [])]);
@@ -440,7 +497,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       await synchronizeDocumentSource(); signal.throwIfAborted();
       if (disposed || revision !== renderRevision) return;
       const state = session.getState(), snapshot: PresentedScene = { sourceScene: session.sourceScene, revision: state.revision,
-        selection: new Set(state.selection), frame: session.getSelectionFrame(), delta: preview && state.previewing ? requestedPreview : null };
+        selection: new Set(state.selection), frame: session.getSelectionFrame(), delta: preview && state.previewing ? requestedPreview : null,
+        drawings: pendingDrawings.capture() };
       const scene = await session.getScene({ signal, preview });
       if (disposed || revision !== renderRevision) return;
       // Preparing a newer pose can supersede older preparation. Once host
@@ -456,12 +514,13 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       const publish = (): void => {
         if (acknowledged || disposed || signal.aborted || sceneApplication !== application) return;
         acknowledged = true; latestScene = scene; presented = snapshot; updatePointerCursor();
+        pendingDrawings.acknowledge(snapshot.drawings);
         if (tool === "form") updateFieldPaint();
         // Preserve focused field drafts; only reposition existing controls.
         if (active) updateGeometry(true);
       };
       try {
-        await host.applyScene(scene, signal, publish); signal.throwIfAborted();
+        await host.applyScene(scene, signal, publish, { preview }); signal.throwIfAborted();
         // A synchronous host may finish its draw before returning.
         if (!acknowledged) publish();
       } finally {
@@ -469,7 +528,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         finish?.();
         if (!disposed) { updatePointerCursor(); if (active) updateGeometry(); }
       }
-    } catch (error) { report(error); }
+    } catch (error) { if (propagateError) throw error; report(error); }
     finally { if (scenePreparation === abort) scenePreparation = null; }
   }
   function commit(change: () => void): void {
@@ -481,7 +540,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     commit(() => { if (redo) session.redo(); else session.undo(); if (tool === "form") renderFields(); });
   }
   function runPreview(): void {
-    previewFrame = 0; if (!pointer || !active || disposed) return;
+    previewQueued = false; if (!pointer || !active || disposed) return;
     previewPending = false; previewRunning = true;
     void refreshScene(undefined, true).finally(() => {
       previewRunning = false;
@@ -490,11 +549,16 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   function queuePreview(): void {
     previewPending = true;
-    if (previewRunning || previewFrame) return;
-    previewFrame = window.requestAnimationFrame(runPreview);
+    if (previewRunning || previewQueued) return;
+    previewQueued = true;
+    const generation = ++previewGeneration;
+    queueMicrotask(() => {
+      if (generation !== previewGeneration) return;
+      previewQueued = false; runPreview();
+    });
   }
   function clearPreview(restore = false): void {
-    window.cancelAnimationFrame(previewFrame); previewFrame = 0; previewPending = false;
+    previewGeneration++; previewQueued = false; previewPending = false;
     requestedPreview = null;
     const wasPreviewing = session.getState().previewing; interaction.cancelTransform();
     if (restore && wasPreviewing) void refreshScene();
@@ -531,10 +595,15 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   function renderFields(): void {
     fields.replaceChildren(); fieldDrafts.clear();
     const appearances = getSceneAnnotationRuns(latestScene);
+    const values = session.getFieldValues(), sourceAnnotations = new Map(session.sourceScene.annotations?.map(annotation => [annotation.id, annotation]));
     for (const currentAnnotation of latestScene.annotations ?? []) {
       const annotation = getEditorAnnotationSource(latestScene, currentAnnotation.id) ?? currentAnnotation;
       const name = annotation.field?.name;
-      const input = createEditorFieldControl(document, annotation, name ? session.getFieldValues().get(name) : undefined,
+      // Canonical placements retain old field metadata for geometry. Values
+      // come from the current session, including its source fallback after Undo.
+      const sourceField = sourceAnnotations.get(currentAnnotation.id)?.field ?? currentAnnotation.field;
+      const value = name && values.has(name) ? values.get(name) : sourceField?.value;
+      const input = createEditorFieldControl(document, annotation, value ?? null,
         value => commit(() => {
           session.setFieldValue(name!, value);
           for (const [control] of fieldDrafts) {
@@ -542,9 +611,11 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
             if (!sibling || sibling.field?.name !== name) continue;
             setEditorFieldControlValue(control, getEditorAnnotationSource(latestScene, sibling.id) ?? sibling, value); fieldDrafts.set(control, editorFieldDraftSignature(control));
           }
+          updateFieldPaint();
         }), { usePdfAppearance: currentAnnotation.hasAppearance || Boolean(appearances.get(annotation.id)?.length) });
       if (input) {
         input.hidden = Boolean(host.subscribeToFrames);
+        input.addEventListener("input", () => updateFieldPaint(input));
         fieldDrafts.set(input, editorFieldDraftSignature(input)); fields.append(input);
         const choices = createEditorFieldOptions(document, annotation, input); if (choices) fields.append(choices);
         if (annotation.field?.textStyle) void editorServices.fonts.resolve(annotation.field.textStyle).then(async font => {
@@ -554,15 +625,15 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         }).catch(report);
       }
     }
+    updateFieldPaint();
     if (active) host.requestFrame?.();
   }
-  function updateFieldPaint(): void {
-    const annotations = new Map(latestScene.annotations?.map(annotation => [annotation.id, annotation]));
-    const appearances = getSceneAnnotationRuns(latestScene);
-    for (const [control] of fieldDrafts) {
-      const annotation = annotations.get(control.dataset.fieldId!);
-      if (annotation?.hasAppearance || appearances.get(control.dataset.fieldId!)?.length) control.dataset.pdfAppearance = "true";
-      else delete control.dataset.pdfAppearance;
+  function updateFieldPaint(changedControl?: EditorFieldControl): void {
+    if (!fieldPaintCache || fieldPaintCache.scene !== latestScene) fieldPaintCache = { scene: latestScene,
+      annotations: new Map(latestScene.annotations?.map(annotation => [annotation.id, annotation])), appearances: getSceneAnnotationRuns(latestScene) };
+    for (const control of changedControl ? [changedControl] : fieldDrafts.keys()) {
+      const annotation = fieldPaintCache.annotations.get(control.dataset.fieldId!);
+      updateEditorFieldControlAppearance(control, annotation, Boolean(annotation?.hasAppearance || fieldPaintCache.appearances.get(control.dataset.fieldId!)?.length));
     }
   }
   function fieldAtClientPoint(client: PrimitivePoint): string | null {
@@ -633,9 +704,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (p.action === "move") return [1, 0, 0, 1, point.x - p.start.x, point.y - p.start.y];
     const frame = p.frame ?? { bounds: p.bounds!, transform: IDENTITY };
     if (p.action === "rotate") {
-      const { x: cx, y: cy } = editorFrameCenter(frame);
-      const angle = Math.atan2(point.y - cy, point.x - cx) - Math.atan2(p.start.y - cy, p.start.x - cx), c = Math.cos(angle), s = Math.sin(angle);
-      return [c, s, -s, c, cx - c * cx + s * cy, cy - s * cx - c * cy];
+      return editorFrameRotationDragMatrix(frame, p.start, point, p.freeRotation);
     }
     return editorFrameResizeMatrix(frame, p.start, point, p.handle ?? "se", p.freeResize);
   }
@@ -654,10 +723,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   function transformProperty(name: string, value: number): void {
     const bounds = session.getSelectionBounds(), frame = session.getSelectionFrame();
     if (!bounds || !frame || !Number.isFinite(value)) return;
-    const { x: cx, y: cy } = editorFrameCenter(frame);
     if (name === "rotation") {
-      const angle = value * Math.PI / 180, c = Math.cos(angle), s = Math.sin(angle);
-      commit(() => interaction.applyTransform([c, s, -s, c, cx - c * cx + s * cy, cy - s * cx - c * cy]));
+      commit(() => interaction.applyTransform(editorFrameRotationMatrix(frame, value)));
     } else if (name === "x" || name === "y") {
       commit(() => interaction.nudge(name === "x" ? value - bounds.minX : 0, name === "y" ? value - bounds.minY : 0));
     } else if (name === "width" || name === "height") {
@@ -666,21 +733,65 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       commit(() => interaction.applyTransform(matrix));
     }
   }
+  function changeTransform(input: HTMLInputElement): void {
+    if (input.value.trim() !== "") transformProperty(input.dataset.transform!, Number(input.value));
+    if (input.dataset.transform === "rotation") {
+      updateRotationValue(session.getSelectionFrame(), undefined, true);
+      // Retain the accepted value while this numeric edit still owns focus,
+      // including frames drawn before the committed scene is ready.
+      if (document.activeElement === input) rotationDraft = { selection: currentState.selection, sourceScene: session.sourceScene };
+    }
+  }
+  function createShapeDraft(shape: EditorShapeInput["shape"], pageIndex: number): EditorShapeInput {
+    const strokeWidth = Number(property("stroke").value);
+    if (!Number.isFinite(strokeWidth) || strokeWidth < 0 || !Number.isFinite(Math.fround(strokeWidth)) || strokeWidth > 0 && Math.fround(strokeWidth / 2) === 0)
+      throw new RangeError("Stroke width must be a nonnegative float32-representable number.");
+    return { kind: "shape", shape, pageIndex, x: 0, y: 0, width: 0, height: 0, opacity: objectOpacity, fillOpacity,
+      color: property("color").value, strokeWidth, fill: property("fill-enabled").checked ? property("fill").value : null };
+  }
+  function updateShapeGesture(p: PointerGesture, point: PrimitivePoint): void {
+    const shape = p.shape; if (!shape) return;
+    const start = pageLocal(p.start, shape.pageIndex), end = pageLocal(point, shape.pageIndex);
+    Object.assign(shape, { x: Math.min(start[0], end[0]), y: Math.min(start[1], end[1]),
+      width: Math.abs(end[0] - start[0]), height: Math.abs(end[1] - start[1]) });
+    if (shape.shape === "line" || shape.shape === "arrow") shape.points = [start, end];
+  }
+  function updatePolygonPreview(hover: readonly [number, number] | null = null): void {
+    if (!polygon) return;
+    const last = polygon.points[polygon.points.length - 1], points = hover && (!last || hover[0] !== last[0] || hover[1] !== last[1])
+      ? [...polygon.points, hover] : polygon.points;
+    if (!points.length) return;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const [x, y] of points) { minX = Math.min(minX, x); minY = Math.min(minY, y); maxX = Math.max(maxX, x); maxY = Math.max(maxY, y); }
+    polygon.preview = { ...polygon.object, points, x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+  }
   async function pointerDown(event: PointerEvent): Promise<void> {
-    if (!active || running || activeText || pointer || pendingPick || isSceneSettling() || tool === "pan" || tool === "form" || event.button !== 0 || (event.target as Element).closest(".hepr-editor-field")) return;
+    if (!active || running || activeText || pointer || pendingPick ||
+        isSceneSettling() && (!["ink", "rectangle", "ellipse", "line", "arrow", "polygon", "polyline", "signature"].includes(tool) || !presented || presented.sourceScene !== session.sourceScene) ||
+        tool === "pan" || tool === "form" || event.button !== 0 || (event.target as Element).closest(".hepr-editor-field")) return;
     textRequest++;
     const targetHandle = tool === "select" ? (event.target as Element).getAttribute("data-handle") : null;
     const handleFrame = targetHandle && ["nw", "ne", "sw", "se", "rotate"].includes(targetHandle) ? session.getSelectionFrame() : null;
     const moveFrame = tool === "select" && !event.ctrlKey && !event.metaKey && !event.shiftKey &&
       (event.target as Element).getAttribute("data-selection-move") === "true" ? session.getSelectionFrame() : null;
     const gestureFrame = handleFrame ?? moveFrame;
-    const point = host.clientToScenePoint(event.clientX, event.clientY, gestureFrame?.pageIndex); if (!point || tool !== "select" && pageAt(point) < 0) return;
+    if (polygon) polygon.previousPointCount = undefined;
+    const point = host.clientToScenePoint(event.clientX, event.clientY, gestureFrame?.pageIndex ?? polygon?.pageIndex); if (!point || tool !== "select" && pageAt(point) < 0) return;
     event.preventDefault(); event.stopPropagation();
     const client = { x: event.clientX, y: event.clientY }, toggle = event.ctrlKey || event.metaKey, additive = toggle || event.shiftKey;
     const handle = handleFrame ? targetHandle : null;
     if (tool === "polygon" || tool === "polyline") {
-      polygon ??= { pageIndex: pageAt(point), points: [] };
-      if (polygon.pageIndex === pageAt(point)) polygon.points.push([point.x, point.y]);
+      if (!polygon) {
+        const pageIndex = pageAt(point), object = createShapeDraft(tool, pageIndex);
+        polygon = { pageIndex, points: [], object, preview: object };
+      }
+      if (polygon.pageIndex === pageAt(point)) {
+        const local = pageLocal(point, polygon.pageIndex), last = polygon.points[polygon.points.length - 1];
+        polygon.previousPointCount = polygon.points.length;
+        // Double-click completion produces two presses at the final vertex.
+        if (!last || last[0] !== local[0] || last[1] !== local[1]) polygon.points.push(local);
+        updatePolygonPreview();
+      }
       return;
     }
     if (tool === "text") { await startText(point); return; }
@@ -715,32 +826,46 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         }
       }
     }
-    pointer = { id: event.pointerId, start: point, startClient: client, last: point, points: [[point.x, point.y]], bounds: session.getSelectionBounds(), frame: gestureFrame ?? session.getSelectionFrame() ?? undefined, action, additive, handle: handle ?? undefined,
-      freeResize: event.shiftKey, scaleText: event.altKey };
+    const drawingShape = ["rectangle", "ellipse", "line", "arrow"].includes(tool);
+    const pageIndex = tool === "ink" || drawingShape ? pageAt(point) : -1, points: [number, number][] = tool === "ink" ? [pageLocal(point, pageIndex)] : [[point.x, point.y]];
+    const ink: EditorInkInput | undefined = tool === "ink" ? { kind: "ink", pageIndex, paths: [points], opacity: objectOpacity, fillOpacity,
+      smoothing: editorInkCaptureTolerance(point, p => host.sceneToClientPoint(p.x, p.y, pageIndex)),
+      color: property("color").value, strokeWidth: Number(property("stroke").value), fill: property("fill-enabled").checked ? property("fill").value : null } : undefined;
+    if (ink && (!Number.isFinite(ink.strokeWidth) || ink.strokeWidth! < 0)) throw new RangeError("Stroke width must be a finite number at least 0.");
+    const shape = drawingShape ? createShapeDraft(tool as EditorShapeInput["shape"], pageIndex) : undefined;
+    pointer = { id: event.pointerId, start: point, startClient: client, last: point, points, ink, shape, bounds: session.getSelectionBounds(), frame: gestureFrame ?? session.getSelectionFrame() ?? undefined, action, additive, handle: handle ?? undefined,
+      freeResize: event.shiftKey, scaleText: event.altKey, freeRotation: event.altKey };
+    updateShapeGesture(pointer, point);
     updatePointerCursor();
     overlay.setPointerCapture?.(event.pointerId);
   }
   function pointerMove(event: PointerEvent): void {
     if (active && tool === "signature") signatureHover = event.pointerType === "touch" ? null : { x: event.clientX, y: event.clientY };
+    if (active && polygon && (tool === "polygon" || tool === "polyline")) {
+      const point = host.clientToScenePoint(event.clientX, event.clientY, polygon.pageIndex);
+      updatePolygonPreview(point && pageAt(point) === polygon.pageIndex ? pageLocal(point, polygon.pageIndex) : null);
+    }
     if (pendingPick?.id === event.pointerId) pendingPick.lastClient = { x: event.clientX, y: event.clientY };
     if (!pointer || event.pointerId !== pointer.id) return;
-    const point = host.clientToScenePoint(event.clientX, event.clientY, pointer.action !== "draw" && pointer.action !== "marquee" ? pointer.frame?.pageIndex : undefined); if (!point) return;
-    pointer.last = point; pointer.freeResize = event.shiftKey; pointer.scaleText = event.altKey;
+    const point = host.clientToScenePoint(event.clientX, event.clientY, pointer.ink?.pageIndex ?? pointer.shape?.pageIndex ?? (pointer.action !== "draw" && pointer.action !== "marquee" ? pointer.frame?.pageIndex : undefined)); if (!point) return;
+    pointer.last = point; pointer.freeResize = event.shiftKey; pointer.scaleText = event.altKey; pointer.freeRotation = event.altKey;
     if (pointer.action === "draw" && tool === "ink") {
-      const pageIndex = pageAt(pointer.start);
+      const pageIndex = pointer.ink!.pageIndex;
       appendEditorInkSamples(pointer.points, event, sample => {
-        const p = host.clientToScenePoint(sample.clientX, sample.clientY, pageIndex); return p ? [p.x, p.y] : null;
+        const p = host.clientToScenePoint(sample.clientX, sample.clientY, pageIndex); return p ? pageLocal(p, pageIndex) : null;
       });
-    } else if (pointer.bounds && ["move", "resize", "rotate"].includes(pointer.action)) {
+    } else if (pointer.action === "draw" && pointer.shape) updateShapeGesture(pointer, point);
+    else if (pointer.bounds && ["move", "resize", "rotate"].includes(pointer.action)) {
       const matrix = dragMatrix(pointer, point);
       if (matrix[0] * matrix[3] - matrix[1] * matrix[2] !== 0) { interaction.previewTransform(matrix); requestedPreview = matrix; queuePreview(); }
       else clearPreview(true);
     }
     event.preventDefault();
   }
-  function resizeModifiers(event: KeyboardEvent): void {
-    if (!active || running || event.isComposing || !pointer?.bounds || pointer.action !== "resize" || event.key !== "Shift" && event.key !== "Alt") return;
-    pointer.freeResize = event.shiftKey; pointer.scaleText = event.altKey;
+  function transformModifiers(event: KeyboardEvent): void {
+    if (!active || running || event.isComposing || !pointer?.bounds ||
+        !(pointer.action === "resize" && (event.key === "Shift" || event.key === "Alt") || pointer.action === "rotate" && event.key === "Alt")) return;
+    pointer.freeResize = event.shiftKey; pointer.scaleText = event.altKey; pointer.freeRotation = event.altKey;
     const matrix = dragMatrix(pointer, pointer.last);
     if (matrix[0] * matrix[3] - matrix[1] * matrix[2] !== 0) { interaction.previewTransform(matrix); requestedPreview = matrix; queuePreview(); }
     else clearPreview(true);
@@ -749,14 +874,18 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (pendingPick?.id === event.pointerId) { pendingPick.released = true; pendingPick.lastClient = { x: event.clientX, y: event.clientY }; overlay.releasePointerCapture?.(event.pointerId); }
     const p = pointer; if (!p || event.pointerId !== p.id) return; pointer = null; updatePointerCursor();
     if (p.action === "draw" && tool === "ink") {
-      const pageIndex = pageAt(p.start);
+      const pageIndex = p.ink!.pageIndex;
       appendEditorInkSamples(p.points, event, sample => {
-        const point = host.clientToScenePoint(sample.clientX, sample.clientY, pageIndex); return point ? [point.x, point.y] : null;
+        const point = host.clientToScenePoint(sample.clientX, sample.clientY, pageIndex); return point ? pageLocal(point, pageIndex) : null;
       });
     }
-    if (p.action === "resize") {
+    if (p.action === "draw" && p.shape) {
+      p.last = host.clientToScenePoint(event.clientX, event.clientY, p.shape.pageIndex) ?? p.last;
+      updateShapeGesture(p, p.last);
+    }
+    if (p.action === "resize" || p.action === "rotate") {
       p.last = host.clientToScenePoint(event.clientX, event.clientY, p.frame?.pageIndex) ?? p.last;
-      p.freeResize = event.shiftKey; p.scaleText = event.altKey;
+      p.freeResize = event.shiftKey; p.scaleText = event.altKey; p.freeRotation = event.altKey;
     }
     clearPreview(true);
     overlay.releasePointerCapture?.(event.pointerId);
@@ -775,28 +904,17 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         } else commit(() => interaction.applyTransform(matrix));
       }
     } else if (moved || tool === "ink") {
-      const pageIndex = pageAt(p.start), [x, y] = pageLocal({ x: Math.min(p.start.x, p.last.x), y: Math.min(p.start.y, p.last.y) }, pageIndex);
-      if (pageIndex < 0) return;
-      let object: EditorObjectInput;
-      if (tool === "ink") object = { kind: "ink", pageIndex, opacity: objectOpacity, fillOpacity, paths: [p.points.map(([px, py]) => pageLocal({ x: px, y: py }, pageIndex))],
-        smoothing: editorInkCaptureTolerance(p.start, point => host.sceneToClientPoint(point.x, point.y, pageIndex)),
-        color: property("color").value, strokeWidth: Number(property("stroke").value), fill: property("fill-enabled").checked ? property("fill").value : null };
-      else object = { kind: "shape", pageIndex, shape: tool as "rectangle" | "ellipse" | "line" | "arrow", x, y,
-        width: Math.abs(p.last.x - p.start.x), height: Math.abs(p.last.y - p.start.y),
-        points: tool === "line" || tool === "arrow" ? [pageLocal(p.start, pageIndex), pageLocal(p.last, pageIndex)] : undefined,
-        opacity: objectOpacity, fillOpacity, color: property("color").value, strokeWidth: Number(property("stroke").value), fill: property("fill-enabled").checked ? property("fill").value : null };
-      commit(() => { const id = session.addObject(object); session.select([id]); });
+      const object = p.ink ?? p.shape; if (!object) return;
+      commit(() => { const id = session.addObject(object); pendingDrawings.add(id); session.select([id]); });
     }
   }
-  function completePolygon(): void {
-    if (!polygon || polygon.points.length < (tool === "polyline" ? 2 : 3)) { polygon = null; return; }
-    const p = polygon; polygon = null;
-    const minX = Math.min(...p.points.map(point => point[0])), minY = Math.min(...p.points.map(point => point[1]));
-    const [x, y] = pageLocal({ x: minX, y: minY }, p.pageIndex);
-    commit(() => { const id = session.addObject({ kind: "shape", shape: tool === "polyline" ? "polyline" : "polygon", pageIndex: p.pageIndex, opacity: objectOpacity, fillOpacity, x, y,
-      width: Math.max(...p.points.map(point => point[0])) - minX, height: Math.max(...p.points.map(point => point[1])) - minY,
-      points: p.points.map(([px, py]) => pageLocal({ x: px, y: py }, p.pageIndex)), color: property("color").value,
-      strokeWidth: Number(property("stroke").value), fill: property("fill-enabled").checked ? property("fill").value : null }); session.select([id]); });
+  function completePolygon(doubleClick = false): void {
+    // A double-click's second press finishes the first press's endpoint, even
+    // when slight pointer drift would otherwise add a tiny extra segment.
+    if (doubleClick && polygon?.previousPointCount !== undefined) polygon.points.length = polygon.previousPointCount;
+    if (!polygon || new Set(polygon.points.map(point => `${point[0]},${point[1]}`)).size < (polygon.object.shape === "polyline" ? 2 : 3)) { polygon = null; return; }
+    updatePolygonPreview(); const object = polygon.preview; polygon = null;
+    commit(() => { const id = session.addObject(object); pendingDrawings.add(id); session.select([id]); });
   }
   async function activateFont(font: EditorFont): Promise<void> {
     if (fontFaces.has(font.id)) return;
@@ -987,7 +1105,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     commit(() => { const id = session.addObject({ kind: "signature", pageIndex, opacity: objectOpacity, fillOpacity,
       paths: asset.paths.map(path => Array.from({ length: path.length / 2 }, (_, index) => [e + path[index * 2] * a, f + path[index * 2 + 1] * d] as [number, number])),
       ...(asset.smoothing !== undefined ? { smoothing: asset.smoothing * Math.abs(scale) } : {}),
-      color: property("color").value, strokeWidth: Number(property("stroke").value) }); session.select([id]); });
+      color: property("color").value, strokeWidth: Number(property("stroke").value) }); pendingDrawings.add(id); session.select([id]); });
   }
   async function save(kind: "pdf" | "flatten" | "hep" | "print"): Promise<void> {
     if (structuralRunning) return;
@@ -1126,14 +1244,18 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       case "signatures": signatureHover = null; showSignatureDialog(document, value => { signature = value; setTool("signature"); setStatus("Click to place the signature centered on the cursor. Escape returns to Select."); }, report); break;
     }
   });
-  toolbar.addEventListener("input", opacityInput);
+  function toolbarInput(event: Event): void {
+    const input = event.target as HTMLInputElement;
+    if (input.dataset.transform === "rotation") rotationDraft = { selection: currentState.selection, sourceScene: session.sourceScene };
+    else opacityInput(event);
+  }
+  toolbar.addEventListener("input", toolbarInput);
   toolbar.addEventListener("change", event => {
     if (structuralRunning) return;
     const input = event.target as HTMLInputElement;
     if (changeOpacity(input)) return;
     if (input.dataset.transform) {
-      transformProperty(input.dataset.transform, Number(input.value));
-      if (input.dataset.transform === "rotation") input.value = "0";
+      changeTransform(input);
     } else if (activeText) {
       activeText.element.focus();
       if (input.dataset.prop === "color") document.execCommand("foreColor", false, input.value);
@@ -1188,7 +1310,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   overlay.addEventListener("contextmenu", event => { void openContextMenu(event).catch(report); });
   overlay.addEventListener("pointermove", pointerMove); overlay.addEventListener("pointerup", pointerUp);
   overlay.addEventListener("pointerenter", pointerMove);
-  overlay.addEventListener("pointerleave", () => { signatureHover = null; });
+  overlay.addEventListener("pointerleave", () => { signatureHover = null; updatePolygonPreview(); });
   overlay.addEventListener("pointercancel", () => { signatureHover = null; cancelPointerGesture(); });
   overlay.addEventListener("lostpointercapture", event => { if (pointer?.id === event.pointerId || pendingPick?.id === event.pointerId && !pendingPick.released) cancelPointerGesture(); });
   overlay.addEventListener("wheel", event => {
@@ -1198,8 +1320,9 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       deltaX: event.deltaX, deltaY: event.deltaY, deltaZ: event.deltaZ, deltaMode: event.deltaMode, ctrlKey: event.ctrlKey, metaKey: event.metaKey, shiftKey: event.shiftKey }));
   }, { passive: false });
   async function doubleClick(event: MouseEvent): Promise<void> {
-    if (!active || running || isSceneSettling()) return;
-    if (tool === "polygon" || tool === "polyline") { completePolygon(); return; }
+    if (!active || running) return;
+    if (tool === "polygon" || tool === "polyline") { completePolygon(true); return; }
+    if (isSceneSettling()) return;
     if (tool !== "select" || activeText) return;
     const fieldId = fieldAtClientPoint({ x: event.clientX, y: event.clientY });
     if (fieldId) {
@@ -1246,8 +1369,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       commit(() => interaction.nudge(event.key === "ArrowLeft" ? -d : event.key === "ArrowRight" ? d : 0, event.key === "ArrowDown" ? -d : event.key === "ArrowUp" ? d : 0)); }
   }
   window.addEventListener("keydown", keydown, { signal: lifetime.signal });
-  window.addEventListener("keydown", resizeModifiers, { signal: lifetime.signal });
-  window.addEventListener("keyup", resizeModifiers, { signal: lifetime.signal });
+  window.addEventListener("keydown", transformModifiers, { signal: lifetime.signal });
+  window.addEventListener("keyup", transformModifiers, { signal: lifetime.signal });
   function hasUnsavedChanges(): boolean {
     return session.getState().dirty || hasPendingEditorTextChanges(activeText) || hasPendingEditorFields(fieldDrafts) ||
       pdfProtection.hasChanges() || Boolean(passwordDialog?.hasDraftChanges()) || structuralRunning;
@@ -1261,23 +1384,46 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   window.addEventListener("beforeunload", beforeUnload, { signal: lifetime.signal });
   updatePointerCursor(); updateState(session.getState()); toolbar.hidden = overlay.hidden = true;
   return {
-    async setEditing(value) {
+    async setEditing(value, externalSignal) {
       if (disposed || structuralRunning || active === value) return;
+      const signal = AbortSignal.any([lifetime.signal, ...(externalSignal ? [externalSignal] : [])]);
+      signal.throwIfAborted();
       contextMenu.close();
       if (!value) pendingFieldFocus = null;
       if (!value) { flushEditorFieldDrafts(fieldDrafts); if (activeText) await finishText(); }
       if (!value) { toolRequest++; cancelPointerGesture(); polygon = null; signatureHover = null; textRequest++; }
-      active = value; toolbar.hidden = overlay.hidden = !value; document.body.classList.toggle("hepr-editing", value);
-      layerControls.setActive(value); if (!value) layerDialog?.close();
-      releaseFrameListener?.(); releaseFrameListener = null;
-      if (value) releaseFrameListener = host.subscribeToFrames?.(() => { if (active && !disposed) updateGeometry(true); }) ?? null;
-      host.setEditing(value); host.onModeChange?.(value);
-      if (value) { updateGeometry(); await refreshScene(); tick(); } else window.cancelAnimationFrame(frame);
+      // Detach drawing previews only after the document has drawn their replacement.
+      if (!value) while (pendingDrawings.capture()) {
+        await refreshScene(signal, false, true); signal.throwIfAborted();
+        if (disposed) return;
+        cancelPointerGesture();
+      }
+      try {
+        active = value; toolbar.hidden = overlay.hidden = !value; document.body.classList.toggle("hepr-editing", value);
+        layerControls.setActive(value); if (!value) layerDialog?.close();
+        releaseFrameListener?.(); releaseFrameListener = null;
+        if (value) releaseFrameListener = host.subscribeToFrames?.(() => { if (active && !disposed) updateGeometry(true); }) ?? null;
+        host.setEditing(value); host.onModeChange?.(value);
+        if (value) {
+          host.onSetupProgress?.({ stage: "display" });
+          if (host.onSetupProgress) await yieldAfterPaint(signal);
+          signal.throwIfAborted();
+          updateGeometry(); await refreshScene(signal, false, true); signal.throwIfAborted(); tick();
+        } else window.cancelAnimationFrame(frame);
+      } catch (error) {
+        if (value && !disposed) {
+          active = false; toolbar.hidden = overlay.hidden = true; document.body.classList.remove("hepr-editing");
+          layerControls.setActive(false); releaseFrameListener?.(); releaseFrameListener = null;
+          window.cancelAnimationFrame(frame); host.setEditing(false); host.onModeChange?.(false);
+        }
+        throw error;
+      }
     },
     isEditing: () => active, isBusy: () => running || structuralRunning, isDirty: hasUnsavedChanges, save, attachDocuments, dropImages, confirmDocumentChange,
     dispose() {
-      if (disposed) return; disposed = true; active = false; cancelPointerGesture(false); lifetime.abort(); scenePreparation?.abort(); operation?.abort(); window.cancelAnimationFrame(frame); window.cancelAnimationFrame(previewFrame);
+      if (disposed) return; disposed = true; active = false; cancelPointerGesture(false); lifetime.abort(); scenePreparation?.abort(); operation?.abort(); window.cancelAnimationFrame(frame);
       pendingFieldFocus = null;
+      pendingDrawings.clear();
       releaseFrameListener?.(); releaseFrameListener = null;
       passwordDialog?.close(); pagesDialog?.close(true); pdfProtection.dispose();
       contextMenu.dispose();

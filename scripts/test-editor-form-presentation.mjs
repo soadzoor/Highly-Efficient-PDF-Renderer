@@ -9,10 +9,23 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
     ? next(`${specifier}.ts`, context) : next(specifier, context);
 } });
 class Element extends EventTarget {
-  children = []; dataset = {}; style = {}; value = ""; selected = false; checked = false; multiple = false;
+  children = []; dataset = {}; style = {}; storedValue = ""; selected = false; checked = false; multiple = false;
   constructor(tag, ownerDocument) { super(); this.tagName = tag.toUpperCase(); this.ownerDocument = ownerDocument; }
   setAttribute() {}
-  append(...children) { this.children.push(...children); }
+  append(...children) {
+    for (const child of children) {
+      if (this.tagName === "SELECT" && !this.multiple && child.selected) for (const option of this.children) option.selected = false;
+      this.children.push(child);
+    }
+    if (this.tagName === "SELECT" && !this.multiple && (!this.size || this.size === 1) && !this.children.some(option => option.selected)) this.children[0].selected = true;
+  }
+  get value() { return this.tagName === "SELECT" ? this.selectedOptions[0]?.value ?? "" : this.storedValue; }
+  set value(value) {
+    if (this.tagName === "SELECT") {
+      let selected = false;
+      for (const option of this.children) { option.selected = !selected && option.value === value; selected ||= option.selected; }
+    } else this.storedValue = value;
+  }
   get options() { return this.children; }
   get selectedOptions() { return this.children.filter(option => option.selected); }
 }
@@ -25,13 +38,15 @@ const checkAppearance = "0 0 0 RG 1.25 w 2 7 m 5 3 l 12 12 l S";
 try {
   const { NativePdfDocument } = await import("../src/pdf/nativeDocument.ts");
   const { NativePdfFormAppearanceRegistry } = await import("../src/pdf/nativeForms.ts");
+  const { NativePdfAnnotationMetadataRegistry } = await import("../src/pdf/nativeAnnotations.ts");
+  const { createNativeOptionalContentRegistry } = await import("../src/pdf/nativeOptionalContent.ts");
   const { openPdf } = await import("../src/pdfSession.ts");
   const { createNodeBundledStandardFontResolver } = await import("../src/nodePdfResources.ts");
   const { createEditorFontRegistry } = await import("../src/editorFonts.ts");
   const { createEditorFieldAppearanceReader } = await import("../src/editorFormAppearance.ts");
   const { createEditorAppServices } = await import("../src/editorAppServices.ts");
   const { openEditorSession } = await import("../src/editorSession.ts");
-  const { createEditorFieldControl, styleEditorFieldControl, setEditorFieldControlValue } = await import("../src/editorFormControls.ts");
+  const { createEditorFieldControl, styleEditorFieldControl, setEditorFieldControlValue, updateEditorFieldControlAppearance } = await import("../src/editorFormControls.ts");
   const { editorFieldClientGeometry } = await import("../src/editorCoordinates.ts");
   const { getEditorAnnotationFrameTransform, getEditorAnnotationSource, editorTransformBounds } = await import("../src/editorScene.ts");
   const { validateAnnotations } = await import("../src/annotationData.ts");
@@ -75,6 +90,7 @@ try {
   try {
     plain = await parser.compileVectorPage(0, { optimization: "none" });
     assert(plain.annotations.every(annotation => !annotation.field?.textStyle), "ordinary View compilation does not discover or register editor typing styles");
+    assert(plain.annotations.every(annotation => !annotation.field?.buttonMark), "ordinary View compilation does not read Widget mark captions");
     editor = await openEditorSession(plain, services.sessionOptions);
     const named = name => editor.sourceScene.annotations.find(annotation => annotation.field?.name === name);
     assert.equal(named("Fixed").field.textStyle.fontSize, 10); assert.equal(named("Auto").field.textStyle.fontSize, 0);
@@ -146,10 +162,16 @@ try {
     let committed;
     const radio = createEditorFieldControl(document, named("Radio"), "Off", value => committed = value, { usePdfAppearance: true });
     assert.equal(radio.type, "radio"); assert.equal(radio.name, "hepr-field-Radio"); assert.equal(radio.dataset.pdfAppearance, "true");
+    assert.equal(named("Radio").field.buttonMark, "check"); assert.equal(radio.dataset.buttonMark, "check", "a /CA(4) radio uses the document's checkmark without changing group semantics");
+    assert.equal(radio.style.backgroundImage, "none");
     radio.checked = true; radio.dispatchEvent(new Event("change")); assert.equal(committed, "Yes");
+    const radioSvg = buttonSvg(radio);
+    assert.match(radioSvg, /<path d="M/); assert.match(radioSvg, /stroke="#000"/); assert.doesNotMatch(radioSvg, /ellipse/);
     const css = await readFile(new URL("../src/editorUi.css", import.meta.url), "utf8");
-    assert.match(css, /input\.hepr-editor-field\[data-pdf-appearance=true\]\[type=radio\]\{[^}]*appearance:none/,
-      "PDF-backed radio controls leave their stored check glyph visible instead of adding a native radio dot");
+    assert.match(css, /input\.hepr-editor-field\[type=radio\]\{[^}]*appearance:none/,
+      "checkbox/radio previews never use browser-native blue marks");
+    assert.match(css, /input\.hepr-editor-field\[data-pdf-appearance=true\]:not\(\[data-pdf-pending=true\]\)\[type=radio\]\{[^}]*background-image:none!important/,
+      "PDF-backed radio controls hide the temporary SVG after the matching appearance is drawn");
     editor.setFieldValue("Radio", "Yes");
     const saved = await NativePdfDocument.open({ kind: "bytes", bytes: new Uint8Array(await (await editor.savePdf()).arrayBuffer()) });
     try {
@@ -181,11 +203,131 @@ try {
     assert.equal(Buffer.from(hepBytes).indexOf(Buffer.from(buildTinySfnt())), -1, "HEP contains no embedded source font program");
     assert.equal(Buffer.from(hepBytes).indexOf(Buffer.from(bytes)), -1, "HEP contains no source PDF");
   } finally { compact.dispose(); }
+  for (const [caption, expected] of [["4", "check"], ["l", "circle"], ["8", "cross"], ["u", "diamond"], ["n", "square"], ["H", "star"], ["constructor", undefined]]) {
+    const source = await NativePdfDocument.open({ kind: "bytes", bytes: fixture(caption) });
+    try {
+      const forms = new NativePdfFormAppearanceRegistry(source), optional = await createNativeOptionalContentRegistry(source);
+      const registry = new NativePdfAnnotationMetadataRegistry(source, forms, optional, () => {}, true);
+      const annotation = (await registry.getPageAnnotations(0)).find(annotation => annotation.field?.name === "Radio");
+      assert.equal(annotation.field.buttonMark, expected, `editor-only caption ${caption} discovery`);
+    } finally { await source.close(); }
+  }
+  const markOnly = structuredClone(plain);
+  for (const annotation of markOnly.annotations) if (annotation.field) {
+    const { type, name, flags, value } = annotation.field; annotation.field = { type, name, flags, value, buttonMark: "check" };
+  }
+  const marked = await openEditorSession(markOnly);
+  try {
+    const bytes = new Uint8Array(await (await marked.saveHep({ withVectorLod: false, withTextLod: false, encodeRasterImages: false, compression: "store" })).arrayBuffer());
+    const reopened = await loadSceneFromHep(bytes);
+    assert(reopened.annotations.every(annotation => !annotation.field?.buttonMark), "HEP strips preview-only mark hints even when no other editing metadata exists");
+  } finally { marked.dispose(); }
+  const seed = structuredClone(plain.annotations.find(annotation => annotation.field?.type === "Tx"));
+  seed.field.value = "Old";
+  const painted = value => ({ ...seed, field: { ...seed.field, value } });
+  for (const value of ["New", "", null]) {
+    const control = createEditorFieldControl(document, seed, value, () => {}, { usePdfAppearance: true });
+    assert.equal(control.value, value ?? "", "explicit null clears rather than falling back to the source value");
+    control.selectionStart = control.selectionEnd = 0;
+    updateEditorFieldControlAppearance(control, seed, true);
+    assert.equal(control.dataset.pdfPending, "true", "a new or cleared value must cover old presented glyphs");
+    updateEditorFieldControlAppearance(control, painted(value), true);
+    assert.equal(control.dataset.pdfPending, undefined, "matching presented values hand paint back to the PDF");
+    assert.equal(control.value, value ?? ""); assert.equal(control.selectionStart, 0); assert.equal(control.selectionEnd, 0);
+    updateEditorFieldControlAppearance(control, seed, false);
+    assert.equal(control.dataset.pdfAppearance, undefined); assert.equal(control.dataset.pdfPending, undefined, "controls without PDF paint remain naturally visible");
+  }
+  const originalControl = createEditorFieldControl(document, seed, undefined, () => {});
+  assert.equal(originalControl.value, "Old", "undefined still uses the original field value after undo removes the override");
+  for (const flags of [0, 4096]) for (const value of ["First\r\nSecond", "First\rSecond", "First\nSecond"]) {
+    const annotation = { ...seed, field: { ...seed.field, flags, value } };
+    const nativeValue = flags & 4096 ? value.replace(/\r\n?/g, "\n") : value.replace(/[\r\n]/g, "");
+    const control = createEditorFieldControl(document, annotation, nativeValue, () => {}, { usePdfAppearance: true });
+    updateEditorFieldControlAppearance(control, annotation, true);
+    assert.equal(control.dataset.pdfPending, undefined, "native newline sanitization does not keep unchanged PDF fields pending forever");
+    control.value += " New"; updateEditorFieldControlAppearance(control, annotation, true);
+    assert.equal(control.dataset.pdfPending, "true", "newline normalization still detects newly edited text");
+  }
+  const rapid = createEditorFieldControl(document, seed, "B", () => {}, { usePdfAppearance: true });
+  updateEditorFieldControlAppearance(rapid, seed, true); assert.equal(rapid.dataset.pdfPending, "true");
+  rapid.value = "C"; rapid.selectionStart = 1;
+  updateEditorFieldControlAppearance(rapid, painted("B"), true); assert.equal(rapid.dataset.pdfPending, "true", "an older B draw cannot expose itself over the C draft");
+  updateEditorFieldControlAppearance(rapid, painted("C"), true); assert.equal(rapid.dataset.pdfPending, undefined);
+  assert.equal(rapid.value, "C"); assert.equal(rapid.selectionStart, 1, "paint handoff preserves the focused caret");
+  rapid.value = "Old"; updateEditorFieldControlAppearance(rapid, seed, true);
+  assert.equal(rapid.dataset.pdfPending, undefined, "returning to an already presented value needs no new appearance");
+  const choice = { ...seed, field: { ...seed.field, type: "Ch", flags: 2097152,
+    options: [{ value: "A", label: "Alpha" }, { value: "B", label: "Beta" }, { value: "C", label: "Gamma" }], value: ["A"] } };
+  const list = createEditorFieldControl(document, choice, ["B", "A"], () => {}, { usePdfAppearance: true });
+  updateEditorFieldControlAppearance(list, choice, true); assert.equal(list.dataset.pdfPending, "true");
+  updateEditorFieldControlAppearance(list, { ...choice, field: { ...choice.field, value: ["B", "A", "A"] } }, true);
+  assert.equal(list.dataset.pdfPending, undefined, "multiple choices compare export-value sets rather than labels, order or duplicate values");
+  const emptyList = createEditorFieldControl(document, choice, null, () => {});
+  assert.equal(emptyList.selectedOptions.length, 0, "null clears a list instead of reselecting source values");
+  const dropdown = { ...choice, field: { ...choice.field, flags: 131072, value: "A" } };
+  const select = createEditorFieldControl(document, dropdown, "B", () => {}); setEditorFieldControlValue(select, dropdown, "B");
+  updateEditorFieldControlAppearance(select, dropdown, true); assert.equal(select.dataset.pdfPending, "true");
+  updateEditorFieldControlAppearance(select, { ...dropdown, field: { ...dropdown.field, value: "B" } }, true); assert.equal(select.dataset.pdfPending, undefined);
+  for (const options of [dropdown.field.options, []]) for (const value of ["Unavailable", "", null]) {
+    const annotation = { ...dropdown, field: { ...dropdown.field, options, value } };
+    const control = createEditorFieldControl(document, annotation, undefined, () => {}, { usePdfAppearance: true });
+    assert.equal(control.value, ""); assert.equal(control.selectedOptions.length, 0, "unrepresented source values must not default to the first option");
+    updateEditorFieldControlAppearance(control, annotation, true);
+    assert.equal(control.dataset.pdfPending, undefined, "an unavailable, empty or null source choice keeps its original PDF appearance");
+  }
+  for (const value of ["", null]) {
+    const cleared = createEditorFieldControl(document, dropdown, value, () => {});
+    assert.equal(cleared.value, ""); assert.equal(cleared.selectedOptions.length, 0, "explicit empty/null choices clear the browser's first-option default");
+    updateEditorFieldControlAppearance(cleared, dropdown, true); assert.equal(cleared.dataset.pdfPending, "true");
+    updateEditorFieldControlAppearance(cleared, { ...dropdown, field: { ...dropdown.field, value } }, true); assert.equal(cleared.dataset.pdfPending, undefined);
+  }
+  const combo = { ...dropdown, field: { ...dropdown.field, flags: 262144 } };
+  const editableChoice = createEditorFieldControl(document, combo, null, () => {});
+  assert.equal(editableChoice.value, "");
+  updateEditorFieldControlAppearance(editableChoice, combo, true); assert.equal(editableChoice.dataset.pdfPending, "true");
+  for (const flags of [0, 32768]) for (const onValue of ["A", "B"]) {
+    const annotation = { ...seed, field: { name: "Shared", type: "Btn", flags, onValue, value: "A" } };
+    const control = createEditorFieldControl(document, annotation, "B", () => {}, { usePdfAppearance: true });
+    updateEditorFieldControlAppearance(control, annotation, true);
+    assert.equal(control.dataset.pdfPending, "true", "each shared widget's checked state must cover its old mark");
+    updateEditorFieldControlAppearance(control, { ...annotation, field: { ...annotation.field, value: "B" } }, true);
+    assert.equal(control.dataset.pdfPending, undefined); assert.equal(control.checked, onValue === "B");
+    const cleared = createEditorFieldControl(document, annotation, null, () => {});
+    assert.equal(cleared.checked, false, "null clears both checkbox and radio controls");
+    updateEditorFieldControlAppearance(cleared, { ...annotation, field: { ...annotation.field, value: null } }, true);
+    assert.equal(cleared.dataset.pdfPending, undefined);
+  }
+  for (const [mark, element] of [["check", "path"], ["cross", "path"], ["circle", "ellipse"], ["diamond", "path"], ["square", "rect"], ["star", "polygon"]]) {
+    const annotation = { ...seed, pdfGeometry: { rect: [0, 0, 20, 16] }, border: { width: 1 },
+      field: { name: "Mark", type: "Btn", flags: 0, onValue: "Yes", value: "Off", buttonMark: mark } };
+    const control = createEditorFieldControl(document, annotation, "Yes", () => {}), svg = buttonSvg(control);
+    assert.match(svg, new RegExp(`<${element} `)); assert.match(svg, /viewBox="0 0 20 16"/); assert.match(svg, /#000/);
+    assert.equal(control.dataset.buttonMark, mark);
+    if (mark === "check") {
+      assert.match(svg, /stroke-width="1\.6"/, "check stroke matches native synthesis's tenth of the shorter edge");
+      assert.match(svg, /M2\.88 /, "check inset matches native synthesis's 18 percent or border-plus-one rule");
+    }
+    setEditorFieldControlValue(control, annotation, "Off"); assert.equal(control.style.backgroundImage, "none");
+    control.checked = true; control.dispatchEvent(new Event("input")); assert.equal(control.style.backgroundImage, `url("data:image/svg+xml,${encodeURIComponent(svg)}")`);
+  }
+  for (const flags of [0, 32768]) {
+    const annotation = { ...seed, field: { name: "Default mark", type: "Btn", flags, onValue: "Yes" } };
+    const control = createEditorFieldControl(document, annotation, true, () => {});
+    assert.equal(control.dataset.buttonMark, flags ? "circle" : "check", "buttons without caption hints use compact PDF-like default marks");
+    assert.match(buttonSvg(control), flags ? /<ellipse / : /<path /);
+  }
+  const invalidMark = structuredClone(seed); invalidMark.field.buttonMark = "triangle";
+  assert.throws(() => validateAnnotations([invalidMark], { pageCount: 1, conditionCount: plain.optionalContent?.conditions.length ?? 0 }), /annotation metadata/);
   assert.deepEqual(bytes, original);
   console.log("Form presentation: source fonts/styles, PDFium auto sizes, transformed accessible controls, source radio checks and compact HEP passed.");
 } finally { hooks.deregister(); }
 
-function fixture() {
+function buttonSvg(control) {
+  const match = /^url\("data:image\/svg\+xml,(.*)"\)$/.exec(control.style.backgroundImage);
+  assert(match, "checked controls expose an inline vector preview"); return decodeURIComponent(match[1]);
+}
+
+function fixture(caption = "4") {
   const text = (name, rect, extra = "") => `<< /Type /Annot /Subtype /Widget /FT /Tx /T (${name}) /V () /Rect [${rect}] /AP << /N 9 0 R >> ${extra} >>`;
   return writeTinyPdf({ objects: [
     { number: 1, body: "<< /Type /Catalog /Pages 2 0 R /AcroForm 11 0 R >>" },
@@ -204,7 +346,7 @@ function fixture() {
     { number: 14, body: text("Styled", "10 110 80 130", "/DA (/Emb 9.5 Tf .2 .3 .4 rg)") },
     { number: 15, body: text("Cmyk", "10 80 80 100", "/DA (/TiRo 7 Tf 0 .5 .7 .2 k)") },
     { number: 16, body: text("Multi", "10 30 80 67.49", "/Ff 4096 /DA (/TiRo 0 Tf 0 g) /BS << /W 1 >> /MK << /BC [0] >>") },
-    { number: 17, body: "<< /Type /Annot /Subtype /Widget /FT /Btn /Ff 49152 /T (Radio) /V /Off /AS /Off /Rect [100 20 114.173 34.173] /MK << /CA (4) >> /AP << /N << /Off 9 0 R /Yes 10 0 R >> >> >>" },
+    { number: 17, body: `<< /Type /Annot /Subtype /Widget /FT /Btn /Ff 49152 /T (Radio) /V /Off /AS /Off /Rect [100 20 114.173 34.173] /MK << /CA (${caption}) >> /AP << /N << /Off 9 0 R /Yes 10 0 R >> >> >>` },
     { number: 18, body: text("Borderless", "0 0 500 13", "/DA (/TiRo 0 Tf 0 g)") }
   ] });
 }

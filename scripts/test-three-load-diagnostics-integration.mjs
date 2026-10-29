@@ -40,7 +40,7 @@ function fixture(layout, backend) {
   };
   const cameraPart = { copy: noop };
   const context = vm.createContext({
-  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
+  pdfEditor: null, editorSceneApplicationActive: false, discardNativeEditor: () => true, discardThreeEditor: () => true,
     performance, AbortController, URLSearchParams, console: { warn: noop }, ViewerLoadDiagnostics,
     document: { querySelector: selector => controls[selector.slice(1)] },
     window: Object.assign(new Control(), {
@@ -64,7 +64,7 @@ function fixture(layout, backend) {
     readThreeObjectOptions: () => ({ vectorLod: "auto", textLod: "auto" }),
     cancelActiveHepExport: noop, filenameFromUrl: value => value.split("/").at(-1),
     setStatus: message => statuses.push(message), clearLoadedStatus: noop,
-    setLoadingProgress: noop, setLoadControlsEnabled: noop,
+    setLoadingProgress: noop, setLoadControlsEnabled: noop, updateThreeBackendSelectDisabledState: noop,
     setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop,
     resetVectorStrokeLodBuildTiming: noop,
     consumeVectorStrokeLodBuildTiming: () => ({ elapsedMs: 0, buildCount: 0 }),

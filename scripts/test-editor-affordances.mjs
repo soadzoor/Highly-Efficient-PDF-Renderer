@@ -3,12 +3,13 @@ import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 import { sourceFunction } from "./lib/sourceFunction.mjs";
 import { editorFrameCorners, editorFrameCenter, editorFrameSize, editorFrameResizeMatrix, editorFrameScaleMatrix,
-  editorFrameClientGeometry } from "../src/editorSelectionGeometry.ts";
+  editorFrameClientGeometry, editorFrameRotation, editorFrameRotationMatrix, editorFrameRotationDragMatrix } from "../src/editorSelectionGeometry.ts";
 import { waitForLoad } from "../src/loadCancellation.ts";
 import { droppedFileKind } from "../src/documentDropFiles.ts";
 
 const IDENTITY = [1, 0, 0, 1, 0, 0];
-const frameHelpers = { editorFrameCorners, editorFrameCenter, editorFrameSize, editorFrameResizeMatrix, editorFrameScaleMatrix, editorFrameClientGeometry, IDENTITY };
+const frameHelpers = { editorFrameCorners, editorFrameCenter, editorFrameSize, editorFrameResizeMatrix, editorFrameScaleMatrix, editorFrameClientGeometry,
+  editorFrameRotation, editorFrameRotationMatrix, editorFrameRotationDragMatrix, IDENTITY };
 
 const [source, css, nativeCss, threeHtml] = await Promise.all([
   readFile(new URL("../src/editorUi.ts", import.meta.url), "utf8"),
@@ -17,11 +18,16 @@ const [source, css, nativeCss, threeHtml] = await Promise.all([
   readFile(new URL("../three-example.html", import.meta.url), "utf8")
 ]);
 const nested = source.replace(/^ {2}/gm, "");
-const install = (context, ...names) => { for (const name of names) vm.runInContext(sourceFunction(nested, name), context); };
+const install = (context, ...names) => {
+  if (names.some(name => ["pointerDown", "pointerMove", "pointerUp"].includes(name))) names.push("createShapeDraft", "updateShapeGesture");
+  for (const name of names) vm.runInContext(sourceFunction(nested, name), context);
+};
 const bounds = { minX: 10, minY: 20, maxX: 50, maxY: 60 };
 let geometryFrame = { bounds, transform: IDENTITY };
 const shapes = [], overlay = { dataset: {}, style: {} };
+const rotationInput = { value: "", disabled: false, dataset: { transform: "rotation" } }, rotationDocument = { activeElement: null };
 const geometry = vm.createContext({
+  pendingDrawings: { visible: () => [] },
   ...frameHelpers,
   currentState: { revision: 0, selection: ["object"] }, presented: null, isSceneSettling: () => false,
   host: { getCanvas: () => ({ getBoundingClientRect: () => ({ left: 100, top: 50, width: 400, height: 300 }) }),
@@ -31,9 +37,10 @@ const geometry = vm.createContext({
   sceneBoundsToClient: value => ({ minX: value.minX + 100, minY: value.minY + 50, maxX: value.maxX + 100, maxY: value.maxY + 50 }),
   svg: (tag, attributes) => { const element = { tag, ...attributes, style: {} }; shapes.push(element); return element; }, fields: { querySelectorAll: () => [] },
   pointer: null, pendingPick: null, polygon: null, signature: null, signatureHover: null, activeText: null, running: false, tool: "select", latestScene: {},
-  property: () => ({ value: "#123456" }), focusPendingField() {}, updateTextVisibility: () => true
+  property: () => ({ value: "#123456" }), focusPendingField() {}, updateTextVisibility: () => true,
+  query: () => rotationInput, document: rotationDocument, rotationDraft: null, opacityInput() {}
 });
-install(geometry, "displayedSelection", "updatePointerCursor", "updateGeometry");
+install(geometry, "displayedSelection", "updatePointerCursor", "toolbarInput", "updateRotationValue", "updateGeometry");
 for (const tool of ["select", "pan", "form", "text", "rectangle", "ellipse", "line", "arrow", "polygon", "polyline", "ink", "signature", "image"]) {
   geometry.tool = tool; geometry.updateGeometry();
   const handles = shapes.filter(item => item["data-handle"]);
@@ -49,6 +56,7 @@ assert.equal(shapes.some(item => item.class === "hepr-editor-selection-hit"), fa
 geometry.running = false;
 geometry.activeText = { pageIndex: 0, x: 1, y: 2, width: 10, height: 10, transform: [1, 0, 0, 1, 0, 0], element: { style: {} } };
 geometry.updateGeometry(); assert.equal(shapes.filter(item => item["data-handle"]).length, 0, "an active textbox owns the editing affordance");
+assert.equal(rotationInput.disabled, true, "finish the textbox draft before changing its selection rotation");
 assert.equal(shapes.some(item => item.class === "hepr-editor-selection-hit"), false);
 geometry.activeText = null;
 for (const [action, handle] of [["move", ""], ["rotate", ""], ["resize", "ne"], ["resize", "sw"], ["draw", ""], ["marquee", ""]]) {
@@ -71,7 +79,8 @@ const gestures = vm.createContext({
   active: true, running: false, structuralRunning: false, activeText: null, disposed: false, tool: "select", toolRequest: 0, textRequest: 0,
   pointer: null, pendingPick: null, pendingFieldFocus: null, fieldAtClientPoint: () => null, picking: { abort() { abortedPicks++; } }, polygon: null,
   overlay: gestureOverlay, fields: { hidden: true }, toolbar: { querySelectorAll: () => toolButtons },
-  property: () => ({ disabled: true }), renderFields() {}, updateGeometry() {}, finishText: async () => {},
+  objectOpacity: 1, fillOpacity: 1, pageLocal: point => [point.x, point.y],
+  property: name => ({ disabled: true, value: name === "stroke" ? "2" : "#123456", checked: false }), renderFields() {}, updateGeometry() {}, finishText: async () => {},
   currentState: { selection: [] }, updateOpacityControls() {},
   contextMenu: { close() {} },
   host: { clientToScenePoint: (x, y) => ({ x, y }) }, pageAt: () => 0,
@@ -376,7 +385,7 @@ const resizing = vm.createContext({ active: true, running: false, structuralRunn
   interaction: { previewTransform: matrix => resizePreviews.push(Array.from(matrix)), applyTransform: matrix => resizeCommits.push(Array.from(matrix)) },
   commit: change => change()
 });
-install(resizing, "dragMatrix", "resizeTextBox", "resizeModifiers", "updatePointerCursor", "pointerDown", "pointerMove", "pointerUp");
+install(resizing, "dragMatrix", "resizeTextBox", "transformModifiers", "updatePointerCursor", "pointerDown", "pointerMove", "pointerUp");
 const resizeEvent = (x, y, modifiers = {}) => ({ ...event(30, "ne"), clientX: x, clientY: y, shiftKey: false, altKey: false, ...modifiers });
 await resizing.pointerDown(resizeEvent(110, 70, { shiftKey: true, altKey: true }));
 assert.equal(resizing.pointer.freeResize, true); assert.equal(resizing.pointer.scaleText, true, "corner press captures Shift and Alt");
@@ -432,22 +441,22 @@ for (const [name, transform] of [["rotated", [0, 1, -1, 0, 200, 300]], ["sheared
 resizing.session.sourceScene = { pageRects: [0, 0, 400, 300] }; resizeSelection = ["first", "second"];
 await resizing.pointerDown(resizeEvent(110, 70)); resizing.pointerMove(resizeEvent(210, 45));
 const stationaryPosition = resizing.pointer.last;
-resizing.resizeModifiers({ key: "Shift", shiftKey: true, altKey: false });
+resizing.transformModifiers({ key: "Shift", shiftKey: true, altKey: false });
 assert.equal(resizing.pointer.freeResize, true); nearMatrix(resizePreviews.at(-1), [2, 0, 0, .5, -10, 10], "Shift press previews free scaling without pointer movement");
-resizing.resizeModifiers({ key: "Alt", shiftKey: true, altKey: true }); assert.equal(resizing.pointer.scaleText, true);
-resizing.resizeModifiers({ key: "Shift", shiftKey: false, altKey: true });
+resizing.transformModifiers({ key: "Alt", shiftKey: true, altKey: true }); assert.equal(resizing.pointer.scaleText, true);
+resizing.transformModifiers({ key: "Shift", shiftKey: false, altKey: true });
 assert.equal(resizing.pointer.freeResize, false); nearMatrix(resizePreviews.at(-1), [1.7, 0, 0, 1.7, -7, -14], "Shift release restores constrained scaling without pointer movement");
-resizing.resizeModifiers({ key: "Alt", shiftKey: false, altKey: false }); assert.equal(resizing.pointer.scaleText, false);
+resizing.transformModifiers({ key: "Alt", shiftKey: false, altKey: false }); assert.equal(resizing.pointer.scaleText, false);
 assert.equal(resizing.pointer.last, stationaryPosition);
 const modifierPreviews = resizePreviews.length;
-resizing.resizeModifiers({ key: "Shift", shiftKey: true, altKey: false, isComposing: true });
-resizing.resizeModifiers({ key: "x", shiftKey: true, altKey: false });
+resizing.transformModifiers({ key: "Shift", shiftKey: true, altKey: false, isComposing: true });
+resizing.transformModifiers({ key: "x", shiftKey: true, altKey: false });
 assert.equal(resizePreviews.length, modifierPreviews, "IME and unrelated keys do not alter active resize geometry");
 resizing.pointerUp(resizeEvent(210, 45)); nearMatrix(resizeCommits.at(-1), resizePreviews.at(-1), "stationary modifier preview and final commit agree");
 await resizing.pointerDown(resizeEvent(110, 70, { shiftKey: true })); resizing.pointerMove(resizeEvent(-40, 120, { shiftKey: true }));
 nearMatrix(resizePreviews.at(-1), [-.5, 0, 0, 2, 15, -20], "valid reflected free preview before releasing Shift");
 const beforeSingularPreview = resizePreviews.length, beforeSingularCommit = resizeCommits.length;
-resizing.resizeModifiers({ key: "Shift", shiftKey: false, altKey: false });
+resizing.transformModifiers({ key: "Shift", shiftKey: false, altKey: false });
 assert.equal(resizePreviews.length, beforeSingularPreview); assert.equal(resizeRestores.at(-1), true, "singular uniform projection restores committed paint rather than retaining the prior preview");
 geometry.IDENTITY = [1, 0, 0, 1, 0, 0]; geometry.dragMatrix = matrixHost.dragMatrix; geometry.pointer = resizing.pointer;
 geometryFrame = resizing.pointer.frame; geometry.presented = null;
@@ -461,13 +470,22 @@ const reflectedPreviewCount = resizePreviews.length, restoresBeforeSingularMove 
 resizing.pointerMove(resizeEvent(-40, 120));
 assert.equal(resizePreviews.length, reflectedPreviewCount); assert.equal(resizeRestores.length, restoresBeforeSingularMove + 1); assert.equal(resizeRestores.at(-1), true, "pointer movement to zero projection also clears an earlier reflected preview");
 resizing.pointerUp(resizeEvent(-40, 120));
-for (const type of ["keydown", "keyup"]) assert.match(source, new RegExp(`window\\.addEventListener\\(["']${type}["'],\\s*resizeModifiers`));
+for (const type of ["keydown", "keyup"]) assert.match(source, new RegExp(`window\\.addEventListener\\(["']${type}["'],\\s*transformModifiers`));
 
 // The rendered frame retains its actual corners through preview and all
 // committed-selection states, instead of replacing them with an axis hull.
 const angle30 = Math.PI / 6, initialOrientedFrame = { bounds: resizeBounds,
   transform: [Math.cos(angle30), Math.sin(angle30), -Math.sin(angle30), Math.cos(angle30), 200, 150] };
 geometryFrame = initialOrientedFrame; geometry.pointer = null; geometry.updateGeometry();
+assert.equal(rotationInput.value, "30", "Rotate shows the selection's current angle");
+rotationDocument.activeElement = rotationInput; rotationInput.value = "12.75"; geometry.toolbarInput({ target: rotationInput }); geometry.updateGeometry();
+assert.equal(rotationInput.value, "12.75", "frame updates preserve an active numeric draft");
+geometry.currentState = { revision: 0, selection: ["other"] };
+geometry.updateRotationValue({ bounds: resizeBounds, transform: [0, 1, -1, 0, 0, 0] });
+assert.equal(rotationInput.value, "90", "selecting another object refreshes a focused Rotate field");
+assert.equal(geometry.rotationDraft, null, "a draft cannot carry over to another selection");
+geometry.currentState = { revision: 0, selection: ["object"] };
+rotationDocument.activeElement = null; geometry.updateGeometry(); assert.equal(rotationInput.value, "30");
 const renderedCorners = () => shapes.find(item => item.tag === "polygon" && item.class === "hepr-editor-selection")?.points.split(" ").map(pair => {
   const [x, y] = pair.split(",").map(Number); return { x, y };
 });
@@ -502,14 +520,20 @@ geometry.pointer = { action: "rotate", frame: initialOrientedFrame, bounds: resi
 const rotationDelta = geometry.dragMatrix(geometry.pointer, geometry.pointer.last), committedFrame = { ...initialOrientedFrame,
   transform: composeMatrices(rotationDelta, initialOrientedFrame.transform) };
 geometry.updateGeometry(); checkRenderedFrame(editorFrameCorners(initialOrientedFrame));
+assert.equal(rotationInput.value, "30", "the angle keeps the last presented pose until its preview is drawn");
 geometry.presented = { sourceScene: geometry.session.sourceScene, revision: 0, selection: new Set(["object"]), frame: initialOrientedFrame, delta: rotationDelta };
+rotationDocument.activeElement = rotationInput;
 geometry.updateGeometry(); checkRenderedFrame(editorFrameCorners(initialOrientedFrame, rotationDelta));
+near(Number(rotationInput.value), editorFrameRotation(initialOrientedFrame, rotationDelta), "the displayed angle follows the presented rotation preview");
 assert(shapes.filter(item => item.tag === "rect" && item["data-handle"]).every(handle => handle.style.cursor === "inherit"),
   "corner handles inherit the active rotation cursor instead of overriding it with idle resize cursors");
 geometryFrame = committedFrame; geometry.pointer = null;
 geometry.presented = { sourceScene: geometry.session.sourceScene, revision: 0, selection: new Set(["object"]), frame: committedFrame, delta: null };
 geometry.updateGeometry(); checkRenderedFrame(editorFrameCorners(committedFrame));
+near(Number(rotationInput.value), editorFrameRotation(committedFrame), "a focused field follows the committed rotation after release");
+rotationDocument.activeElement = null;
 geometryFrame = null; geometry.updateGeometry(); assert.equal(renderedCorners(), undefined);
+assert.equal(rotationInput.value, ""); assert.equal(rotationInput.disabled, true, "clearing selection disables and clears Rotate");
 assert.equal(shapes.some(item => item.class === "hepr-editor-selection-hit"), false, "empty selection has no move hit area");
 geometryFrame = committedFrame; geometry.updateGeometry(); checkRenderedFrame(editorFrameCorners(committedFrame));
 geometryFrame = initialOrientedFrame; geometry.updateGeometry(); checkRenderedFrame(editorFrameCorners(initialOrientedFrame));
@@ -566,26 +590,83 @@ nearMatrix(resizeCommits.at(-1), [2.6, 0, 0, 2.6, -16, -32], "final handle relea
 
 let numericFrame = initialOrientedFrame;
 const numericMatrices = [], numericNudges = [];
-const numeric = vm.createContext({ ...frameHelpers, session: { getSelectionFrame: () => numericFrame,
+const numeric = vm.createContext({ ...frameHelpers, activeText: null, pointer: null, currentState: { selection: ["numeric"] }, rotationDraft: null,
+  document: rotationDocument, query: () => rotationInput, session: { sourceScene: {}, getSelectionFrame: () => numericFrame,
   getSelectionBounds() { const corners = editorFrameCorners(numericFrame); return { minX: Math.min(...corners.map(point => point.x)), minY: Math.min(...corners.map(point => point.y)), maxX: Math.max(...corners.map(point => point.x)), maxY: Math.max(...corners.map(point => point.y)) }; } },
   commit: change => change(), interaction: { applyTransform(matrix) { numericMatrices.push(Array.from(matrix)); numericFrame = { ...numericFrame, transform: composeMatrices(matrix, numericFrame.transform) }; },
     nudge(x, y) { numericNudges.push([x, y]); } } });
-install(numeric, "transformProperty");
+install(numeric, "transformProperty", "changeTransform", "updateRotationValue");
 const initialSize = editorFrameSize(numericFrame), fixedSouthwest = editorFrameCorners(numericFrame)[3];
 numeric.transformProperty("width", initialSize.width * 2);
 near(editorFrameSize(numericFrame).width, initialSize.width * 2, "numeric rotated local width"); near(editorFrameSize(numericFrame).height, initialSize.height, "numeric width retains local height");
 near(editorFrameCorners(numericFrame)[3].x, fixedSouthwest.x, "numeric southwest X"); near(editorFrameCorners(numericFrame)[3].y, fixedSouthwest.y, "numeric southwest Y");
 numeric.transformProperty("height", initialSize.height * 1.5); near(editorFrameSize(numericFrame).height, initialSize.height * 1.5, "numeric rotated local height");
 const beforeNumericRotation = numericFrame, numericCenter = editorFrameCenter(numericFrame);
-numeric.transformProperty("rotation", 30); const numericRotation = numericMatrices.at(-1);
+numeric.transformProperty("rotation", 90); const numericRotation = numericMatrices.at(-1);
+near(editorFrameRotation(numericFrame), 90, "numeric Rotate sets the absolute selection angle");
 near(transformPoint(numericRotation, numericCenter).x, numericCenter.x, "numeric rotation fixes frame center X"); near(transformPoint(numericRotation, numericCenter).y, numericCenter.y, "numeric rotation fixes frame center Y");
+const numericDragAngle = (90 - editorFrameRotation(beforeNumericRotation)) * Math.PI / 180;
 const dragRotation = matrixHost.dragMatrix({ action: "rotate", frame: beforeNumericRotation, bounds: resizeBounds,
-  start: { x: numericCenter.x + 50, y: numericCenter.y } }, { x: numericCenter.x + Math.cos(angle30) * 50, y: numericCenter.y + Math.sin(angle30) * 50 });
+  freeRotation: true, start: { x: numericCenter.x + 50, y: numericCenter.y } },
+  { x: numericCenter.x + Math.cos(numericDragAngle) * 50, y: numericCenter.y + Math.sin(numericDragAngle) * 50 });
 nearMatrix(numericRotation, dragRotation, "numeric and drag rotation use the same center");
+numeric.transformProperty("rotation", 90); nearMatrix(numericMatrices.at(-1), IDENTITY, "repeating an absolute angle does not rotate again");
+numeric.transformProperty("rotation", 12.75); near(editorFrameRotation(numericFrame), 12.75, "numeric entry retains precise unsnapped angles");
+numeric.transformProperty("rotation", 450); near(editorFrameRotation(numericFrame), 90, "numeric angles wrap to the current orientation");
+rotationDocument.activeElement = rotationInput; rotationInput.value = "450";
+numeric.changeTransform(rotationInput); assert.equal(rotationInput.value, "90", "a committed numeric angle normalizes even while focused");
+numeric.updateRotationValue(beforeNumericRotation);
+assert.equal(rotationInput.value, "90", "the accepted numeric value is retained while earlier document frames are still displayed");
+const beforeBlankRotation = numericMatrices.length; rotationInput.value = ""; numeric.changeTransform(rotationInput);
+assert.equal(numericMatrices.length, beforeBlankRotation, "blank rotation input does not rotate the selection to zero"); assert.equal(rotationInput.value, "90");
+numeric.pointer = { action: "rotate" }; numeric.updateRotationValue(beforeNumericRotation);
+assert.equal(rotationInput.value, "30", "a subsequent rotation gesture takes over from the focused numeric edit");
+numeric.pointer = null; numeric.updateRotationValue(numericFrame); assert.equal(rotationInput.value, "90", "release or cancellation updates a focused field after gesture takeover");
+rotationDocument.activeElement = null;
 const worldBounds = numeric.session.getSelectionBounds(); numeric.transformProperty("x", worldBounds.minX + 17); numeric.transformProperty("y", worldBounds.minY - 9);
 assert.deepEqual(numericNudges, [[17, 0], [0, -9]], "numeric positions retain their world-axis placement contract");
 const transformsBeforeInvalidProperty = numericMatrices.length; numeric.transformProperty("width", 0); numeric.transformProperty("rotation", NaN);
 assert.equal(numericMatrices.length, transformsBeforeInvalidProperty);
+
+// Rotation uses the same snapped/free pose for drag previews, stationary
+// modifier changes and final release, including a page-plane handle drag.
+const rotateRadians = 17 * Math.PI / 180;
+resizeFrame = { bounds: resizeBounds, transform: [Math.cos(rotateRadians), Math.sin(rotateRadians), -Math.sin(rotateRadians), Math.cos(rotateRadians), 20, 30], pageIndex: 7 };
+resizeSelection = ["first", "second"];
+const rotateCenter = editorFrameCenter(resizeFrame), rotationPages = [];
+resizing.host.clientToScenePoint = (x, y, pageIndex) => { rotationPages.push(pageIndex); return { x, y }; };
+const rotateEvent = (angle, modifiers = {}) => {
+  const radians = angle * Math.PI / 180;
+  return { ...resizeEvent(rotateCenter.x + Math.cos(radians) * 100, rotateCenter.y + Math.sin(radians) * 100, modifiers), target: event(30, "rotate").target };
+};
+const resultingAngle = matrix => editorFrameRotation(resizeFrame, matrix);
+await resizing.pointerDown(rotateEvent(0));
+assert.equal(resizing.pointer.action, "rotate"); assert.equal(resizing.pointer.freeRotation, false);
+resizing.pointerMove(rotateEvent(-14)); near(resultingAngle(resizePreviews.at(-1)), 0, "rotation near zero snaps to zero");
+resizing.pointerMove(rotateEvent(-11)); near(resultingAngle(resizePreviews.at(-1)), 6, "rotation outside zero's five-degree window remains free");
+resizing.pointerMove(rotateEvent(18)); near(resultingAngle(resizePreviews.at(-1)), 35, "rotation outside the next snapping window remains free");
+resizing.pointerMove(rotateEvent(30)); near(resultingAngle(resizePreviews.at(-1)), 45, "drag snaps the absolute orientation to 45 degrees");
+resizing.transformModifiers({ key: "Alt", altKey: true, shiftKey: false });
+near(resultingAngle(resizePreviews.at(-1)), 47, "Alt frees rotation without requiring pointer motion");
+const beforeIgnoredRotationModifier = resizePreviews.length;
+resizing.transformModifiers({ key: "Shift", altKey: true, shiftKey: true });
+assert.equal(resizePreviews.length, beforeIgnoredRotationModifier, "Shift keeps its existing selection/resize role");
+resizing.transformModifiers({ key: "Alt", altKey: false, shiftKey: false });
+near(resultingAngle(resizePreviews.at(-1)), 45, "releasing Alt restores snapping at the stationary pointer");
+resizing.pointerUp(rotateEvent(43, { altKey: true }));
+near(resultingAngle(resizeCommits.at(-1)), 60, "release uses its final coordinates and Alt modifier");
+assert(rotationPages.every(page => page === 7), "rotation keeps the selected page plane through release");
+await resizing.pointerDown(rotateEvent(0, { altKey: true }));
+assert.equal(resizing.pointer.freeRotation, true, "Alt is captured when the rotation starts");
+resizing.pointerMove(rotateEvent(40, { altKey: true })); near(resultingAngle(resizePreviews.at(-1)), 57, "Alt pointer motion retains precise rotation");
+resizing.pointerUp(rotateEvent(40)); near(resultingAngle(resizeCommits.at(-1)), 57, "release outside the snapping window stays free without Alt");
+await resizing.pointerDown(rotateEvent(0, { altKey: true }));
+resizing.pointerMove(rotateEvent(40, { altKey: true }));
+resizing.pointerUp(rotateEvent(32)); near(resultingAngle(resizeCommits.at(-1)), 45, "release entering the snapping window uses the final coordinates and modifier");
+const beforeRotationClick = resizeCommits.length;
+await resizing.pointerDown(rotateEvent(0)); resizing.pointerUp(rotateEvent(0));
+assert.equal(resizeCommits.length, beforeRotationClick, "clicking a rotated grip without dragging does not snap or commit");
+assert.doesNotMatch(source, /input\.dataset\.transform === "rotation"\) input\.value = "0"/, "numeric Rotate is never reset to zero after a change");
 
 const surfaceSelection = ["first", "second"], surfaceModifiers = [], surfacePlanes = [], surfaceTransforms = [], surfaceText = [];
 let surfacePicks = 0;
@@ -640,6 +721,11 @@ assert(rule(/data-tool\s*=\s*["']?text/, /cursor\s*:\s*text/), "Text uses an ins
 assert.match(css, /--hepr-editor-pencil-cursor\s*:\s*url\([^;]+,\s*crosshair/);
 assert(rule(/data-tool\s*=\s*["']?ink/, /cursor\s*:\s*var\(--hepr-editor-pencil-cursor\)/), "pencil drawing has its own cursor");
 assert(rule(/data-busy\s*=\s*["']?true/, /cursor\s*:\s*progress/), "busy surfaces do not advertise actionable drawing cursors");
+assert(!rule(/data-tool\s*=\s*["']?(?:form|pan)[^{}]*hepr-editor-graphic/, /display\s*:\s*none/),
+  "switching to Fill or Pan keeps pending drawing previews visible until presentation");
+const settlingCursor = rules.find(value => /data-settling/.test(value.selector) && /cursor\s*:\s*progress/.test(value.declarations));
+assert(settlingCursor); assert.match(settlingCursor.selector, /:is\(\[data-tool=select\],\[data-tool=text\],\[data-tool=image\]\)/,
+  "same-source drawing tools retain their actionable cursors during preparation");
 assert(rule(/^\.hepr-editor-overlay$/, /cursor\s*:\s*crosshair/), "shape and asset placement retain a precision crosshair fallback");
 assert(rule(/data-tool\s*=\s*["']?pan/, /pointer-events\s*:\s*none/), "Pan leaves event ownership with the host canvas");
 for (const style of [nativeCss, threeHtml]) {

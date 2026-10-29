@@ -53,7 +53,7 @@ export function vectorClipChainBounds(clips: readonly VectorClipPath[] = []): Fl
 
 type ClipRectangle = [number, number, number, number];
 
-function clipRectangle(edges: Float32Array): ClipRectangle | undefined {
+export function clipRectangle(edges: Float32Array): ClipRectangle | undefined {
   if (edges.length !== 16) return undefined;
   for (let offset = 0; offset < 16; offset += 4) {
     const next = (offset + 4) % 16;
@@ -178,6 +178,8 @@ export interface VectorClipPackingStats {
 }
 
 export interface PackVectorClipOptions {
+  /** Mutable editor previews reserve independent payloads for these clip nodes. */
+  readonly exclusive?: ReadonlySet<number>;
   /**
    * Index polygons with cells instead of bands. Only shaders that read flag
    * bit 2 may be given this layout: the clip GLSL and WGSL both do.
@@ -252,11 +254,11 @@ export function packVectorClips(clips: readonly VectorClipPath[] = [], maxTexels
     // and fill rule; those stay in each original node's header.
     const edges = rectangle ? Float32Array.from(rectangle) : clip.edges;
     const words = new Uint32Array(edges.buffer, edges.byteOffset, edges.length);
-    const key = clipPayloadKey(words, !!rectangle), bucket = buckets.get(key);
+    const key = clipPayloadKey(words, !!rectangle), exclusive = options.exclusive?.has(index), bucket = exclusive ? undefined : buckets.get(key);
     let payload = bucket?.find(candidate => candidate.words.every((word, i) => word === words[i]));
     if (!payload) {
       payload = { edges, words, rectangle: !!rectangle, bands: null, cells: null, coarsened: false, offset: 0 };
-      if (bucket) bucket.push(payload); else buckets.set(key, [payload]);
+      if (!exclusive) { if (bucket) bucket.push(payload); else buckets.set(key, [payload]); }
       payloads.push(payload);
       count += edges.length / 4;
     }

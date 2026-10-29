@@ -3,6 +3,9 @@ import type { VectorClipPath, VectorScene } from "./pdfVectorExtractor";
 import { MAX_VECTOR_CLIP_TEXELS, packVectorClips } from "./vectorClips";
 import { copyThreePdfShapeUniform } from "./threePdfShape";
 import { copyThreePaintFold } from "./threePaintFold";
+import { getEditorSceneTranslationHint } from "./editorScenePreview";
+import { editorPreviewRectangleClipTexels, type EditorPreviewSceneUpdate } from "./editorPreviewSceneUpdate";
+import { patchThreeEditorPreviewTexture } from "./threeEditorPreview";
 
 const materialTextures = new WeakMap<THREE.Material, THREE.DataTexture>();
 type NodeClipCloner = (source: THREE.Material, target: THREE.Material, clipIndex: number | null, texture: THREE.DataTexture) => void;
@@ -12,6 +15,7 @@ interface SharedClipTexture {
   texture: THREE.DataTexture;
   users: number;
   failedCapacity?: { maxSize: number; error: unknown };
+  exclusive?: ReadonlySet<number>;
 }
 const sharedClipTextures = new WeakMap<readonly VectorClipPath[], SharedClipTexture>();
 const emptyClipPaths: readonly VectorClipPath[] = [];
@@ -25,7 +29,9 @@ export function acquireThreeVectorClipTexture(scene: VectorScene): {
   const key = scene.clipPaths ?? emptyClipPaths;
   let entry = sharedClipTextures.get(key);
   if (!entry) {
-    entry = { texture: createThreeVectorClipTexture(scene), users: 0 };
+    const moved = getEditorSceneTranslationHint(scene)?.changedClips;
+    entry = { texture: createThreeVectorClipTexture(scene), users: 0,
+      exclusive: moved?.length ? new Set(moved) : undefined };
     sharedClipTextures.set(key, entry);
   }
   entry.users++;
@@ -57,7 +63,8 @@ const INSTANCE_VECTOR_CLIP_UNIFORM = -2;
 export function createThreeVectorClipTexture(scene: VectorScene): THREE.DataTexture {
   // Prefer cell storage for both shader backends; complete edge scans remain
   // available when an optional index cannot fit the texture capacity.
-  const image = packThreeVectorClipImage(scene.clipPaths, Math.sqrt(MAX_VECTOR_CLIP_TEXELS));
+  const moved = getEditorSceneTranslationHint(scene)?.changedClips;
+  const image = packThreeVectorClipImage(scene.clipPaths, Math.sqrt(MAX_VECTOR_CLIP_TEXELS), moved?.length ? new Set(moved) : undefined);
   const texture = new THREE.DataTexture(image.data, image.width, image.height, THREE.RGBAFormat, THREE.FloatType);
   texture.minFilter = texture.magFilter = THREE.NearestFilter;
   texture.generateMipmaps = false;
@@ -76,7 +83,7 @@ export function prepareThreeVectorClipTexture(scene: VectorScene, maxTextureSize
   if (entry.failedCapacity?.maxSize === maxSize) throw entry.failedCapacity.error;
   let image: ReturnType<typeof packThreeVectorClipImage>;
   try {
-    image = packThreeVectorClipImage(clips, maxSize);
+    image = packThreeVectorClipImage(clips, maxSize, entry.exclusive);
   } catch (error) {
     entry.failedCapacity = { maxSize, error };
     throw error;
@@ -92,16 +99,28 @@ export function prepareThreeVectorClipTexture(scene: VectorScene, maxTextureSize
   entry.failedCapacity = undefined;
 }
 
-function packThreeVectorClipImage(clips: readonly VectorClipPath[] | undefined, maxSize: number): {
+function packThreeVectorClipImage(clips: readonly VectorClipPath[] | undefined, maxSize: number, exclusive?: ReadonlySet<number>): {
   data: Float32Array;
   width: number;
   height: number;
 } {
-  const data = packVectorClips(clips, Math.min(MAX_VECTOR_CLIP_TEXELS, maxSize ** 2), { cells: true });
+  const data = packVectorClips(clips, Math.min(MAX_VECTOR_CLIP_TEXELS, maxSize ** 2), { cells: true, exclusive });
   const width = Math.min(maxSize, Math.max(1, Math.ceil(Math.sqrt(data.length / 4))));
   const height = Math.ceil(data.length / 4 / width);
   const padded = new Float32Array(width * height * 4); padded.set(data);
   return { data: padded, width, height };
+}
+
+/** Stage a change to the existing shared clip texture without changing its leases. */
+export function prepareThreeEditorClipUpdate(previous: Pick<VectorScene, "clipPaths">, scene: VectorScene, update: EditorPreviewSceneUpdate): (() => void) | null {
+  if (!update.hint.changedClips?.length) return () => {};
+  const entry = sharedClipTextures.get(previous.clipPaths ?? emptyClipPaths);
+  if (!entry) return null;
+  const headers = (entry.texture.image.data as Float32Array).subarray(0, (scene.clipPaths?.length ?? 0) * 4);
+  const prepared = editorPreviewRectangleClipTexels(scene, update, headers); if (!prepared) return null;
+  return () => {
+    patchThreeEditorPreviewTexture(entry.texture, prepared.patches.map(patch => ({ ...patch, kind: "glyphA" as const })));
+  };
 }
 
 export function initializeThreeVectorClip(material: THREE.Material, texture: THREE.DataTexture): void {

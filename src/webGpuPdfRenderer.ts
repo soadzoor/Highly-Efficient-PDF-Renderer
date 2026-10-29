@@ -8,6 +8,9 @@ import { vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { MIN_VECTOR_INDEXED_PATH_SEGMENTS, vectorFillBandIndex, buildVectorFillBandIndex } from "./vectorFillBands";
 import { vectorIndexedPathStore } from "./vectorCellIndex";
 import { vectorFillCoverageMetadata } from "./vectorFillCoverage";
+import { getEditorSceneTranslationHint } from "./editorScenePreview";
+import { prepareEditorPreviewSceneUpdate, editorPreviewFillCoverage, editorPreviewFillDrawData, editorPreviewRectangleClipTexels,
+  editorPreviewSceneTexels, coalesceEditorPreviewTexels, type EditorPreviewTexture } from "./editorPreviewSceneUpdate";
 import { vectorFillDrawData, fillDrawColorTexels, type VectorFillDrawData } from "./vectorFillDrawSelection";
 import { VECTOR_CELL_COVERAGE_WGSL } from "./vectorCellShaders";
 import { paintFoldFragmentWgsl } from "./nativePaintFold";
@@ -1425,6 +1428,8 @@ export class WebGpuPdfRenderer {
   private orderedCullingBounds: Bounds | null = null;
   private orderedRunsCulled = false;
   private vectorClipTexture: any = null;
+  private vectorClipTextureWidth = 1;
+  private vectorClipHeaders: Float32Array | null = null;
   private readonly vectorClipBindGroupLayout: any;
   private vectorClipBuffers: any[] = [];
   private vectorClipBindGroups: any[] = [];
@@ -2643,6 +2648,49 @@ export class WebGpuPdfRenderer {
     this.requestFrame();
   }
 
+  updateEditorPreviewScene(scene: VectorScene): boolean {
+    if (this.isDisposed || !this.scene || this.vectorLodRuntime || this.textLodGpuActive || this.primitiveColors) return false;
+    const update = prepareEditorPreviewSceneUpdate(this.scene, scene);
+    if (!update || update.fills.some(index => this.fillDrawData?.parts.has(index))) return false;
+    const clips = editorPreviewRectangleClipTexels(scene, update, this.vectorClipHeaders); if (!clips) return false;
+    const coverage = editorPreviewFillCoverage(scene, update), patches = editorPreviewSceneTexels(scene, update, coverage);
+    for (const index of update.fills) {
+      if (this.fillBandBase >= 0) patches.push({ kind: "fillSegmentsA", index: this.fillBandBase + index, pixels: new Float32Array(4) });
+      if (this.fillCellBase >= 0) patches.push({ kind: "fillSegmentsA", index: this.fillCellBase + index, pixels: new Float32Array(4) });
+    }
+    const textures: Record<EditorPreviewTexture, { texture: any; width: number }> = {
+      strokeA: { texture: this.segmentTextureA, width: this.segmentTextureWidth }, strokeB: { texture: this.segmentTextureB, width: this.segmentTextureWidth },
+      strokeBounds: { texture: this.segmentTextureD, width: this.segmentTextureWidth }, fillA: { texture: this.fillPathMetaTextureA, width: this.fillPathMetaTextureWidth },
+      fillB: { texture: this.fillPathMetaTextureB, width: this.fillPathMetaTextureWidth }, fillC: { texture: this.fillPathMetaTextureC, width: this.fillPathMetaTextureWidth },
+      fillSegmentsA: { texture: this.fillSegmentTextureA, width: this.fillSegmentTextureWidth }, fillSegmentsB: { texture: this.fillSegmentTextureB, width: this.fillSegmentTextureWidth },
+      textB: { texture: this.textInstanceTextureB, width: this.textInstanceTextureWidth }, glyphA: { texture: this.textGlyphMetaTextureA, width: this.textGlyphMetaTextureWidth }
+    };
+    const widths = Object.fromEntries(Object.entries(textures).map(([kind, value]) => [kind, value.width])) as Record<EditorPreviewTexture, number>;
+    for (const row of coalesceEditorPreviewTexels(patches, widths)) {
+      const target = textures[row.kind]; this.gpuDevice.queue.writeTexture({ texture: target.texture,
+        origin: [row.index % target.width, Math.floor(row.index / target.width)] }, row.pixels, {}, [row.count, 1]);
+    }
+    if (clips.bounds) {
+      for (const row of clips.patches) this.gpuDevice.queue.writeTexture({ texture: this.vectorClipTexture,
+        origin: [row.index % this.vectorClipTextureWidth, Math.floor(row.index / this.vectorClipTextureWidth)] }, row.pixels, {}, [1, 1]);
+      this.vectorClipBounds = clips.bounds;
+      for (const index of update.hint.changedClips!) this.gpuDevice.queue.writeBuffer(this.vectorClipBuffers[index + 2], 0,
+        new Float32Array([index, 0, 0, 0, ...clips.bounds.subarray(index * 4, index * 4 + 4)]));
+    }
+    if (this.allSegmentIds.length !== this.segmentCount) {
+      this.allSegmentIds = Uint32Array.from({ length: this.segmentCount }, (_, index) => index);
+      this.ensureSegmentIdBuffers(this.segmentCount);
+      if (this.segmentCount) this.gpuDevice.queue.writeBuffer(this.segmentIdBufferAll, 0, this.allSegmentIds);
+      this.refreshStrokeBindGroups();
+    }
+    this.scene = scene; this.orderedBatches = null; this.mixedVectorBatches = null;
+    this.orderedRunCuller = new VectorDrawRunCuller(scene, undefined, coverage);
+    this.scenePaintVisibility = new ScenePaintVisibility(scene); this.scenePaintVisibility.setVisibility(this.optionalContentVisibility);
+    if (this.fillDrawData) this.fillDrawData = editorPreviewFillDrawData(scene, update, coverage, this.fillDrawData);
+    this.fillCoverageMetadata = this.fillDrawData ?? coverage;
+    this.destroyVectorMinifyResources(); this.needsVisibleSetUpdate = true; this.requestFrame(); return true;
+  }
+
   setScene(scene: VectorScene, options: SceneUpdateOptions = {}): SceneStats {
     const transitionStarted = performance.now();
     if (this.isDisposed) {
@@ -2694,7 +2742,7 @@ export class WebGpuPdfRenderer {
     const maxTextureSize = this.maxTextureSize();
 
     const lodStarted = performance.now();
-    const textLodBuildResult = this.scenePaintVisibility.requiresCompositing ? null : this.textLodMode === "auto"
+    const textLodBuildResult = this.scenePaintVisibility.requiresCompositing || getEditorSceneTranslationHint(scene) ? null : this.textLodMode === "auto"
       ? getOrBuildTextLod(scene)
       : getCachedTextLod(scene);
     this.recordPerformanceTransition("pageSwap.textLod", performance.now() - lodStarted);
@@ -3301,6 +3349,7 @@ export class WebGpuPdfRenderer {
     this.orderedBatches = null;
     this.runLookup = null;
     this.vectorClipTexture?.destroy();
+    this.vectorClipHeaders = null;
     for (const buffer of this.vectorClipBuffers) buffer.destroy();
     this.vectorClipBuffers = [];
     this.vectorClipBindGroups = [];
@@ -4062,8 +4111,10 @@ export class WebGpuPdfRenderer {
     this.vectorClipBindGroups = [];
     // Optional spatial indices accelerate exact clipping at any zoom.
     const maxSize = this.maxTextureSize();
-    const data = packVectorClips(scene.clipPaths, Math.min(MAX_VECTOR_CLIP_TEXELS, maxSize ** 2), { cells: true });
+    const data = packVectorClips(scene.clipPaths, Math.min(MAX_VECTOR_CLIP_TEXELS, maxSize ** 2), { cells: true,
+      exclusive: getEditorSceneTranslationHint(scene)?.changedClips?.length ? new Set(getEditorSceneTranslationHint(scene)!.changedClips) : undefined });
     const dims = chooseTextureDimensions(data.length / 4, maxSize);
+    this.vectorClipTextureWidth = dims.width; this.vectorClipHeaders = data.slice(0, (scene.clipPaths?.length ?? 0) * 4);
     this.vectorClipTexture = this.createFloatTexture(dims.width, dims.height, data);
     const usage = (globalThis as any).GPUBufferUsage;
     this.vectorClipBounds = vectorClipChainBounds(scene.clipPaths);
@@ -4827,7 +4878,7 @@ export class WebGpuPdfRenderer {
 
   private prepareVectorLod(scene: VectorScene): boolean {
     this.destroyMixedVectorInstances();
-    if (shouldUseVectorStrokeLod(this.vectorLodMode, "webgpu", scene.segmentCount)) {
+    if (!getEditorSceneTranslationHint(scene) && shouldUseVectorStrokeLod(this.vectorLodMode, "webgpu", scene.segmentCount)) {
       this.vectorLodRuntime = takePrebuiltVectorStrokeLodRuntime(scene) ?? new VectorStrokeLodRuntime(scene);
       this.vectorLodRuntime.setForceExact(this.primitiveColors?.has("stroke") ?? false);
     } else {

@@ -185,6 +185,18 @@ class AnnotationReader {
           }));
         });
         if (opts) result.field.options = opts;
+        if (result.field.type === "Btn") {
+          const mark = await this.optional("MK/CA", async () => {
+            const mk = await this.resolve(d.get("MK"));
+            if (!isPdfDictionary(mk)) return undefined;
+            const caption = await this.text(mk.get("CA"));
+            const marks = new Map<string, NonNullable<AnnotationField["buttonMark"]>>([
+              ["4", "check"], ["l", "circle"], ["8", "cross"], ["u", "diamond"], ["n", "square"], ["H", "star"]
+            ]);
+            return caption === undefined ? undefined : marks.get(caption);
+          });
+          if (mark) result.field.buttonMark = mark;
+        }
         const state = await this.optional("AS", () => this.text(d.get("AS"), true));
         if (state !== undefined) result.field.appearanceState = state;
         const appearances = await this.optional("AP", async () => {

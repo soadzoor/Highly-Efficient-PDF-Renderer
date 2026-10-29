@@ -22,12 +22,15 @@ import { createNativeOptionalContentRegistry } from "./pdf/nativeOptionalContent
 import { AnnotationLayerBuilder } from "./annotationLayers";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 import { createEditorFieldAppearanceReader } from "./editorFormAppearance";
+import { createLoadYielder, waitForLoad } from "./loadCancellation";
 
 export interface EditorAppServicesOptions {
   sourcePdf?: Uint8Array;
   password?: string;
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   loadFontAsset?: (url: URL) => Promise<Uint8Array>;
+  /** Completed source-page/widget preparation, normalized within this phase. */
+  onPrepareProgress?: (value?: number) => void;
 }
 export interface EditorAppServices {
   sessionOptions: EditorSessionOptions;
@@ -58,6 +61,10 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
     } }))
     : nativeVectorMissingFontResolver();
   let disposed = false;
+  const servicesLifetime = new AbortController();
+  type FieldAppearancePages = Map<number, Map<string, VectorScene>>;
+  let fieldAppearanceCache: { key: string; sourcePdf: Uint8Array; password?: string; controller: AbortController;
+    waiters: number; promise: Promise<FieldAppearancePages> } | undefined;
   const sourceServices = new Set<EditorAppServices>();
   const diagnostic = (message: string) => options.onDiagnostic?.({ code: "editor.appearance-regenerated", severity: "warning", message });
   const compileObject = async (object: EditorObject, signal?: AbortSignal): Promise<VectorScene> => {
@@ -70,62 +77,92 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
     finally { await parser.close(); }
   };
   const compileFields = async (scene: VectorScene, values: ReadonlyMap<string, EditorFieldValue>, signal?: AbortSignal): Promise<VectorScene> => {
+    signal = signal ? AbortSignal.any([signal, servicesLifetime.signal]) : servicesLifetime.signal;
     signal?.throwIfAborted();
+    values = new Map([...values].map(([name, value]) => [name, Array.isArray(value) ? value.slice() : value]));
     const targets = (scene.annotations ?? []).filter(annotation => annotation.field?.name && values.has(annotation.field.name));
     const partition = new ScenePageViews(scene);
     const pages = Array.from({ length: scene.pageCount }, (_, i) => {
       const view = partition.extract(i); remapEditorPaintIdentity(scene, view.scene, view.primitives); return view.scene;
     });
     const additions: Map<string, VectorScene | null>[] = Array.from({ length: scene.pageCount }, () => new Map());
-    let parser: NativeVectorPdfSession | undefined;
+    let appearances: FieldAppearancePages | undefined;
     if (options.sourcePdf) {
-      const document = await NativePdfDocument.open({ kind: "bytes", bytes: options.sourcePdf }, { password: options.password, signal });
-      let bytes: Uint8Array;
-      try { const writer = new NativePdfWriter(document); await applyEditorPdfFields(writer, values, fonts, { signal, onWarning: diagnostic }); bytes = await writer.save(signal); }
-      finally { await document.close(); }
-      // Regenerated appearances can still reference nonembedded source fonts.
-      parser = await openPdf({ kind: "bytes", bytes }, { password: options.password, signal,
-        missingFontResolver: await getMissingFontResolver(), onDiagnostic: options.onDiagnostic }) as NativeVectorPdfSession;
-    }
-    try {
-      for (let index = 0; index < pages.length; index++) {
-        signal?.throwIfAborted();
-        const annotations = targets.filter(annotation => annotation.pageIndex === index); if (!annotations.length) continue;
-        const origin = [scene.pageRects[index * 4], scene.pageRects[index * 4 + 1]] as const;
-        if (parser) {
-          const sourceIndex = scene.pdfPages?.find(page => page.pageIndex === index)?.sourcePageIndex ?? index;
-          const updated = await parser.compileVectorPage(sourceIndex, { signal,
-            optimization: "none" });
-          for (const annotation of annotations) {
-            const appearance = extractEditorFieldAppearance(updated, annotation.id, signal);
-            const delta = getEditorAnnotationTransform(scene, annotation.id) ?? [1, 0, 0, 1, 0, 0];
-            additions[index].set(annotation.id, transformWholeEditorScene(appearance, multiplyEditorMatrices(delta, [1, 0, 0, 1, ...origin]), signal));
-          }
-        } else for (const annotation of annotations) {
-          if (annotation.flags & (1 | 2 | 32)) { additions[index].set(annotation.id, null); continue; }
-          const source = getEditorAnnotationSource(scene, annotation.id) ?? annotation;
-          const delta = getEditorAnnotationFrameTransform(scene, annotation.id) ?? [1, 0, 0, 1, 0, 0];
-          const field = annotation.field!, value = values.get(field.name!)!, r = source.bounds;
-          const x = r.minX - origin[0], y = r.minY - origin[1], width = r.maxX - r.minX, height = r.maxY - r.minY;
-          let object: EditorObject;
-          if (field.type === "Btn") {
-            const selected = value === true || String(value) === (field.onValue ?? "Yes");
-            if (!selected) { additions[index].set(annotation.id, null); continue; }
-            object = { kind: "shape", shape: field.flags & (1 << 15) ? "ellipse" : "line", id: annotation.id, pageIndex: index,
-              transform: [1, 0, 0, 1, 0, 0], x: x + width * .2, y: y + height * .2, width: width * .6, height: height * .6,
-              fill: 0, color: 0, strokeWidth: 1 };
-          } else object = { kind: "text", id: annotation.id, pageIndex: index, transform: [1, 0, 0, 1, 0, 0],
-            x: x + 2, y: y + 2, width: Math.max(1, width - 4), height: Math.max(1, height - 4),
-            text: Array.isArray(value) ? value.join("\n") : String(value ?? ""), fontSize: Math.min(12, height * .6) };
-          const geometry = await compileObject(object, signal);
-          const layers = new AnnotationLayerBuilder(geometry.optionalContent, [...(geometry.optionalContent?.conditions ?? [])]);
-          geometry.drawRuns = (geometry.drawRuns ?? defaultVectorDrawRuns(geometry)).map(run => ({ ...run,
-            optionalContent: layers.condition(run.optionalContent, annotation.id) }));
-          geometry.optionalContent = layers.build();
-          additions[index].set(annotation.id, transformWholeEditorScene(geometry, multiplyEditorMatrices(delta, [1, 0, 0, 1, ...origin]), signal));
-        }
+      const requests = new Map<number, Set<string>>();
+      for (const annotation of targets) {
+        const sourceIndex = scene.pdfPages?.find(page => page.pageIndex === annotation.pageIndex)?.sourcePageIndex ?? annotation.pageIndex;
+        let ids = requests.get(sourceIndex); if (!ids) requests.set(sourceIndex, ids = new Set()); ids.add(annotation.id);
       }
-    } finally { await parser?.close(); }
+      const key = JSON.stringify([[...values].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([name, value]) => [name, typeof value, value]),
+        [...requests].sort(([a], [b]) => a - b).map(([page, ids]) => [page, [...ids].sort()])]);
+      const sourcePdf = options.sourcePdf, password = options.password;
+      if (!fieldAppearanceCache || fieldAppearanceCache.key !== key || fieldAppearanceCache.sourcePdf !== sourcePdf || fieldAppearanceCache.password !== password) {
+        // Cache only canonical appearances. Each consumer still applies its
+        // current field transforms, page placement, clipping and paint slots.
+        const previous = fieldAppearanceCache, controller = new AbortController(), capturedValues = values;
+        const sharedSignal = AbortSignal.any([servicesLifetime.signal, controller.signal]);
+        const promise = (async (): Promise<FieldAppearancePages> => {
+          const document = await NativePdfDocument.open({ kind: "bytes", bytes: sourcePdf }, { password, signal: sharedSignal });
+          let bytes: Uint8Array;
+          try { const writer = new NativePdfWriter(document); await applyEditorPdfFields(writer, capturedValues, fonts,
+            { signal: sharedSignal, onWarning: diagnostic }); bytes = await writer.save(sharedSignal); }
+          finally { await document.close(); }
+          // Regenerated appearances can still reference nonembedded source fonts.
+          const parser = await openPdf({ kind: "bytes", bytes }, { password, signal: sharedSignal,
+            missingFontResolver: await getMissingFontResolver(), onDiagnostic: options.onDiagnostic }) as NativeVectorPdfSession;
+          try {
+            const result: FieldAppearancePages = new Map();
+            for (const [page, ids] of requests) {
+              sharedSignal.throwIfAborted();
+              const updated = await parser.compileVectorPage(page, { signal: sharedSignal, optimization: "none" });
+              result.set(page, new Map([...ids].map(id => [id, extractEditorFieldAppearance(updated, id, sharedSignal)])));
+            }
+            return result;
+          } finally { await parser.close(); }
+        })();
+        fieldAppearanceCache = { key, sourcePdf, password, controller, waiters: 0, promise };
+        if (previous && !previous.waiters) previous.controller.abort();
+        void promise.catch(() => { if (fieldAppearanceCache?.promise === promise) fieldAppearanceCache = undefined; });
+      }
+      const entry = fieldAppearanceCache; entry.waiters++;
+      try { appearances = await waitForLoad(entry.promise, signal); }
+      finally { if (!--entry.waiters && entry !== fieldAppearanceCache) entry.controller.abort(); }
+    }
+    for (let index = 0; index < pages.length; index++) {
+      signal?.throwIfAborted();
+      const annotations = targets.filter(annotation => annotation.pageIndex === index); if (!annotations.length) continue;
+      const origin = [scene.pageRects[index * 4], scene.pageRects[index * 4 + 1]] as const;
+      if (appearances) {
+        const sourceIndex = scene.pdfPages?.find(page => page.pageIndex === index)?.sourcePageIndex ?? index;
+        for (const annotation of annotations) {
+          const appearance = appearances.get(sourceIndex)!.get(annotation.id)!;
+          const delta = getEditorAnnotationTransform(scene, annotation.id) ?? [1, 0, 0, 1, 0, 0];
+          additions[index].set(annotation.id, transformWholeEditorScene(appearance, multiplyEditorMatrices(delta, [1, 0, 0, 1, ...origin]), signal));
+        }
+      } else for (const annotation of annotations) {
+        if (annotation.flags & (1 | 2 | 32)) { additions[index].set(annotation.id, null); continue; }
+        const source = getEditorAnnotationSource(scene, annotation.id) ?? annotation;
+        const delta = getEditorAnnotationFrameTransform(scene, annotation.id) ?? [1, 0, 0, 1, 0, 0];
+        const field = annotation.field!, value = values.get(field.name!)!, r = source.bounds;
+        const x = r.minX - origin[0], y = r.minY - origin[1], width = r.maxX - r.minX, height = r.maxY - r.minY;
+        let object: EditorObject;
+        if (field.type === "Btn") {
+          const selected = value === true || String(value) === (field.onValue ?? "Yes");
+          if (!selected) { additions[index].set(annotation.id, null); continue; }
+          object = { kind: "shape", shape: field.flags & (1 << 15) ? "ellipse" : "line", id: annotation.id, pageIndex: index,
+            transform: [1, 0, 0, 1, 0, 0], x: x + width * .2, y: y + height * .2, width: width * .6, height: height * .6,
+            fill: 0, color: 0, strokeWidth: 1 };
+        } else object = { kind: "text", id: annotation.id, pageIndex: index, transform: [1, 0, 0, 1, 0, 0],
+          x: x + 2, y: y + 2, width: Math.max(1, width - 4), height: Math.max(1, height - 4),
+          text: Array.isArray(value) ? value.join("\n") : String(value ?? ""), fontSize: Math.min(12, height * .6) };
+        const geometry = await compileObject(object, signal);
+        const layers = new AnnotationLayerBuilder(geometry.optionalContent, [...(geometry.optionalContent?.conditions ?? [])]);
+        geometry.drawRuns = (geometry.drawRuns ?? defaultVectorDrawRuns(geometry)).map(run => ({ ...run,
+          optionalContent: layers.condition(run.optionalContent, annotation.id) }));
+        geometry.optionalContent = layers.build();
+        additions[index].set(annotation.id, transformWholeEditorScene(geometry, multiplyEditorMatrices(delta, [1, 0, 0, 1, ...origin]), signal));
+      }
+    }
     const preserveNonText = !options.sourcePdf ? new Set(targets.filter(annotation => annotation.field?.type === "Tx").map(annotation => annotation.id)) : undefined;
     const updatedPages = pages.map((page, index) => replaceEditorFieldAppearances(page, additions[index], { preserveNonText, signal }));
     const result = composeOverlappingVectorScenes(updatedPages); composeEditorPaintIdentity(updatedPages, result);
@@ -148,7 +185,10 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
       } };
     },
     prepareScene: async (scene, signal) => {
-      if (!options.sourcePdf || !scene.annotations?.some(annotation => annotation.field)) return scene;
+      signal?.throwIfAborted();
+      options.onPrepareProgress?.(0);
+      if (!options.sourcePdf || !scene.annotations?.some(annotation => annotation.field)) { options.onPrepareProgress?.(1); return scene; }
+      const yieldProgress = options.onPrepareProgress ? createLoadYielder(signal) : undefined;
       const document = await NativePdfDocument.open({ kind: "bytes", bytes: options.sourcePdf }, { password: options.password, signal });
       try {
         const forms = new NativePdfFormAppearanceRegistry(document);
@@ -158,14 +198,22 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
         const frames = new Map<string, NonNullable<Awaited<ReturnType<typeof readEditorFieldFrame>>>>();
         const sourcePages = new Set(scene.annotations.filter(annotation => annotation.field).map(annotation => annotation.sourcePageIndex));
         const styles = createEditorFieldAppearanceReader(document, fonts, await getMissingFontResolver(), options.onDiagnostic);
+        let completedPages = 0;
         for (const page of sourcePages) {
           for (const annotation of await registry.getPageAnnotations(page, signal)) if (annotation.field) fields.set(annotation.id, annotation.field);
-          for (const annotation of await forms.listPageAnnotations(page, signal)) {
-            const field = fields.get(annotation.id), frame = field && await readEditorFieldFrame(document, annotation, signal);
-            const textStyle = field && await styles.read(frame ? { ...annotation, rectangle: frame.rect } : annotation, signal);
+          const widgets = (await forms.listPageAnnotations(page, signal)).filter(annotation => fields.has(annotation.id));
+          for (let index = 0; index < widgets.length; index++) {
+            const annotation = widgets[index], field = fields.get(annotation.id)!;
+            const frame = await readEditorFieldFrame(document, annotation, signal);
+            const textStyle = await styles.read(frame ? { ...annotation, rectangle: frame.rect } : annotation, signal);
             if (field && textStyle) fields.set(annotation.id, { ...field, textStyle });
             if (frame) frames.set(annotation.id, frame);
+            options.onPrepareProgress?.((completedPages + (index + 1) / widgets.length) / sourcePages.size);
+            if (yieldProgress) await yieldProgress();
           }
+          completedPages++;
+          options.onPrepareProgress?.(completedPages / sourcePages.size);
+          if (yieldProgress) await yieldProgress();
         }
         const result = { ...scene, annotations: scene.annotations.map(annotation => fields.has(annotation.id)
           ? { ...annotation, field: fields.get(annotation.id) } : annotation) };
@@ -178,6 +226,7 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
             bounds: editorTransformBounds({ minX, minY, maxX, maxY }, mapping) };
           setEditorAnnotationSource(result, original, multiplyEditorMatrices(mapping, multiplyEditorMatrices(frame.transform, invertEditorMatrix(mapping))));
         }
+        options.onPrepareProgress?.(1);
         return result;
       } finally { await document.close(); }
     },
@@ -195,6 +244,7 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
     },
     dispose() {
       if (disposed) return; disposed = true;
+      servicesLifetime.abort(); fieldAppearanceCache = undefined;
       for (const services of sourceServices) services.dispose(); sourceServices.clear();
       if (!sharedFonts) fonts.dispose();
     } };

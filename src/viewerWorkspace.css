@@ -37,3 +37,15 @@
 .viewer-settings.collapsed { display: none; }
 .viewer-settings :is(input, select, textarea, button) { max-width: 100%; }
 .viewer-settings .row { flex-wrap: wrap; }
+
+.viewer-settings .number-row-color { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); }
+.viewer-settings .color-controls { min-width: 0; flex-wrap: wrap; }
+.viewer-settings .color-controls input[type="color"] { flex: 0 0 44px; }
+.viewer-settings .color-controls input[type="range"] {
+  flex: 1 1 0;
+  width: 0;
+  min-width: 0;
+  max-width: 80px;
+  margin: 0;
+}
+.viewer-settings .color-controls input[type="number"] { flex: 0 0 52px; width: 52px; min-width: 0; }

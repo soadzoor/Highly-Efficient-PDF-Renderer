@@ -130,6 +130,8 @@ export interface RendererApi {
 
   /** Upload a parsed scene and return GPU/resource stats. */
   setScene(scene: VectorScene, options?: SceneUpdateOptions): SceneStats;
+  /** Apply a proven stable editor translation without reallocating scene resources. */
+  updateEditorPreviewScene?(scene: VectorScene): boolean;
 
   /** Return stats for the uploaded scene, if available. */
   getSceneStats(): SceneStats | null;

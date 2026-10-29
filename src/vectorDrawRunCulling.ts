@@ -30,15 +30,15 @@ export class VectorDrawRunCuller {
   private guardFlags: Uint8Array | null = null;
 
   /** `strokes` replaces the scene's strokes, e.g. with every Vector LOD level; `sourceRuns` maps its IDs to runs. */
-  constructor(scene: VectorScene, strokes?: StrokeRecordSource & { sourceRuns: Uint32Array }) {
+  constructor(scene: VectorScene, strokes?: StrokeRecordSource & { sourceRuns: Uint32Array }, suppliedCoverage?: ReturnType<typeof vectorFillCoverageMetadata>) {
     this.scene = scene;
     const runs = scene.drawRuns ?? [];
     // Rendered fills use decoded hulls. Use the same bounds for visibility and
     // the scheduler's overlap dependencies, including with Vector LOD off.
     // Legacy partial scenes without geometry retain their canonical extents;
     // malformed decoded paths fall back individually in the metadata helper.
-    const fillCoverage = scene.fillPathCount > 0 && scene.fillSegmentsA && scene.fillSegmentsB && scene.fillPathMetaC
-      ? vectorFillCoverageMetadata(scene) : null;
+    const fillCoverage = suppliedCoverage ?? (scene.fillPathCount > 0 && scene.fillSegmentsA && scene.fillSegmentsB && scene.fillPathMetaC
+      ? vectorFillCoverageMetadata(scene) : null);
     const fillMetaA = fillCoverage?.pathMetaA ?? scene.fillPathMetaA;
     const fillMetaB = fillCoverage?.pathMetaB ?? scene.fillPathMetaB;
     this.bounds = new Float64Array(runs.length * 4);

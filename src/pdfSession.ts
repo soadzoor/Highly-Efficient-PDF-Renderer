@@ -187,6 +187,7 @@ import { buildNativeVectorPage } from "./pdf/nativeVectorPage";
 import { bindNativeSourceJpxStore } from "./pdf/nativeSourceJpx";
 
 import { placeSceneAnnotation, validateAnnotationAppearanceMode, type PdfAnnotation } from "./annotationData";
+import { AnnotationLayerBuilder } from "./annotationLayers";
 import { NativePdfAnnotationMetadataRegistry } from "./pdf/nativeAnnotations";
 import { NativePdfStructureTree } from "./pdf/nativeStructure";
 
@@ -692,8 +693,18 @@ class NativePdfSession implements NativeVectorPdfSession {
       const canvasLimits = { maxImagePixels: this.document.limits.maxImagePixels,
         maxDecodedStreamBytes: this.document.limits.maxDecodedStreamBytes };
       if (options.optionalContent) {
-        const hiddenAnnotations = new Set(options.optionalContent.layers
-          .filter(layer => !layer.visible && layer.id.startsWith("annotation:")).map(layer => layer.id.slice("annotation:".length)));
+        const data = await this.optionalContent.sceneData(signal);
+        const values = new Map(options.optionalContent.layers.map(layer => [layer.id, layer.visible]));
+        // Recreate the page's collision-safe appearance IDs. A PDF layer can
+        // legitimately use the annotation: prefix, so its name is not ownership.
+        const annotationLayers = new AnnotationLayerBuilder(data, [...(data?.conditions ?? [])]);
+        for (let index = 0; index < page.stores.markedContent.tags.length; index++) {
+          if (page.stores.markedContent.tags[index] !== HEPR_ANNOTATION_MARKED_CONTENT_TAG) continue;
+          const id = page.stores.markedContent.propertyNames[index];
+          if (id) annotationLayers.condition(undefined, id);
+        }
+        const hiddenAnnotations = new Set((annotationLayers.build()?.groups ?? [])
+          .filter(group => group.annotationId !== undefined && values.get(group.id) === false).map(group => group.annotationId!));
         if (hiddenAnnotations.size) {
           const keep = (command: HeprDisplayCommand) => page.stores.markedContent.tags[command.markedContentIndex] !== HEPR_ANNOTATION_MARKED_CONTENT_TAG ||
             !hiddenAnnotations.has(page.stores.markedContent.propertyNames[command.markedContentIndex] ?? "");
@@ -701,9 +712,7 @@ class NativePdfSession implements NativeVectorPdfSession {
             groups: page.displayProgram.groups.map(group => ({ ...group, commands: group.commands.filter(keep) })),
             programs: page.displayProgram.programs.map(program => ({ ...program, commands: program.commands.filter(keep) })) } };
         }
-        const data = await this.optionalContent.sceneData(signal);
         if (data) {
-          const values = new Map(options.optionalContent.layers.map(layer => [layer.id, layer.visible]));
           const visibility = createDefaultOptionalContentSnapshot({ ...createEmptyVectorScene(), optionalContent: { ...data,
             groups: data.groups.map(group => ({ ...group, defaultVisible: values.get(group.id) ?? group.defaultVisible })) } });
           page = { ...page, stores: { ...page.stores, optionalContent: { ...page.stores.optionalContent,

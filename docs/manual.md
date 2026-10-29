@@ -34,10 +34,23 @@ uncompressed option and [Node conversion](#node-conversion) for server requireme
 ## Editing documents
 
 Both viewers start in **View** mode. Choose **Edit** to prepare full-quality
-editing data and show editing tools. Preparation can take longer and use more
-memory than viewing. Returning to View keeps the modifications and removes the
-editor overlay and its frame work. New visible content still has its ordinary
-rendering cost. Browser/GPU performance must be verified on your documents.
+editing data and show editing tools. A **Loading Edit mode** card appears inside
+the canvas before the editing tools load, even with Settings closed. It remains
+visible through the first displayed editable frame, including when returning to
+an existing editing session. A spinner and progress bar identify the current
+stage: loading tools, preparing full-quality pages, preparing form fields and
+fonts, preparing controls, or drawing the editable document. Percentages measure
+page or field progress within that stage; stages without a measurable total use
+an indeterminate bar.
+
+The mode button becomes **Cancel editing setup** while preparation is running.
+Cancel or a setup failure returns to View and removes the loading card; failures
+remain in the status message. Choose Edit to retry. Cancelling re-entry preserves
+your earlier modifications. Preparation can take longer and use more memory than
+viewing. Returning to View keeps the modifications and removes the editor overlay
+and its frame work. Setup UI, layout observers and listeners exist only during
+setup. New visible content still has its ordinary rendering cost. Browser/GPU
+performance must be verified on your documents.
 
 View and Edit use the same vector toolbar icons. Hover for descriptive titles,
 or navigate by keyboard with accessible button names and visible focus. Page,
@@ -70,9 +83,36 @@ during a drag. Use undo/redo, duplicate, delete, grouping,
 and arrow-key nudging from the editing tools and shortcuts.
 The selection frame and handles follow the object's rotation and transform.
 Resize along the visible frame's axes; numeric W/H controls use its edge lengths.
+Dragging the rotation grip snaps the resulting absolute frame angle to the
+nearest multiple of 45°, including 0°, only when it is within 5° of that angle
+(inclusive). Other angles rotate freely. Hold Alt (Option on macOS) to bypass
+snapping entirely. Pressing or releasing Alt/Option updates the preview even
+without moving the pointer; the final pointer position and modifier state are
+honored when you release the grip.
+Shift retains its selection and free-resize behavior.
+**Rotate** displays and sets the selection frame's absolute angle, normalized to
+`[-180°, 180°)` with positive angles counterclockwise. Entering 90° sets the frame
+to 90°; entering 90° again keeps it there. During a drag, the value follows the
+displayed preview.
 During a transform, the objects and selection frame advance together with each
 rendered preview. New pointer positions are coalesced while a preview prepares;
 the previous displayed pose remains together until the next one is drawn.
+Transform previews reuse PDF field appearances while the source, values and
+target widgets are unchanged, applying current geometry, clips and paint order
+on each update. Identical glyph resources also reuse the existing text atlas.
+Supported moves prepare the current scene once, then move selected text, paths
+and form appearances while retaining paint order and antialiased clipping.
+Native WebGL/WebGPU reuse GPU resources for compatible poses; Three.js also
+reuses material textures while viewing a single document object, including Grid
+and single-page Reader. Independent multi-page Reader views use the regular
+update path, including when those page views are retained on returning to Grid.
+Rotation, resizing, selected images/gradients, complex effects and incompatible
+clipping/text state keep full compilation. Existing LOD settings are preserved,
+and releasing, cancelling or leaving Edit resumes normal document updates.
+Each source session retains current reusable resource sets rather than an
+appearance history; superseded preparation stops when no active operation needs
+it. Reusable preparation and active export snapshots survive cancellation of a
+single preview, and disposing the source session releases its caches.
 Transform handles appear only in Select. Rotation and resize cursors remain
 visible throughout a drag; Text and Pencil use their own cursors. Switching
 tools or pressing Escape cancels the current gesture.
@@ -96,6 +136,14 @@ keyboard interaction. Typing uses the PDF's
 font and point size, with automatic sizing similar to Chrome/PDFium. Unfocused
 controls retain the document's appearance, including checkmarks in radio groups;
 keyboard focus remains visible. PDF actions and JavaScript are not executed.
+After a value changes, the native control keeps the current value visible even
+after losing focus, until its matching regenerated appearance is drawn. This
+also covers shared widgets and cleared fields, so the previous value does not
+flash while the document updates. Failed regeneration keeps the current value
+visible for correction or retry.
+Pending checkbox/radio marks use black vector shapes following the PDF's standard
+mark choice, including checkmarks on radio fields, while retaining radio-group
+and keyboard behavior. The document's own appearance takes over after rendering.
 Field borders and controls follow the document's rendered zoom and pan frames
 without replacing focused inputs or their drafts.
 Rotate or resize a field with Select, then return to Fill to type in its original
@@ -114,14 +162,24 @@ the stroke (or text/image), and **Fill opacity** independently controls closed
 fills. Each has a linked slider and number input from 0 to 1, with 0.1 steps.
 Slider movement updates the number immediately; releasing commits one undoable
 change. Existing fill opacity is preserved when changing stroke opacity.
+Rectangle, ellipse, line, arrow, polygon and polyline previews show their actual
+outlines, chosen document-scaled width, colors and separate stroke/fill opacities,
+including closed fills and arrowheads. Polygon/polyline styles are captured on
+the first click; the next segment follows the pointer on that original page.
+Press Enter or double-click to finish using clicked vertices only.
+Finished shapes, pencil strokes and signature copies remain visible independently
+until their matching document frame is drawn. You can start the next drawing on
+the same document while an earlier one compiles. Returning to View waits for
+that handoff before removing the previews.
 The signature library saves
 drawn vector handwriting in this browser's `localStorage`; placed copies can
 have independent size, stroke thickness and color. Saved signatures show clickable
 vector previews with their names. New signatures offer **Smooth strokes** to
 straighten small sampling zigzags and fit compact curves; turn it off to keep
 the raw handwriting. Smoothed captures also discard redundant stored points.
-Pencil strokes share the curve fitter with a smaller error budget. Endpoints,
-pen lifts, loops and dots are retained, and reopening stored captures does not
+Pencil strokes share the curve fitter with a smaller error budget and preview
+their committed fitted curves. Endpoints, pen lifts, loops and dots are retained,
+and reopening stored captures does not
 repeatedly smooth or rewrite them. Choosing a signature activates its toolbar
 button and shows a translucent preview centered on the cursor. Click a page to
 stamp the preview's size, color and stroke width; click again for another copy,
@@ -244,6 +302,18 @@ flattened PDF and HEP, reopen each, inspect text search and appearance, and prin
 using your browser and an independent PDF reader. Compare matched performance
 captures in default View mode and after editing; offline Canvas2D checks do not
 prove browser or GPU behavior.
+In both viewers with WebGL and WebGPU, close Settings and enter Edit with a large
+PDF or a slow tool download. Check that **Loading Edit mode** appears before tool
+loading and stays visible until the editable document is drawn. Check stage
+labels, measured page/field percentages and indeterminate stages; percentages
+describe each stage rather than the entire setup. Cancel during preparation and
+initial drawing, then retry. Make edits, return to View and cancel re-entry;
+verify that another attempt retains the edits. Force a setup failure, such as a
+blocked editor-tool download, and check that its status remains visible with no
+stuck card or editing controls. Replace the document during preparation and
+verify that late progress cannot affect the replacement. Check the card's bounds
+with Settings open/closed and on narrow screens, and that setup UI and its layout
+work are absent in idle View mode.
 Select and rotate objects near each canvas edge, then pan or zoom them beneath
 the top bar, thumbnails and Settings panel. Confirm selection graphics and fields
 stay behind those controls and do not intercept their clicks. Check Examples
@@ -275,9 +345,38 @@ and choice fields. Check that their borders remain aligned with the document,
 including the final zoom frame, in both viewers and both backends. Repeat in
 Reader and Grid, while a text field is focused, after backend switches and after
 leaving and reentering Edit; verify that typing drafts and the caret survive zoom.
+With slow form regeneration or delayed drawing, type and click outside the field;
+check that the current value remains visible without exposing the previous value
+or doubling the text. Repeat with shared widgets, rapid successive changes and
+deleting all text. Check undo/redo, switching tools, leaving and reentering Edit,
+and a failed regeneration followed by retry. Verify that the correct value stays
+visible and pending updates preserve an active typing draft and caret.
+Repeat on rotated/resized fields and fields with custom backgrounds;
+check that the original appearance returns only after the matching value is drawn.
+Check checkbox/radio changes during and after the update, including radio fields
+using checkmarks and circles. Verify keyboard/group behavior, undo and save/reopen,
+with no browser-blue mark flash or duplicate marks.
 Rotate and resize text and choice fields, return to Fill, and type several values.
 Check that the control, text size and appearance keep their orientation without
 expanding to the rotated bounds. Repeat after undo/redo and PDF save/reopen.
+After filling a PDF, drag a source field, a new shape, a textbox and a
+multi-selection in both viewers and backends. Compare repeated drags before and
+after filling; check that unchanged fields keep their appearance while moved
+fields, clips, stacking and text/search geometry follow the current transform.
+Repeat after undo, gesture cancellation, further value changes, source replacement
+and backend switching. Change checkbox/radio values quickly during pending
+preparation, and verify the latest value appears while active save snapshots
+retain their captured values. Browser/GPU drag performance remains a manual check.
+Repeat translation over overlapping artwork and partially clipped glyphs; compare
+the moving pose with the released result, with no changed stacking, clipping-edge
+coverage or selection-frame lag. Compare native and Three WebGL/WebGPU in Grid,
+single-page Reader and multi-page Reader, including Reader-to-Grid transitions.
+Cancel by Escape, change selection or source during preparation, and switch
+backend or mode; verify current geometry, LOD behavior and field values remain
+correct. Save/reopen PDF and HEP after releasing and after cancelling a gesture.
+For performance comparisons, keep document, zoom, selection and backend matched;
+separate initial gesture preparation from repeated moves. Offline CPU timings
+and mocked uploads do not establish browser frame rates or GPU performance.
 Before entering Edit, print a PDF and a HEP from the main toolbar. Print a
 protected PDF using its existing unlock password, and check selected-page scope.
 After editing, return to View and print again; verify the retained changes are
@@ -285,6 +384,13 @@ included and printing leaves the unsaved-change indicator intact.
 Check all four resize corners and rotation while dragging beyond the handles.
 Rotate objects and groups, release the handle, reselect them, and check undo/redo.
 Rotate a multi-selection and check its frame during the drag and after committing.
+Start from a non-grid angle and approach 0°, 45° and negative multiples of 45°.
+Check that absolute angles within 5° of each target, including exactly 5°, snap;
+angles outside that range remain free. Hold Alt/Option to bypass snapping, then
+press and release it without moving the pointer. Release at a new pointer
+position and verify the final angle respects the latest modifier state. Check that
+**Rotate** follows the displayed frame, accepts signed absolute angles, and leaves
+the angle unchanged when the same value is entered twice.
 Check that corner cursors follow the frame's angle and the rotation grip remains
 outside its top edge at different zooms.
 Drag handles beyond a page border and across Reader gaps; they should stay tied
@@ -292,6 +398,21 @@ to the selected page rather than stop or jump to an adjacent page.
 Move, resize and rotate selections quickly, then release or cancel while a
 preview is preparing. Check that objects, frame and handles stay aligned until
 the final or restored pose appears, including after switching renderer backends.
+Draw pencil strokes at several zooms on rotated/cropped pages, using thin/wide
+strokes, transparency and optional fills. Check that the fitted curve, thickness,
+colors and opacities stay consistent while drawing, on release and when the
+document appears. Delay rendering with several strokes pending; verify there is
+no gap or doubled opacity as each matching frame takes over. Check undo/delete,
+gesture cancellation, tool/mode/document changes and failed compilation for
+stray previews or lost committed strokes.
+Repeat with rectangles, ellipses, lines and arrows in every drag direction,
+releasing at a new position without another move event. Check directed arrowheads
+and closed fills. For polygons/polylines, move the next segment around the first
+page, change toolbar styles after the first click, and finish with Enter or
+double-click; only clicked vertices and the initially chosen style should commit.
+Check repeated vertices and double-click completion for extra endpoints. Draw
+several shapes or stamp signatures while earlier drawings are pending, then
+return to View; verify independent, continuous handoffs to the rendered document.
 Resize images, shapes, signatures and multi-selections with and without Shift;
 press and release Shift during the drag and check both preview and final size.
 Check textbox wrapping with plain/Shift resizing and appearance scaling with

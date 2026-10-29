@@ -50,6 +50,46 @@ export function editorFrameSize(frame: EditorSelectionFrame): { width: number; h
     height: Math.hypot(c * (bounds.maxY - bounds.minY), d * (bounds.maxY - bounds.minY)) };
 }
 
+function normalizedDegrees(degrees: number): number {
+  const wrapped = degrees % 360;
+  return wrapped >= 180 ? wrapped - 360 : wrapped < -180 ? wrapped + 360 : wrapped === 0 ? 0 : wrapped;
+}
+
+/** Local x-axis orientation in page coordinates, normalized to [-180, 180). */
+export function editorFrameRotation(frame: EditorSelectionFrame, delta?: EditorMatrix): number {
+  if (!validFrame(frame)) return 0;
+  const [a, b] = multiply(previewMatrix(delta), frame.transform);
+  return Number.isFinite(a) && Number.isFinite(b) ? normalizedDegrees(Math.atan2(b, a) * 180 / Math.PI) : 0;
+}
+
+function rotateFrame(frame: EditorSelectionFrame, degrees: number): EditorMatrix {
+  const angle = normalizedDegrees(degrees);
+  if (Math.abs(angle) <= Number.EPSILON * 360 * 4) return IDENTITY;
+  const center = editorFrameCenter(frame); if (!finitePoint(center)) return IDENTITY;
+  const radians = angle * Math.PI / 180, c = Math.cos(radians), s = Math.sin(radians);
+  return safeMatrix([c, s, -s, c, center.x - c * center.x + s * center.y, center.y - s * center.x - c * center.y]);
+}
+
+/** Absolute orientation changes rotate the whole frame, preserving its shear and reflection. */
+export function editorFrameRotationMatrix(frame: EditorSelectionFrame, targetDegrees: number): EditorMatrix {
+  if (!validFrame(frame) || !Number.isFinite(targetDegrees)) return IDENTITY;
+  return rotateFrame(frame, normalizedDegrees(targetDegrees) - editorFrameRotation(frame));
+}
+
+/** Dragging snaps within five degrees of the absolute 45-degree grid; free rotation bypasses it. */
+export function editorFrameRotationDragMatrix(frame: EditorSelectionFrame, start: PrimitivePoint,
+  point: PrimitivePoint, freeRotation = false): EditorMatrix {
+  if (!validFrame(frame) || !finitePoint(start) || !finitePoint(point)) return IDENTITY;
+  const center = editorFrameCenter(frame); if (!finitePoint(center)) return IDENTITY;
+  const sx = start.x - center.x, sy = start.y - center.y, dx = point.x - center.x, dy = point.y - center.y;
+  if (sx === 0 && sy === 0 || dx === 0 && dy === 0) return IDENTITY;
+  const angle = (Math.atan2(dy, dx) - Math.atan2(sy, sx)) * 180 / Math.PI;
+  if (freeRotation) return rotateFrame(frame, angle);
+  const rotation = editorFrameRotation(frame), absolute = normalizedDegrees(rotation + angle), target = Math.round(absolute / 45) * 45;
+  // atan2 and affine composition can put an exact five-degree boundary a few ulps outside it.
+  return rotateFrame(frame, Math.abs(absolute - target) <= 5 + Number.EPSILON * 360 * 8 ? target - rotation : angle);
+}
+
 function localScale(frame: EditorSelectionFrame, anchor: PrimitivePoint, sx: number, sy: number): EditorMatrix {
   const inverted = inverse(frame.transform); if (!inverted || !Number.isFinite(sx) || !Number.isFinite(sy)) return IDENTITY;
   const matrix: EditorMatrix = [sx, 0, 0, sy, anchor.x * (1 - sx), anchor.y * (1 - sy)];

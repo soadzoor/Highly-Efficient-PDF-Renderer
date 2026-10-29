@@ -12,8 +12,9 @@ const [uiSource, threeSource, formSource] = await Promise.all([
 ]);
 const eligibility = vm.createContext({}); vm.runInContext(sourceFunction(formSource, "canEditEditorField"), eligibility);
 const canEditEditorField = eligibility.canEditEditorField;
+vm.runInContext(sourceFunction(formSource, "updateEditorFieldControlAppearance"), eligibility);
 const nested = uiSource.replace(/^ {2}/gm, "");
-const apiStart = uiSource.indexOf("  return {\n    async setEditing(value)"), apiEnd = uiSource.indexOf("\n  };\n}", apiStart);
+const apiStart = uiSource.indexOf("  return {\n    async setEditing("), apiEnd = uiSource.indexOf("\n  };\n}", apiStart);
 assert(apiStart >= 0 && apiEnd > apiStart, "the editor exposes its mode and disposal lifecycle");
 const apiSource = stripTypeScriptTypes(`globalThis.api = ${uiSource.slice(apiStart + "  return ".length, apiEnd + "\n  }".length)};`);
 const tickStart = nested.indexOf("function tick("), tickEnd = nested.indexOf("\nfunction updateState(", tickStart);
@@ -27,7 +28,7 @@ function harness(frameHost = true) {
   const fieldValues = new Map([["Text", "Initial value"], ["Legacy", "Legacy value"]]);
   let nextRaf = 0, listener = null, releases = 0, requests = 0, replacements = 0;
   let zoom = 1, panX = 0, panY = 0, projected = 0;
-  let canvasRect = { left: 100, top: 50, width: 400, height: 300 }, geometryReads = 0;
+  let canvasRect = { left: 100, top: 50, width: 400, height: 300 }, geometryReads = 0, fieldQueries = 0;
   const makeCanvas = () => ({ getBoundingClientRect() { geometryReads++; return canvasRect; } });
   let canvas = makeCanvas();
   const sourceScene = {
@@ -41,7 +42,7 @@ function harness(frameHost = true) {
   const fields = {
     replaceChildren() { replacements++; controls.length = 0; },
     append(element) { element.parentElement = fields; controls.push(element); },
-    querySelectorAll: () => controls
+    querySelectorAll() { fieldQueries++; return controls; }
   };
   const host = {
     getCanvas: () => canvas,
@@ -55,20 +56,24 @@ function harness(frameHost = true) {
     return () => { releases++; if (listener === callback) listener = null; events.push("unsubscribe"); };
   };
   const context = vm.createContext({
-    host, document, fields, editorFieldClientGeometry, latestScene: sourceScene, presented: null,
+    pendingDrawings: { visible: () => [], capture() {}, clear() {} },
+    host, document, fields, AbortSignal, editorFieldClientGeometry, latestScene: sourceScene, presented: null,
     overlay: { dataset: {}, style: {}, remove: noop }, toolbar: { style: {}, querySelectorAll: () => [], remove: noop }, graphic: { setAttribute: noop, replaceChildren: noop },
     displayedSelection: () => ({ frame: null }), pointer: null, polygon: null, activeText: null, tool: "form", running: false,
     active: false, disposed: false, structuralRunning: false, releaseFrameListener: null, frame: 0, previewFrame: 0,
-    toolRequest: 0, textRequest: 0, pendingFieldFocus: null, fieldDrafts: new Map(), fontFaces: new Map(),
+    toolRequest: 0, textRequest: 0, pendingFieldFocus: null, fieldDrafts: new Map(), fieldPaintCache: null, fontFaces: new Map(),
     session: { sourceScene, getFieldValues: () => fieldValues, setFieldValue: (name, value) => fieldValues.set(name, value), isAnnotationVisible: () => true, dispose: noop },
     layerControls: { setActive: noop, dispose: noop }, layerDialog: null,
     contextMenu: { close: noop, dispose: noop },
-    currentState: { selection: [] }, updateOpacityControls: noop,
+    currentState: { selection: [] }, updateOpacityControls: noop, rotationDraft: null,
+    query: () => ({ value: "", disabled: false }),
     canEditEditorField, isSceneSettling: () => false, property: () => ({ disabled: false }),
+    updateEditorFieldControlAppearance: eligibility.updateEditorFieldControlAppearance,
     getEditorAnnotationSource: (scene, id) => annotationSources.get(scene)?.get(id),
     getEditorAnnotationFrameTransform: (scene, id) => annotationTransforms.get(scene)?.get(id),
     getSceneAnnotationRuns: () => new Map(),
     createEditorFieldControl: (_document, annotation, value, onValue) => ({ dataset: { fieldId: annotation.id }, annotation, value, onValue, hidden: false, style: {},
+      addEventListener: noop,
       focus(options) { assert(!this.hidden && !fields.hidden, "focus waits until the input is placed and visible"); document.activeElement = this; events.push({ focus: annotation.id, options }); },
       click: () => assert.fail("autofocus cannot toggle a control"), dispatchEvent: () => assert.fail("autofocus cannot synthesize a value change") }),
     setEditorFieldControlValue(control, annotation, value) { control.styledAnnotation = annotation; control.value = value; }, commit: apply => apply(),
@@ -83,7 +88,7 @@ function harness(frameHost = true) {
     styleEditorFieldControl(control, annotation, family) { control.fontStyleAnnotation = annotation; control.fontFamily = family; },
     report: error => assert.fail(String(error))
   });
-  for (const name of ["sceneBoundsToClient", "focusPendingField", "updateTextVisibility", "updateGeometry", "renderFields", "setTool", "fieldAtClientPoint", "doubleClick"]) vm.runInContext(sourceFunction(nested, name), context);
+  for (const name of ["sceneBoundsToClient", "focusPendingField", "updateTextVisibility", "updateGeometry", "updateFieldPaint", "renderFields", "setTool", "fieldAtClientPoint", "doubleClick"]) vm.runInContext(sourceFunction(nested, name), context);
   vm.runInContext(`${tickSource}\n${apiSource}`, context);
   return {
     context, host, document, fields, controls, callbacks, events, raf,
@@ -95,7 +100,7 @@ function harness(frameHost = true) {
     draw() { assert(listener); events.push("draw"); listener(); },
     runRaf() { const entry = raf.entries().next().value; assert(entry); raf.delete(entry[0]); entry[1](); },
     get listener() { return listener; }, get releases() { return releases; }, get requests() { return requests; },
-    get replacements() { return replacements; }, get projected() { return projected; }, get geometryReads() { return geometryReads; }
+    get replacements() { return replacements; }, get projected() { return projected; }, get geometryReads() { return geometryReads; }, get fieldQueries() { return fieldQueries; }
   };
 }
 
@@ -308,6 +313,24 @@ for (const boundary of ["tool", "view", "source", "dispose"]) {
   assert.equal(field.fontStyleAnnotation, source, "late font activation uses the latest scene's canonical field dimensions");
   assert.equal(field.fontFamily, '"canonical-field-font"');
   h.context.api.dispose();
+}
+
+// Retained Fill controls consume no projection or DOM enumeration while a
+// different tool is active, even when many widgets remain mounted.
+{
+  const h = harness();
+  for (let index = 2; index < 40; index++) h.context.latestScene.annotations.push({
+    ...h.context.latestScene.annotations[0], id: `shared-${index}`
+  });
+  await h.context.api.setEditing(true); h.context.renderFields(); h.draw(); assert.equal(h.controls.length, 40);
+  h.context.setTool("select"); const projected = h.projected, queries = h.fieldQueries;
+  h.requestView(2, 13, -7); h.runRaf(); h.draw();
+  assert.equal(h.projected, projected); assert.equal(h.fieldQueries, queries, "Select does not enumerate hidden Fill controls");
+  h.fields.hidden = false; h.context.updateGeometry(true); assert.equal(h.fieldQueries, queries, "the tool guard also excludes retained controls");
+  h.context.tool = "form"; h.fields.hidden = true; h.context.updateGeometry(true);
+  assert.equal(h.fieldQueries, queries, "a hidden Fill container does no projection work");
+  h.fields.hidden = false; h.draw(); assert(h.fieldQueries > queries); assert(h.projected > projected);
+  assertPlacement(h, 2, 13, -7); h.context.api.dispose();
 }
 
 // A host without frame notifications retains the existing RAF integration.

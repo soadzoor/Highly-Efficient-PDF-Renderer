@@ -6,7 +6,7 @@ import {
   type SceneOptionalContent
 } from "./optionalContentData";
 
-/** Layer id of the annotation layer that shows or hides one compiled appearance. */
+/** Preferred layer id; builders avoid collisions with actual PDF layer ids. */
 export function annotationLayerId(annotationId: string): string {
   return `annotation:${annotationId}`;
 }
@@ -29,11 +29,40 @@ export class AnnotationLayerBuilder {
   private readonly groupConditions = new Map<string, number>();
   private readonly combined = new Map<string, number>();
   private readonly unavailable = new Set<string>();
+  private readonly usedIds = new Set<string>();
+  private readonly existingGroups = new Map<string, OptionalContentGroup>();
+  private initialized = false;
 
   /** `conditions` starts as the page's table and receives the appended entries. */
   constructor(base: SceneOptionalContent | undefined, conditions: OptionalContentCondition[]) {
     this.base = base;
     this.conditions = conditions;
+  }
+
+  private initialize(): void {
+    if (this.initialized) return;
+    this.initialized = true;
+    for (const group of this.base?.groups ?? []) {
+      this.usedIds.add(group.id);
+      if (group.annotationId !== undefined && !this.existingGroups.has(group.annotationId)) this.existingGroups.set(group.annotationId, group);
+    }
+    if (!this.existingGroups.size) return;
+    const byId = new Map([...this.existingGroups.values()].map(group => [group.id, group]));
+    for (let index = 0; index < this.conditions.length; index++) {
+      const condition = this.conditions[index]; if (condition.kind !== "group") continue;
+      const group = byId.get(condition.groupId);
+      if (group?.annotationId !== undefined && this.existingGroups.get(group.annotationId) === group && !this.groupConditions.has(group.annotationId)) {
+        this.groupConditions.set(group.annotationId, index);
+      }
+    }
+    // Rewrapping an existing appearance should reuse its common AND gate too.
+    const gates = new Set(this.groupConditions.values());
+    for (let index = 0; index < this.conditions.length; index++) {
+      const condition = this.conditions[index]; if (condition.kind !== "and" || condition.operands.length !== 2) continue;
+      const [first, second] = condition.operands;
+      if (gates.has(first)) this.combined.set(`${second}:${first}`, index);
+      if (gates.has(second)) this.combined.set(`${first}:${second}`, index);
+    }
   }
 
   /** Annotations beyond the layer ceilings keep painting without their own layer. */
@@ -44,21 +73,28 @@ export class AnnotationLayerBuilder {
   /** The condition for paint owned by `annotationId`, or `condition` itself when it has no layer. */
   condition(condition: number | undefined, annotationId: string | undefined): number | undefined {
     if (annotationId === undefined) return condition;
+    this.initialize();
     let group = this.groupConditions.get(annotationId);
     if (group === undefined) {
+      const existing = this.existingGroups.get(annotationId);
       if (this.unavailable.has(annotationId) ||
-          (this.base?.groups.length ?? 0) + this.groups.length >= MAX_OPTIONAL_CONTENT_GROUPS ||
+          (!existing && (this.base?.groups.length ?? 0) + this.groups.length >= MAX_OPTIONAL_CONTENT_GROUPS) ||
           this.conditions.length + 2 > MAX_OPTIONAL_CONTENT_CONDITIONS) {
         this.unavailable.add(annotationId);
         return condition;
       }
-      const id = annotationLayerId(annotationId);
-      this.groups.push({ id, name: `Annotation ${annotationId}`, defaultVisible: true, locked: true, usedInView: false, annotationId });
+      let id = existing?.id ?? annotationLayerId(annotationId);
+      if (!existing) {
+        let collision = 0;
+        while (this.usedIds.has(id)) id = `hepr-annotation:${JSON.stringify([annotationId, collision++])}`;
+        this.usedIds.add(id);
+        this.groups.push({ id, name: `Annotation ${annotationId}`, defaultVisible: true, locked: true, usedInView: false, annotationId });
+      }
       group = this.conditions.length;
       this.conditions.push({ kind: "group", groupId: id });
       this.groupConditions.set(annotationId, group);
     }
-    if (condition === undefined) return group;
+    if (condition === undefined || condition === group) return group;
     const key = `${condition}:${group}`;
     let index = this.combined.get(key);
     if (index === undefined) {

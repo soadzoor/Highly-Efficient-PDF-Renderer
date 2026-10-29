@@ -7,7 +7,8 @@ import { PAGE_PRIMITIVE_KINDS, ScenePageViews, scenePrimitiveCounts } from "./sc
 import type { ScenePaintNode } from "./scenePaintGraph";
 import type { EditorAnnotationEdit, EditorFieldValue, EditorMatrix, EditorObject, EditorObjectInput, EditorSession, EditorSessionOptions,
   EditorSourceEdit, EditorSourceObject, EditorState, EditorSelectionFrame, EditorLayerEdits, EditorStackingAction } from "./editorTypes";
-import { editorPaintIdentity, editorAuthoredOwner, setEditorPaintIdentity, remapEditorPaintIdentity, composeEditorPaintIdentity } from "./editorPaintIdentity";
+import { editorPaintIdentity, editorAuthoredOwner, editorPaintOwnerObject, setEditorPaintIdentity, remapEditorPaintIdentity, composeEditorPaintIdentity } from "./editorPaintIdentity";
+import { prepareEditorTranslationPreview } from "./editorTranslationPreview";
 import { editorCloneOwner } from "./editorObjectOrder";
 import { editorLayerCatalog, editorLayer, createEditorLayer, updateEditorLayer, moveEditorLayer, setEditorLayerOrder, removeEditorLayer, importEditorLayerCondition } from "./editorLayers";
 import { getOptionalContentGroupIds, createDefaultOptionalContentSnapshot } from "./optionalContent";
@@ -27,6 +28,7 @@ import { bakeEditorAnnotationEdits, bakeEditorSourceScene, compactEditorScene, c
 import { compileEditorObjectGeometry, editorArrowHeadPoints } from "./editorSceneObjects";
 import { waitForLoad } from "./loadCancellation";
 import { createLoadProgressReporter, type PDFLoadProgress } from "./loadProgress";
+import { createEditorGlyphStoreCache } from "./editorGlyphStoreCache";
 
 interface Snapshot {
   objects: Map<string, EditorObject>;
@@ -121,9 +123,18 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     return id;
   };
   let cache: { revision: number; previewSequence: number; scene: VectorScene } | null = null, sourcePartition: ScenePageViews | null = null;
+  let committedSceneCache: { identity: object; scene: VectorScene } | null = null;
+  let translationPreviewCache: { identity: object; selection: string; promise: Promise<ReturnType<typeof prepareEditorTranslationPreview>> } | null = null;
   let frameCache: { snapshot: Snapshot; frame: EditorSelectionFrame | null } | null = null;
   const compiled = new WeakMap<EditorObject, Promise<VectorScene>>();
   const geometryOrigins = new WeakMap<EditorObject, EditorObject>();
+  const glyphStores = createEditorGlyphStoreCache(sourceScene);
+  const reuseGlyphStores = (scene: VectorScene): VectorScene => {
+    const shared = glyphStores.reuse(scene);
+    if (shared.textGlyphMetaA === scene.textGlyphMetaA && shared.textGlyphMetaB === scene.textGlyphMetaB &&
+        shared.textGlyphSegmentsA === scene.textGlyphSegmentsA && shared.textGlyphSegmentsB === scene.textGlyphSegmentsB) return scene;
+    const result = { ...scene, ...shared }; retainEditorAnnotationPlacements(scene, result); return result;
+  };
   const lifetime = new AbortController();
   const sourcePdf = options.sourcePdf?.slice();
   const assertLive = () => { if (disposed) throw new Error("Editor session is disposed."); };
@@ -823,6 +834,52 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       const useFullCache = includeObjects && !sourceCopiesOnly;
       signal.throwIfAborted(); progress.report(0, { ...compileMeta, unit: "pages", processed: 0, total: pageCount }); signal.throwIfAborted();
       if (useFullCache && cache?.revision === startedRevision && cache.previewSequence === startedPreview) { const cachedScene = cache.scene; progress.complete(completeMeta); return cachedScene; }
+      if (useFullCache && (!preview || !capturedPreview) && committedSceneCache?.identity === committedSnapshot.identity) {
+        progress.complete(completeMeta); return committedSceneCache.scene;
+      }
+      if (useFullCache && preview && capturedPreview && state === committedSnapshot && capturedPreview[0] === 1 && capturedPreview[1] === 0 && capturedPreview[2] === 0 && capturedPreview[3] === 1) {
+        const selection = JSON.stringify(committedSnapshot.selection), identity = committedSnapshot.identity;
+        if (!translationPreviewCache || translationPreviewCache.identity !== identity || translationPreviewCache.selection !== selection) {
+          const owners = new Set<string>(), authored = new Set<string>(), annotationIds = new Set<string>(), originalRefs = new Set<string>();
+          const originalIdentity = editorPaintIdentity(sourceScene), visit = (id: string): void => {
+            const object = committedSnapshot.objects.get(id) ?? sourceObject(id);
+            if (object.kind === "group") { object.children.forEach(visit); return; }
+            if (object.kind === "source" && !committedSnapshot.objects.has(id)) {
+              if (object.annotationId) annotationIds.add(object.annotationId);
+              else for (const ref of object.primitives) { owners.add(originalIdentity(ref)); originalRefs.add(editorRefKey(ref)); }
+            } else authored.add(id);
+          };
+          committedSnapshot.selection.forEach(visit);
+          const promise = (async (): Promise<ReturnType<typeof prepareEditorTranslationPreview>> => {
+            const canonical = committedSceneCache?.identity === identity ? committedSceneCache.scene : await session.getScene({ preview: false, signal: lifetime.signal });
+            // A host-supplied shared owner cannot safely identify one precise primitive.
+            const originalCounts = scenePrimitiveCounts(sourceScene);
+            if (owners.size) for (const kind of PAGE_PRIMITIVE_KINDS) for (let index = 0; index < originalCounts[kind]; index++) {
+              const ref = { kind, index }; if (owners.has(originalIdentity(ref)) && !originalRefs.has(editorRefKey(ref))) return null;
+            }
+            const selected = new Map<string, PrimitiveRef>(), counts = scenePrimitiveCounts(canonical), resolve = editorPaintIdentity(canonical);
+            for (const kind of PAGE_PRIMITIVE_KINDS) for (let index = 0; index < counts[kind]; index++) {
+              const ref = { kind, index }, owner = resolve(ref);
+              let objectId: string | undefined;
+              try { objectId = editorPaintOwnerObject(owner); } catch { return null; }
+              if (owners.has(owner) || objectId !== undefined && authored.has(objectId)) selected.set(editorRefKey(ref), ref);
+            }
+            const appearances = getSceneAnnotationRuns(canonical);
+            for (const id of annotationIds) for (const run of appearances.get(id) ?? []) for (let index = run.first; index < run.first + run.count; index++) {
+              const ref = { kind: run.kind, index }; selected.set(editorRefKey(ref), ref);
+            }
+            return prepareEditorTranslationPreview(canonical, [...selected.values()], [...annotationIds]);
+          })();
+          translationPreviewCache = { identity, selection, promise };
+          void promise.catch(() => { if (translationPreviewCache?.promise === promise) translationPreviewCache = null; });
+        }
+        const prepared = await waitForLoad(translationPreviewCache.promise, signal);
+        if (prepared) {
+          const scene = prepared.translate(capturedPreview[4], capturedPreview[5], signal);
+          if (revision === startedRevision && previewSequence === startedPreview && !disposed) cache = { revision, previewSequence: startedPreview, scene };
+          progress.complete(completeMeta); return scene;
+        }
+      }
       const snapshot = preview && capturedPreview ? transformedSnapshot(committedSnapshot, capturedPreview) : committedSnapshot;
       const layeredSource = await appliedLayerSource(snapshot, signal);
       let base = bakeEditorSourceScene(layeredSource, [...snapshot.edits.values()], signal, options.onDiagnostic);
@@ -839,6 +896,8 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         base = reorderEditorSceneLayers(base, layerEdits(snapshot));
         if (objectOrder) base = applyEditorObjectOrdering(base, objectOrder);
         base = await refreshEditorSceneLayerDefaults(base, { signal, onDiagnostic: options.onDiagnostic });
+        base = reuseGlyphStores(base);
+        if (useFullCache && (!preview || !capturedPreview) && !disposed && state.identity === committedSnapshot.identity) committedSceneCache = { identity: committedSnapshot.identity, scene: base };
         if (useFullCache && revision === startedRevision && (!preview || previewSequence === startedPreview) && !disposed) cache = { revision, previewSequence: startedPreview, scene: base };
         progress.complete(completeMeta); return base;
       }
@@ -904,6 +963,8 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       result = reorderEditorSceneLayers(result, layerEdits(snapshot));
       if (objectOrder) result = applyEditorObjectOrdering(result, objectOrder);
       result = await refreshEditorSceneLayerDefaults(result, { signal, onDiagnostic: options.onDiagnostic });
+      result = reuseGlyphStores(result);
+      if (useFullCache && (!preview || !capturedPreview) && !disposed && state.identity === committedSnapshot.identity) committedSceneCache = { identity: committedSnapshot.identity, scene: result };
       if (useFullCache && revision === startedRevision && (!preview || previewSequence === startedPreview) && !disposed) cache = { revision, previewSequence: startedPreview, scene: result };
       progress.complete(completeMeta); return result;
     },
@@ -1003,7 +1064,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       saveOptions.signal?.throwIfAborted();
       // Extra form controls are editor state, not an expansion of HEP's
       // established compact field metadata schema.
-      const exportScene: VectorScene = scene.annotations?.some(annotation => annotation.field && ["maxLength", "options", "selectedIndices", "alignment", "textStyle", "onValue", "appearanceState"].some(key => key in annotation.field!))
+      const exportScene: VectorScene = scene.annotations?.some(annotation => annotation.field && ["maxLength", "options", "selectedIndices", "alignment", "textStyle", "buttonMark", "onValue", "appearanceState"].some(key => key in annotation.field!))
         ? { ...scene, annotations: scene.annotations.map(annotation => {
           if (!annotation.field) return annotation;
           const { type, name, flags, value, defaultValue } = annotation.field;
@@ -1015,7 +1076,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       saveOptions.signal?.throwIfAborted(); progress.complete({ sourceType: "hep", unit: "pages", processed: pageCount, total: pageCount, pageCount });
       if (!disposed && revision === targetRevision) session.markSaved(); return blob;
     },
-    dispose() { if (disposed) return; disposed = true; lifetime.abort(); listeners.clear(); undoStack.length = redoStack.length = 0; sourceObjects.clear(); cache = null; frameCache = null; sourcePartition = null; state = { objects: new Map(), fields: new Map(), edits: new Map(), annotationEdits: new Map(), layers: initialLayers, selection: [], identity: {} }; }
+    dispose() { if (disposed) return; disposed = true; lifetime.abort(); listeners.clear(); undoStack.length = redoStack.length = 0; sourceObjects.clear(); cache = null; committedSceneCache = null; translationPreviewCache = null; frameCache = null; sourcePartition = null; glyphStores.clear(); state = { objects: new Map(), fields: new Map(), edits: new Map(), annotationEdits: new Map(), layers: initialLayers, selection: [], identity: {} }; }
   };
   orderReaders.set(session, () => { assertLive(); return [...visibility().getObjectOrder().order]; });
   orderedSourceReaders.set(session, options => session.getScene({ ...options, preview: false, sourceCopiesOnly: true } as NonNullable<Parameters<EditorSession["getScene"]>[0]>));

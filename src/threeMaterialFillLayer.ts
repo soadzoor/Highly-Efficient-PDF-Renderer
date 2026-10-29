@@ -11,6 +11,8 @@ import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
+import { patchThreeEditorPreviewTexture } from "./threeEditorPreview";
+import type { EditorPreviewSceneUpdate, EditorPreviewTexel } from "./editorPreviewSceneUpdate";
 import { acquireThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
 import { enableThreeRawPaintFold, threePaintFoldFragmentGlsl } from "./threePaintFold";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
@@ -98,6 +100,7 @@ export class ThreeMaterialFillLayer {
   private selectionBounds: CullingBounds | null = null;
   private useLocalToClip = false;
   private usingFillSelection = false;
+  private editorPreview = false;
 
   constructor(scene: VectorScene, options: FillLayerOptions) {
     this.scene = scene;
@@ -284,6 +287,32 @@ export class ThreeMaterialFillLayer {
     this.mesh.visible = visible;
   }
 
+  canUpdateEditorPreview(update: EditorPreviewSceneUpdate): boolean {
+    return update.fills.every(id => !this.fillData.parts.has(id));
+  }
+
+  updateEditorPreview(scene: VectorScene, update: EditorPreviewSceneUpdate, patches: readonly EditorPreviewTexel[]): void {
+    if (!update.fills.length) return;
+    this.editorPreview = true; this.selectionBounds = null; this.usingFillSelection = false;
+    for (const [kind, texture] of [["fillA", this.fillPathMetaTextureA], ["fillB", this.fillPathMetaTextureB],
+      ["fillC", this.fillPathMetaTextureC], ["fillSegmentsB", this.fillSegmentTextureB]] as const)
+      patchThreeEditorPreviewTexture(texture, patches.filter(patch => patch.kind === kind));
+    const indexPatches: EditorPreviewTexel[] = patches.filter(patch => patch.kind === "fillSegmentsA");
+    const data = this.fillSegmentTextureA.image.data as Float32Array;
+    for (const id of update.fills) {
+      // A moved contour uses the same exact segment scan; its old spatial
+      // indexes refer to the pre-drag position and must not be sampled.
+      for (const base of [this.mixedOptions.fillBandBase, this.mixedOptions.fillCellBase]) if (base !== undefined && base >= 0) {
+        const index = base + id, pixels = data.slice(index * 4, index * 4 + 4); pixels[1] = 0;
+        indexPatches.push({ kind: "fillSegmentsA", index, pixels });
+      }
+      const offset = id * 4;
+      this.fillMinX[id] = scene.fillPathMetaA[offset + 2]; this.fillMinY[id] = scene.fillPathMetaA[offset + 3];
+      this.fillMaxX[id] = scene.fillPathMetaB[offset]; this.fillMaxY[id] = scene.fillPathMetaB[offset + 1];
+    }
+    patchThreeEditorPreviewTexture(this.fillSegmentTextureA, indexPatches);
+  }
+
   setPrimitiveColorUpdates(updates: readonly PrimitiveColorUpdate[], scene: VectorScene): void {
     patchPrimitiveColorTexture(this.fillPathMetaTextureB, scene.fillPathMetaB, updates, "fill", [
       { source: 2, target: 2 }, { source: 3, target: 3 }
@@ -339,7 +368,7 @@ export class ThreeMaterialFillLayer {
     // padding computed from the presentation viewport. Keep whole paints.
     const reduced = resolution && (resolution.width < viewport.width || resolution.height < viewport.height);
     this.projectedFillFootprint.set(0, 0);
-    const units = reduced ? null : this.fillUnitsPerPixel(viewState, viewport);
+    const units = reduced || this.editorPreview ? null : this.fillUnitsPerPixel(viewState, viewport);
     // Nested composite targets can change their pixel grid independently of
     // the presentation projection. Their fills retain the original padding.
     if (units === null || compositing) this.projectedFillFootprint.set(0, 0);

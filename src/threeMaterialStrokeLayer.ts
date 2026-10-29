@@ -6,6 +6,8 @@ import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTrans
 import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
+import { patchThreeEditorPreviewTexture } from "./threeEditorPreview";
+import type { EditorPreviewSceneUpdate, EditorPreviewTexel } from "./editorPreviewSceneUpdate";
 import {
   sceneStrokeRecords, splitStrokeTextures, type SplitStrokeTextures, type StrokeRecords, type StrokeTextureData
 } from "./strokeRecords";
@@ -103,6 +105,7 @@ export class ThreeMaterialStrokeLayer {
   private drawInstanceCount: number;
   private markToken = 1;
   private usingAllSegments = true;
+  private editorMovedSegments: readonly number[] = [];
   private useLocalToClip = false;
 
   constructor(scene: VectorScene, options: StrokeLayerOptions) {
@@ -301,7 +304,18 @@ export class ThreeMaterialStrokeLayer {
       if (update.color) this.solidColorOverrides.add(key);
       else this.solidColorOverrides.delete(key);
     }
-    this.orderedRuns?.setStrokeRedundancyEnabled(!this.pageTransforms && this.solidColorOverrides.size === 0);
+    this.orderedRuns?.setStrokeRedundancyEnabled(!this.editorMovedSegments.length && !this.pageTransforms && this.solidColorOverrides.size === 0);
+  }
+
+  updateEditorPreview(update: EditorPreviewSceneUpdate, patches: readonly EditorPreviewTexel[]): void {
+    this.editorMovedSegments = update.strokes;
+    for (const [kind, head, tail] of [["strokeA", this.segmentTextureA, this.segmentTailTextureA],
+      ["strokeB", this.segmentTextureB, this.segmentTailTextureB], ["strokeBounds", this.segmentBoundsTexture, this.segmentTailBoundsTexture]] as const) {
+      const values = patches.filter(patch => patch.kind === kind);
+      patchThreeEditorPreviewTexture(head, values, 0, this.segmentSplit);
+      patchThreeEditorPreviewTexture(tail, values, this.segmentSplit, this.segmentCount - this.segmentSplit);
+    }
+    this.orderedRuns?.setStrokeRedundancyEnabled(false);
   }
 
   setVectorOverride(red: number, green: number, blue: number, opacity: number): void {
@@ -461,7 +475,12 @@ export class ThreeMaterialStrokeLayer {
       viewMaxY < grid.minY ||
       viewMinY > grid.maxY
     ) {
-      return 0;
+      if (writeVisibleIds) {
+        this.visibleSegmentIds.set(this.editorMovedSegments);
+        this.usingAllSegments = false;
+        this.overwrittenSegmentIds = Math.max(this.overwrittenSegmentIds, this.editorMovedSegments.length);
+      }
+      return this.editorMovedSegments.length;
     }
 
     if (
@@ -491,6 +510,11 @@ export class ThreeMaterialStrokeLayer {
 
     let outCount = 0;
     const bounds = this.strokeBounds;
+    for (const id of this.editorMovedSegments) {
+      this.segmentMarks[id] = this.markToken;
+      if (writeVisibleIds) this.visibleSegmentIds[outCount] = id;
+      outCount++;
+    }
     for (let row = r0; row <= r1; row += 1) {
       // A stroke is registered only in cells its bounds reach, so a cell inside
       // the view needs no per-stroke test. Border cells also hold strokes

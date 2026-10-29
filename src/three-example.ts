@@ -5,16 +5,19 @@ import { createThreeLinkNavigation } from "./threeLinkNavigation";
 import { createReaderViewport, type ReaderView } from "./readerViewport";
 import { computeReaderPageRects, readerContentMetrics, readerFitZoom, readerViewFromScroll } from "./readerGeometry";
 import type { VectorScene } from "./pdfVectorExtractor";
+import { getEditorSceneTranslationHint } from "./editorScenePreview";
 import { createAnnotationOverlay, isLinkAnnotation } from "./annotationOverlay";
 import { createAnnotationInteractionController, type AnnotationInteractionController } from "./annotationInteraction";
 import { createThreeAnnotationInteractionAdapter } from "./threeAnnotationInteraction";
 import * as THREE from "three";
-import { waitForLoad } from "./loadCancellation";
+import { waitForLoad, yieldAfterPaint } from "./loadCancellation";
 import { warmViewerRendering } from "./viewerRenderWarmup";
 import { createThreeExampleLoadDiagnostics } from "./threeExampleLoadDiagnostics";
 import { createViewerPrintAction, type ViewerPrintAction, type ViewerPrintDocument } from "./viewerPrint";
 import { createViewerFileDropController } from "./viewerFileDrop";
 import { initializeToolbarIcons, setToolbarIconButton, toolbarIconMarkup } from "./toolbarIcons";
+import { createEditorSetupLoading, type EditorSetupLoadingHandle } from "./editorSetupLoading";
+import "./editorSetupLoading.css";
 import { WebGPURenderer } from "three/webgpu";
 import { MapControls } from "three/addons/controls/MapControls.js";
 
@@ -360,6 +363,8 @@ let lastLoadedSource: File | string | null = null;
 let pdfEditor: import("./editorUi").EditorUi | null = null;
 let editorFrameListener: (() => void) | null = null;
 let editorInitialization: AbortController | null = null;
+const editorSetupLoading = createEditorSetupLoading(() => canvasElement);
+let activeEditorSetup: EditorSetupLoadingHandle | null = null;
 const editorModeButton = document.querySelector<HTMLButtonElement>("#editor-mode")!;
 const printPdfButton = document.querySelector<HTMLButtonElement>("#print-pdf")!;
 let viewerPrintAction: ViewerPrintAction | null = null;
@@ -543,32 +548,46 @@ editorModeButton.addEventListener("click", () => { void togglePdfEditing(); });
 function setThreeEditing(active: boolean): void {
   if (active) { drawingSelection.disable(); textSelection.disable(); annotationOverlay.hide(); }
   else if (textSelectionCheckboxElement.checked) textSelection.enable();
+  if (!active) currentPdfObject?.resumePageLoading();
   annotationInteraction?.setInteractionEnabled(!active); textSelectionCheckboxElement.disabled = active;
   for (const control of [ocrTextCheckboxElement, pageStreamingCheckboxElement, compressScansCheckboxElement]) control.disabled = active || Boolean(pdfEditor) || currentPdfObject?.sourceKind !== "pdf";
   const layout = document.querySelector<HTMLSelectElement>(".reader-layout"); if (layout) layout.disabled = active;
   for (const button of pageLayoutButtons) button.disabled = active;
-  setToolbarIconButton(editorModeButton, active ? "view" : "edit", active ? "View PDF" : "Edit PDF"); editorModeButton.setAttribute("aria-pressed", String(active));
+  setToolbarIconButton(editorModeButton, editorInitialization ? "cancel" : active ? "view" : "edit",
+    editorInitialization ? "Cancel editing setup" : active ? "View PDF" : "Edit PDF"); editorModeButton.setAttribute("aria-pressed", String(active));
   viewerPrintAction?.refresh();
 }
 
 async function togglePdfEditing(): Promise<void> {
   if (editorInitialization) { editorInitialization.abort(); return; }
+  let setup: EditorSetupLoadingHandle | undefined, controller: AbortController | undefined;
   try {
-    const editor = await ensureThreeEditor();
-    const controller = editorInitialization = new AbortController();
-    try { await editor.setEditing(!editor.isEditing()); clearLoadedStatus(); }
-    finally { if (editorInitialization === controller) editorInitialization = null; viewerPrintAction?.refresh(); }
+    if (!pdfEditor?.isEditing()) activeEditorSetup = setup = editorSetupLoading.begin({ stage: pdfEditor ? "display" : "loading" });
+    const editor = await ensureThreeEditor(undefined, setup);
+    controller = editorInitialization = new AbortController();
+    setToolbarIconButton(editorModeButton, "cancel", "Cancel editing setup"); editorModeButton.setAttribute("aria-busy", "true");
+    if (setup) { setup.report({ stage: "display" }); await yieldAfterPaint(controller.signal); }
+    await editor.setEditing(!editor.isEditing(), controller.signal);
+    controller.signal.throwIfAborted(); clearLoadedStatus();
   } catch (error) {
     if (!(error instanceof DOMException && error.name === "AbortError")) setStatus(`Could not enter Edit mode: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    if (controller && editorInitialization === controller) {
+      editorInitialization = null; editorModeButton.removeAttribute("aria-busy");
+      setToolbarIconButton(editorModeButton, pdfEditor?.isEditing() ? "view" : "edit", pdfEditor?.isEditing() ? "View PDF" : "Edit PDF");
+    }
+    setup?.finish(); if (activeEditorSetup === setup) activeEditorSetup = null;
+    viewerPrintAction?.refresh();
   }
 }
 
-async function ensureThreeEditor(signal?: AbortSignal): Promise<import("./editorUi").EditorUi> {
+async function ensureThreeEditor(signal?: AbortSignal, setup?: EditorSetupLoadingHandle): Promise<import("./editorUi").EditorUi> {
   signal?.throwIfAborted();
   if (editorInitialization || sourceLoadController || pageLayoutWarmingUp || backendChangeActive)
     throw new Error("Wait for the document or renderer change to finish before editing the document.");
   if (!currentPdfObject) throw new Error("Open a PDF or HEP before editing the document.");
   if (pdfEditor) return pdfEditor;
+  const loading = setup ?? editorSetupLoading.begin({ stage: "loading" }); activeEditorSetup = loading;
   setToolbarIconButton(editorModeButton, "cancel", "Cancel editing setup"); editorModeButton.setAttribute("aria-busy", "true");
   const controller = editorInitialization = new AbortController();
   const abort = (): void => controller.abort(signal?.reason);
@@ -576,6 +595,7 @@ async function ensureThreeEditor(signal?: AbortSignal): Promise<import("./editor
   try {
     if (!pdfEditor) {
       setStatus("Preparing full-quality editing data…");
+      loading.report({ stage: "loading" }); await yieldAfterPaint(controller.signal);
       const { createEditorUi } = await import("./editorUi"); controller.signal.throwIfAborted();
       const { waitForEditorScenePresentation } = await import("./editorPresentation"); controller.signal.throwIfAborted();
       const originalSource = { sourceKind: currentPdfObject.sourceKind, sourceBytes: currentPdfObject.sourceBytes,
@@ -587,13 +607,15 @@ async function ensureThreeEditor(signal?: AbortSignal): Promise<import("./editor
         getCanvas: () => canvasElement, getScene: () => currentPdfObject?.sceneData ?? null,
         getSource: () => ({ pdf: currentPdfObject?.sourceKind === "pdf" ? currentPdfObject.sourceBytes : undefined,
           password: currentPdfObject?.sourceOptions?.password, label: currentPdfObject?.sourceLabel ?? "document" }),
-        async prepareScene(signal) {
+        async prepareScene(signal, onProgress) {
           const object = currentPdfObject!; object.pausePageLoading();
           if (object.sourceKind !== "pdf" || !object.sourceBytes) return object.sceneData;
           const { loadPdfSceneFromSource } = await import("./pdfObjectGenerator");
           return (await loadPdfSceneFromSource(object.sourceBytes, { ...object.sourceOptions,
             compressScans: false, ocrTextOnly: false, segmentMerge: false, invisibleCull: false, pageLoading: "eager",
-            onProgress: progress => { if (!signal.aborted && currentPdfObject === object) setStatus(`Preparing editing data: ${Math.round(progress.value * 100)}%`); }
+            onProgress: progress => { if (!signal.aborted && currentPdfObject === object) {
+              onProgress?.(progress); setStatus(`Preparing editing data: ${Math.round(progress.value * 100)}%`);
+            } }
           }, signal)).scene;
         },
         documentChanged(_scene, source) {
@@ -601,21 +623,36 @@ async function ensureThreeEditor(signal?: AbortSignal): Promise<import("./editor
             sourceOptions: { ...originalSource.sourceOptions, password: source.password,
               ocrTextOnly: false, compressScans: false, pageLoading: "eager" } } : originalSource;
         },
-        async applyScene(sceneData, signal, onPresented) {
+        async applyScene(sceneData, signal, onPresented, options) {
           signal.throwIfAborted();
           editorSceneApplicationActive = true; updateThreeBackendSelectDisabledState();
           try {
             await waitForLoad(backendChangeCompletion, signal); signal.throwIfAborted();
             const previous = currentPdfObject; if (!previous) throw new DOMException("Document closed.", "AbortError");
+            if (options?.preview && !editedSource && previous.updateEditorPreviewScene(sceneData)) {
+              requestRender();
+              const presentedRenderer = renderer;
+              if (onPresented) await waitForEditorScenePresentation({ signal, onPresented,
+                isCurrent: () => renderer === presentedRenderer && currentPdfObject === previous && previous.sceneData === sceneData,
+                subscribe: notify => {
+                  pendingRenderedFrameResolvers.push(notify);
+                  return () => { const index = pendingRenderedFrameResolvers.indexOf(notify); if (index >= 0) pendingRenderedFrameResolvers.splice(index, 1); };
+                } });
+              return;
+            }
             const snapshot = captureCameraSnapshot();
             const source = editedSource ?? previous;
+            const objectOptions = readThreeObjectOptions();
             const next = await createThreePdfObject({ scene: sceneData, sourceKind: source.sourceKind, sourceLabel: previous.sourceLabel,
-              sourceBytes: source.sourceBytes, sourceOptions: source.sourceOptions }, readThreeObjectOptions(), signal);
+              sourceBytes: source.sourceBytes, sourceOptions: source.sourceOptions }, options?.preview && getEditorSceneTranslationHint(sceneData)
+                ? { ...objectOptions, textLod: "off", vectorLod: "off" } : objectOptions, signal);
             try {
               signal.throwIfAborted(); next.position.copy(previous.position); next.quaternion.copy(previous.quaternion); next.scale.copy(previous.scale);
               const layout = await preparePageLayoutReplacement(next, signal); signal.throwIfAborted();
               replacePdfObject(next, { fitCamera: false, pageLayoutView: layout, layout: activePageLayout });
-              restoreCameraSnapshot(snapshot); updateSceneMetrics(next); reader.invalidateThumbnails(); requestRender();
+              restoreCameraSnapshot(snapshot);
+              if (!options?.preview) { updateSceneMetrics(next); reader.invalidateThumbnails(); }
+              requestRender();
               const presentedRenderer = renderer;
               if (onPresented) await waitForEditorScenePresentation({ signal, onPresented,
                 isCurrent: () => renderer === presentedRenderer && currentPdfObject === next,
@@ -633,17 +670,28 @@ async function ensureThreeEditor(signal?: AbortSignal): Promise<import("./editor
           return () => { if (editorFrameListener === listener) editorFrameListener = null; };
         },
         requestFrame: requestRender,
-        setEditing: setThreeEditing, onStatus: setStatus, onBusyChange: () => viewerPrintAction?.refresh()
+        setEditing: setThreeEditing, onStatus: setStatus, onBusyChange: () => viewerPrintAction?.refresh(),
+        onSetupProgress: progress => { if (!controller.signal.aborted) loading.report(progress); }
       }, controller.signal);
     }
     controller.signal.throwIfAborted(); return pdfEditor;
-  } finally { signal?.removeEventListener("abort", abort); if (editorInitialization === controller) editorInitialization = null; editorModeButton.removeAttribute("aria-busy");
-    setToolbarIconButton(editorModeButton, pdfEditor?.isEditing() ? "view" : "edit", pdfEditor?.isEditing() ? "View PDF" : "Edit PDF"); if (!pdfEditor) currentPdfObject?.resumePageLoading(); viewerPrintAction?.refresh(); }
+  } finally {
+    signal?.removeEventListener("abort", abort);
+    if (!setup) { loading.finish(); if (activeEditorSetup === loading) activeEditorSetup = null; }
+    if (editorInitialization === controller) {
+      editorInitialization = null; editorModeButton.removeAttribute("aria-busy");
+      setToolbarIconButton(editorModeButton, pdfEditor?.isEditing() ? "view" : "edit", pdfEditor?.isEditing() ? "View PDF" : "Edit PDF");
+      if (!pdfEditor) currentPdfObject?.resumePageLoading();
+    }
+    viewerPrintAction?.refresh();
+  }
 }
 
 function discardThreeEditor(): boolean {
   if (pdfEditor && !pdfEditor.confirmDocumentChange()) return false;
-  editorInitialization?.abort(); editorInitialization = null; pdfEditor?.dispose(); pdfEditor = null; setThreeEditing(false); return true;
+  editorInitialization?.abort(); editorInitialization = null;
+  activeEditorSetup?.finish(); activeEditorSetup = null;
+  pdfEditor?.dispose(); pdfEditor = null; setThreeEditing(false); return true;
 }
 
 setPanelCollapsed(false);
@@ -1798,6 +1846,8 @@ function disposeExample(): void {
     return;
   }
   lifetimeAbortController.abort();
+  editorInitialization?.abort(); editorInitialization = null;
+  activeEditorSetup?.finish(); activeEditorSetup = null;
   fileDropController.dispose();
   loadToken += 1;
   sourceLoadController?.abort();

@@ -31,7 +31,7 @@ const annotation = (type, extra = {}) => ({ id: "widget:1", subtype: "Widget", v
   tooltip: "Field label", field: { name: "customer", type, flags: 0, ...extra } });
 
 try {
-  const { createEditorFieldControl, createEditorFieldOptions, setEditorFieldControlValue, editorFieldDraftSignature, hasPendingEditorFields, flushEditorFieldDrafts } = await import("../src/editorFormControls.ts");
+  const { createEditorFieldControl, createEditorFieldOptions, setEditorFieldControlValue, editorFieldDraftSignature, hasPendingEditorFields, flushEditorFieldDrafts, updateEditorFieldControlAppearance } = await import("../src/editorFormControls.ts");
   const { readRichTextRuns, normalizeEditorTextColor, commitEditorText, hasPendingEditorTextChanges } = await import("../src/editorRichText.ts");
   const { validateEditorOpacity, editorStyledSelection, applyEditorOpacity } = await import("../src/editorProperties.ts");
   const { LoadProgressReporter } = await import("../src/loadProgress.ts");
@@ -364,6 +364,7 @@ try {
   const focusedDocument = { activeElement: focusedField }; let finishCompile;
   const compilePending = new Promise(resolve => { finishCompile = resolve; });
   const refreshHost = vm.createContext({ renderRevision: 0, operation: null, AbortController, disposed: false, tool: "form", latestScene: { id: "before" },
+    pendingDrawings: { capture() {}, acknowledge() {} },
     scenePreparation: null, sceneApplication: null, lifetime: new AbortController(), AbortSignal, active: false, requestedPreview: null, presented: null, updatePointerCursor() {},
     synchronizeDocumentSource: async () => {}, updateFieldPaint() {},
     session: { getState: () => ({ revision: 0, selection: [], previewing: false }), getSelectionFrame: () => null, getScene: () => compilePending }, host: { applyScene: async () => {} },
@@ -427,6 +428,7 @@ try {
   keyHost.keydown({ key: "s", ctrlKey: true, preventDefault() {} }); keyHost.keydown({ key: "Escape", preventDefault() {} });
   assert.equal(cancelledStructure, 1); assert.deepEqual(savedFromFocus, ["pdf", "pdf"], "structural work blocks keyboard exports and allows cancellation");
   const created = [], creationHost = vm.createContext({ objectOpacity: .375, fillOpacity: .6, tool: "rectangle", pendingPick: null, pointer: null,
+    pendingDrawings: { add() {} },
     appendEditorInkSamples, editorInkCaptureTolerance, host: { clientToScenePoint: (x, y) => ({ x, y }), sceneToClientPoint: (x, y) => ({ x, y }) },
     Math, editorSignaturePlacement, clearPreview() {}, updatePointerCursor() {}, overlay: { releasePointerCapture() {} }, property: name => ({ value: name === "color" ? "#123456" : "2", checked: false }),
     pageAt: () => 0, pageLocal: point => [point.x, point.y], setTool() {}, commit: apply => apply(),
@@ -434,11 +436,15 @@ try {
     pendingImage: { kind: "image", imageWidth: 1, imageHeight: 1, data: Uint8Array.of(1, 2, 3, 255) },
     session: { sourceScene: { pageRects: Float32Array.of(0, 0, 200, 300) }, addObject(object) { created.push(object); return "created"; }, select() {} }
   });
-  for (const name of ["signaturePlacementAt", "placeImage", "placeSignature", "pointerUp"]) vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), name), creationHost);
+  for (const name of ["signaturePlacementAt", "placeImage", "placeSignature", "createShapeDraft", "updateShapeGesture", "pointerUp"]) vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), name), creationHost);
+  const captureInk = pointer => { pointer.ink = { kind: "ink", pageIndex: 0, paths: [pointer.points], opacity: .375, fillOpacity: .6,
+    smoothing: editorInkCaptureTolerance(pointer.start, point => point), color: "#123456", strokeWidth: 2, fill: null }; };
   creationHost.placeImage({ x: 20, y: 60 }); creationHost.placeSignature({ x: 20, y: 60 });
   for (const tool of ["rectangle", "ink"]) {
     creationHost.tool = tool; creationHost.pointer = { id: 1, start: { x: 10, y: 20 }, last: { x: 40, y: 50 }, startClient: { x: 10, y: 20 },
       points: [[10, 20], [20, 40], [40, 50]], bounds: null, action: "draw", additive: false };
+    if (tool === "ink") captureInk(creationHost.pointer);
+    else { creationHost.pointer.shape = creationHost.createShapeDraft(tool, 0); creationHost.updateShapeGesture(creationHost.pointer, creationHost.pointer.last); }
     creationHost.pointerUp({ pointerId: 1, clientX: 40, clientY: 50 });
   }
   assert.deepEqual(created.map(object => object.kind), ["image", "signature", "shape", "ink"]);
@@ -447,15 +453,18 @@ try {
   creationHost.tool = "ink";
   creationHost.pointer = { id: 2, start: { x: 10, y: 10 }, last: { x: 10, y: 10 }, startClient: { x: 10, y: 10 },
     points: [[10, 10], [20, 10], [20, 20], [10, 10]], bounds: null, action: "draw" };
+  captureInk(creationHost.pointer);
   creationHost.pointerUp({ pointerId: 2, clientX: 10, clientY: 10, getCoalescedEvents: () => [] });
   assert.equal(created.at(-1).paths[0].length, 4, "a pencil loop survives a release back at its start");
   assert(created.at(-1).smoothing > 0 && created.at(-1).smoothing < .35);
   creationHost.pointer = { id: 3, start: { x: 7, y: 8 }, last: { x: 7, y: 8 }, startClient: { x: 7, y: 8 },
     points: [[7, 8]], bounds: null, action: "draw" };
+  captureInk(creationHost.pointer);
   creationHost.pointerUp({ pointerId: 3, clientX: 7, clientY: 8 });
   assert.deepEqual(Array.from(created.at(-1).paths[0][0]), [7, 8], "a pencil tap creates a vector dot");
   creationHost.pointer = { id: 4, start: { x: 0, y: 0 }, last: { x: 2, y: 2 }, startClient: { x: 0, y: 0 },
     points: [[0, 0], [2, 2]], bounds: null, action: "draw" };
+  captureInk(creationHost.pointer);
   creationHost.pointerUp({ pointerId: 4, clientX: 9, clientY: 11, getCoalescedEvents: () => [] });
   assert.deepEqual(Array.from(created.at(-1).paths[0].at(-1)), [9, 11], "pencil release appends the actual final pen location");
   const textCreationHost = vm.createContext({ disposed: false, textRequest: 0,
@@ -520,13 +529,16 @@ try {
   assert.equal(fontLoads, 1, "fields using one font share its in-flight browser font load");
   resolveFont(); await Promise.all(fieldFontLoads); assert.equal(installedFonts, 1);
   await fontHost.activateFont(typingFont); assert.equal(fontLoads, 1);
-  const paintedControl = { dataset: { fieldId: "new-appearance" }, value: "focused draft", selectionStart: 4 };
-  const paintHost = vm.createContext({ latestScene: { annotations: [{ id: "new-appearance", hasAppearance: false }] },
+  const paintedControl = { tagName: "INPUT", type: "text", dataset: { fieldId: "new-appearance" }, value: "focused draft", selectionStart: 4 };
+  const paintHost = vm.createContext({ fieldPaintCache: null, updateEditorFieldControlAppearance,
+    latestScene: { annotations: [{ id: "new-appearance", hasAppearance: false, field: { value: "focused draft" } }] },
     fieldDrafts: new Map([[paintedControl, "draft"]]), getSceneAnnotationRuns: () => new Map() });
   vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), "updateFieldPaint"), paintHost);
   paintHost.updateFieldPaint(); assert.equal(paintedControl.dataset.pdfAppearance, undefined);
   paintHost.getSceneAnnotationRuns = () => new Map([["new-appearance", [{ kind: "fill", count: 1 }]]]);
+  paintHost.latestScene = { ...paintHost.latestScene };
   paintHost.updateFieldPaint(); assert.equal(paintedControl.dataset.pdfAppearance, "true", "newly generated field paint replaces the native control's duplicate visual");
+  assert.equal(paintedControl.dataset.pdfPending, undefined, "a matching presented value releases native pending paint");
   assert.equal(paintedControl.value, "focused draft"); assert.equal(paintedControl.selectionStart, 4);
   console.log("Editor form controls and rich text tests passed.");
 } finally { hooks.deregister(); }
