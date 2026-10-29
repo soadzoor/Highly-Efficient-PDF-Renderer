@@ -239,15 +239,26 @@ outlines, Unicode mappings and images that remain; it needs no original PDF.
 ### Layers
 
 Use the **Layers** toolbar icon to open layer editing in the right Settings dock.
-Add named layers, rename them, change default visibility or its lock, choose a
-parent, and move layers up or down. The top layer paints in front; reordering
+Each row has a name, **Visible by default** checkbox under the eye column and
+**Lock visibility** checkbox under the padlock column. Click a row to make it the
+active destination without changing the selected artwork. Double-click its name,
+or press F2/Enter on the row, to rename in place; Enter or blur commits, Escape
+cancels. Drag the six-dot grip with a mouse, touchscreen or pen above or below
+another row to reorder complete layer subtrees. Hold near the list's top or
+bottom edge to scroll through longer lists. Swiping names or other list areas
+scrolls normally. Release over a valid insertion marker to commit; Escape,
+pointer cancellation or release outside the list cancels the drag.
+Up/Down/Home/End select rows; Alt+Up/Down reorders siblings.
+Choose a parent and access removal controls in **Layer options**.
+The top layer paints in front; reordering
 also changes artwork stacking. Unlayered artwork keeps its existing paint slots,
 and compositing groups move as units so their clips, masks and blending survive.
 Content associated with several layers uses its frontmost listed membership.
 Newly creating or renaming a layer alone does not reorder existing artwork.
 
-**New objects** chooses the active layer for text, shapes, signatures and images.
-Choose **Unlayered** to add independent content. A hidden active layer must be
+The blue highlighted row chooses the destination for new text, shapes,
+signatures, images and pasted objects. Click **Unlayered** at the top of the list to add
+independent content. A hidden active layer must be
 shown before placing new content. Select existing objects, choose their destination
 and use **Assign selection**; **Select contents** selects a layer's visible objects.
 **Remove layer, keep artwork** removes the visibility membership, retaining other
@@ -257,6 +268,24 @@ layer edits participate in Undo/Redo; changing the active layer is a preference.
 New textbox drafts retain the layer chosen when typing begins. Editing a reopened
 textbox preserves its actual compound membership; hiding a layer hides its typing
 draft without discarding the text, and showing it restores the draft.
+
+Select artwork and use **Copy** (Ctrl/Cmd+C) or **Cut** (Ctrl/Cmd+X), click a
+different layer row, then **Paste** (Ctrl/Cmd+V). The same commands are available
+in the toolbar and Select-tool context menu, including Paste on empty document
+space. Copies use successive small offsets; **Paste in place**
+(Ctrl/Cmd+Shift+V) preserves the original position. Cut/paste preserves position
+by default. Cut and paste have separate Undo steps. Layer-row focus keeps object
+shortcuts available; typing in a layer name, textbox or form retains normal text
+copy/paste and IME input.
+
+The clipboard belongs to the open document and stays in memory. Added textboxes,
+images, handwriting and groups retain their editing models; source PDF artwork
+and form widgets copy their current appearance as independent artwork. Changing
+the original field later does not change its copy, and copied widgets do not
+become new linked form fields. Paste retains the source pages and assigns the
+chosen layer, including hidden destinations without showing them automatically.
+After a page-structure change, recopy before pasting, or undo that page change.
+Neither PDF nor HEP stores the clipboard.
 
 With **Select** active, right-click an object or anywhere inside the current
 selection frame to open its drawing-order menu. **Bring to front** and **Send to
@@ -291,6 +320,11 @@ crossings between page artwork, annotations and form widgets.
 Check the four right-click commands with overlapping source and newly added
 objects, multi-selections and separate layers. Reopen saved copies and verify
 that clicking an overlap selects the object now in front.
+Check inline renaming, row visibility/locks, mouse/touch/pen drag insertion markers,
+edge scrolling, cancellation, nested reordering and narrow dock layout in both
+viewers. Check real touch scrolling outside grips. Copy/cut artwork, select a
+different row and paste; test paste-in-place, hidden destinations, Undo/Redo,
+normal text clipboard behavior and cancelled source captures.
 
 ### Manual editing verification
 

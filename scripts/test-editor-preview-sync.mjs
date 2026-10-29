@@ -229,7 +229,7 @@ for (const boundary of ["cancel", "view", "dispose"]) {
   const scene = {}, nodes = new Map(), counts = { bounds: 0, frames: 0, queries: 0, opacity: 0, mode: 0, reconcile: 0, cursors: 0 }, statuses = [];
   const c = vm.createContext({ currentState: initial, currentSourceScene: scene, active: true, running: false, document: { activeElement: null },
     contextMenu: { close() {} }, pendingDrawings: { reconcile() { counts.reconcile++; } },
-    updatePointerCursor() { counts.cursors++; }, setStatus: value => statuses.push(value), hasUnsavedChanges: () => true,
+    updatePointerCursor() { counts.cursors++; }, updateClipboardButtons() {}, setStatus: value => statuses.push(value), hasUnsavedChanges: () => true,
     query(selector) { counts.queries++; if (!nodes.has(selector)) nodes.set(selector, {}); return nodes.get(selector); },
     editorFrameSize: () => ({ width: 100, height: 50 }), updateRotationValue() {}, updateOpacityControls() { counts.opacity++; },
     session: { sourceScene: scene, getSelectionBounds() { counts.bounds++; return frame(0).bounds; }, getSelectionFrame() { counts.frames++; return frame(0); } },

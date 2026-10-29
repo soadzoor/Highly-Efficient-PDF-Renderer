@@ -60,7 +60,7 @@ function harness(frameHost = true) {
     host, document, fields, AbortSignal, editorFieldClientGeometry, latestScene: sourceScene, presented: null,
     overlay: { dataset: {}, style: {}, remove: noop }, toolbar: { style: {}, querySelectorAll: () => [], remove: noop }, graphic: { setAttribute: noop, replaceChildren: noop },
     displayedSelection: () => ({ frame: null }), pointer: null, polygon: null, activeText: null, tool: "form", running: false,
-    active: false, disposed: false, structuralRunning: false, releaseFrameListener: null, frame: 0, previewFrame: 0,
+    active: false, disposed: false, structuralRunning: false, clipboardRunning: false, releaseFrameListener: null, frame: 0, previewFrame: 0,
     toolRequest: 0, textRequest: 0, pendingFieldFocus: null, fieldDrafts: new Map(), fieldPaintCache: null, fontFaces: new Map(),
     session: { sourceScene, getFieldValues: () => fieldValues, setFieldValue: (name, value) => fieldValues.set(name, value), isAnnotationVisible: () => true, dispose: noop },
     layerControls: { setActive: noop, dispose: noop }, layerDialog: null,

@@ -73,7 +73,7 @@ try {
         addObject(object) { objects.push(object); return `signature-${objects.length}`; }, select(ids) { selections.push(Array.from(ids)); } },
       pageLocal: (point, index) => [point.x - context.session.sourceScene.pageRects[index * 4], point.y - context.session.sourceScene.pageRects[index * 4 + 1]],
       displayedSelection: () => ({ frame: null }), isSceneSettling: () => context.settling,
-      active: true, disposed: false, running: false, structuralRunning: false, settling: false,
+      active: true, disposed: false, running: false, structuralRunning: false, clipboardRunning: false, settling: false,
       tool: "select", toolRequest: 0, textRequest: 0, pendingFieldFocus: null, pointer: null, pendingPick: null, picking: null,
       activeText: null, polygon: null, latestScene: {}, presented: null, fillOpacity: .7,
       currentState: { selection: [] }, updateOpacityControls: noop,

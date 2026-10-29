@@ -67,7 +67,7 @@ const activate = source.slice(methodStart, methodEnd).replace("async setEditing"
 function activation(mode = "success") {
   const events = [], controller = new AbortController(); let subscriptions = 0, releases = 0, ticks = 0;
   const classes = new Set(), context = vm.createContext({ AbortController, AbortSignal,
-    disposed: false, structuralRunning: false, active: false, lifetime: new AbortController(), frame: 1,
+    disposed: false, structuralRunning: false, clipboardRunning: false, active: false, lifetime: new AbortController(), frame: 1,
     contextMenu: { close() {} }, toolbar: { hidden: true }, overlay: { hidden: true }, layerDialog: null, releaseFrameListener: null,
     layerControls: { setActive: value => events.push(["layers", value]) },
     document: { body: { classList: { toggle(name, value) { if (value) classes.add(name); else classes.delete(name); }, remove: name => classes.delete(name) } } },

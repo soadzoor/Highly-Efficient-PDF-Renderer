@@ -30,6 +30,7 @@ import { prepareEditorNativePdfLayers } from "./editorNativeLayers";
 import { applyEditorSceneLayers, assignEditorGeometryLayer, reorderEditorSceneLayers, editorLayerPaintRank } from "./editorLayerScene";
 import { isScenePaintRunVisible, scenePaintOrderedRuns } from "./scenePaintQuery";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
+import { getEditorCapturedSourceScene } from "./editorClipboard";
 
 export const EDITOR_PDF_LAYER_STACKING_DIAGNOSTIC_CODE = "editor.pdf-layer-stacking";
 
@@ -1024,8 +1025,9 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
       const work = objectProgress(object);
       const keep = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind => [kind, new Set<number>()])) as Record<PrimitiveKind, Set<number>>;
       for (const ref of object.primitives) keep[ref.kind].add(ref.index);
-      const cloneSource = await applyEditorSceneLayers(session.sourceScene, session.getObjectLayerEdits(object.id), { signal: options.signal, onDiagnostic: options.onDiagnostic });
-      const cloned = transformWholeEditorScene(compactEditorScene(cloneSource, keep), object.transform, options.signal);
+      const captured = getEditorCapturedSourceScene(session, object.id);
+      const cloneSource = captured ?? await applyEditorSceneLayers(session.sourceScene, session.getObjectLayerEdits(object.id), { signal: options.signal, onDiagnostic: options.onDiagnostic });
+      const cloned = captured ?? transformWholeEditorScene(compactEditorScene(cloneSource, keep), object.transform, options.signal);
       const view = assignEditorGeometryLayer(new ScenePageViews(cloned).extract(object.pageIndex).scene, layerEdits.catalog, object.layerId, object.layerCondition);
       const imported = await importEditorPdfPage(new Uint8Array(await (await writeScenePdf(view, work.options)).arrayBuffer()), writer, options.signal);
       const sourceIndex = session.sourceScene.pdfPages?.find(page => page.pageIndex === object.pageIndex)?.sourcePageIndex ?? object.pageIndex;

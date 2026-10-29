@@ -3,4 +3,7 @@
 .hepr-editor-context-menu button{display:block;box-sizing:border-box;width:100%;flex:none;padding:7px 12px;border:0;border-radius:3px;background:transparent;color:inherit;text-align:start;white-space:normal;overflow-wrap:anywhere;cursor:pointer;font:inherit}
 .hepr-editor-context-menu button:hover:not(:disabled),.hepr-editor-context-menu button:focus-visible{background:#dceaff;color:#12429b;outline:1px solid #306ed8;outline-offset:-1px}
 .hepr-editor-context-menu button:disabled{opacity:.45;cursor:default}
+.hepr-editor-context-menu button[data-clipboard-action]{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.hepr-editor-menu-shortcut{min-width:0;font-size:11px;opacity:.7;text-align:end}
+.hepr-editor-menu-separator{flex:none;border-top:1px solid #d5deea;margin:3px 4px}
 @media print{.hepr-editor-context-menu{display:none!important}}

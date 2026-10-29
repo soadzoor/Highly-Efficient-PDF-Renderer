@@ -35,7 +35,7 @@ import { droppedFileKind } from "./documentDropFiles";
 import { waitForLoad, yieldAfterPaint } from "./loadCancellation";
 import type { EditorSetupProgress } from "./editorSetupLoading";
 import { createEditorLayerControls } from "./editorLayerControls";
-import { createEditorContextMenu } from "./editorContextMenu";
+import { createEditorContextMenu, type EditorClipboardAction } from "./editorContextMenu";
 
 export interface EditorUiHost {
   getCanvas(): HTMLCanvasElement;
@@ -139,6 +139,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   let opacityControlSelection = "";
   let rotationDraft: { selection: readonly string[]; sourceScene: VectorScene } | null = null;
   let renderRevision = 0, operation: AbortController | null = null, running = false;
+  let clipboardRunning = false;
   let previewGeneration = 0, previewQueued = false, previewRunning = false, previewPending = false;
   let picker: ScenePrimitivePicker | null = null;
   let picking: AbortController | null = null;
@@ -170,6 +171,9 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     ${editorIconButton("action", "image", "Import an image (PNG, JPEG or WebP)")}
     ${editorIconButton("action", "undo", "Undo (Ctrl/Cmd+Z)")}
     ${editorIconButton("action", "redo", "Redo (Ctrl/Cmd+Shift+Z)")}
+    ${editorIconButton("action", "copy", "Copy selected objects (Ctrl/Cmd+C)")}
+    ${editorIconButton("action", "cut", "Cut selected objects (Ctrl/Cmd+X)")}
+    ${editorIconButton("action", "paste", "Paste into the active layer (Ctrl/Cmd+V); Ctrl/Cmd+Shift+V pastes in place")}
     ${editorIconButton("action", "duplicate", "Duplicate selected objects")}
     ${editorIconButton("action", "delete", "Delete selected objects")}
     ${editorIconButton("action", "group", "Group selected objects")}
@@ -279,7 +283,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     } });
   const contextMenu = createEditorContextMenu(document, {
     canRun: action => canOpenContextMenu() && session.canReorderSelection(action),
-    run: action => { if (canOpenContextMenu()) commit(() => session.reorderSelection(action)); }, onError: report
+    run: action => { if (canOpenContextMenu()) commit(() => session.reorderSelection(action)); },
+    clipboard: { canRun: canUseClipboard, run: runClipboard }, onError: report
   });
   const styleEnabled = (name: string): boolean => query(`[data-style="${name}"]`).getAttribute("aria-pressed") === "true";
   function pageAt(point: PrimitivePoint): number {
@@ -469,7 +474,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     query<HTMLButtonElement>('[data-action="undo"]').disabled = !state.canUndo;
     query<HTMLButtonElement>('[data-action="redo"]').disabled = !state.canRedo;
     query("[data-selection]").textContent = state.selection.length ? `${state.selection.length} selected` : "No selection";
-    for (const action of ["duplicate", "delete", "group", "ungroup"]) query<HTMLButtonElement>(`[data-action="${action}"]`).disabled = state.selection.length === 0;
+    for (const action of ["duplicate", "delete", "group", "ungroup", "copy", "cut"]) query<HTMLButtonElement>(`[data-action="${action}"]`).disabled = state.selection.length === 0;
+    updateClipboardButtons();
     const bounds = session.getSelectionBounds(), frame = session.getSelectionFrame(), size = frame && editorFrameSize(frame);
     for (const [name, value] of Object.entries({ x: bounds?.minX, y: bounds?.minY, width: size?.width, height: size?.height })) {
       const input = query<HTMLInputElement>(`[data-transform="${name}"]`); input.disabled = !bounds;
@@ -538,6 +544,52 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   function changeHistory(redo: boolean): void {
     commit(() => { if (redo) session.redo(); else session.undo(); if (tool === "form") renderFields(); });
+  }
+  function updateClipboardButtons(): void {
+    const unavailable = running || structuralRunning || activeText !== null;
+    for (const action of ["copy", "cut"]) query<HTMLButtonElement>(`[data-action="${action}"]`).disabled = unavailable || !session.getSelection().length;
+    query<HTMLButtonElement>('[data-action="paste"]').disabled = unavailable || !session.canPaste();
+  }
+  function canUseClipboard(action: EditorClipboardAction): boolean {
+    return active && !disposed && !running && !structuralRunning && !activeText && !pointer && !pendingPick && !polygon && !isSceneSettling() &&
+      (action === "paste" ? session.canPaste() : session.getSelection().length > 0);
+  }
+  async function runClipboard(action: EditorClipboardAction, inPlace = false): Promise<void> {
+    if (!canUseClipboard(action)) return;
+    contextMenu.close();
+    if (action === "paste") {
+      if (tool !== "select") setTool("select");
+      commit(() => {
+        const ids = session.pasteSelection(inPlace ? { offset: [0, 0] } : undefined);
+        if (ids.length) {
+          const layer = session.getLayers().find(item => item.id === session.getActiveLayer());
+          const hidden = ids.some(id => !session.isObjectVisible(id));
+          setStatus(`Pasted ${ids.length} ${ids.length === 1 ? "object" : "objects"} into ${layer?.name ?? "Unlayered"}.${hidden ? " Some objects are hidden by their layer." : ""}`);
+        }
+      });
+      return;
+    }
+    cancelPointerGesture(false); textRequest++;
+    const abort = new AbortController(); operation = abort;
+    const signal = AbortSignal.any([lifetime.signal, abort.signal]);
+    clipboardRunning = running = true; updatePointerCursor(); updateClipboardButtons(); host.onBusyChange?.(true);
+    query('[data-action="cancel-operation"]').hidden = false;
+    setStatus(action === "cut" ? "Cutting objects…" : "Copying objects…");
+    let copied = 0, failed = false;
+    try {
+      copied = action === "cut" ? await session.cutSelection({ signal }) : await session.copySelection({ signal });
+      signal.throwIfAborted();
+      if (action === "cut" && copied) await refreshScene(signal, false, true);
+    } catch (error) { failed = true; report(error); }
+    finally {
+      if (operation === abort) operation = null;
+      clipboardRunning = running = false; host.onBusyChange?.(false);
+      if (!disposed) {
+        updatePointerCursor(); updateClipboardButtons(); query('[data-action="cancel-operation"]').hidden = true;
+        if (signal.aborted) setStatus("Clipboard operation cancelled.");
+        else if (!failed && copied) setStatus(`${copied} ${copied === 1 ? "object" : "objects"} ${action === "cut" ? "cut" : "copied"}. Select a layer and paste.`);
+      }
+    }
   }
   function runPreview(): void {
     previewQueued = false; if (!pointer || !active || disposed) return;
@@ -972,12 +1024,14 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       width: object?.width ?? 220, height: object?.height ?? 50, transform: object?.transform ?? IDENTITY, opacity: object?.opacity ?? objectOpacity, lineHeight: object?.lineHeight,
       baseline: { html: element.innerHTML, align: element.style.textAlign, opacity: object?.opacity ?? objectOpacity } };
     overlay.append(element); query('[data-action="apply-text"]').hidden = false; query('[data-action="cancel-text"]').hidden = false;
+    updateClipboardButtons();
     updateGeometry(); if (!element.hidden) element.focus(); activeText.baseline.html = element.innerHTML;
   }
   function cancelText(): void {
     textRequest++;
     activeText?.element.remove(); activeText = null;
     query('[data-action="apply-text"]').hidden = true; query('[data-action="cancel-text"]').hidden = true;
+    updateClipboardButtons();
   }
   async function finishText(): Promise<void> {
     if (!activeText) return;
@@ -1209,6 +1263,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   toolbar.addEventListener("click", event => {
     if (structuralRunning) return;
     const button = (event.target as Element).closest<HTMLButtonElement>("button"); if (!button) return;
+    if (clipboardRunning) { if (button.dataset.action === "cancel-operation") operation?.abort(); return; }
     if (button.dataset.tool) { setTool(button.dataset.tool as Tool); return; }
     if (button.dataset.style) { applyTextStyle(button.dataset.style); return; }
     switch (button.dataset.action) {
@@ -1216,6 +1271,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         if (layerDialog && !layerDialog.open) layerDialog.showModal();
         host.showLayerControls?.(); layerControls.show(); break;
       case "undo": changeHistory(false); break; case "redo": changeHistory(true); break;
+      case "copy": case "cut": case "paste": void runClipboard(button.dataset.action); break;
       case "delete": commit(() => session.deleteSelection()); break; case "duplicate": commit(() => session.cloneSelection()); break;
       case "group": commit(() => session.groupSelection()); break; case "ungroup": commit(() => session.ungroupSelection()); break;
       case "apply-text": void finishText().catch(report); break; case "cancel-text": cancelText(); break;
@@ -1285,8 +1341,15 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     return active && !disposed && !running && !structuralRunning && !activeText && !pointer && !pendingPick && tool === "select" && !isSceneSettling();
   }
   function showSelectionContextMenu(): void {
-    if (!canOpenContextMenu() || !session.getSelection().length) return;
-    const frame = session.getSelectionFrame(); if (!frame) return;
+    if (!canOpenContextMenu()) return;
+    const frame = session.getSelection().length ? session.getSelectionFrame() : null;
+    if (!frame) {
+      if (canUseClipboard("paste")) {
+        const rect = host.getCanvas().getBoundingClientRect();
+        contextMenu.show({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+      }
+      return;
+    }
     const center = editorFrameCenter(frame), point = host.sceneToClientPoint(center.x, center.y, frame.pageIndex);
     if (point) contextMenu.show(point);
   }
@@ -1301,9 +1364,13 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     const revision = session.revision, sourceScene = session.sourceScene, selectionKey = JSON.stringify(selection);
     const before = host.sceneToClientPoint(point.x, point.y);
     const id = await pick(point, { x: event.clientX, y: event.clientY });
-    if (!id || !canOpenContextMenu() || request !== textRequest || revision !== session.revision || sourceScene !== session.sourceScene || selectionKey !== JSON.stringify(session.getSelection())) return;
+    if (!canOpenContextMenu() || request !== textRequest || revision !== session.revision || sourceScene !== session.sourceScene || selectionKey !== JSON.stringify(session.getSelection())) return;
     const after = host.sceneToClientPoint(point.x, point.y);
     if (!before || !after || Math.abs(before.x - after.x) + Math.abs(before.y - after.y) > .1) return;
+    if (!id) {
+      if (canUseClipboard("paste")) { session.select([]); contextMenu.show({ x: event.clientX, y: event.clientY }); }
+      return;
+    }
     if (!selection.includes(id)) session.select([id]);
     contextMenu.show({ x: event.clientX, y: event.clientY });
   }
@@ -1350,16 +1417,23 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   overlay.addEventListener("dblclick", event => { void doubleClick(event).catch(report); });
   function keydown(event: KeyboardEvent): void {
-    if (!active || event.isComposing || event.keyCode === 229) return;
-    if (structuralRunning) {
+    if (!active || event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
+    if (structuralRunning || running && clipboardRunning) {
       if (event.key === "Escape") operation?.abort();
-      if (event.key === "Escape" || (event.ctrlKey || event.metaKey) && /^[szd]$/i.test(event.key)) event.preventDefault();
+      if (event.key === "Escape" || (event.ctrlKey || event.metaKey) && /^[szdcxv]$/i.test(event.key)) event.preventDefault();
       return;
     }
     if (event.key === "Escape") { polygon = null; cancelPointerGesture(); cancelText(); operation?.abort(); if (tool === "signature") setTool("select"); session.select([]); return; }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") { event.preventDefault(); void save("pdf"); return; }
-    if ((event.target as Element | null)?.closest?.("dialog")) return;
+    const dialog = (event.target as Element | null)?.closest?.("dialog");
+    if (dialog && dialog !== layerDialog) return;
     if (inputTarget(event.target)) return;
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && /^[cxv]$/i.test(event.key)) {
+      const action = event.key.toLowerCase() === "c" ? "copy" : event.key.toLowerCase() === "x" ? "cut" : "paste";
+      if (action !== "paste" && document.getSelection()?.isCollapsed === false) return;
+      if (canUseClipboard(action)) { event.preventDefault(); void runClipboard(action, action === "paste" && event.shiftKey); }
+      return;
+    }
     if ((event.key === "ContextMenu" || event.shiftKey && event.key === "F10") && canOpenContextMenu()) { event.preventDefault(); showSelectionContextMenu(); return; }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") { event.preventDefault(); changeHistory(event.shiftKey); }
     else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "d") { event.preventDefault(); commit(() => session.cloneSelection()); }
@@ -1389,6 +1463,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       const signal = AbortSignal.any([lifetime.signal, ...(externalSignal ? [externalSignal] : [])]);
       signal.throwIfAborted();
       contextMenu.close();
+      if (!value && clipboardRunning) operation?.abort();
       if (!value) pendingFieldFocus = null;
       if (!value) { flushEditorFieldDrafts(fieldDrafts); if (activeText) await finishText(); }
       if (!value) { toolRequest++; cancelPointerGesture(); polygon = null; signatureHover = null; textRequest++; }

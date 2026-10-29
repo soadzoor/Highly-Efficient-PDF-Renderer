@@ -20,7 +20,7 @@ export function createEditorDrawingPreviewHarness(initialTool = "ink") {
   const sourceScene = { pageRects: new Float32Array([1000, 2000, 1300, 2400]) };
   const rect = { left: 80, top: 40, width: 800, height: 1000, right: 880, bottom: 1040 };
   const captures = new Set(); let state = { revision: 0, selection: [], previewing: false };
-  const context = vm.createContext({ AbortController, AbortSignal, Set, active: true, disposed: false, running: false, structuralRunning: false,
+  const context = vm.createContext({ AbortController, AbortSignal, Set, active: true, disposed: false, running: false, structuralRunning: false, clipboardRunning: false,
     currentState: state, presented: { sourceScene, revision: 0, selection: new Set(), frame: null, delta: null },
     requestedPreview: null, scenePreparation: null, sceneApplication: null, renderRevision: 0,
     latestScene: sourceScene, lifetime: new AbortController(), pointer: null, pendingPick: null, picking: null,

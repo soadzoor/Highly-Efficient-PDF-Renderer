@@ -5,6 +5,7 @@ import type { NativeVectorPdfSession } from "./pdfSession";
 import { createLoadProgressReporter, type PDFLoadProgress } from "./loadProgress";
 import { invertEditorMatrix, multiplyEditorMatrices } from "./editorScene";
 import { editorOperationPageMap, rebaseEditorOrderedSource } from "./editorPageOrderRebase";
+import { editorClipboardStore, shareEditorClipboard, getEditorCapturedSourceScene, registerEditorCapturedSourceReader } from "./editorClipboard";
 
 export interface EditorDocumentVersion { session: EditorSession; options: EditorSessionOptions }
 interface Version extends EditorDocumentVersion { observedRevision: number; unsubscribe: () => void }
@@ -32,6 +33,7 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
     }
   };
   const retain = (value: EditorDocumentVersion): Version => {
+    shareEditorClipboard(initial.session, value.session);
     const version: Version = { ...value, observedRevision: value.session.revision, unsubscribe: () => {} };
     versions.add(version);
     version.unsubscribe = version.session.subscribe(state => {
@@ -161,6 +163,10 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
     setPreviewTransform: matrix => { assertLive(); current.version.session.setPreviewTransform(matrix); },
     deleteSelection: () => { assertLive(); current.version.session.deleteSelection(); },
     cloneSelection: offset => { assertLive(); return current.version.session.cloneSelection(offset); },
+    copySelection: options => { assertLive(); return current.version.session.copySelection(options); },
+    cutSelection: options => { assertLive(); return current.version.session.cutSelection(options); },
+    canPaste: () => { assertLive(); return current.version.session.canPaste(); },
+    pasteSelection: options => { assertLive(); return current.version.session.pasteSelection(options); },
     groupSelection: () => { assertLive(); return current.version.session.groupSelection(); },
     ungroupSelection: () => { assertLive(); current.version.session.ungroupSelection(); },
     setFieldValue: (name, value) => { assertLive(); current.version.session.setFieldValue(name, value); },
@@ -245,9 +251,12 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
     },
     dispose() {
       if (disposed) return; disposed = true; lifetime.abort(); listeners.clear(); undo.length = redo.length = 0;
+      const clipboard = editorClipboardStore(initial.session); clipboard.value = null; clipboard.sequence++;
       for (const version of versions) { version.unsubscribe(); version.session.dispose(); } versions.clear();
     }
   };
+  shareEditorClipboard(initial.session, session);
+  registerEditorCapturedSourceReader(session, id => getEditorCapturedSourceScene(current.version.session, id));
   return session;
 }
 

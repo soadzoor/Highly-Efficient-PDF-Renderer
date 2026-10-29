@@ -28,7 +28,8 @@ class Element extends Target {
   setAttribute(name, value) { this.attributes.set(name, value); }
   contains(node) { return node === this || this.childNodes.some(child => child.contains(node)); }
   closest(selector) {
-    return selector === "[data-stack-action]" && this.dataset.stackAction ? this : this.parent?.closest(selector) ?? null;
+    return (selector === "[data-stack-action]" && this.dataset.stackAction || selector === "[data-clipboard-action]" && this.dataset.clipboardAction)
+      ? this : this.parent?.closest(selector) ?? null;
   }
   focus(options) { if (this.disabled) return; this.ownerDocument.activeElement = this; this.focusCount++; this.focusOptions = options; }
   getBoundingClientRect() { return { width: Math.min(180, parseFloat(this.style.maxWidth) || 0), height: Math.min(128, parseFloat(this.style.maxHeight) || 0) }; }
@@ -125,4 +126,55 @@ assert.equal(errors.at(-1), "Async action failed"); asyncError = null;
 anchor.focus(); widget.show({ x: 0, y: 0 }); widget.dispose();
 assert(!menu()); assert.equal(window.listenerCount, 0); assert.equal(document.activeElement, anchor);
 widget.show({ x: 10, y: 10 }); widget.close(); widget.dispose(); assert(!menu()); assert.equal(window.listenerCount, 0);
-console.log("Editor context menu: commands, boundaries, keyboard/focus, viewport, dismissal and idle cleanup passed.");
+
+const clipboardEnabled = new Set(["copy", "cut"]), clipboardCalls = [];
+let clipboardFailure;
+const clipboardWidget = createEditorContextMenu(document, {
+  canRun: action => enabled.has(action), run: action => calls.push(action),
+  clipboard: {
+    canRun: action => clipboardEnabled.has(action),
+    run(action) {
+      assert(!menu(), "clipboard commands close before mutating the document or selection");
+      clipboardCalls.push(action); if (clipboardFailure) return Promise.reject(clipboardFailure);
+    }
+  },
+  onError: error => errors.push(error.message)
+});
+const clipboardButton = action => menu().childNodes.find(button => button.dataset.clipboardAction === action);
+const clickClipboard = (action, shortcut = false) => {
+  const button = clipboardButton(action); return event(menu(), "click", shortcut ? button.childNodes[0] : button);
+};
+anchor.focus(); clipboardWidget.show({ x: 20, y: 30 }); panel = menu();
+assert.equal(panel.attributes.get("aria-label"), "Selected objects and layer drawing order");
+assert.deepEqual(panel.childNodes.filter(node => node.attributes.get("role") === "menuitem").map(button => button.textContent),
+  ["Copy", "Cut", "Paste", "Bring to front", "Bring forward", "Send backward", "Send to back"]);
+assert.equal(panel.childNodes[3].attributes.get("role"), "separator");
+assert.equal(clipboardButton("copy").attributes.get("aria-keyshortcuts"), "Control+C Meta+C");
+assert.equal(clipboardButton("cut").childNodes[0].textContent, "Ctrl/Cmd+X");
+assert.equal(clipboardButton("cut").childNodes[0].attributes.get("aria-hidden"), "true");
+assert(clipboardButton("paste").disabled); assert.match(clipboardButton("paste").title, /active layer/);
+assert.equal(document.activeElement.dataset.clipboardAction, "copy");
+key("ArrowDown", true); assert.equal(document.activeElement.dataset.clipboardAction, "cut");
+key("ArrowDown", true); assert.equal(document.activeElement.dataset.stackAction, "bring-to-front", "navigation skips a disabled paste command and the separator");
+clickClipboard("paste"); assert.deepEqual(clipboardCalls, []); assert(menu(), "disabled paste cannot execute");
+clickClipboard("copy", true); assert.deepEqual(clipboardCalls, ["copy"], "clicking a visible shortcut label invokes its command");
+assert.equal(document.activeElement, anchor); assert.equal(window.listenerCount, 0);
+
+clipboardWidget.show({ x: 30, y: 40 }); clickClipboard("cut"); assert.equal(clipboardCalls.at(-1), "cut");
+clipboardEnabled.clear(); clipboardEnabled.add("paste");
+clipboardWidget.show({ x: 30, y: 40 });
+assert(clipboardButton("copy").disabled && clipboardButton("cut").disabled);
+assert.equal(document.activeElement.dataset.clipboardAction, "paste", "an empty canvas can present an enabled Paste command");
+clipboardEnabled.delete("paste"); clickClipboard("paste");
+assert.deepEqual(clipboardCalls, ["copy", "cut"], "clipboard eligibility is rechecked at execution"); assert(!menu());
+clipboardEnabled.add("paste"); clipboardWidget.show({ x: 30, y: 40 }); clickClipboard("paste"); assert.equal(clipboardCalls.at(-1), "paste");
+
+clipboardWidget.show({ x: 30, y: 40 });
+const pasteShortcut = event(window, "keydown", document.activeElement, { key: "v", ctrlKey: true });
+assert(!pasteShortcut.stopped && !pasteShortcut.value.defaultPrevented, "the host receives object clipboard shortcuts after the popup closes");
+assert(!menu()); assert.equal(document.activeElement, anchor);
+clipboardFailure = new Error("Clipboard failed"); clipboardWidget.show({ x: 30, y: 40 }); clickClipboard("paste");
+await new Promise(resolve => setImmediate(resolve)); assert.equal(errors.at(-1), "Clipboard failed"); clipboardFailure = null;
+clipboardWidget.show({ x: 30, y: 40 }); clipboardWidget.dispose();
+assert(!menu()); assert.equal(window.listenerCount, 0); assert.equal(document.activeElement, anchor);
+console.log("Editor context menu: clipboard and stacking commands, eligibility, keyboard/focus, viewport, dismissal and idle cleanup passed.");

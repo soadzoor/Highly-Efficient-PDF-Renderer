@@ -6,7 +6,11 @@ export interface EditorContextMenu {
   dispose(): void;
 }
 
-const actions: readonly { action: EditorStackingAction; label: string }[] = [
+export type EditorClipboardAction = "copy" | "cut" | "paste";
+type MenuCommand = { kind: "stack"; action: EditorStackingAction; label: string } |
+  { kind: "clipboard"; action: EditorClipboardAction; label: string; key: string };
+
+const stackingActions: readonly { action: EditorStackingAction; label: string }[] = [
   { action: "bring-to-front", label: "Bring to front" },
   { action: "bring-forward", label: "Bring forward" },
   { action: "send-backward", label: "Send backward" },
@@ -17,14 +21,40 @@ const actions: readonly { action: EditorStackingAction; label: string }[] = [
 export function createEditorContextMenu(document: Document, options: {
   canRun(action: EditorStackingAction): boolean;
   run(action: EditorStackingAction): void | Promise<void>;
+  clipboard?: {
+    canRun(action: EditorClipboardAction): boolean;
+    run(action: EditorClipboardAction): void | Promise<void>;
+  };
   onError?(error: unknown): void;
 }): EditorContextMenu {
   const window = document.defaultView;
+  const clipboard = options.clipboard;
+  const actions: readonly MenuCommand[] = [
+    ...(clipboard ? [
+      { kind: "clipboard" as const, action: "copy" as const, label: "Copy", key: "C" },
+      { kind: "clipboard" as const, action: "cut" as const, label: "Cut", key: "X" },
+      { kind: "clipboard" as const, action: "paste" as const, label: "Paste", key: "V" }
+    ] : []),
+    ...stackingActions.map(action => ({ ...action, kind: "stack" as const }))
+  ];
+  const canRun = (command: MenuCommand): boolean => command.kind === "clipboard" ? clipboard!.canRun(command.action) : options.canRun(command.action);
   const menu = document.createElement("div"); menu.className = "hepr-editor-context-menu"; menu.hidden = true; menu.tabIndex = -1;
-  menu.setAttribute("role", "menu"); menu.setAttribute("aria-label", "Drawing order within layer");
-  const buttons = actions.map(({ action, label }) => {
+  menu.setAttribute("role", "menu"); menu.setAttribute("aria-label", clipboard ? "Selected objects and layer drawing order" : "Drawing order within layer");
+  const buttons = actions.map((command, index) => {
+    if (clipboard && index === 3) {
+      const separator = document.createElement("div"); separator.className = "hepr-editor-menu-separator";
+      separator.setAttribute("role", "separator"); menu.append(separator);
+    }
+    const { action, label } = command;
     const button = document.createElement("button"); button.type = "button"; button.tabIndex = -1;
-    button.dataset.stackAction = action; button.textContent = label; button.title = `${label} within the layer`;
+    button.textContent = label;
+    if (command.kind === "clipboard") {
+      button.dataset.clipboardAction = action;
+      button.title = `${label} (Ctrl/Cmd+${command.key})${action === "paste" ? " into the active layer" : " selected objects"}`;
+      button.setAttribute("aria-keyshortcuts", `Control+${command.key} Meta+${command.key}`);
+      const shortcut = document.createElement("span"); shortcut.className = "hepr-editor-menu-shortcut";
+      shortcut.textContent = `Ctrl/Cmd+${command.key}`; shortcut.setAttribute("aria-hidden", "true"); button.append(shortcut);
+    } else { button.dataset.stackAction = action; button.title = `${label} within the layer`; }
     button.setAttribute("role", "menuitem"); menu.append(button); return button;
   });
   const lifetime = new AbortController();
@@ -54,15 +84,16 @@ export function createEditorContextMenu(document: Document, options: {
     menu.style.top = `${clamp(y + menuHeight > top + height - margin ? y - menuHeight : y, top + margin, top + height - margin - menuHeight)}px`;
   }
   menu.addEventListener("click", event => {
-    const button = (event.target as Element).closest<HTMLButtonElement>("[data-stack-action]");
+    const target = event.target as Element;
+    const button = target.closest<HTMLButtonElement>("[data-stack-action]") ?? target.closest<HTMLButtonElement>("[data-clipboard-action]");
     if (!open || !button || button.disabled) return;
     event.stopPropagation();
-    const action = actions.find(item => item.action === button.dataset.stackAction)?.action;
-    if (!action) return;
+    const command = actions.find(item => item.kind === "clipboard" ? item.action === button.dataset.clipboardAction : item.action === button.dataset.stackAction);
+    if (!command) return;
     try {
       // Selection/history may have changed while the menu was open.
-      if (!options.canRun(action)) { hide(true); return; }
-      hide(true); void Promise.resolve(options.run(action)).catch(error => options.onError?.(error));
+      if (!canRun(command)) { hide(true); return; }
+      hide(true); void Promise.resolve(command.kind === "clipboard" ? clipboard!.run(command.action) : options.run(command.action)).catch(error => options.onError?.(error));
     } catch (error) { hide(true); options.onError?.(error); }
   }, { signal: lifetime.signal });
   menu.addEventListener("pointerdown", event => event.stopPropagation(), { signal: lifetime.signal });
@@ -94,7 +125,7 @@ export function createEditorContextMenu(document: Document, options: {
       if (disposed) return;
       const restoreTo = open ? previous : document.activeElement as HTMLElement | null;
       hide(false);
-      try { buttons.forEach((button, index) => { button.disabled = !options.canRun(actions[index].action); }); }
+      try { buttons.forEach((button, index) => { button.disabled = !canRun(actions[index]); }); }
       catch (error) { if (restoreTo?.isConnected) restoreTo.focus({ preventScroll: true }); options.onError?.(error); return; }
       previous = restoreTo; open = true; menu.hidden = false; document.body.append(menu); position(point);
       dismissal = new AbortController(); const signal = dismissal.signal;

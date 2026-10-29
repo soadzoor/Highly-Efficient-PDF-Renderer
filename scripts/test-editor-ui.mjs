@@ -409,7 +409,8 @@ try {
   guards.passwordDialog = { hasDraftChanges: () => true }; assert.equal(guards.hasUnsavedChanges(), true, "unapplied password dialog drafts guard tab closing");
   guards.passwordDialog = null;
   guards.structuralRunning = true; assert.equal(guards.hasUnsavedChanges(), true, "a pending structural operation guards document replacement"); guards.structuralRunning = false;
-  const savedFromFocus = [], keyHost = vm.createContext({ active: true, structuralRunning: false, inputTarget: () => true, save: kind => savedFromFocus.push(kind) });
+  const savedFromFocus = [], keyHost = vm.createContext({ active: true, structuralRunning: false, running: false, clipboardRunning: false, layerDialog: null,
+    inputTarget: () => true, save: kind => savedFromFocus.push(kind) });
   vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), "keydown"), keyHost);
   let preventedSave = 0;
   keyHost.keydown({ key: "s", ctrlKey: true, metaKey: false, target: draftField, preventDefault() { preventedSave++; } });

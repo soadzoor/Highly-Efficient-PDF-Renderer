@@ -15,6 +15,15 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 - Add undoable PDF layer (OCG) management in the native and Three.js editor
   Settings docks: create, rename, nest, reorder, remove while retaining artwork,
   set saved visibility/locks, choose an active layer and assign selected content.
+  Put inline naming, default visibility and visibility lock in compact rows;
+  mouse/touch/pen drag grips reorder whole layer subtrees with insertion markers,
+  edge scrolling, cancellation and keyboard alternatives. Keep normal touch
+  scrolling outside grips. The blue active row chooses the creation/paste
+  destination without disturbing artwork selection; remove the redundant
+  active-layer dropdown and retain an Unlayered row. Add toolbar/context-menu and Ctrl/Cmd copy,
+  cut and paste, including paste-in-place, independent current source appearances,
+  authored groups, destination-layer assignment and Undo/Redo. Keep clipboard
+  data in memory and retain originals when capture fails or is cancelled.
   Retain compound memberships and portable fonts when editing or reassigning
   reopened textboxes; hide text drafts and form controls with their layers
   without discarding their contents.

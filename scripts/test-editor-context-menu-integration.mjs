@@ -8,7 +8,7 @@ function harness() {
   let selection = ["a", "b"], pickResult = "c", projection = 1;
   const shown = [], selected = [], calls = { picks: 0, closes: 0 };
   const context = vm.createContext({ active: true, disposed: false, running: false, structuralRunning: false,
-    inputTarget: () => false,
+    inputTarget: () => false, canUseClipboard: () => false,
     activeText: null, pointer: null, pendingPick: null, tool: "select", textRequest: 0, isSceneSettling: () => false,
     session: { revision: 0, sourceScene: {}, getSelection: () => selection,
       select(ids) { selection = [...ids]; selected.push(selection); },
@@ -37,6 +37,13 @@ function harness() {
   assert.deepEqual(h.selection, ["c"], "right-click selects an unselected hit before showing actions");
   h.setSelection(["a", "b"]); h.setHit("a"); await h.context.openContextMenu(h.event()); assert.deepEqual(h.selection, ["a", "b"]);
   h.setHit(null); const before = h.shown.length; await h.context.openContextMenu(h.event()); assert.equal(h.shown.length, before, "blank space has no object-arrangement menu");
+}
+{
+  const h = harness(); h.setHit(null); h.context.canUseClipboard = action => action === "paste";
+  await h.context.openContextMenu(h.event());
+  assert.deepEqual(h.selection, []); assert.deepEqual(h.shown, [{ x: 30, y: 40 }], "blank document space offers Paste without retaining a misleading hit selection");
+  h.context.host.getCanvas = () => ({ getBoundingClientRect: () => ({ left: 50, top: 100, width: 400, height: 200 }) });
+  h.context.showSelectionContextMenu(); assert.deepEqual(h.shown.at(-1), { x: 250, y: 200 }, "keyboard Paste menu is available with no canvas selection");
 }
 for (const patch of [{ active: false }, { disposed: true }, { running: true }, { structuralRunning: true }, { tool: "rectangle" },
   { tool: "form" }, { activeText: {} }, { pointer: {} }, { pendingPick: {} }, { isSceneSettling: () => true }]) {

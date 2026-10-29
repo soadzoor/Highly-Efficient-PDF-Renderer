@@ -141,11 +141,40 @@ editor.updateLayer(notes, { name: "Approved notes", defaultVisible: true });
 editor.moveLayer(notes, { parentId: null, index: 0 });
 ```
 
-`setActiveLayer(id | null)` controls new objects, without dirtying the document.
+`setActiveLayer(id | null)` controls new and pasted objects, without dirtying the document.
 An explicit `layerId` on `addObject` overrides it; null means unlayered. The UI
 rejects placement on a hidden active layer. `getObjectLayerIds(id)`,
 `assignObjectsToLayer(ids, layerId | null)`, `assignSelectionToLayer(layerId | null)`,
 `getLayerObjects(id)` and `selectLayerContents(id)` support custom controls.
+The stock panel highlights one active row for creation and paste, including an
+Unlayered row for null; no separate active-layer selector is needed. It provides
+inline naming and default-visibility/lock controls. Grip dragging uses Pointer
+Events for mouse, touch and pen, with capture, insertion markers, edge scrolling
+and cancellation; ordinary list swipes still scroll. A completed drag updates
+`setLayerOrder`, including artwork stacking. Heading nodes and subtrees survive,
+and gesture listeners/frame work detach when the drag ends or controls close.
+
+`await copySelection({ signal? })` and `await cutSelection({ signal? })` capture
+the selected roots into a private in-memory clipboard and return their count.
+Copy leaves history and dirty state unchanged; cut deletes only after successful
+capture and rejects a changed document/selection rather than cutting newer work.
+`canPaste()` reports whether the clipboard has content.
+`pasteSelection({ offset?: [dx, dy] })` returns independent new root IDs, assigns
+the current active layer (null means unlayered), retains page indexes and selects
+visible copies. Each paste is one undoable transaction. Copy pastes use successive
+`[12, -12]` offsets; cut pastes default to `[0, 0]`. Supply `[0, 0]` for an explicit
+paste in place. Hidden destinations stay hidden. Added author models retain rich
+text, geometry, images and groups; source objects/widgets capture their current
+rendered appearance as independent artwork, without linked field semantics.
+Clipboard state survives selection, layer and Undo/Redo changes, is never saved,
+and requires recopy or undo before pasting across a page-structure change.
+
+```ts
+await editor.cutSelection({ signal });
+editor.setActiveLayer(notes);
+const pasted = editor.pasteSelection();
+```
+
 `copyObjectLayerMembership(sourceId, targetId)` copies the exact current
 visibility expression when replacing an object, including compound/negated
 OCMD membership, without coupling it to the original annotation's ownership.

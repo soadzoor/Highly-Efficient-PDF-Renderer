@@ -185,6 +185,11 @@ export interface EditorState {
   previewing: boolean;
 }
 export type EditorStackingAction = "send-to-back" | "bring-to-front" | "bring-forward" | "send-backward";
+export interface EditorClipboardOptions { signal?: AbortSignal }
+export interface EditorPasteOptions {
+  /** Composed scene offset; defaults to successive 12/-12 steps for copy, zero for cut. */
+  offset?: readonly [number, number];
+}
 
 export interface EditorSession {
   readonly sourceScene: VectorScene;
@@ -211,6 +216,13 @@ export interface EditorSession {
   setPreviewTransform(matrix: EditorMatrix | null): void;
   deleteSelection(): void;
   cloneSelection(offset?: readonly [number, number]): readonly string[];
+  /** Capture independent author models and current source appearances without changing history. */
+  copySelection(options?: EditorClipboardOptions): Promise<number>;
+  /** Capture successfully before deleting the selected objects as one undoable edit. */
+  cutSelection(options?: EditorClipboardOptions): Promise<number>;
+  canPaste(): boolean;
+  /** Paste independent copies into the active layer, retaining their original pages. */
+  pasteSelection(options?: EditorPasteOptions): readonly string[];
   groupSelection(): string | null;
   ungroupSelection(): void;
   setFieldValue(name: string, value: EditorFieldValue): void;

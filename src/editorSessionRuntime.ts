@@ -29,6 +29,7 @@ import { compileEditorObjectGeometry, editorArrowHeadPoints } from "./editorScen
 import { waitForLoad } from "./loadCancellation";
 import { createLoadProgressReporter, type PDFLoadProgress } from "./loadProgress";
 import { createEditorGlyphStoreCache } from "./editorGlyphStoreCache";
+import { editorClipboardStore, releaseEditorClipboard, registerEditorCapturedSourceReader, type EditorCapturedSource, type EditorClipboardSnapshot } from "./editorClipboard";
 
 interface Snapshot {
   objects: Map<string, EditorObject>;
@@ -128,6 +129,8 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
   let frameCache: { snapshot: Snapshot; frame: EditorSelectionFrame | null } | null = null;
   const compiled = new WeakMap<EditorObject, Promise<VectorScene>>();
   const geometryOrigins = new WeakMap<EditorObject, EditorObject>();
+  const capturedSources = new WeakMap<EditorObject, EditorCapturedSource>();
+  const capturedSource = (object: EditorObject): EditorCapturedSource | undefined => capturedSources.get(geometryOrigins.get(object) ?? object);
   const glyphStores = createEditorGlyphStoreCache(sourceScene);
   const reuseGlyphStores = (scene: VectorScene): VectorScene => {
     const shared = glyphStores.reuse(scene);
@@ -174,6 +177,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     (!!(object.annotationId && state.annotationEdits.get(object.annotationId)?.deleted) ||
       (object.primitives.length > 0 && object.primitives.every(ref => state.edits.get(editorRefKey(ref))?.deleted)));
   const sourceBounds = (object: EditorSourceObject, snapshot = state): Bounds => {
+    if (capturedSource(object)) return editorTransformBounds(object.bounds, object.transform);
     if (!object.primitives.length) return editorTransformBounds(object.bounds, snapshot.objects.has(object.id) ? object.transform :
       (object.annotationId ? snapshot.annotationEdits.get(object.annotationId)?.transform : undefined) ?? EDITOR_IDENTITY);
     let box: Bounds | null = null;
@@ -227,6 +231,8 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
   const objectFrame = (id: string, snapshot = state, visiting = new Set<string>()): EditorSelectionFrame => {
     const object = snapshot.objects.get(id) ?? sourceObject(id);
     if (object.kind === "source") {
+      const captured = capturedSource(object);
+      if (captured) return { ...captured.frame, transform: multiplyEditorMatrices(object.transform, captured.frame.transform) };
       if (snapshot.objects.has(id)) return { bounds: object.bounds, transform: object.transform, pageIndex: object.pageIndex };
       if (!object.primitives.length) return { bounds: object.bounds,
         transform: object.annotationId ? snapshot.annotationEdits.get(object.annotationId)?.transform ?? EDITOR_IDENTITY : EDITOR_IDENTITY, pageIndex: object.pageIndex };
@@ -511,6 +517,66 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     const owners = selectedPaintOwners();
     return owners.size ? visibility().getObjectOrder().arrange(owners, action) : { changed: false, order: [] };
   };
+  const captureSelection = async (cut: boolean, suppliedSignal?: AbortSignal): Promise<number> => {
+    assertLive(); const signal = suppliedSignal ? AbortSignal.any([suppliedSignal, lifetime.signal]) : lifetime.signal;
+    signal.throwIfAborted();
+    const snapshot = state, roots = snapshot.selection.slice(); if (!roots.length) return 0;
+    const store = editorClipboardStore(session), sequence = ++store.sequence;
+    const objects = new Map<string, EditorObject>(), frames = new Map<string, EditorSelectionFrame>();
+    const visit = (id: string) => {
+      if (objects.has(id)) return;
+      const object = internalObject(id); objects.set(id, copy(object));
+      if (object.kind === "group") object.children.forEach(visit);
+      else if (object.kind === "source") frames.set(id, copy(objectFrame(id, snapshot)));
+    };
+    roots.forEach(visit);
+    const basis = copy(selectionFrame(snapshot)?.transform), sources = new Map<string, EditorCapturedSource>();
+    if (frames.size) {
+      // getScene captures the current snapshot before its first await. Copy the
+      // actual appearance, including current form values, clips and shared resources.
+      const canonical = await session.getScene({ preview: false, signal }), resolve = editorPaintIdentity(canonical);
+      const originalIdentity = editorPaintIdentity(sourceScene), counts = scenePrimitiveCounts(canonical), appearances = getSceneAnnotationRuns(canonical);
+      for (const [id, frame] of frames) {
+        signal.throwIfAborted(); const object = objects.get(id) as EditorSourceObject;
+        const keep = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind => [kind, new Set<number>()])) as Record<PrimitiveRef["kind"], Set<number>>;
+        if (!snapshot.objects.has(id) && object.annotationId) {
+          for (const run of appearances.get(object.annotationId) ?? []) for (let index = run.first; index < run.first + run.count; index++) keep[run.kind].add(index);
+        } else {
+          const owners = new Set(object.primitives.map(originalIdentity));
+          if (!snapshot.objects.has(id)) {
+            const selected = new Set(object.primitives.map(editorRefKey)), originalCounts = scenePrimitiveCounts(sourceScene);
+            for (const kind of PAGE_PRIMITIVE_KINDS) for (let index = 0; index < originalCounts[kind]; index++) {
+              const ref = { kind, index };
+              if (owners.has(originalIdentity(ref)) && !selected.has(editorRefKey(ref))) throw new Error("This content shares an inseparable source identity. Select the complete source group before copying.");
+            }
+          }
+          for (const kind of PAGE_PRIMITIVE_KINDS) for (let index = 0; index < counts[kind]; index++) {
+            const owner = resolve({ kind, index });
+            if (snapshot.objects.has(id) ? editorPaintOwnerObject(owner) === id : owners.has(owner)) keep[kind].add(index);
+          }
+        }
+        const geometry = detachEditorGeometryAnnotationLayers(compactEditorScene(canonical, keep));
+        geometry.annotations = undefined; geometry.markedContent = undefined; geometry.structureElements = undefined;
+        sources.set(id, { scene: geometry, frame });
+        object.bounds = editorTransformBounds(frame.bounds, frame.transform); object.transform = EDITOR_IDENTITY; object.primitives = []; object.isClone = true;
+        delete object.annotationId;
+      }
+    }
+    signal.throwIfAborted(); assertLive();
+    if (store.sequence !== sequence) throw new DOMException("A newer clipboard operation superseded this capture.", "AbortError");
+    if (cut && (state.identity !== snapshot.identity || JSON.stringify(state.selection) !== JSON.stringify(roots))) {
+      throw new Error("The selection or document changed while copying. Cut was cancelled; the selected objects are unchanged.");
+    }
+    const captured: EditorClipboardSnapshot = { source: sourceScene, roots, objects, sources, basis, cut, pastes: 0 }, previous = store.value;
+    store.value = captured;
+    try { if (cut) session.deleteSelection(); else emit(); }
+    catch (error) { store.value = previous; throw error; }
+    return roots.length;
+  };
+  const capturedSourceScene = (id: string, snapshot = state): VectorScene | undefined => {
+    const object = snapshot.objects.get(id), captured = object && capturedSource(object);
+    return object && captured ? transformWholeEditorScene(captured.scene, object.transform, lifetime.signal, options.onDiagnostic) : undefined;
+  };
   const session: EditorSession = {
     sourceScene, sourcePdf,
     get revision() { return revision; },
@@ -605,6 +671,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       if (object.kind === "group") throw new TypeError("Use group and ungroup operations to change group membership.");
       if (Object.keys(patch).every(key => key === "transform" || key === "pageIndex")) geometryOrigins.set(object, geometryOrigins.get(original) ?? original);
       const inherited = cloneLayers.get(original); if (inherited) cloneLayers.set(object, inherited);
+      const captured = capturedSource(original); if (captured) capturedSources.set(object, captured);
       change(() => { state.objects.set(id, object); if (object.layerId !== original.layerId || object.layerCondition !== original.layerCondition) state.layers = { ...state.layers }; });
     },
     transformSelection(input) {
@@ -661,12 +728,44 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
             clone.transform = matrices[0];
           }
           if (clone.kind === "source") clone.isClone = true;
+          const captured = capturedSource(original); if (captured) capturedSources.set(clone, captured);
           if (clone.kind === "source") cloneLayers.set(clone, cloneLayers.get(geometryOrigins.get(original) ?? original) ?? layerEdits());
           change(() => { state.objects.set(clone.id, clone); if (objectLayerIds(id).length) state.layers = { ...state.layers }; }); clones.push(clone.id);
         }
         state.selection = clones; state.selectionBasis = clones.length > 1 ? basis : undefined;
         session.transformSelection([1, 0, 0, 1, offset[0], offset[1]]);
       }); return clones;
+    },
+    copySelection(clipboardOptions = {}) { return captureSelection(false, clipboardOptions.signal); },
+    cutSelection(clipboardOptions = {}) { return captureSelection(true, clipboardOptions.signal); },
+    canPaste() { assertLive(); return editorClipboardStore(session).value !== null; },
+    pasteSelection(pasteOptions = {}) {
+      assertLive(); const store = editorClipboardStore(session), captured = store.value;
+      if (!captured) return [];
+      if (captured.source !== sourceScene) throw new Error("Document pages changed since these objects were copied. Copy them again, or undo the page change before pasting.");
+      const step = captured.cut ? 0 : captured.pastes + 1, offset = pasteOptions.offset ?? [12 * step, -12 * step];
+      finite(offset[0], "Paste X offset"); finite(offset[1], "Paste Y offset");
+      const destination = session.getActiveLayer(); if (destination !== null) editorLayer(state.layers.catalog, destination);
+      const ids = new Map([...captured.objects.keys()].map(id => [id, nextObjectId()])), additions: EditorObject[] = [];
+      for (const [id, original] of captured.objects) {
+        const object = copy(original); object.id = ids.get(id)!;
+        if (object.kind === "group") { object.children = object.children.map(child => ids.get(child)!); delete object.layerId; delete object.layerCondition; }
+        else { object.layerId = destination; delete object.layerCondition; }
+        validateObject(object, pageCount);
+        const source = captured.sources.get(id); if (source) capturedSources.set(object, source);
+        additions.push(object);
+      }
+      const roots = captured.roots.map(id => ids.get(id)!);
+      session.transaction("Paste", () => {
+        change(() => {
+          for (const object of additions) state.objects.set(object.id, object);
+          state.layers = { ...state.layers }; state.selection = roots; state.selectionBasis = roots.length > 1 ? captured.basis : undefined;
+        });
+        session.transformSelection([1, 0, 0, 1, offset[0], offset[1]]);
+        state.selection = state.selection.filter(objectVisible);
+      });
+      store.value = { ...captured, pastes: captured.pastes + 1 };
+      return roots;
     },
     groupSelection() {
       if (state.selection.length < 2) return null;
@@ -911,17 +1010,21 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         const object = additions[objectIndex];
         signal?.throwIfAborted(); let geometry: VectorScene;
         if (object.kind === "source") {
-          const keep = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind => [kind, new Set<number>()])) as Record<PrimitiveRef["kind"], Set<number>>;
-          for (const ref of object.primitives) keep[ref.kind].add(ref.index);
-          const cloneEdits = objectLayerEdits(object.id, snapshot);
-          let clonePromise = appliedCloneLayers.get(cloneEdits);
-          if (!clonePromise) {
-            clonePromise = applyEditorSceneLayers(sourceScene, cloneEdits, { signal: lifetime.signal, onDiagnostic: options.onDiagnostic })
-              .then(scene => cloneEdits.objectOrderChanged ? applyEditorObjectOrdering(scene, createEditorObjectOrderSchedule(sourceScene, cloneEdits, [])) : scene);
-            appliedCloneLayers.set(cloneEdits, clonePromise); void clonePromise.catch(() => appliedCloneLayers.delete(cloneEdits));
+          const captured = capturedSource(object);
+          if (captured) geometry = transformWholeEditorScene(captured.scene, object.transform, signal, options.onDiagnostic);
+          else {
+            const keep = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind => [kind, new Set<number>()])) as Record<PrimitiveRef["kind"], Set<number>>;
+            for (const ref of object.primitives) keep[ref.kind].add(ref.index);
+            const cloneEdits = objectLayerEdits(object.id, snapshot);
+            let clonePromise = appliedCloneLayers.get(cloneEdits);
+            if (!clonePromise) {
+              clonePromise = applyEditorSceneLayers(sourceScene, cloneEdits, { signal: lifetime.signal, onDiagnostic: options.onDiagnostic })
+                .then(scene => cloneEdits.objectOrderChanged ? applyEditorObjectOrdering(scene, createEditorObjectOrderSchedule(sourceScene, cloneEdits, [])) : scene);
+              appliedCloneLayers.set(cloneEdits, clonePromise); void clonePromise.catch(() => appliedCloneLayers.delete(cloneEdits));
+            }
+            const cloneSource = await waitForLoad(clonePromise, signal);
+            geometry = transformWholeEditorScene(compactEditorScene(cloneSource, keep), object.transform, signal, options.onDiagnostic);
           }
-          const cloneSource = await waitForLoad(clonePromise, signal);
-          geometry = transformWholeEditorScene(compactEditorScene(cloneSource, keep), object.transform, signal, options.onDiagnostic);
           geometry.pageCount = 1; geometry.pageRects = sourceScene.pageRects.slice(object.pageIndex * 4, object.pageIndex * 4 + 4);
           geometry.pageTextRanges = Uint32Array.of(0, geometry.textInstanceCount); geometry.pagePrimitiveRanges = undefined;
           geometry.pdfPages = undefined; geometry.annotations = undefined;
@@ -1039,11 +1142,12 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         createLayer: readOnly, updateLayer: readOnly, moveLayer: readOnly, setLayerOrder: readOnly, removeLayer: readOnly,
         setActiveLayer: readOnly, assignObjectsToLayer: readOnly, assignSelectionToLayer: readOnly, selectLayerContents: readOnly, copyObjectLayerMembership: readOnly,
         addObject: readOnly, updateObject: readOnly, transformSelection: readOnly, setPreviewTransform: readOnly,
-        deleteSelection: readOnly, cloneSelection: readOnly, groupSelection: readOnly, ungroupSelection: readOnly,
+        deleteSelection: readOnly, cloneSelection: readOnly, copySelection: readOnly, cutSelection: readOnly, canPaste: () => false, pasteSelection: readOnly, groupSelection: readOnly, ungroupSelection: readOnly,
         setFieldValue: readOnly, transaction: readOnly, undo: readOnly, redo: readOnly, markSaved: readOnly,
         rotatePages: readOnly, removePages: readOnly, insertPdf: readOnly,
         subscribe: readOnly, savePdf: readOnly, saveHep: readOnly, dispose: readOnly
       };
+      registerEditorCapturedSourceReader(owner, id => capturedSourceScene(id, snapshot));
       progress.report(.4, { stage: "pdf-page", sourceType: "scene", unit: "pages", processed: 0, total: pageCount, pageCount });
       saveOptions.signal?.throwIfAborted();
       const persistenceOptions = { ...saveOptions, onProgress: (payload: PDFLoadProgress) => {
@@ -1076,8 +1180,9 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       saveOptions.signal?.throwIfAborted(); progress.complete({ sourceType: "hep", unit: "pages", processed: pageCount, total: pageCount, pageCount });
       if (!disposed && revision === targetRevision) session.markSaved(); return blob;
     },
-    dispose() { if (disposed) return; disposed = true; lifetime.abort(); listeners.clear(); undoStack.length = redoStack.length = 0; sourceObjects.clear(); cache = null; committedSceneCache = null; translationPreviewCache = null; frameCache = null; sourcePartition = null; glyphStores.clear(); state = { objects: new Map(), fields: new Map(), edits: new Map(), annotationEdits: new Map(), layers: initialLayers, selection: [], identity: {} }; }
+    dispose() { if (disposed) return; disposed = true; lifetime.abort(); releaseEditorClipboard(session); listeners.clear(); undoStack.length = redoStack.length = 0; sourceObjects.clear(); cache = null; committedSceneCache = null; translationPreviewCache = null; frameCache = null; sourcePartition = null; glyphStores.clear(); state = { objects: new Map(), fields: new Map(), edits: new Map(), annotationEdits: new Map(), layers: initialLayers, selection: [], identity: {} }; }
   };
+  registerEditorCapturedSourceReader(session, id => { assertLive(); return capturedSourceScene(id); });
   orderReaders.set(session, () => { assertLive(); return [...visibility().getObjectOrder().order]; });
   orderedSourceReaders.set(session, options => session.getScene({ ...options, preview: false, sourceCopiesOnly: true } as NonNullable<Parameters<EditorSession["getScene"]>[0]>));
   orderRestorers.set(session, (tokens, stackingChanged = state.layers.stackingChanged) => {
