@@ -1,0 +1,39 @@
+.viewer-workspace {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.viewer-workspace-root { position: absolute; inset: 0; }
+.viewer-document { position: relative; flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
+
+/* Keep the existing panel nodes and controls, but give Settings its own column.
+   ID specificity overrides the standalone demos' original floating panels. */
+.viewer-workspace > #hud.viewer-settings,
+.viewer-workspace > #panel.viewer-settings {
+  position: relative;
+  inset: auto;
+  z-index: 25;
+  flex: 0 0 min(360px, 45%);
+  width: min(360px, 45%);
+  min-width: 0;
+  min-height: 0;
+  max-width: 45%;
+  max-height: none;
+  margin: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  overflow-wrap: anywhere;
+  border: 0;
+  border-left: 1px solid #64748b66;
+  border-radius: 0;
+  background: var(--viewer-settings-background, #f8fafc);
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.viewer-settings.collapsed { display: none; }
+.viewer-settings :is(input, select, textarea, button) { max-width: 100%; }
+.viewer-settings .row { flex-wrap: wrap; }

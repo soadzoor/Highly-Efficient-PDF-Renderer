@@ -42,6 +42,8 @@
       }
 
       #panel {
+        --viewer-settings-background: #151b24;
+        color: #e8edf5;
         position: fixed;
         max-height: calc(100vh - 50px);
 	      overflow-y: auto;
@@ -561,19 +563,16 @@
     <div id="panel" role="group" aria-label="Three.js HEPR controls">
       <div class="panel-header">
         <h2 class="panel-title">Settings</h2>
-        <button id="toggle-panel" class="settings-close" type="button" aria-expanded="true" aria-controls="panel-content" aria-label="Close settings" title="Close settings">
-          <span id="toggle-panel-icon" aria-hidden="true">×</span>
-          <span>Close</span>
-        </button>
+        <button id="toggle-panel" class="settings-close" type="button" data-toolbar-icon="close" aria-expanded="true" aria-controls="panel-content" aria-label="Close settings" title="Close settings">Close settings</button>
       </div>
       <div id="panel-content" class="panel-content">
         <div class="toolbar startup-controls">
           <a class="package-version" href="https://www.npmjs.com/package/@soadzoor/hepr" target="_blank" rel="noopener noreferrer" title="HEPR package version used by this build">npm v%HEPR_PACKAGE_VERSION%</a>
-          <button id="open-file" type="button" title="Open a PDF or HEPR-exported .hep file">Open PDF / HEP</button>
-          <button id="editor-mode" type="button" aria-pressed="false" title="Enter PDF editing mode">Edit PDF</button>
-          <button id="print-pdf" type="button" title="Print the current document" disabled>Print</button>
+          <button id="open-file" type="button" data-toolbar-icon="open" title="Open a PDF or HEPR-exported .hep file">Open PDF / HEP</button>
+          <button id="editor-mode" type="button" data-toolbar-icon="edit" aria-pressed="false" title="Enter PDF editing mode">Edit PDF</button>
+          <button id="print-pdf" type="button" data-toolbar-icon="print" title="Print the current document" disabled>Print</button>
           <div id="example-dropdown" class="example-dropdown">
-            <button id="example-select" class="example-trigger" type="button" aria-label="Load example PDF or HEP file" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
+            <button id="example-select" class="example-trigger" type="button" title="Load example PDF or HEP file" aria-label="Load example PDF or HEP file" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
               <span id="example-select-label" class="example-trigger-label">Examples (loading...)</span>
               <span class="example-trigger-chevron" aria-hidden="true">▾</span>
             </button>
@@ -582,8 +581,8 @@
         </div>
         <input id="file-input" type="file" accept=".pdf,.hep,application/pdf,application/x-hep" hidden />
         <div class="toolbar settings-downloads">
-          <button id="download-data" type="button" hidden disabled>Download HEP</button>
-          <button id="download-pdf" type="button" hidden disabled>Download PDF</button>
+          <button id="download-data" type="button" data-toolbar-icon="download-hep" hidden disabled>Download HEP</button>
+          <button id="download-pdf" type="button" data-toolbar-icon="download-pdf" hidden disabled>Download PDF</button>
         </div>
       <div class="toggles">
         <label class="toggle">
@@ -616,19 +615,19 @@
         <div class="search-controls">
           <input id="text-search-input" type="search" placeholder="Load a document to search" autocomplete="off" spellcheck="false" disabled />
           <span id="text-search-count" class="search-count" hidden>0/0</span>
-          <button id="text-search-prev" type="button" title="Previous match (Shift+Enter)" aria-label="Previous match" disabled>▲</button>
-          <button id="text-search-next" type="button" title="Next match (Enter)" aria-label="Next match" disabled>▼</button>
-          <button id="text-search-case" type="button" title="Match case" aria-label="Match case" aria-pressed="false" disabled>Aa</button>
+          <button id="text-search-prev" type="button" data-toolbar-icon="search-previous" title="Previous match (Shift+Enter)" aria-label="Previous match (Shift+Enter)" disabled>▲</button>
+          <button id="text-search-next" type="button" data-toolbar-icon="search-next" title="Next match (Enter)" aria-label="Next match (Enter)" disabled>▼</button>
+          <button id="text-search-case" type="button" data-toolbar-icon="match-case" title="Match case" aria-label="Match case" aria-pressed="false" disabled>Aa</button>
         </div>
       </div>
       <div id="page-layout-row" class="number-row" hidden>
         <span id="page-layout-label">Page Layout</span>
         <div class="page-layout-controls">
           <div class="page-layout-buttons" role="group" aria-labelledby="page-layout-label">
-            <button type="button" data-page-layout="reader" aria-pressed="false">Reader</button>
-            <button type="button" data-page-layout="grid" aria-pressed="true">Grid</button>
-            <button type="button" data-page-layout="sphere" aria-pressed="false">Sphere</button>
-            <button type="button" data-page-layout="helix" aria-pressed="false">Helix</button>
+            <button type="button" data-page-layout="reader" data-toolbar-icon="reader" aria-pressed="false">Reader</button>
+            <button type="button" data-page-layout="grid" data-toolbar-icon="grid" aria-pressed="true">Grid</button>
+            <button type="button" data-page-layout="sphere" data-toolbar-icon="sphere" aria-pressed="false">Sphere</button>
+            <button type="button" data-page-layout="helix" data-toolbar-icon="helix" aria-pressed="false">Helix</button>
           </div>
           <span id="page-layout-progress" class="page-layout-progress" role="status" hidden>
             <span class="loader-spinner" aria-hidden="true"></span>
@@ -686,8 +685,8 @@
         <span>Record loading diagnostics</span>
       </label>
       <div class="row">
-        <button id="show-load-report" type="button">Show load report</button>
-        <button id="copy-load-report" type="button">Copy load report</button>
+        <button id="show-load-report" type="button" data-toolbar-icon="pages">Show load report</button>
+        <button id="copy-load-report" type="button" data-toolbar-icon="duplicate">Copy load report</button>
       </div>
       <div id="load-diagnostics-status" class="row" role="status"></div>
       <textarea id="load-diagnostics-report" readonly hidden aria-label="Loading diagnostics report"></textarea>

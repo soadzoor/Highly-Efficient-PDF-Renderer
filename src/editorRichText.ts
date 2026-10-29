@@ -31,6 +31,7 @@ export function commitEditorText(session: EditorSession, object: Extract<EditorO
     else if (target.objectId && !object) { session.select([target.objectId]); session.deleteSelection(); }
     if (object) {
       id = target.objectId && !target.sourceAnnotationId ? target.objectId : session.addObject(object);
+      if (target.sourceAnnotationId) session.copyObjectLayerMembership(`annotation:${target.sourceAnnotationId}`, id);
       if (target.objectId && !target.sourceAnnotationId) session.updateObject(id, object);
     }
     session.select(id ? [id] : []);

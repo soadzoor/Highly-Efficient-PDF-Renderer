@@ -79,6 +79,12 @@ identity. `transformSelection(matrix)` takes a delta in composed scene coordinat
 so a shared gesture can transform a multi-object selection about one pivot.
 Reader/Grid and camera presentation must be converted by the host adapter.
 
+Shapes, ink and signatures accept `fillOpacity` from 0 to 1 independently of
+stroke `opacity`. When omitted, fills retain the legacy `opacity` fallback;
+explicit values also work with fully transparent strokes or fills. Arrowheads
+follow stroke opacity. Both values compile into ordinary PDF/HEP paint data,
+without adding renderer frame work. Text and images continue using `opacity`.
+
 `getSelectionFrame()` returns committed `{ bounds, transform, pageIndex? }` data
 for drawing transform handles. The bounds use the frame's local axes; transform
 its four corners with the supplied matrix to obtain composed scene coordinates.
@@ -107,6 +113,73 @@ with normalized `value` and `stage`; failed saves do not clear dirty state.
 dirty state; saves exclude previews. `getScene({ includeObjects: false, preview:
 false })` returns only the edited original content and filled fields.
 
+Layer authoring uses the existing PDF optional-content model. `getLayers()` lists
+user OCGs (`id`, `name`, `defaultVisible`, `locked`, `usedInView`), excluding internal
+annotation groups; `getLayerOrder()` returns its nested group/label hierarchy.
+`createLayer({ name, defaultVisible?, locked?, parentId?, index? })` returns an ID.
+`updateLayer(id, { name?, defaultVisible?, locked? })` changes properties;
+visibility changes respect locked layers, source View intent and radio groups.
+`moveLayer(id, { parentId?, index })` and `setLayerOrder(tree)` change both list
+order and stacking: top listed layers paint in front, compound memberships use
+their frontmost layer, and unlayered paint slots remain fixed. Compositing units
+move together. Creation and renaming alone retain original paint order.
+
+```ts
+const notes = editor.createLayer({ name: "Review notes" });
+editor.setActiveLayer(notes);
+editor.assignSelectionToLayer(notes);
+editor.updateLayer(notes, { name: "Approved notes", defaultVisible: true });
+editor.moveLayer(notes, { parentId: null, index: 0 });
+```
+
+`setActiveLayer(id | null)` controls new objects, without dirtying the document.
+An explicit `layerId` on `addObject` overrides it; null means unlayered. The UI
+rejects placement on a hidden active layer. `getObjectLayerIds(id)`,
+`assignObjectsToLayer(ids, layerId | null)`, `assignSelectionToLayer(layerId | null)`,
+`getLayerObjects(id)` and `selectLayerContents(id)` support custom controls.
+`copyObjectLayerMembership(sourceId, targetId)` copies the exact current
+visibility expression when replacing an object, including compound/negated
+OCMD membership, without coupling it to the original annotation's ownership.
+The source must be one annotation or one authored object; heterogeneous source
+collections and temporary groups retain their per-primitive scopes and cannot
+be reduced to a single copied condition.
+`getObjectLayerCondition(id)` returns `{ catalog, condition? }` for custom writers.
+Advanced authored objects can use `layerCondition` as an index into the session's
+current catalog instead of `layerId`; it is session-local and must be remapped
+when moving objects between documents. Use the copy operation for replacements.
+`removeLayer(id, { targetLayerId? })` keeps artwork: omission/null forgets the
+removed visibility variable, retaining other memberships; a destination retargets
+it. Negated and compound visibility expressions are projected together so removal
+cannot reveal previously impossible content. Layer document changes are undoable.
+
+`canReorderSelection(action)` and `reorderSelection(action)` expose object
+arrangement within each layer and page. `EditorStackingAction` is
+`"bring-to-front"`, `"bring-forward"`, `"send-backward"` or `"send-to-back"`.
+They preserve selected objects' relative order, leave other layers' paint slots
+fixed, and treat inseparable compositing scopes as units. Compound memberships
+use the same frontmost-layer ownership as layer reordering; unlayered content
+arranges within its own page scope. Boundary operations are no-ops and do not
+add undo history. Reordering updates compiled drawing order and picking ranks.
+PDF/HEP save the resulting ordinary paint data, without editor order/history
+sections. Editable PDF still obeys its separate page/annotation/widget paint
+passes; flattened PDF reproduces the compiled order across those passes.
+
+`isObjectVisible`, `isPrimitiveVisible` and `isAnnotationVisible` use current
+editor visibility. `getPrimitivePaintRank(ref)` and `getObjectPaintRank(id)` supply
+matching source and authored-object picking order;
+pass it as `ScenePrimitivePickOptions.resolvePaintRank` after reordering layers.
+`getLayerRevision()` changes for layer/membership edits, allowing controls to skip
+work during transform previews. `getLayerEdits()` returns a detached persistence
+snapshot for writers. Compiled scenes and HEP use ordinary optional-content data.
+PDF saves preserve OCG identities and visibility configuration. Metadata-only
+edits retain original drawing streams; changing source membership, removing
+referenced layers or restacking can rebuild affected page/annotation appearances
+as vectors, with compatibility warnings. `savePdf({ onDiagnostic })` also reports
+the `editor.pdf-layer-stacking` warning for separate annotation paint passes.
+Editable PDF
+annotations and widgets still obey independent readers' separate paint passes;
+use `savePdf({ flatten: true })` for exact displayed order across those passes.
+
 `getPages()` returns current page indexes, displayed dimensions and
 rotation. Page indexes are zero-based. `rotatePages(indexes, degrees, options?)`
 accepts clockwise multiples of 90 degrees; `removePages(indexes, options?)`
@@ -130,6 +203,10 @@ await editor.insertPdf(otherPdfBytes, { at: 1, password: otherPassword, signal }
 Page changes share undo/redo with object and field edits. They retain the current
 authoring state in memory and commit only after the new document is ready;
 cancelled, failed or stale operations leave the active document unchanged.
+Explicit drawing order is retained in the canonical scene during page changes,
+including source content interleaved with authored annotations; editable PDF
+materialization alone cannot represent all such interleaving. Source-copy
+appearances become ordinary editable source annotations after materialization.
 `sourceScene` and `sourcePdf` can change after page operations and undo/redo.
 Hosts must refresh picking and page-coordinate adapters when `sourceScene`
 changes. The stock UI calls `EditorUiHost.documentChanged(scene, source)` before
@@ -156,12 +233,34 @@ Pass `{ pdf: editor.sourcePdf, password }` as `source` after page operations.
 `createEditorUi(host, signal?)` supplies optional shared browser controls. Its
 `EditorUiHost` supplies the current scene/source, full-quality preparation,
 scene installation, canvas and bidirectional client/scene coordinate conversion,
-plus edit-mode notifications. Instantiate it only when editing is requested;
+plus edit-mode notifications. Instantiate it when editing or attachment is requested;
 `setEditing(false)` removes editor frame work while retaining the session.
+For frame-aligned form controls, supply `subscribeToFrames(listener)` and return
+an unsubscribe function. Invoke the listener synchronously after drawing or
+submitting each document frame, including camera-only frames, while coordinate
+conversion still uses that frame's camera. `requestFrame()` schedules an initial
+draw when the Fill tool creates controls; provide it with frame notifications
+unless the host already guarantees that draw. These hooks are optional; hosts
+without frame notifications retain animation-frame positioning. The UI subscribes
+only in Edit mode and unsubscribes on returning to View or disposing.
+Supply optional `layerControlsContainer` and `showLayerControls()` to mount the
+layer editor in a host dock beside the canvas and open that dock from the toolbar.
+Without a container, the shared UI uses an accessible layer dialog. Layer controls
+unsubscribe when returning to View.
 `save("print")` also works while those controls are hidden and does not mark the
 document saved. Optional host `onStatus` and `onBusyChange` callbacks let a View
 toolbar expose inactive-editor progress/errors and coordinate its controls;
 the stock UI also exposes `isBusy()`.
+`attachDocuments(files, signal?)` appends PDF or HEP files in order using the same
+page history as the Pages dialog. It flushes active text/form drafts and works
+while the UI is in View; it does not enable editing controls or mark changes saved.
+Each file commits atomically, so earlier attachments remain if a later one fails
+or is cancelled. HEP files (including legacy ZIPs) are rebuilt as PDF pages from
+their retained scene content; missing original authoring semantics are not recovered.
+`dropImages(files, { x, y }, signal?)` accepts client coordinates and PNG/JPEG/WebP
+files in active Edit mode. It captures the page position before decoding and
+inserts each full-resolution image with undo support. Tool, mode or document
+changes cancel stale placement. Drops outside a document page are rejected.
 Hosts can instead build their own interface around `EditorSession`.
 
 `await createEditorInteractionController(editor)` supplies the same DOM-free
@@ -189,6 +288,15 @@ the resulting authoring-structure limitation. `{ flatten: true }` requests a
 rendering-data PDF. Existing supported password encryption is preserved by
 default, including flattened copies. No cryptographic signing or PDF script
 execution occurs.
+
+For editable PDF exports, `onWarning` also reports artwork that may overlap
+visible form widgets. Chrome and some other readers draw widgets after ordinary
+annotations regardless of their array order. The standalone viewers offer an
+editable/flattened copy choice for these overlaps. API callers can request
+`flatten: true` to keep the compiled visual stacking; the resulting copy has no
+interactive form fields or annotations. Detection uses committed geometry and
+conservative bounds, respects moved/deleted/hidden fields, and runs only during
+export. It adds no View-mode rendering work and never silently flattens output.
 
 PDF saves accept `protection: { mode: "preserve" }` (the default), `{ mode:
 "remove" }`, or `{ mode: "password", password, ownerPassword? }`. Set the existing
@@ -249,8 +357,11 @@ new editor persistence schema or application-defined object count limit.
 adapter and exposes `list`, `save`, and `remove`. `normalizeEditorSignature`
 normalizes flat handwriting coordinate paths without rasterization. Browser
 storage errors propagate, leaving the existing stored library intact.
-`normalizeEditorSignature(paths, name, id, smoothing = 0)` can record a maximum
-centerline fitting error in template coordinates without altering its samples.
+`normalizeEditorSignature(paths, name, id, smoothing = 0)` accepts a total error
+budget in template coordinates. A positive budget uses one quarter to compact
+redundant captured points and reserves three quarters in the returned `smoothing`
+for curve fitting. Zero retains raw polyline samples. Existing stored templates remain
+compatible and are not rewritten when listed or reused.
 The optional `smoothing` on ink/signature objects uses local page units; zero
 retains the original polylines. SVG previews, compiled curves and explicit PDF
 appearances share the fitted geometry; PDF `InkList` samples follow those curves.

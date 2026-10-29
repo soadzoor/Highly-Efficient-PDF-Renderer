@@ -20,5 +20,21 @@ export function editorStyledSelection(session: EditorSession, ids = session.getS
 export function applyEditorOpacity(session: EditorSession, opacity: number): void {
   validateEditorOpacity(opacity); const ids = editorStyledSelection(session);
   if (!ids.length) return;
-  session.transaction("Change opacity", () => { for (const id of ids) session.updateObject(id, { opacity }); });
+  session.transaction("Change color opacity", () => { for (const id of ids) {
+    const object = session.getObject(id);
+    session.updateObject(id, { opacity, ...(object.kind === "shape" || object.kind === "ink" || object.kind === "signature"
+      ? { fillOpacity: object.fillOpacity ?? object.opacity ?? 1 } : {}) });
+  } });
+}
+
+export function editorFillSelection(session: EditorSession, styled = editorStyledSelection(session)): string[] {
+  return styled.filter(id => {
+    const kind = session.getObject(id).kind; return kind === "shape" || kind === "ink" || kind === "signature";
+  });
+}
+
+export function applyEditorFillOpacity(session: EditorSession, fillOpacity: number): void {
+  validateEditorOpacity(fillOpacity); const ids = editorFillSelection(session);
+  if (!ids.length) return;
+  session.transaction("Change fill opacity", () => { for (const id of ids) session.updateObject(id, { fillOpacity }); });
 }

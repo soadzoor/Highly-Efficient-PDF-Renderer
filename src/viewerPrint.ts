@@ -1,6 +1,7 @@
 import { formatPdfDownloadFilename, type PdfDownloadSource } from "./downloadUtils";
 import type { EditorUi } from "./editorUi";
 import type { VectorScene } from "./pdfVectorExtractor";
+import { setToolbarIconButton } from "./toolbarIcons";
 
 export interface ViewerPrintDocument {
   identity: unknown;
@@ -29,7 +30,7 @@ export function createViewerPrintAction(options: ViewerPrintActionOptions): View
   let job: { source: ViewerPrintDocument; abort: AbortController } | null = null;
   function refresh(): void {
     options.button.disabled = !options.getDocument() || options.isBusy() || job !== null;
-    options.button.textContent = job ? "Preparing print…" : "Print";
+    setToolbarIconButton(options.button, "print", job ? "Preparing print…" : "Print");
     options.button.setAttribute("aria-busy", String(job !== null));
   }
   async function print(): Promise<void> {

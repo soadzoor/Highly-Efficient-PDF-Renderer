@@ -4,6 +4,7 @@ import type { HepEncodingOptions } from "./hepBuilder";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import type { LoadProgressCallback } from "./loadProgress";
 import type { PdfOutputProtection } from "./pdf/pdfProtection";
+import type { OptionalContentGroup, OptionalContentOrderNode, SceneOptionalContent } from "./optionalContentData";
 export type { PdfOutputProtection } from "./pdf/pdfProtection";
 
 /** Affine [a,b,c,d,e,f], with X right and Y up. */
@@ -25,6 +26,32 @@ export interface EditorObjectBase {
   /** Local page coordinates, before transform. Page origin is the displayed lower left. */
   transform: EditorMatrix;
   opacity?: number;
+  /** User PDF layer; null is unlayered. Omitted source clones retain source membership. */
+  layerId?: string | null;
+  /** Exact compound layer membership, indexed in getLayerEdits().catalog.conditions. */
+  layerCondition?: number;
+}
+export interface EditorLayerCreateOptions {
+  name: string;
+  defaultVisible?: boolean;
+  locked?: boolean;
+  parentId?: string | null;
+  index?: number;
+}
+export interface EditorLayerEdits {
+  catalog: SceneOptionalContent;
+  catalogChanged: boolean;
+  /** An explicit layer move/order operation also requests visual restacking. */
+  stackingChanged: boolean;
+  /** Explicit object ordering is independent of PDF layer-list ordering. */
+  objectOrderChanged?: boolean;
+  /** Transient back-to-front owner identities, baked into ordinary saved paint order. */
+  objectOrder?: readonly string[];
+  /** Ordered removals retain retargeting dependencies across successive edits. */
+  removals: readonly { id: string; targetLayerId: string | null }[];
+  removedLayerIds: readonly string[];
+  sourceAssignments: readonly { ref: PrimitiveRef; layerId: string | null }[];
+  annotationAssignments: readonly { id: string; layerId: string | null }[];
 }
 export interface EditorTextObject extends EditorObjectBase {
   kind: "text";
@@ -60,6 +87,8 @@ export interface EditorShapeObject extends EditorObjectBase {
   points?: readonly (readonly [number, number])[];
   color?: EditorColor;
   fill?: EditorColor | null;
+  /** Independent fill alpha; omission retains the legacy object-opacity fallback. */
+  fillOpacity?: number;
   strokeWidth?: number;
 }
 interface EditorInkData extends EditorObjectBase {
@@ -68,6 +97,8 @@ interface EditorInkData extends EditorObjectBase {
   smoothing?: number;
   color?: EditorColor;
   fill?: EditorColor | null;
+  /** Independent fill alpha; omission retains the legacy object-opacity fallback. */
+  fillOpacity?: number;
   strokeWidth?: number;
 }
 export type EditorInkObject = EditorInkData & ({ kind: "ink" } | { kind: "signature" });
@@ -103,6 +134,7 @@ export interface EditorPdfSaveOptions {
   /** Preserve source encryption by default, remove it, or set a new opening password. */
   protection?: PdfOutputProtection;
   onWarning?: (message: string) => void;
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
 }
 export interface EditorPageInfo {
   /** Zero-based position in the current document. */
@@ -152,6 +184,8 @@ export interface EditorState {
   selection: readonly string[];
   previewing: boolean;
 }
+export type EditorStackingAction = "send-to-back" | "bring-to-front" | "bring-forward" | "send-backward";
+
 export interface EditorSession {
   readonly sourceScene: VectorScene;
   readonly sourcePdf?: Uint8Array;
@@ -183,6 +217,35 @@ export interface EditorSession {
   getFieldValues(): ReadonlyMap<string, EditorFieldValue>;
   getSourceEdits(): readonly EditorSourceEdit[];
   getAnnotationEdits(): readonly EditorAnnotationEdit[];
+  getLayers(): readonly OptionalContentGroup[];
+  getLayerOrder(): readonly OptionalContentOrderNode[];
+  createLayer(options: EditorLayerCreateOptions): string;
+  updateLayer(id: string, patch: { name?: string; defaultVisible?: boolean; locked?: boolean }): void;
+  moveLayer(id: string, position: { parentId?: string | null; index: number }): void;
+  setLayerOrder(order: readonly OptionalContentOrderNode[]): void;
+  canReorderSelection(action: EditorStackingAction): boolean;
+  reorderSelection(action: EditorStackingAction): void;
+  /** Remove the layer while retaining its content, optionally on another layer. */
+  removeLayer(id: string, options?: { targetLayerId?: string | null }): void;
+  getActiveLayer(): string | null;
+  /** Creation preference; does not change document history or dirty state. */
+  setActiveLayer(id: string | null): void;
+  getObjectLayerIds(id: string): readonly string[];
+  getObjectLayerCondition(id: string): { catalog: SceneOptionalContent; condition?: number };
+  /** Copy exact annotation/authored membership, including compound and negated PDF layers. */
+  copyObjectLayerMembership(sourceId: string, targetId: string): void;
+  assignObjectsToLayer(ids: readonly string[], layerId: string | null): void;
+  assignSelectionToLayer(layerId: string | null): void;
+  getLayerObjects(id: string): readonly string[];
+  selectLayerContents(id: string): void;
+  getLayerEdits(): EditorLayerEdits;
+  getObjectLayerEdits(id: string): EditorLayerEdits;
+  getLayerRevision(): number;
+  isObjectVisible(id: string): boolean;
+  isPrimitiveVisible(ref: PrimitiveRef): boolean;
+  isAnnotationVisible(id: string): boolean;
+  getPrimitivePaintRank(ref: PrimitiveRef): number;
+  getObjectPaintRank(id: string): number;
   getPages(): readonly EditorPageInfo[];
   rotatePages(indices: readonly number[], degrees: number, options?: EditorPageOperationOptions): Promise<void>;
   removePages(indices: readonly number[], options?: EditorPageOperationOptions): Promise<void>;

@@ -1,14 +1,13 @@
-import { createEditorSignatureLibrary, normalizeEditorSignature, type EditorSignature } from "./editorSignatures";
+import { createEditorSignatureLibrary, getEditorSignatureInkPaths, normalizeEditorSignature, type EditorSignature } from "./editorSignatures";
 import { appendEditorInkSamples } from "./editorInkCapture";
-import { fitEditorInkPaths, editorInkBounds, editorInkPathData, type EditorInkSegment } from "./editorInkGeometry";
+import { editorInkBounds, editorInkPathData, type EditorInkSegment, type InkPoint } from "./editorInkGeometry";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
 /** The library and placed copy derive the same vector from the unmodified template. */
 export function createEditorSignaturePreview(document: Document, signature: EditorSignature): SVGSVGElement {
-  const paths = signature.paths.map(path => Array.from({ length: path.length / 2 }, (_, index) => [path[index * 2], path[index * 2 + 1]] as [number, number]));
-  const curves = fitEditorInkPaths(paths, signature.smoothing ?? 0), bounds = editorInkBounds(curves)!;
+  const curves = getEditorSignatureInkPaths(signature), bounds = editorInkBounds(curves)!;
   const padding = Math.max(2, Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY) * .025);
   const width = Math.max(1, bounds.maxX - bounds.minX), height = Math.max(1, bounds.maxY - bounds.minY);
   const svg = document.createElementNS(SVG_NS, "svg"), path = document.createElementNS(SVG_NS, "path");
@@ -29,13 +28,13 @@ export function showSignatureDialog(document: Document, onChoose: (signature: Ed
   document.body.append(dialog);
   const canvas = dialog.querySelector("canvas")!, context = canvas.getContext("2d")!, paths: [number, number][][] = [];
   const smooth = dialog.querySelector<HTMLInputElement>("[data-signature-smooth]")!;
-  smooth.title = "Gently smooth handwriting while keeping its shape";
+  smooth.title = "Straighten small pen jitter and fit smooth curves while preserving the handwriting";
   const completed = new Map<readonly [number, number][], { tolerance: number; curves: EditorInkSegment[][] }>();
   let current: [number, number][] | null = null, pointerId: number | null = null;
   const status = dialog.querySelector<HTMLElement>("[data-signature-status]")!;
   let library: ReturnType<typeof createEditorSignatureLibrary> | undefined;
   try { library = createEditorSignatureLibrary(document.defaultView!.localStorage); } catch (error) { status.textContent = message(error); }
-  const tolerance = (): number => smooth.checked ? .35 * canvas.width / Math.max(1, canvas.getBoundingClientRect().width) : 0;
+  const tolerance = (): number => smooth.checked ? canvas.width / Math.max(1, canvas.getBoundingClientRect().width) : 0;
   function redraw(): void {
     context.clearRect(0, 0, canvas.width, canvas.height); context.lineWidth = 3; context.lineCap = "round"; context.lineJoin = "round";
     context.strokeStyle = context.fillStyle = "#111";
@@ -47,7 +46,15 @@ export function showSignatureDialog(document: Document, onChoose: (signature: Ed
         for (let index = 1; index < points.length; index++) context.lineTo(points[index][0], points[index][1]);
       } else {
         let fitted = completed.get(points);
-        if (!fitted || fitted.tolerance !== error) { fitted = { tolerance: error, curves: fitEditorInkPaths([points], error) }; completed.set(points, fitted); }
+        if (!fitted || fitted.tolerance !== error) {
+          const capture = normalizeEditorSignature([points.length === 1 ? [...points, points[0]].flat() : points.flat()], "Preview", "capture-preview", error);
+          let minX = Infinity, minY = Infinity;
+          for (const [x, y] of points) { minX = Math.min(minX, x); minY = Math.min(minY, y); }
+          const translate = (p: InkPoint): [number, number] => [p[0] + minX, p[1] + minY];
+          fitted = { tolerance: error, curves: getEditorSignatureInkPaths(capture).map(path => path.map(segment => ({
+            start: translate(segment.start), end: translate(segment.end), ...(segment.control ? { control: translate(segment.control) } : {})
+          }))) }; completed.set(points, fitted);
+        }
         for (const segment of fitted.curves[0] ?? []) {
           if (segment.control) context.quadraticCurveTo(...segment.control, ...segment.end);
           else context.lineTo(...segment.end);

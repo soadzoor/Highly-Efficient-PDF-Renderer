@@ -12,24 +12,25 @@ export class EditorPdfLayers {
   private readonly flatten: boolean;
   constructor(writer: PdfByteWriter, data: SceneOptionalContent | undefined, flatten = false) {
     this.writer = writer; this.data = data; this.flatten = flatten;
-    if (!flatten) for (const group of data?.groups ?? []) this.groups.set(group.id,
+    if (!flatten) for (const group of data?.groups ?? []) if (!group.annotationId) this.groups.set(group.id,
       writer.add(`<< /Type /OCG /Name ${pdfUtf16Hex(group.name)} /HEPRLayerId ${pdfUtf16Hex(group.id)} >>`));
   }
 
   catalog(): string {
     const data = this.data;
-    if (this.flatten || !data?.groups.length) return "";
-    const references = (ids: readonly string[]) => ids.map(id => pdfRef(this.groups.get(id)!)).join(" ");
+    if (this.flatten || !data || !this.groups.size) return "";
+    const references = (ids: readonly string[]) => ids.filter(id => this.groups.has(id)).map(id => pdfRef(this.groups.get(id)!)).join(" ");
     const order = (nodes: readonly OptionalContentOrderNode[]): string => nodes.map(node => {
       const children = node.children?.length ? order(node.children) : "";
-      if (node.kind === "label") return `[${pdfUtf16Hex(node.label)} ${children}]`;
+      if (node.kind === "label") return children ? `[${pdfUtf16Hex(node.label)} ${children}]` : "";
+      if (!this.groups.has(node.groupId)) return children;
       const reference = pdfRef(this.groups.get(node.groupId)!);
       return `${reference}${children ? ` [${children}]` : ""}`;
     }).join(" ");
     return `/OCProperties << /OCGs [${references(data.groups.map(group => group.id))}] /D << /BaseState /ON ` +
       `/OFF [${references(data.groups.filter(group => !group.defaultVisible).map(group => group.id))}] ` +
       `/Order [${order(data.order)}] /Locked [${references(data.groups.filter(group => group.locked).map(group => group.id))}] ` +
-      `/RBGroups [${data.radioGroups.map(ids => `[${references(ids)}]`).join(" ")}] >> >>`;
+      `/RBGroups [${data.radioGroups.map(ids => references(ids)).filter(Boolean).map(value => `[${value}]`).join(" ")}] >> >>`;
   }
 
   wrap(content: string, data: SceneOptionalContent | undefined, condition: number | undefined,
@@ -54,7 +55,7 @@ export class EditorPdfLayers {
       const group = data.groups.find(group => group.id === condition.groupId);
       if (!group) throw new RangeError("Unknown PDF layer.");
       const reference = this.groups.get(group.id);
-      result = { value: this.flatten ? group.defaultVisible : pdfRef(reference!), visible: group.defaultVisible,
+      result = { value: group.annotationId ? true : this.flatten ? group.defaultVisible : pdfRef(reference!), visible: group.annotationId ? true : group.defaultVisible,
         groups: reference === undefined ? [] : [reference] };
     } else if (condition.kind === "not") {
       const child = this.expression(data, condition.operand);

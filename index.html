@@ -11,18 +11,16 @@
     <div id="hud" class="panel">
       <div class="panel-header">
         <h2 class="panel-title">Settings</h2>
-        <button id="toggle-hud" class="settings-close" type="button" aria-expanded="true" aria-controls="hud-content" aria-label="Close settings" title="Close settings">
-          <span id="toggle-hud-icon" aria-hidden="true">×</span> Close
-        </button>
+        <button id="toggle-hud" class="settings-close" type="button" data-toolbar-icon="close" aria-expanded="true" aria-controls="hud-content" aria-label="Close settings" title="Close settings">Close settings</button>
       </div>
       <div id="hud-content" class="panel-content">
         <div class="toolbar startup-controls">
           <a class="package-version" href="https://www.npmjs.com/package/@soadzoor/hepr" target="_blank" rel="noopener noreferrer" title="HEPR package version used by this build">npm v%HEPR_PACKAGE_VERSION%</a>
-          <button id="open-file" type="button" title="Open a PDF or HEPR-exported .hep file">Open PDF / HEP</button>
-          <button id="editor-mode" type="button" aria-pressed="false" title="Enter PDF editing mode">Edit PDF</button>
-          <button id="print-pdf" type="button" title="Print the current document" disabled>Print</button>
+          <button id="open-file" type="button" data-toolbar-icon="open" title="Open a PDF or HEPR-exported .hep file">Open PDF / HEP</button>
+          <button id="editor-mode" type="button" data-toolbar-icon="edit" aria-pressed="false" title="Enter PDF editing mode">Edit PDF</button>
+          <button id="print-pdf" type="button" data-toolbar-icon="print" title="Print the current document" disabled>Print</button>
           <div id="example-dropdown" class="example-dropdown">
-            <button id="example-select" class="example-trigger" type="button" aria-label="Load example PDF or HEP file" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
+            <button id="example-select" class="example-trigger" type="button" title="Load example PDF or HEP file" aria-label="Load example PDF or HEP file" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
               <span id="example-select-label" class="example-trigger-label">Examples (loading...)</span>
               <span class="example-trigger-chevron" aria-hidden="true">▾</span>
             </button>
@@ -31,18 +29,18 @@
         </div>
         <input id="file-input" type="file" accept=".pdf,.hep,application/pdf,application/x-hep" hidden />
         <div class="toolbar settings-downloads">
-          <button id="download-data" type="button" hidden disabled>Download HEP</button>
-          <button id="download-pdf" type="button" hidden disabled>Download PDF</button>
-          <button id="download-all-data" type="button" hidden disabled>Download All Example HEP Files</button>
+          <button id="download-data" type="button" data-toolbar-icon="download-hep" hidden disabled>Download HEP</button>
+          <button id="download-pdf" type="button" data-toolbar-icon="download-pdf" hidden disabled>Download PDF</button>
+          <button id="download-all-data" type="button" data-toolbar-icon="download-all" hidden disabled>Download All Example HEP Files</button>
         </div>
         <div class="number-row search-row">
           <label for="text-search-input">Find Text</label>
           <div class="search-controls">
             <input id="text-search-input" type="search" placeholder="Load a document to search" autocomplete="off" spellcheck="false" disabled />
             <span id="text-search-count" class="search-count" hidden>0/0</span>
-            <button id="text-search-prev" type="button" class="search-nav" title="Previous match (Shift+Enter)" aria-label="Previous match" disabled>▲</button>
-            <button id="text-search-next" type="button" class="search-nav" title="Next match (Enter)" aria-label="Next match" disabled>▼</button>
-            <button id="text-search-case" type="button" class="search-case" title="Match case" aria-label="Match case" aria-pressed="false" disabled>Aa</button>
+            <button id="text-search-prev" type="button" data-toolbar-icon="search-previous" class="search-nav" title="Previous match (Shift+Enter)" aria-label="Previous match (Shift+Enter)" disabled>▲</button>
+            <button id="text-search-next" type="button" data-toolbar-icon="search-next" class="search-nav" title="Next match (Enter)" aria-label="Next match (Enter)" disabled>▼</button>
+            <button id="text-search-case" type="button" data-toolbar-icon="match-case" class="search-case" title="Match case" aria-label="Match case" aria-pressed="false" disabled>Aa</button>
           </div>
         </div>
         <div class="number-row">

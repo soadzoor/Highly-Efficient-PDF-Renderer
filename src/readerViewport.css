@@ -1,5 +1,7 @@
 .reader-shell {
-  position: fixed;
+  /* A fixed shell traps its toolbar below body-mounted document overlays.
+     The viewport-sized app body keeps this absolute shell in the same place. */
+  position: absolute;
   inset: 0;
   display: flex;
   flex-direction: column;
@@ -9,7 +11,7 @@
 
 .reader-toolbar {
   position: relative;
-  z-index: 30;
+  z-index: 35;
   display: flex;
   align-items: center;
   flex-wrap: wrap;
@@ -26,7 +28,7 @@
   position: absolute;
   top: 8px;
   left: 8px;
-  z-index: 31;
+  z-index: 36;
   height: 30px;
   padding: 3px 8px;
   border: 1px solid #cbd5e1;
@@ -78,7 +80,6 @@
 .reader-toolbar .example-trigger-count { background: #e2e8f0; color: #334155; }
 .reader-toolbar .example-trigger-chevron { color: #475569; }
 
-.reader-workspace { position: relative; display: flex; flex: 1; min-height: 0; min-width: 0; }
 .reader-scroll { position: relative; flex: 1; min-width: 0; overflow: hidden; outline-offset: -2px; }
 .reader-active .reader-scroll { overflow: auto; overflow-anchor: none; overscroll-behavior: contain; }
 .reader-surface { position: relative; width: 100%; height: 100%; }
@@ -94,8 +95,11 @@
 
 .reader-thumbnails {
   position: relative;
-  flex: 0 0 180px;
+  z-index: 22;
+  flex: 0 1 180px;
   width: 180px;
+  max-width: 25%;
+  min-width: 0;
   overflow: auto;
   overscroll-behavior: contain;
   border-right: 1px solid #94a3b8;
@@ -125,10 +129,6 @@
 .reader-thumbnail-image { display: block; background: #fff; box-shadow: 0 1px 4px #0f172a3d; }
 .reader-thumbnail-image canvas { display: block; width: 100%; height: 100%; }
 .reader-thumbnail-failed .reader-thumbnail-image { background: repeating-linear-gradient(135deg, #fff, #fff 8px, #e2e8f0 8px, #e2e8f0 16px); }
-
-.has-reader-toolbar #hud, .has-reader-toolbar #panel { top: var(--reader-toolbar-height, 64px); z-index: 25; }
-.has-reader-toolbar #hud, .has-reader-toolbar #panel { max-height: calc(100vh - var(--reader-toolbar-height, 64px) - 24px); }
-.reader-active #hud, .reader-active #panel { left: auto; right: 16px; }
 
 @media (max-width: 799px) {
   .reader-toolbar { gap: 4px; padding: 6px; }

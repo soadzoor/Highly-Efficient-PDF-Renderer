@@ -1,0 +1,6 @@
+.hepr-editor-context-menu{position:fixed;z-index:90;box-sizing:border-box;display:flex;flex-direction:column;gap:2px;padding:4px;background:#fff;color:#172333;border:1px solid #b6c3d4;border-radius:6px;box-shadow:0 5px 20px #0003;overflow:auto;overscroll-behavior:contain;font:13px system-ui,sans-serif}
+.hepr-editor-context-menu[hidden]{display:none}
+.hepr-editor-context-menu button{display:block;box-sizing:border-box;width:100%;flex:none;padding:7px 12px;border:0;border-radius:3px;background:transparent;color:inherit;text-align:start;white-space:normal;overflow-wrap:anywhere;cursor:pointer;font:inherit}
+.hepr-editor-context-menu button:hover:not(:disabled),.hepr-editor-context-menu button:focus-visible{background:#dceaff;color:#12429b;outline:1px solid #306ed8;outline-offset:-1px}
+.hepr-editor-context-menu button:disabled{opacity:.45;cursor:default}
+@media print{.hepr-editor-context-menu{display:none!important}}

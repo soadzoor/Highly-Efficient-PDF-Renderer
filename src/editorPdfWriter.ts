@@ -318,7 +318,7 @@ class ScenePdfPageWriter {
     return `q\n${(flags & 4) ? `${numbers([bounds[offset], bounds[offset + 1], bounds[offset + 2] - bounds[offset], bounds[offset + 3] - bounds[offset + 1]])} re W n\n` : ""}` +
       `${this.state(resources, alpha, blend, maskState)}${paint < 0 ? `${numbers([styles[offset + 1], styles[offset + 2], styles[offset + 3]])} RG\n`
         : `/Pattern CS ${resources.use("Pattern", await this.gradientPattern(paint))} SCN\n`}` +
-      `${pdfNumber(styles[offset] * 2)} w 1 J 1 j\n${segmentPath(a, b, index, 1, false)}S\nQ\n`;
+      `${pdfNumber(styles[offset] * 2)} w ${(flags & 2) ? 1 : 0} J 1 j\n${segmentPath(a, b, index, 1, false)}S\nQ\n`;
   }
 
   private async gradientStroke(index: number, resources: Resources): Promise<string> {

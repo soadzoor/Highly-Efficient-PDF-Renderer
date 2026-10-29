@@ -1,5 +1,6 @@
 import type { Bounds, VectorClipPath, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { composeOverlappingVectorScenes } from "./pdfVectorExtractor";
+import { editorPaintIdentity, setEditorPaintIdentity, retainEditorPaintIdentity, remapEditorPaintIdentity, composeEditorPaintIdentity } from "./editorPaintIdentity";
 import type { PrimitiveKind, PrimitiveRef } from "./scenePrimitives";
 import { getScenePrimitive, getPrimitiveClipChain, getPrimitiveSegmentClipBounds, getSceneAnnotationRuns, validatePrimitiveRef } from "./scenePrimitives";
 import { transformAnnotationGeometry, transformAnnotationPoints } from "./annotationData";
@@ -11,12 +12,32 @@ import { ScenePageViews, PAGE_PRIMITIVE_KINDS, scenePrimitiveCounts } from "./sc
 import { buildNativeGlyphStroke } from "./pdf/nativeGlyphStroke";
 import { rasterRepeatMatrix } from "./rasterRepeat";
 import type { EditorAnnotationEdit, EditorMatrix, EditorSourceEdit } from "./editorTypes";
+import type { SceneAnnotation } from "./annotationData";
 
 export const EDITOR_IDENTITY: EditorMatrix = [1, 0, 0, 1, 0, 0];
 const annotationTransforms = new WeakMap<VectorScene, ReadonlyMap<string, EditorMatrix>>();
+const annotationSources = new WeakMap<VectorScene, ReadonlyMap<string, { annotation: SceneAnnotation; transform: EditorMatrix }>>();
 /** Operation-local placement for regenerating a transformed field appearance; never serialized. */
 export function getEditorAnnotationTransform(scene: VectorScene, id: string): EditorMatrix | undefined {
   const matrix = annotationTransforms.get(scene)?.get(id); return matrix ? [...matrix] as unknown as EditorMatrix : undefined;
+}
+/** Native field dimensions before editing; transformed bounds remain conservative AABBs. */
+export function getEditorAnnotationSource(scene: VectorScene, id: string): SceneAnnotation | undefined {
+  return annotationSources.get(scene)?.get(id)?.annotation;
+}
+/** Include an appearance's original local frame, recovered when reopening an edited PDF. */
+export function getEditorAnnotationFrameTransform(scene: VectorScene, id: string): EditorMatrix | undefined {
+  const source = annotationSources.get(scene)?.get(id), delta = annotationTransforms.get(scene)?.get(id);
+  return source ? multiplyEditorMatrices(delta ?? EDITOR_IDENTITY, source.transform) : delta ? [...delta] as unknown as EditorMatrix : undefined;
+}
+export function setEditorAnnotationSource(scene: VectorScene, annotation: SceneAnnotation, transform: EditorMatrix = EDITOR_IDENTITY): void {
+  const sources = new Map(annotationSources.get(scene)); sources.set(annotation.id, { annotation, transform: editorMatrix(transform) }); annotationSources.set(scene, sources);
+}
+/** Keep operation-local field frames through compilation without adding scene/HEP data. */
+export function retainEditorAnnotationPlacements(source: VectorScene, target: VectorScene): void {
+  retainEditorPaintIdentity(source, target);
+  const transforms = annotationTransforms.get(source); if (transforms) annotationTransforms.set(target, transforms);
+  const sources = annotationSources.get(source); if (sources) annotationSources.set(target, sources);
 }
 export function editorMatrix(value: readonly number[]): EditorMatrix {
   if (value.length !== 6 || !value.every(Number.isFinite)) throw new TypeError("An editor transform must have six finite components.");
@@ -56,8 +77,9 @@ export function bakeEditorAnnotationEdits(scene: VectorScene, edits: readonly Ed
   const pending = new Map(edits.filter(edit => edit.deleted || !editorMatrixIsIdentity(edit.transform)).map(edit => [edit.id, edit]));
   if (!pending.size || !scene.annotations) return scene;
   const transforms = new Map(annotationTransforms.get(scene));
+  const sources = new Map(annotationSources.get(scene));
   const annotations = scene.annotations.flatMap(annotation => {
-    const edit = pending.get(annotation.id); if (!edit) return [annotation]; if (edit.deleted) { transforms.delete(annotation.id); return []; }
+    const edit = pending.get(annotation.id); if (!edit) return [annotation]; if (edit.deleted) { transforms.delete(annotation.id); sources.delete(annotation.id); return []; }
     const matrix = editorMatrix(edit.transform), bounds = annotation.bounds;
     const geometry = transformAnnotationGeometry({ rect: [bounds.minX, bounds.minY, bounds.maxX, bounds.maxY], quadPoints: annotation.quadPoints,
       line: annotation.line, vertices: annotation.vertices, inkList: annotation.inkList }, matrix as PdfMatrix);
@@ -65,14 +87,16 @@ export function bakeEditorAnnotationEdits(scene: VectorScene, edits: readonly Ed
     const mapping = page?.pdfToScene ?? [1, 0, 0, 1, scene.pageRects[annotation.pageIndex * 4], scene.pageRects[annotation.pageIndex * 4 + 1]];
     const pdfMatrix = multiplyEditorMatrices(invertEditorMatrix(mapping), multiplyEditorMatrices(matrix, mapping));
     const original = annotation.pdfGeometry, box = editorTransformBounds({ minX: original.rect[0], minY: original.rect[1], maxX: original.rect[2], maxY: original.rect[3] }, pdfMatrix);
-    transforms.set(annotation.id, matrix);
+    if (!sources.has(annotation.id)) sources.set(annotation.id, { annotation, transform: EDITOR_IDENTITY });
+    transforms.set(annotation.id, multiplyEditorMatrices(matrix, transforms.get(annotation.id) ?? EDITOR_IDENTITY));
     return [{ ...annotation, ...geometry, pdfGeometry: { rect: [box.minX, box.minY, box.maxX, box.maxY] as const,
       ...(original.quadPoints ? { quadPoints: transformAnnotationPoints(original.quadPoints, pdfMatrix as PdfMatrix) } : {}),
       ...(original.line ? { line: transformAnnotationPoints(original.line, pdfMatrix as PdfMatrix) } : {}),
       ...(original.vertices ? { vertices: transformAnnotationPoints(original.vertices, pdfMatrix as PdfMatrix) } : {}),
       ...(original.inkList ? { inkList: original.inkList.map(path => transformAnnotationPoints(path, pdfMatrix as PdfMatrix)) } : {}) } }];
   });
-  const result = { ...scene, annotations }; annotationTransforms.set(result, transforms); return result;
+  const result = { ...scene, annotations }; retainEditorPaintIdentity(scene, result);
+  annotationTransforms.set(result, transforms); annotationSources.set(result, sources); return result;
 }
 
 /** Copy only arrays written by the edit; the caller's canonical scene stays immutable. */
@@ -292,6 +316,12 @@ export function bakeEditorSourceScene(source: VectorScene, edits: readonly Edito
   }
   const kept = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind => [kind, new Set<number>()])) as Record<PrimitiveKind, Set<number>>;
   for (const run of runs) for (let index = run.first; index < run.first + run.count; index++) kept[run.kind].add(index);
+  const identity = editorPaintIdentity(source), replacementsByIdentity = new Map<string, string>();
+  for (const [original, refs] of replacements) {
+    const [kind, index] = original.split(":"); const owner = identity({ kind: kind as PrimitiveKind, index: Number(index) });
+    for (const ref of refs) replacementsByIdentity.set(editorRefKey(ref), owner);
+  }
+  setEditorPaintIdentity(scene, ref => replacementsByIdentity.get(editorRefKey(ref)) ?? identity(ref));
   const compacted = compactEditorScene(scene, kept, owners);
   if (outlinedApproximation) {
     const diagnostic: PdfDiagnostic = { code: "editor.stroke-outline-approximation", severity: "warning",
@@ -301,16 +331,18 @@ export function bakeEditorSourceScene(source: VectorScene, edits: readonly Edito
   if (source.annotations) {
     const appearances = getSceneAnnotationRuns(source);
     const transforms = new Map(annotationTransforms.get(source));
+    const sources = new Map(annotationSources.get(source));
     compacted.annotations = source.annotations.flatMap(annotation => {
       const refs: PrimitiveRef[] = [];
       for (const run of appearances.get(annotation.id) ?? []) for (let index = run.first; index < run.first + run.count; index++) refs.push({ kind: run.kind, index });
       if (!refs.length) return [annotation];
-      if (refs.every(ref => pending.get(editorRefKey(ref))?.deleted)) return [];
+      if (refs.every(ref => pending.get(editorRefKey(ref))?.deleted)) { transforms.delete(annotation.id); sources.delete(annotation.id); return []; }
       const matrix = pending.get(editorRefKey(refs[0]))?.transform;
       if (!matrix || refs.some(ref => {
         const edit = pending.get(editorRefKey(ref)); return !edit || edit.deleted || edit.transform.some((value, index) => value !== matrix[index]);
       })) return [annotation];
-      transforms.set(annotation.id, matrix);
+      if (!sources.has(annotation.id)) sources.set(annotation.id, { annotation, transform: EDITOR_IDENTITY });
+      transforms.set(annotation.id, multiplyEditorMatrices(matrix, transforms.get(annotation.id) ?? EDITOR_IDENTITY));
       const bounds = annotation.bounds, transformed = transformAnnotationGeometry({ rect: [bounds.minX, bounds.minY, bounds.maxX, bounds.maxY],
         quadPoints: annotation.quadPoints, line: annotation.line, vertices: annotation.vertices, inkList: annotation.inkList }, matrix as PdfMatrix);
       const page = source.pdfPages?.find(page => page.pageIndex === annotation.pageIndex);
@@ -324,6 +356,7 @@ export function bakeEditorSourceScene(source: VectorScene, edits: readonly Edito
         ...(original.inkList ? { inkList: original.inkList.map(path => transformAnnotationPoints(path, pdfMatrix as PdfMatrix)) } : {}) } }];
     });
     annotationTransforms.set(compacted, transforms);
+    annotationSources.set(compacted, sources);
   }
   compacted.maxHalfWidth = 0; for (let i = 0; i < compacted.styles.length; i += 4) compacted.maxHalfWidth = Math.max(compacted.maxHalfWidth, compacted.styles[i]);
   compacted.bounds = { ...compacted.pageBounds };
@@ -335,7 +368,7 @@ export function bakeEditorSourceScene(source: VectorScene, edits: readonly Edito
 /** Compact canonical stores and remap paint and text references without rasterization. */
 export function compactEditorScene(source: VectorScene, keep: Record<PrimitiveKind, ReadonlySet<number>>, suppliedOwners?: Record<PrimitiveKind, ArrayLike<number>>): VectorScene {
   const scene: VectorScene = { ...source, pagePrimitiveRanges: undefined }, ids = {} as Record<PrimitiveKind, number[]>, maps = {} as Record<PrimitiveKind, Map<number, number>>;
-  const transforms = annotationTransforms.get(source); if (transforms) annotationTransforms.set(scene, transforms);
+  retainEditorAnnotationPlacements(source, scene);
   const partition = !suppliedOwners && source.pageCount > 1 ? new ScenePageViews(source) : null;
   const owners = suppliedOwners ?? partition?.owners ?? Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind => [kind, Array(scenePrimitiveCounts(source)[kind]).fill(0)])) as unknown as Record<PrimitiveKind, ArrayLike<number>>;
   for (const kind of PAGE_PRIMITIVE_KINDS) { ids[kind] = [...keep[kind]].sort((a, b) => owners[kind][a] - owners[kind][b] || a - b); maps[kind] = new Map(ids[kind].map((id, index) => [id, index])); }
@@ -420,6 +453,7 @@ export function compactEditorScene(source: VectorScene, keep: Record<PrimitiveKi
     }
   });
   scene.pagePrimitiveRanges = ranges;
+  remapEditorPaintIdentity(source, scene, ids);
   compactEditorResources(scene);
   validateVectorDrawRuns(scene); validateScenePaintGraph(scene); return scene;
 }
@@ -497,6 +531,7 @@ function compactEditorResources(scene: VectorScene): void {
 export function composeEditorPage(base: VectorScene, additions: readonly VectorScene[]): VectorScene {
   if (!additions.length) return base;
   const merged = composeOverlappingVectorScenes([base, ...additions]);
+  composeEditorPaintIdentity([base, ...additions], merged);
   merged.pageCount = 1; merged.pagesPerRow = 1; merged.pageRects = base.pageRects.slice(0, 4); merged.pageTextRanges = Uint32Array.of(0, merged.textInstanceCount);
   merged.pagePrimitiveRanges = Uint32Array.from(PAGE_PRIMITIVE_KINDS.flatMap(kind => [0, scenePrimitiveCounts(merged)[kind]]));
   merged.rasterLayers = merged.rasterLayers.map(layer => ({ ...layer, pageIndex: 0 }));

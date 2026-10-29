@@ -33,6 +33,7 @@ try {
   const { openEditorSession } = await import("../src/editorSession.ts");
   const { createEditorFieldControl, styleEditorFieldControl, setEditorFieldControlValue } = await import("../src/editorFormControls.ts");
   const { editorFieldClientGeometry } = await import("../src/editorCoordinates.ts");
+  const { getEditorAnnotationFrameTransform, getEditorAnnotationSource, editorTransformBounds } = await import("../src/editorScene.ts");
   const { validateAnnotations } = await import("../src/annotationData.ts");
   const { convertDeviceCmykToSrgb } = await import("../src/pdf/deviceCmyk.ts");
   const { loadSceneFromHep } = await import("../src/hep.ts");
@@ -114,6 +115,34 @@ try {
       assert(geometry); assert.equal(fixed.style.fontSize, "10px", "font sizes stay in PDF units while the field matrix applies zoom/rotation/UserUnit");
       assert.equal(Math.hypot(...geometry.transform.slice(0, 2)), scale * Math.hypot(matrix[0], matrix[1]));
     }
+    const composedAxes = editorFieldClientGeometry(named("Fixed"), [{ pageIndex: 0, pdfToScene: [0, -2, 2, 0, 30, 400] }],
+      point => ({ x: 50 + point.x * 2, y: 300 - point.y * 2 }), [1.5, .4, -.25, .8, 9, -13]);
+    assert(composedAxes);
+    for (const [actual, expected] of [[composedAxes.origin.x, 1073.038], [composedAxes.origin.y, -600.6768],
+      ...composedAxes.transform.map((value, index) => [value, [1, 3.2, -6, 1.6, 0, 0][index]])]) {
+      assert(Math.abs(actual - expected) < 1e-9, "editor transforms apply after page rotation/crop/UserUnit and before host projection");
+    }
+    const transformedEditor = await openEditorSession(plain, services.sessionOptions);
+    try {
+      const originalField = transformedEditor.sourceScene.annotations.find(annotation => annotation.field?.name === "Auto");
+      const angle = Math.PI / 5, c = Math.cos(angle), s = Math.sin(angle), transform = [1.8 * c, 1.8 * s, -.7 * s, .7 * c, 20, -12];
+      const project = point => ({ x: 50 + point.x * 2, y: 300 - point.y * 2 });
+      const expected = editorFieldClientGeometry(originalField, transformedEditor.sourceScene.pdfPages, project, transform);
+      assert(expected); assert.equal(expected.width, 70); assert(Math.abs(expected.height - 14.173) < 1e-8);
+      transformedEditor.selectAnnotations([originalField.id]); transformedEditor.transformSelection(transform);
+      for (const value of ["A", "B", "A"]) {
+        transformedEditor.setFieldValue("Auto", value);
+        const scene = await transformedEditor.getScene(), current = scene.annotations.find(annotation => annotation.id === originalField.id);
+        const canonical = getEditorAnnotationSource(scene, originalField.id) ?? current;
+        assert.deepEqual(canonical.pdfGeometry.rect, originalField.pdfGeometry.rect, "typing retains the original PDF field rectangle");
+        assert.deepEqual(current.bounds, editorTransformBounds(originalField.bounds, transform));
+        const geometry = editorFieldClientGeometry(canonical, scene.pdfPages, project, getEditorAnnotationFrameTransform(scene, originalField.id));
+        assert.deepEqual(geometry, expected, "rotated, nonuniformly scaled fields keep their oriented frame across typing");
+        const input = createEditorFieldControl(document, canonical, value, () => {});
+        assert.equal(input.style.fontSize, "10px", "auto sizing uses native dimensions while the field matrix scales its appearance");
+        assert.equal(input.style.padding, "2px");
+      }
+    } finally { transformedEditor.dispose(); }
     let committed;
     const radio = createEditorFieldControl(document, named("Radio"), "Off", value => committed = value, { usePdfAppearance: true });
     assert.equal(radio.type, "radio"); assert.equal(radio.name, "hepr-field-Radio"); assert.equal(radio.dataset.pdfAppearance, "true");

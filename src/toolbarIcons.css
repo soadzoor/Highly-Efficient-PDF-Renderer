@@ -1,0 +1,7 @@
+.hepr-toolbar-icon-button{position:relative;display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;width:32px;min-width:32px;height:32px;padding:4px;flex:0 0 auto}
+.hepr-toolbar-icon-button[hidden]{display:none}
+.hepr-toolbar-icon-button:focus-visible{outline:2px solid #1765d7;outline-offset:2px}
+.hepr-toolbar-icon{display:block;flex:0 0 auto;pointer-events:none}
+.hepr-toolbar-button-label{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.reader-toolbar .hepr-toolbar-icon-button,.reader-toolbar-restore.hepr-toolbar-icon-button{width:32px;min-width:32px;height:30px;padding:4px}
+.reader-toolbar-restore.hepr-toolbar-icon-button{position:absolute}

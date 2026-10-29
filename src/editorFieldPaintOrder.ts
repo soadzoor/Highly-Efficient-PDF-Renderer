@@ -1,9 +1,11 @@
 import type { VectorScene, VectorDrawRun } from "./pdfVectorExtractor";
 import type { ScenePaintNode, ScenePaintGroup } from "./scenePaintGraph";
 import type { PrimitiveKind } from "./scenePrimitives";
+import { getSceneAnnotationRuns } from "./scenePrimitives";
 import { PAGE_PRIMITIVE_KINDS } from "./scenePageViews";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 import { compactEditorScene, composeEditorPage } from "./editorScene";
+import { editorPaintIdentity, setEditorPaintIdentity, retainEditorPaintIdentity } from "./editorPaintIdentity";
 
 const ORDINARY = Symbol("ordinary"), MIXED = Symbol("mixed"), EMPTY = Symbol("empty");
 type Owner = string | typeof ORDINARY | typeof MIXED | typeof EMPTY;
@@ -11,7 +13,8 @@ interface Slot { id: string; node: ScenePaintNode; parent: ScenePaintNode[]; anc
 
 function withGraph(scene: VectorScene): VectorScene {
   const drawRuns = scene.drawRuns ?? defaultVectorDrawRuns(scene);
-  return { ...scene, drawRuns, paintGraph: scene.paintGraph ?? { roots: drawRuns.map((_, runIndex) => ({ kind: "draw", runIndex })) } };
+  const result = { ...scene, drawRuns, paintGraph: scene.paintGraph ?? { roots: drawRuns.map((_, runIndex) => ({ kind: "draw", runIndex })) } };
+  retainEditorPaintIdentity(scene, result); return result;
 }
 
 /** Ownership ignores mask paint: masks travel with their enclosing appearance. */
@@ -67,7 +70,8 @@ function compactGraph(scene: VectorScene, roots: ScenePaintNode[], signal?: Abor
     }
   };
   visit(roots);
-  return compactEditorScene({ ...scene, paintGraph: { roots } }, keep);
+  const filtered = { ...scene, paintGraph: { roots } }; retainEditorPaintIdentity(scene, filtered);
+  return compactEditorScene(filtered, keep);
 }
 
 /** Extract one updated field together with every mask needed to paint it. */
@@ -111,7 +115,15 @@ export function replaceEditorFieldAppearances(source: VectorScene, replacements:
 } = {}): VectorScene {
   if (!replacements.size) return source;
   if (source.pageCount !== 1 || source.pageRects.length !== 4) throw new RangeError("Field replacement requires one page.");
-  const original = withGraph(source), entries = [...replacements], additions = entries.map(([, value]) => value ? withGraph(value) : null);
+  const original = withGraph(source), entries = [...replacements], appearances = getSceneAnnotationRuns(original), identity = editorPaintIdentity(original);
+  const additions = entries.map(([id, value]) => {
+    if (!value) return null;
+    const geometry = withGraph(value), first = appearances.get(id)?.find(run => run.count > 0);
+    // New glyphs and borders replace the same ordered appearance, even when
+    // canonical page operations have namespaced its original paint identity.
+    setEditorPaintIdentity(geometry, first ? identity({ kind: first.kind, index: first.first }) : `annotation:${id}`);
+    return geometry;
+  });
   const merged = composeEditorPage(original, additions.filter((value): value is VectorScene => value !== null));
   const roots = merged.paintGraph!.roots.slice(0, original.paintGraph!.roots.length), blocks = new Map<string, ScenePaintNode[]>();
   let offset = original.paintGraph!.roots.length;

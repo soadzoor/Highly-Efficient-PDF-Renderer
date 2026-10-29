@@ -4,6 +4,7 @@ import type { PdfPageOperation } from "./editorPdfPages";
 import type { NativeVectorPdfSession } from "./pdfSession";
 import { createLoadProgressReporter, type PDFLoadProgress } from "./loadProgress";
 import { invertEditorMatrix, multiplyEditorMatrices } from "./editorScene";
+import { editorOperationPageMap, rebaseEditorOrderedSource } from "./editorPageOrderRebase";
 
 export interface EditorDocumentVersion { session: EditorSession; options: EditorSessionOptions }
 interface Version extends EditorDocumentVersion { observedRevision: number; unsubscribe: () => void }
@@ -17,6 +18,8 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
   const lifetime = new AbortController(), undo: Action[] = [], redo: Action[] = [];
   let disposed = false, suppressed = 0, revision = 0, busy = false;
   let current: Point, savedIdentity: object;
+  let layerVersion: Version | undefined, observedLayerRevision = -1, layerRevision = 0;
+  let orderSource = 0;
   const assertLive = () => { if (disposed) throw new Error("Editor session is disposed."); };
   const getState = (): EditorState => ({ ...current.version.session.getState(), revision, dirty: current.identity !== savedIdentity,
     canUndo: undo.length > 0, canRedo: redo.length > 0 });
@@ -83,6 +86,12 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
         } finally { await document.close(); }
         check();
       }
+      const layerEdits = source.session.getLayerEdits();
+      const ordered = layerEdits.objectOrderChanged || layerEdits.stackingChanged;
+      const orderRuntime = ordered ? await import("./editorSessionRuntime") : undefined;
+      const currentOrder = orderRuntime?.getEditorCurrentObjectOrder(source.session);
+      const canonical = ordered ? await orderRuntime!.getEditorOrderedSourceScene(source.session, { signal }) : undefined;
+      check();
       // Inner save markers are private. Only the document facade owns the
       // user's saved identity, so this materialization never clears dirty.
       const materialized = new Uint8Array(await (await source.session.savePdf({ signal, flatten: false, protection: { mode: "preserve" }, onProgress: child(0, .35),
@@ -113,6 +122,8 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
         scene = composeVectorScenesInGrid(pages, source.session.sourceScene.pagesPerRow || 1);
       } finally { await parser.close(); }
       check();
+      const rebased = canonical ? rebaseEditorOrderedSource(source.session, canonical, scene, request, `source:page:${++orderSource}:`, signal) : undefined;
+      if (rebased) scene = rebased.scene;
       const sourceOptions: EditorSessionOptions = source.options.createSourceOptions ? await source.options.createSourceOptions(bytes, password)
         : { sourcePdf: bytes, password, compileObject: source.options.compileObject, loadFontAsset: source.options.loadFontAsset,
           onDiagnostic: source.options.onDiagnostic };
@@ -120,7 +131,10 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
       releaseSource = () => { if (!sourceReleased) { sourceReleased = true; sourceOptions.disposeSource?.(); } };
       check(); opened = await openSingle(scene, { ...sourceOptions, sourceLabel: sourceOptions.sourceLabel ?? source.options.sourceLabel,
         sourcePdf: bytes, password, signal, disposeSource: releaseSource }); check();
-      reseedAuthoredObjects(source.session, opened.session, request); check();
+      const nextSession = opened.session;
+      reseedAuthoredObjects(source.session, nextSession, request, ids => {
+        if (rebased && currentOrder) orderRuntime!.restoreEditorObjectOrder(nextSession, rebased.remapOrder(currentOrder, ids), layerEdits.stackingChanged);
+      }); check();
       const after = { version: retain(opened), identity: {} }; opened = undefined;
       releaseSource = undefined;
       current = after; undo.push({ kind: "pages", before, after }); redo.length = 0; revision++; prune();
@@ -153,6 +167,36 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
     getFieldValues: () => { assertLive(); return current.version.session.getFieldValues(); },
     getSourceEdits: () => { assertLive(); return current.version.session.getSourceEdits(); },
     getAnnotationEdits: () => { assertLive(); return current.version.session.getAnnotationEdits(); },
+    getLayers: () => { assertLive(); return current.version.session.getLayers(); },
+    getLayerOrder: () => { assertLive(); return current.version.session.getLayerOrder(); },
+    createLayer: options => { assertLive(); return current.version.session.createLayer(options); },
+    updateLayer: (id, patch) => { assertLive(); current.version.session.updateLayer(id, patch); },
+    moveLayer: (id, position) => { assertLive(); current.version.session.moveLayer(id, position); },
+    setLayerOrder: order => { assertLive(); current.version.session.setLayerOrder(order); },
+    removeLayer: (id, options) => { assertLive(); current.version.session.removeLayer(id, options); },
+    getActiveLayer: () => { assertLive(); return current.version.session.getActiveLayer(); },
+    setActiveLayer: id => { assertLive(); current.version.session.setActiveLayer(id); },
+    getObjectLayerIds: id => { assertLive(); return current.version.session.getObjectLayerIds(id); },
+    getObjectLayerCondition: id => { assertLive(); return current.version.session.getObjectLayerCondition(id); },
+    copyObjectLayerMembership: (source, target) => { assertLive(); current.version.session.copyObjectLayerMembership(source, target); },
+    assignObjectsToLayer: (ids, id) => { assertLive(); current.version.session.assignObjectsToLayer(ids, id); },
+    assignSelectionToLayer: id => { assertLive(); current.version.session.assignSelectionToLayer(id); },
+    getLayerObjects: id => { assertLive(); return current.version.session.getLayerObjects(id); },
+    selectLayerContents: id => { assertLive(); current.version.session.selectLayerContents(id); },
+    getLayerEdits: () => { assertLive(); return current.version.session.getLayerEdits(); },
+    getObjectLayerEdits: id => { assertLive(); return current.version.session.getObjectLayerEdits(id); },
+    getLayerRevision: () => {
+      assertLive(); const next = current.version.session.getLayerRevision();
+      if (layerVersion !== current.version || observedLayerRevision !== next) { layerRevision++; layerVersion = current.version; observedLayerRevision = next; }
+      return layerRevision;
+    },
+    isObjectVisible: id => { assertLive(); return current.version.session.isObjectVisible(id); },
+    isPrimitiveVisible: ref => { assertLive(); return current.version.session.isPrimitiveVisible(ref); },
+    isAnnotationVisible: id => { assertLive(); return current.version.session.isAnnotationVisible(id); },
+    getPrimitivePaintRank: ref => { assertLive(); return current.version.session.getPrimitivePaintRank(ref); },
+    getObjectPaintRank: id => { assertLive(); return current.version.session.getObjectPaintRank(id); },
+    canReorderSelection: action => { assertLive(); return current.version.session.canReorderSelection(action); },
+    reorderSelection: action => { assertLive(); current.version.session.reorderSelection(action); },
     getPages: () => { assertLive(); return current.version.session.getPages(); },
     async rotatePages(indices, degrees, options = {}) {
       assertLive(); options.signal?.throwIfAborted(); const pages = pageIndices(indices);
@@ -208,15 +252,10 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
 }
 
 /** Keep in-memory author tools while replacing their baked PDF appearances. */
-function reseedAuthoredObjects(previous: EditorSession, next: EditorSession, operation: PdfPageOperation): void {
+function reseedAuthoredObjects(previous: EditorSession, next: EditorSession, operation: PdfPageOperation,
+  restoreOrder?: (ids: ReadonlyMap<string, string>) => void): void {
   const objects = previous.getObjects(), sourceScene = previous.sourceScene, targetScene = next.sourceScene;
-  const removed = new Set(operation.kind === "remove" ? operation.pages : []);
-  const added = targetScene.pageCount - sourceScene.pageCount;
-  let shift = 0;
-  const pageMap = Array.from({ length: sourceScene.pageCount }, (_, index) => {
-    if (removed.has(index)) { shift++; return null; }
-    return operation.kind === "insert" && index >= operation.at ? index + added : index - shift;
-  });
+  const pageMap = editorOperationPageMap(sourceScene.pageCount, targetScene.pageCount, operation);
   const pageIndex = (index: number) => pageMap[index];
   const oldMatrices = new Map(sourceScene.pdfPages?.map(page => [page.pageIndex, page.pdfToScene]));
   const newMatrices = new Map(targetScene.pdfPages?.map(page => [page.pageIndex, page.pdfToScene]));
@@ -252,7 +291,9 @@ function reseedAuthoredObjects(previous: EditorSession, next: EditorSession, ope
     for (const object of authored) {
       const target = pageIndex(object.pageIndex)!;
       const id = next.addObject({ ...object, id: reserved.has(object.id) ? undefined : object.id,
+        ...(object.layerCondition === undefined ? {} : { layerId: null, layerCondition: undefined }),
         pageIndex: target, transform: multiplyEditorMatrices(delta(object.pageIndex, target), object.transform) });
+      if (object.layerCondition !== undefined) next.copyObjectLayerMembership(`annotation:${annotations.get(`${target}:${object.id}`)![0].id}`, id);
       ids.set(object.id, id); reserved.add(id);
     }
     const visiting = new Set<string>();
@@ -267,6 +308,8 @@ function reseedAuthoredObjects(previous: EditorSession, next: EditorSession, ope
       ids.set(id, restored); reserved.add(restored); return true;
     };
     for (const id of groups.keys()) restoreGroup(id);
+    restoreOrder?.(ids);
+    const active = previous.getActiveLayer(); if (active && next.getLayers().some(layer => layer.id === active)) next.setActiveLayer(active);
     next.select(previous.getSelection().flatMap(id => ids.has(id) ? [ids.get(id)!] : []));
   });
   next.markSaved();

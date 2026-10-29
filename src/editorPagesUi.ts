@@ -3,6 +3,7 @@ import { LoadProgressReporter, type LoadProgressCallback } from "./loadProgress"
 import { isPdfPasswordError } from "./pdfObjectGenerator";
 import { promptForPdfPassword } from "./pdfPasswordPrompt";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
+import { droppedFileKind } from "./documentDropFiles";
 
 export function parseEditorPageRange(value: string, count: number): number[] {
   const result = new Set<number>();
@@ -21,18 +22,45 @@ export function parseEditorPageRange(value: string, count: number): number[] {
 export async function insertEditorPdfFiles(session: Pick<EditorSession, "insertPdf" | "getPages">,
   files: readonly File[], at: number, options: { signal: AbortSignal; onProgress?: LoadProgressCallback;
     onDiagnostic?: (diagnostic: PdfDiagnostic) => void; requestPassword?: typeof promptForPdfPassword }): Promise<void> {
+  await insertEditorFiles(session, files, at, options, false);
+}
+
+/** Attach PDF pages or rebuild a HEP's retained visual content as ordinary PDF pages. */
+export async function insertEditorDocumentFiles(session: Pick<EditorSession, "insertPdf" | "getPages">,
+  files: readonly File[], at: number, options: { signal: AbortSignal; onProgress?: LoadProgressCallback;
+    onDiagnostic?: (diagnostic: PdfDiagnostic) => void; requestPassword?: typeof promptForPdfPassword }): Promise<void> {
+  options.signal.throwIfAborted();
+  if (files.some(file => !["pdf", "hep"].includes(droppedFileKind(file) ?? ""))) throw new TypeError("Attach PDF or HEP files.");
+  await insertEditorFiles(session, files, at, options, true);
+}
+
+async function insertEditorFiles(session: Pick<EditorSession, "insertPdf" | "getPages">,
+  files: readonly File[], at: number, options: { signal: AbortSignal; onProgress?: LoadProgressCallback;
+    onDiagnostic?: (diagnostic: PdfDiagnostic) => void; requestPassword?: typeof promptForPdfPassword }, allowHep: boolean): Promise<void> {
   const progress = new LoadProgressReporter(options.onProgress);
   for (let index = 0; index < files.length; index++) {
     options.signal.throwIfAborted();
-    const file = files[index], bytes = new Uint8Array(await file.arrayBuffer());
+    const file = files[index], fileProgress = progress.child(index / files.length, (index + 1) / files.length);
+    const onDiagnostic = (value: PdfDiagnostic): void => options.onDiagnostic?.({ ...value, message: `${file.name}: ${value.message}` });
+    let bytes = new Uint8Array(await file.arrayBuffer());
     options.signal.throwIfAborted();
+    const hep = allowHep && droppedFileKind(file) === "hep";
+    if (hep) {
+      const [{ loadSceneFromHep }, { writeScenePdf }] = await Promise.all([import("./hep"), import("./editorPdfWriter")]);
+      options.signal.throwIfAborted();
+      const scene = await loadSceneFromHep(bytes.buffer, { signal: options.signal,
+        onProgress: fileProgress.child(0, .35).toCallback() });
+      const pdf = await writeScenePdf(scene, { signal: options.signal,
+        onProgress: fileProgress.child(.35, .55).toCallback(),
+        onWarning: message => onDiagnostic({ code: "editor.hep-attachment", severity: "warning", message }) });
+      options.signal.throwIfAborted(); bytes = new Uint8Array(await pdf.arrayBuffer()); options.signal.throwIfAborted();
+    }
     let password: string | undefined;
     for (;;) {
       try {
         const count = session.getPages().length;
         await session.insertPdf(bytes, { at, password, signal: options.signal,
-          onDiagnostic: value => options.onDiagnostic?.({ ...value, message: `${file.name}: ${value.message}` }),
-          onProgress: progress.child(index / files.length, (index + 1) / files.length).toCallback() });
+          onDiagnostic, onProgress: (hep ? fileProgress.child(.55, 1) : fileProgress).toCallback() });
         at += session.getPages().length - count; break;
       } catch (error) {
         if (!isPdfPasswordError(error) || options.signal.aborted) throw error;
@@ -43,6 +71,7 @@ export async function insertEditorPdfFiles(session: Pick<EditorSession, "insertP
       }
     }
   }
+  options.signal.throwIfAborted(); progress.complete({ sourceType: "pdf" });
 }
 
 export interface EditorPagesDialog {

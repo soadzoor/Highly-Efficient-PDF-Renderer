@@ -1,5 +1,6 @@
 import { createThreeLinkNavigation } from "./threeLinkNavigation";
 import { createAnnotationOverlay } from "./annotationOverlay";
+import "./viewerWorkspace.css";
 import * as THREE from "three";
 import { waitForLoad, yieldForLoad } from "./loadCancellation";
 import { MapControls } from "three/addons/controls/MapControls.js";
@@ -1559,6 +1560,7 @@ function updateRoomDomLabels(): void {
   const numbersVisible = showRoomNumbersCheckbox.checked;
 
   const rect = canvas.getBoundingClientRect();
+  const labelRect = roomLabelLayer.getBoundingClientRect();
   const width = Math.max(1, rect.width);
   const height = Math.max(1, rect.height);
   pdfObject.updateMatrixWorld(true);
@@ -1593,8 +1595,8 @@ function updateRoomDomLabels(): void {
       continue;
     }
 
-    const screenX = rect.left + (ndcX * 0.5 + 0.5) * width;
-    const screenY = rect.top + (-ndcY * 0.5 + 0.5) * height;
+    const screenX = rect.left - labelRect.left + (ndcX * 0.5 + 0.5) * width;
+    const screenY = rect.top - labelRect.top + (-ndcY * 0.5 + 0.5) * height;
     label.element.style.display = "";
     label.element.style.transform = `translate3d(${screenX}px, ${screenY}px, 0) translate(-50%, -50%)`;
   }

@@ -47,6 +47,8 @@ export interface RendererApi {
   getOptionalContentVisibility?(): OptionalContentSnapshot | null;
   /** Subscribe to per-frame draw diagnostics. */
   setFrameListener(listener: ((stats: DrawStats) => void) | null): void;
+  /** Schedule a native draw without changing its scene or camera. */
+  requestFrame?(): void;
 
   /** Switch native rendering to an externally driven frame loop. */
   setExternalFrameDriver?(enabled: boolean): void;

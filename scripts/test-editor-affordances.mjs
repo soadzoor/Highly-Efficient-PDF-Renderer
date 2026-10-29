@@ -4,6 +4,8 @@ import vm from "node:vm";
 import { sourceFunction } from "./lib/sourceFunction.mjs";
 import { editorFrameCorners, editorFrameCenter, editorFrameSize, editorFrameResizeMatrix, editorFrameScaleMatrix,
   editorFrameClientGeometry } from "../src/editorSelectionGeometry.ts";
+import { waitForLoad } from "../src/loadCancellation.ts";
+import { droppedFileKind } from "../src/documentDropFiles.ts";
 
 const IDENTITY = [1, 0, 0, 1, 0, 0];
 const frameHelpers = { editorFrameCorners, editorFrameCenter, editorFrameSize, editorFrameResizeMatrix, editorFrameScaleMatrix, editorFrameClientGeometry, IDENTITY };
@@ -24,12 +26,12 @@ const geometry = vm.createContext({
   currentState: { revision: 0, selection: ["object"] }, presented: null, isSceneSettling: () => false,
   host: { getCanvas: () => ({ getBoundingClientRect: () => ({ left: 100, top: 50, width: 400, height: 300 }) }),
     sceneToClientPoint: (x, y) => ({ x: x + 100, y: y + 50 }) },
-  overlay, graphic: { setAttribute() {}, replaceChildren() { shapes.length = 0; } },
+  overlay, toolbar: { style: {} }, graphic: { setAttribute() {}, replaceChildren() { shapes.length = 0; } },
   session: { getSelectionBounds: () => bounds, getSelectionFrame: () => geometryFrame, sourceScene: { pageRects: [0, 0, 400, 300] } },
   sceneBoundsToClient: value => ({ minX: value.minX + 100, minY: value.minY + 50, maxX: value.maxX + 100, maxY: value.maxY + 50 }),
   svg: (tag, attributes) => { const element = { tag, ...attributes, style: {} }; shapes.push(element); return element; }, fields: { querySelectorAll: () => [] },
-  pointer: null, pendingPick: null, polygon: null, activeText: null, running: false, tool: "select", latestScene: {},
-  property: () => ({ value: "#123456" })
+  pointer: null, pendingPick: null, polygon: null, signature: null, signatureHover: null, activeText: null, running: false, tool: "select", latestScene: {},
+  property: () => ({ value: "#123456" }), focusPendingField() {}, updateTextVisibility: () => true
 });
 install(geometry, "displayedSelection", "updatePointerCursor", "updateGeometry");
 for (const tool of ["select", "pan", "form", "text", "rectangle", "ellipse", "line", "arrow", "polygon", "polyline", "ink", "signature", "image"]) {
@@ -67,9 +69,11 @@ const gestures = vm.createContext({
   ...frameHelpers,
   isSceneSettling: () => false,
   active: true, running: false, structuralRunning: false, activeText: null, disposed: false, tool: "select", toolRequest: 0, textRequest: 0,
-  pointer: null, pendingPick: null, picking: { abort() { abortedPicks++; } }, polygon: null,
+  pointer: null, pendingPick: null, pendingFieldFocus: null, fieldAtClientPoint: () => null, picking: { abort() { abortedPicks++; } }, polygon: null,
   overlay: gestureOverlay, fields: { hidden: true }, toolbar: { querySelectorAll: () => toolButtons },
   property: () => ({ disabled: true }), renderFields() {}, updateGeometry() {}, finishText: async () => {},
+  currentState: { selection: [] }, updateOpacityControls() {},
+  contextMenu: { close() {} },
   host: { clientToScenePoint: (x, y) => ({ x, y }) }, pageAt: () => 0,
   pick: () => new Promise(resolve => { finishPick = resolve; }), clearPreview: restore => previews.push(restore),
   interaction: { selectHit: id => selected.push(id), selectArea: () => assert.fail("unexpected area selection") },
@@ -181,6 +185,16 @@ const switchedDoubleClick = gestures.doubleClick(event(24));
 gestures.setTool("rectangle"); finishStaleDoubleClick("editor:text-2"); await switchedDoubleClick;
 assert.equal(openedText.length, 1, "a late double-click pick cannot open text after switching tools");
 
+const freeText = { id: "source-free-text", subtype: "FreeText", pageIndex: 0 };
+gestures.tool = "select"; gestures.session.sourceScene = { annotations: [freeText], pageRects: [0, 0, 400, 300] };
+gestures.session.revision = 1; gestures.session.getAnnotationEdits = () => [];
+gestures.session.getObject = () => ({ kind: "source", annotationId: freeText.id });
+gestures.pick = async () => `annotation:${freeText.id}`;
+gestures.source = { password: undefined }; gestures.lifetime = new AbortController();
+gestures.editorServices = { readTextAnnotation: async () => ({ kind: "text", text: "Source textbox", transform: IDENTITY, pageIndex: 0 }) };
+await gestures.doubleClick(event(24));
+assert.equal(openedText.length, 2); assert.equal(openedText[1].object.text, "Source textbox", "existing PDF FreeText still opens its textbox editor");
+
 const validationErrors = []; gestures.report = error => validationErrors.push(error);
 gestures.pointer = { id: 25, action: "rotate" }; gestureOverlay.setPointerCapture(25); gestures.updatePointerCursor();
 const invalidChange = new Error("Synthetic property validation failure");
@@ -192,7 +206,7 @@ assert.equal(gestureOverlay.dataset.gesture, "");
 const decodeRequests = [], activatedTools = [], imageStatuses = [], decodedCanvases = [], bitmapCloses = [];
 const rgba = Uint8ClampedArray.of(20, 40, 60, 255, 80, 100, 120, 128), previousImage = { preserved: true };
 const images = vm.createContext({ disposed: false, active: true, toolRequest: 1, pendingImage: previousImage,
-  createImageBitmap: file => new Promise(resolve => decodeRequests.push({ file, resolve })),
+  waitForLoad, createImageBitmap: file => new Promise((resolve, reject) => decodeRequests.push({ file, resolve, reject })),
   document: { createElement(tag) {
     assert.equal(tag, "canvas");
     const canvas = { getContext(kind) { assert.equal(kind, "2d"); return {
@@ -202,7 +216,7 @@ const images = vm.createContext({ disposed: false, active: true, toolRequest: 1,
   } },
   setTool: tool => activatedTools.push(tool), setStatus: value => imageStatuses.push(value)
 });
-install(images, "importImage");
+install(images, "decodeImage", "importImage");
 const bitmap = name => ({ width: 2, height: 1, close() { bitmapCloses.push(name); } });
 const switchedImage = images.importImage({ name: "switched.png" }, 1);
 images.toolRequest = 2; decodeRequests.at(-1).resolve(bitmap("switched")); await switchedImage;
@@ -223,6 +237,85 @@ assert.deepEqual([decodedCanvases[0].width, decodedCanvases[0].height], [2, 1]);
 assert.match(imageStatuses[0], /place the image/); assert.equal(imageStatuses.length, 1);
 rgba[0] = 255; assert.equal(images.pendingImage.data[0], 20, "the reusable image owns its decoded pixel copy");
 assert.deepEqual(bitmapCloses, ["switched", "left-edit", "disposed", "ready"], "every completed bitmap is released, including stale decodes");
+
+const droppedObjects = [], droppedSelections = [], dropBusy = [], dropRefreshes = [], imageCancel = { hidden: true };
+const imageSource = { pageRects: Float32Array.of(0, 0, 200, 100) };
+const imageCanvas = { getBoundingClientRect: () => ({ left: 10, top: 20, right: 410, bottom: 220 }) };
+Object.assign(images, { DOMException, AbortController, AbortSignal, droppedFileKind, lifetime: new AbortController(),
+  running: false, structuralRunning: false, activeText: null, fieldDrafts: new Map(), objectOpacity: .6, operation: null,
+  flushEditorFieldDrafts() {}, hasPendingEditorFields: () => false, finishText: async () => {},
+  cancelPointerGesture() {}, updatePointerCursor() {}, query: () => imageCancel,
+  host: { getCanvas: () => imageCanvas, clientToScenePoint: (x, y) => ({ x: (x - 10) / 2, y: 100 - (y - 20) / 2 }), onBusyChange: value => dropBusy.push(value) },
+  session: { sourceScene: imageSource, revision: 0,
+    addObject(object) { droppedObjects.push(object); images.session.revision++; return `image-${droppedObjects.length}`; },
+    select(ids) { droppedSelections.push([...ids]); } },
+  refreshScene: async () => dropRefreshes.push("refresh"),
+  pageLocal: (point, pageIndex) => [point.x - images.session.sourceScene.pageRects[pageIndex * 4], point.y - images.session.sourceScene.pageRects[pageIndex * 4 + 1]],
+  setTool(tool) { images.toolRequest++; activatedTools.push(tool); }
+});
+install(images, "pageAt", "dropImages");
+const imageFiles = [new File(["first"], "first.png", { type: "image/png" }), new File(["second"], "second.webp", { type: "image/webp" })];
+const dropPoint = { x: 50, y: 80 }, settle = () => new Promise(resolve => setImmediate(resolve));
+const requestsBeforeInvalid = decodeRequests.length;
+images.active = false;
+await assert.rejects(images.dropImages(imageFiles, dropPoint), /Edit mode/); images.active = true;
+await assert.rejects(images.dropImages([new File(["pdf"], "document.pdf")], dropPoint), /PNG, JPEG or WebP/);
+await assert.rejects(images.dropImages(imageFiles, { x: 5, y: 80 }), /document page/);
+images.host.clientToScenePoint = () => ({ x: 300, y: 10 });
+await assert.rejects(images.dropImages(imageFiles, dropPoint), /document page/);
+images.host.clientToScenePoint = (x, y) => ({ x: (x - 10) / 2, y: 100 - (y - 20) / 2 });
+assert.equal(decodeRequests.length, requestsBeforeInvalid, "invalid image drops never start a decode");
+const droppedBatch = images.dropImages(imageFiles, dropPoint);
+assert.equal(images.running, true); assert.equal(imageCancel.hidden, false); assert.equal(images.pendingImage, null);
+images.host.clientToScenePoint = () => ({ x: 999, y: 999 });
+decodeRequests.at(-1).resolve(bitmap("drop-first")); await settle();
+assert.equal(decodeRequests.at(-1).file.name, "second.webp", "multiple dropped images decode and commit in order");
+decodeRequests.at(-1).resolve(bitmap("drop-second")); await droppedBatch;
+assert.equal(droppedObjects.length, 2); assert.deepEqual(droppedSelections.at(-1), ["image-1", "image-2"]);
+for (const object of droppedObjects) {
+  assert.deepEqual([object.pageIndex, object.x, object.y, object.width, object.height, object.imageWidth, object.imageHeight, object.opacity], [0, 20, 20, 100, 50, 2, 1, .6],
+    "image top-left anchors to the captured canonical page point despite camera changes during decode");
+  assert.deepEqual([...object.data], [...rgba], "image drops retain all source pixels and alpha");
+}
+assert.equal(images.pendingImage, null); assert.equal(activatedTools.at(-1), "select", "dropping images never arms a later click placement");
+assert.equal(images.running, false); assert.equal(imageCancel.hidden, true); assert.deepEqual(dropBusy, [true, false]);
+assert(dropRefreshes.length >= 1, "completed drops publish their images");
+images.host.clientToScenePoint = (x, y) => ({ x: (x - 10) / 2, y: 100 - (y - 20) / 2 });
+for (const stale of ["tool", "source", "view", "dispose"]) {
+  const beforeObjects = droppedObjects.length, beforeCanvases = decodedCanvases.length;
+  const pending = images.dropImages([imageFiles[0]], dropPoint);
+  if (stale === "tool") images.toolRequest++;
+  else if (stale === "source") images.session.sourceScene = { ...imageSource };
+  else if (stale === "view") images.active = false;
+  else { images.disposed = true; images.active = false; }
+  const statusesBeforeStaleCompletion = imageStatuses.length;
+  decodeRequests.at(-1).resolve(bitmap(`drop-stale-${stale}`));
+  await assert.rejects(pending, { name: "AbortError" });
+  assert.equal(droppedObjects.length, beforeObjects); assert.equal(decodedCanvases.length, beforeCanvases, "stale dropped images release their bitmap without a pixel canvas");
+  if (stale === "dispose") assert.equal(imageStatuses.length, statusesBeforeStaleCompletion, "disposed image imports never replace a new document's status");
+  images.disposed = false; images.active = true; images.session.sourceScene = imageSource;
+}
+const canceledDrop = new AbortController(), beforeCanceled = droppedObjects.length;
+const pendingCanceled = images.dropImages([imageFiles[0]], dropPoint, canceledDrop.signal), lateDecode = decodeRequests.at(-1);
+canceledDrop.abort(); await assert.rejects(pendingCanceled, { name: "AbortError" });
+assert.equal(images.running, false); assert.equal(droppedObjects.length, beforeCanceled, "external cancellation finishes before an uncancellable bitmap decode");
+lateDecode.resolve(bitmap("drop-late-cancelled")); await settle();
+assert(bitmapCloses.includes("drop-late-cancelled"), "a bitmap resolving after cancellation is drained and released");
+const beforePartial = droppedObjects.length, partialDrop = images.dropImages(imageFiles, dropPoint);
+decodeRequests.at(-1).resolve(bitmap("drop-partial-first")); await settle();
+decodeRequests.at(-1).reject(new Error("Synthetic second image decode failure"));
+await assert.rejects(partialDrop, /Synthetic second image/);
+assert.equal(droppedObjects.length, beforePartial + 1, "a later image failure preserves earlier completed image additions");
+assert.equal(images.running, false); assert.equal(images.pendingImage, null);
+const beforeUndoneDrop = droppedObjects.length, undoneDrop = images.dropImages(imageFiles, dropPoint);
+decodeRequests.at(-1).resolve(bitmap("drop-before-undo")); await settle();
+const selectionsBeforeUndo = droppedSelections.length;
+droppedObjects.pop(); images.session.revision++;
+decodeRequests.at(-1).resolve(bitmap("drop-after-undo"));
+await assert.rejects(undoneDrop, { name: "AbortError" });
+assert.equal(droppedObjects.length, beforeUndoneDrop, "undoing an earlier image cancels the remaining decoded image additions");
+assert.equal(droppedSelections.length, selectionsBeforeUndo, "the stale batch never selects a deleted image ID");
+assert.equal(imageStatuses.at(-1), "Image import cancelled.", "superseded batches do not claim undone images remain added");
 
 const near = (actual, expected, label) => {
   assert(Number.isFinite(actual), `${label}: finite result`);
@@ -499,7 +592,7 @@ let surfacePicks = 0;
 const surfaceFrame = { bounds: resizeBounds, transform: IDENTITY, pageIndex: 5 };
 const surface = vm.createContext({ ...frameHelpers, active: true, running: false, disposed: false, activeText: null,
   isSceneSettling: () => false,
-  tool: "select", textRequest: 0, pointer: null, pendingPick: null, picking: null, polygon: null,
+  tool: "select", textRequest: 0, pointer: null, pendingPick: null, picking: null, polygon: null, fieldAtClientPoint: () => null,
   host: { clientToScenePoint(x, y, pageIndex) { surfacePlanes.push(pageIndex); return pageIndex === 5 ? { x, y } : null; } },
   overlay: { dataset: {}, style: {}, setPointerCapture() {}, releasePointerCapture() {} }, clearPreview() {}, queuePreview() {},
   session: { getSelectionBounds: () => resizeBounds, getSelectionFrame: () => surfaceFrame, getSelection: () => surfaceSelection,

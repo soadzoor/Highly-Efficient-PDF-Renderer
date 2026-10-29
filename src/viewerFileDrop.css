@@ -1,0 +1,6 @@
+.hepr-file-drop-dialog{max-width:min(32rem,calc(100vw - 3rem));padding:1.5rem;border:1px solid #aab8c8;border-radius:.5rem;background:#fff;color:#172333;font:14px/1.5 system-ui,sans-serif}
+.hepr-file-drop-dialog::backdrop{background:#10203866}
+.hepr-file-drop-dialog h2{margin:0 0 1rem;font-size:1.2rem}
+.hepr-file-drop-actions{display:flex;justify-content:flex-end;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
+.hepr-file-drop-actions button{padding:.5rem .85rem;border:1px solid #91a2b7;border-radius:.3rem;background:#f2f6fb;color:inherit;cursor:pointer;font:inherit}
+.hepr-file-drop-actions button:focus-visible{outline:2px solid #1765d7;outline-offset:2px}

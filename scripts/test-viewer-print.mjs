@@ -18,8 +18,22 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 const tick = () => new Promise(resolve => setImmediate(resolve));
 class Button extends EventTarget {
-  disabled = false; textContent = ""; attributes = new Map();
+  disabled = false; attributes = new Map(); dataset = {}; title = ""; className = "";
+  markup = ""; caption = ""; markupUpdates = 0; firstElementChild = null;
+  get classList() { return { contains: name => this.className.split(/\s+/).includes(name),
+    add: name => { this.className = [...new Set([...this.className.split(/\s+/).filter(Boolean), name])].join(" "); } }; }
   setAttribute(name, value) { this.attributes.set(name, value); }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
+  set textContent(value) { this.caption = value; this.markup = value; this.firstElementChild = null; }
+  get textContent() { return this.caption; }
+  set innerHTML(value) {
+    this.markup = value; this.markupUpdates++;
+    const icon = /<svg\b[^>]*data-icon="([^"]+)"/.exec(value)?.[1];
+    this.firstElementChild = icon ? { getAttribute: name => name === "data-icon" ? icon : null } : null;
+    this.caption = value.replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/g, "").replace(/<[^>]*>/g, "")
+      .replace(/&#(\d+);/g, (_match, value) => String.fromCharCode(Number(value)));
+  }
+  get innerHTML() { return this.markup; }
 }
 try {
   const { createViewerPrintAction } = await import("../src/viewerPrint.ts");
@@ -50,6 +64,10 @@ try {
   assert.equal(pdf.statuses.at(-1), "Print-ready PDF opened. Actual print preparation warning");
   assert.equal(printed[0][0], blob); assert.equal(printed[0][1], pdf.document); assert.deepEqual(printed[0][2], { filename: "report-print.pdf", title: "Print PDF" });
   assert.equal(pdf.button.disabled, false); assert.equal(pdf.button.textContent, "Print"); assert.equal(pdf.button.attributes.get("aria-busy"), "false");
+  assert.match(pdf.button.innerHTML, /<svg\b[^>]*aria-hidden="true"/, "idle print refresh retains its vector icon");
+  assert.equal(pdf.button.attributes.get("aria-label"), "Print"); assert.equal(pdf.button.title, "Print");
+  const idleMarkupUpdates = pdf.button.markupUpdates; pdf.action.refresh();
+  assert.equal(pdf.button.markupUpdates, idleMarkupUpdates, "unchanged print refresh does not rebuild its icon markup");
 
   fixture.prepare = async (input, options) => { preparations.push({ input, options }); return blob; };
   const hep = create({ identity: {}, label: "drawing.hep", scene });
@@ -65,6 +83,8 @@ try {
   const changing = create({ identity: {}, label: "old.pdf", sourcePdf });
   const stale = changing.action.print(); await tick();
   assert.equal(changing.button.disabled, true); assert.equal(changing.button.textContent, "Preparing print…");
+  assert.match(changing.button.innerHTML, /<svg\b/, "busy print labels retain their vector icon");
+  assert.equal(changing.button.attributes.get("aria-label"), "Preparing print…"); assert.equal(changing.button.title, "Preparing print…");
   await changing.action.print(); assert.equal(pending.length, 1, "one controller preparation owns the action at a time");
   changing.state.source = { identity: {}, label: "new.pdf", sourcePdf };
   const printsBeforeStale = printed.length, statusesBeforeStale = changing.statuses.length;

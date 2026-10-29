@@ -4,6 +4,8 @@ import type { EditorFont, EditorFontRegistry } from "./editorFonts";
 import { PdfByteWriter, pdfName, pdfNumber as n, pdfRef, pdfUtf16Hex } from "./editorPdfBytes";
 import { normalizePrimitiveColor } from "./primitiveAppearance";
 import createBidi from "bidi-js";
+import { allocateEditorTextCodes } from "./editorTextEncoding";
+import { editorTextGlyphOutline } from "./editorTextGlyphOutline";
 
 export interface EditorPositionedGlyph {
   font: EditorFont; glyph: number; unicode: string; x: number; y: number;
@@ -120,6 +122,7 @@ export async function editorTextPdf(object: EditorTextObject, fonts: EditorFontR
   const hb = await import("harfbuzzjs");
   const writer = new PdfByteWriter({ signal }); const root = writer.reserve(), pages = writer.reserve();
   const fontResources: string[] = []; const codes = new Map<EditorPositionedGlyph, { name: string; code: string }>();
+  const outlineFonts = new Map<string, InstanceType<typeof hb.Font>>();
   const fontGroups = new Map<string, { asset: EditorFont; glyphs: EditorPositionedGlyph[] }>();
   const retainFont = (asset: EditorFont) => {
     if (!fontGroups.has(asset.id)) fontGroups.set(asset.id, { asset, glyphs: [] });
@@ -135,31 +138,42 @@ export async function editorTextPdf(object: EditorTextObject, fonts: EditorFontR
   }
   for (const { asset, glyphs: group } of fontGroups.values()) {
     const face = new hb.Face(new hb.Blob(asset.bytes)); const font = new hb.Font(face);
-    const name = `F${fontResources.length}`, postscript = pdfName(face.getName(6, "en") || asset.family.replace(/\s/g, ""));
+    outlineFonts.set(asset.id, font);
+    const postscript = pdfName(face.getName(6, "en") || asset.family.replace(/\s/g, ""));
     const cff = !!face.referenceTable("CFF ") || !!face.referenceTable("CFF2");
     const file = await writer.stream(asset.bytes, cff ? "/Subtype /OpenType" : `/Length1 ${asset.bytes.length}`);
     const extents = font.hExtents(); const factor = 1000 / face.upem;
     const descriptor = writer.add(`<< /Type /FontDescriptor /FontName ${postscript} /FontFamily ${pdfUtf16Hex(asset.family)} /FontWeight ${n(asset.fontWeight)} /Flags 32 /FontBBox [-1000 -1000 3000 3000] /Ascent ${n(extents.ascender * factor)} /Descent ${n(extents.descender * factor)} /CapHeight ${n(extents.ascender * factor)} /ItalicAngle ${asset.fontStyle === "italic" ? -12 : 0} /StemV 80 /${cff ? "FontFile3" : "FontFile2"} ${pdfRef(file)} >>`);
-    const unique = new Map<string, number>(), mappings: string[] = [], unicode: string[] = [];
-    for (const glyph of group) {
-      const key = `${glyph.glyph}:${glyph.unicode}`; let code = unique.get(key);
-      if (code === undefined) {
-        code = unique.size + 1; unique.set(key, code);
-        const hex = code.toString(16).padStart(8, "0"); mappings.push(`<${hex}> ${glyph.glyph}`);
-        unicode.push(`<${hex}> <${[...Array(glyph.unicode.length)].map((_, i) => glyph.unicode.charCodeAt(i).toString(16).padStart(4, "0")).join("")}>`);
-      }
-      codes.set(glyph, { name, code: code.toString(16).padStart(8, "0") });
-    }
+    const { partitions, codes: assigned } = allocateEditorTextCodes(group, signal), firstResource = fontResources.length;
+    for (let index = 0; index < group.length; index++) codes.set(group[index], {
+      name: `F${firstResource + assigned[index].partition}`, code: assigned[index].code.toString(16).padStart(4, "0")
+    });
     const blocks = (rows: string[], op: string) => {
       const output: string[] = []; for (let i = 0; i < rows.length; i += 100) { const part = rows.slice(i, i + 100); output.push(`${part.length} begin${op}\n${part.join("\n")}\nend${op}`); } return output.join("\n");
     };
-    const cmap = await writer.stream(`/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> def\n/CMapName /HEPREncoding def\n/CMapType 1 def\n1 begincodespacerange\n<00000000> <ffffffff>\nendcodespacerange\n${blocks(mappings, "cidchar")}\nendcmap\nCMapName currentdict /CMap defineresource pop\nend end`);
-    const toUnicode = await writer.stream(`/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapName /HEPRUnicode def\n/CMapType 2 def\n1 begincodespacerange\n<00000000> <ffffffff>\nendcodespacerange\n${blocks(unicode, "bfchar")}\nendcmap\nCMapName currentdict /CMap defineresource pop\nend end`);
-    const glyphIds = [...new Set(group.map(glyph => glyph.glyph))].sort((a, b) => a - b);
-    const widths = glyphIds.map(glyph => `${glyph} [${n(font.glyphHAdvance(glyph) * factor)}]`).join(" ");
-    const descendant = writer.add(`<< /Type /Font /Subtype /${cff ? "CIDFontType0" : "CIDFontType2"} /BaseFont ${postscript} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor ${pdfRef(descriptor)} /CIDToGIDMap /Identity /DW 1000 /W [${widths}] >>`);
-    const type0 = writer.add(`<< /Type /Font /Subtype /Type0 /BaseFont ${postscript} /Encoding ${pdfRef(cmap)} /DescendantFonts [${pdfRef(descendant)}] /ToUnicode ${pdfRef(toUnicode)} >>`);
-    fontResources.push(`/${name} ${pdfRef(type0)}`);
+    // PDFium treats a single four-byte codespace as one-byte text. Keep codes
+    // two bytes wide, with additional resources sharing the same embedded font
+    // when a textbox needs more distinct glyph/Unicode pairs than one can hold.
+    for (const entries of partitions) {
+      signal?.throwIfAborted();
+      const name = `F${fontResources.length}`, encodingName = `/HEPREncoding${name}`, unicodeName = `/HEPRUnicode${name}`;
+      const mappings = entries.map(entry => `<${entry.code.toString(16).padStart(4, "0")}> ${entry.glyph}`);
+      // Continuation glyphs still paint, but an empty UTF-16 destination is not
+      // a valid ToUnicode mapping. The cluster's first glyph owns its text.
+      const unicode = entries.filter(entry => entry.unicode.length).map(entry =>
+        `<${entry.code.toString(16).padStart(4, "0")}> <${Array.from({ length: entry.unicode.length }, (_, i) => entry.unicode.charCodeAt(i).toString(16).padStart(4, "0")).join("")}>`);
+      const cidSystemInfo = "<< /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>";
+      const cmap = await writer.stream(`/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo ${cidSystemInfo} def\n/CMapName ${encodingName} def\n/CMapType 1 def\n/WMode 0 def\n1 begincodespacerange\n<0000> <ffff>\nendcodespacerange\n${blocks(mappings, "cidchar")}\nendcmap\nCMapName currentdict /CMap defineresource pop\nend end`,
+        `/Type /CMap /CMapName ${encodingName} /CIDSystemInfo ${cidSystemInfo} /WMode 0`);
+      const unicodeSystemInfo = "<< /Registry (Adobe) /Ordering (UCS) /Supplement 0 >>";
+      const toUnicode = await writer.stream(`/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo ${unicodeSystemInfo} def\n/CMapName ${unicodeName} def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <ffff>\nendcodespacerange\n${blocks(unicode, "bfchar")}\nendcmap\nCMapName currentdict /CMap defineresource pop\nend end`,
+        `/Type /CMap /CMapName ${unicodeName} /CIDSystemInfo ${unicodeSystemInfo}`);
+      const glyphIds = [...new Set(entries.map(entry => entry.glyph))].sort((a, b) => a - b);
+      const widths = glyphIds.map(glyph => `${glyph} [${n(font.glyphHAdvance(glyph) * factor)}]`).join(" ");
+      const descendant = writer.add(`<< /Type /Font /Subtype /${cff ? "CIDFontType0" : "CIDFontType2"} /BaseFont ${postscript} /CIDSystemInfo ${cidSystemInfo} /FontDescriptor ${pdfRef(descriptor)} ${cff ? "" : "/CIDToGIDMap /Identity "}/DW 1000 /W [${widths}] >>`);
+      const type0 = writer.add(`<< /Type /Font /Subtype /Type0 /BaseFont ${postscript} /Encoding ${pdfRef(cmap)} /DescendantFonts [${pdfRef(descendant)}] /ToUnicode ${pdfRef(toUnicode)} >>`);
+      fontResources.push(`/${name} ${pdfRef(type0)}`);
+    }
   }
   const opacity = object.opacity ?? 1;
   const alpha = writer.add(`<< /Type /ExtGState /ca ${n(opacity)} /CA ${n(opacity)} >>`);
@@ -168,10 +182,23 @@ export async function editorTextPdf(object: EditorTextObject, fonts: EditorFontR
   // searchable Unicode retains bidi semantics without collapsing a whole box
   // into one ActualText selection quad.
   for (const glyph of [...layout.glyphs].sort((a, b) => a.logicalIndex - b.logicalIndex)) {
-    const code = codes.get(glyph)!;
-    commands.push(`${glyph.color.map(n).join(" ")} rg ${glyph.color.map(n).join(" ")} RG`, "BT", `/${code.name} ${n(glyph.size)} Tf`,
-      glyph.bold ? `${n(glyph.size * .025)} w 2 Tr` : "0 Tr",
-      `1 0 ${glyph.italic ? ".212556" : "0"} 1 ${n(glyph.x)} ${n(glyph.y)} Tm <${code.code}> Tj`, "ET");
+    commands.push(`${glyph.color.map(n).join(" ")} rg ${glyph.color.map(n).join(" ")} RG`);
+    if (glyph.unicode) {
+      const code = codes.get(glyph)!;
+      commands.push("BT", `/${code.name} ${n(glyph.size)} Tf`, glyph.bold ? `${n(glyph.size * .025)} w 2 Tr` : "0 Tr",
+        `1 0 ${glyph.italic ? ".212556" : "0"} 1 ${n(glyph.x)} ${n(glyph.y)} Tm <${code.code}> Tj`, "ET");
+    } else {
+      // A shaped cluster can paint extra glyphs without owning extra Unicode.
+      // Some readers substitute character codes for missing/empty ToUnicode
+      // entries and ignore empty ActualText. Outline only these continuations;
+      // the cluster's first glyph remains searchable with the complete text.
+      const font = outlineFonts.get(glyph.font.id)!, path = editorTextGlyphOutline(font, glyph.glyph, signal);
+      if (path) {
+        const scale = glyph.size / font.face.upem;
+        commands.push("q", `${n(scale)} 0 ${n(glyph.italic ? scale * .212556 : 0)} ${n(scale)} ${n(glyph.x)} ${n(glyph.y)} cm`,
+          ...(glyph.bold ? [`${n(font.face.upem * .025)} w`] : []), path, glyph.bold ? "B" : "f", "Q");
+      }
+    }
     for (const offset of [glyph.underline ? -.1 : null, glyph.strikethrough ? .3 : null]) if (offset !== null) {
       commands.push(`${n(glyph.x)} ${n(glyph.y + offset * glyph.size)} ${n(glyph.advance)} ${n(glyph.size * .05)} re f`);
     }

@@ -7,6 +7,7 @@ registerHooks({ resolve(specifier, context, next) {
 import { installSelectionTestHost } from "./lib/selectionTestHost.mjs";
 const { createTextSelectionController } = await import("../src/textSelection.ts");
 const { computeCharQuad } = await import("../src/sceneTextGeometry.ts");
+const { createSelectionOverlay } = await import("../src/textSelectionOverlay.ts");
 
 // UO.400 DETAILS, physical page 34: the drawing number precedes the project
 // name in the stream. Its lower baseline accepts B/l but rejects the shorter
@@ -258,5 +259,112 @@ withSelection(linkText, (host, controller) => {
   assert.equal(controller.getSelectedText(), "Chapter", "right click must preserve text selection");
   assert.equal(wordClicks.length, 1, "right click must not activate a link");
 }, { onTextClick: p => wordClicks.push(p) });
+
+withSelection(linkText, (host, controller) => {
+  let reads = 0;
+  host.canvas.getBoundingClientRect = () => { reads++; return { left: 10, top: 20, right: 500, bottom: 400 }; };
+  controller.updateOverlay(); assert.equal(reads, 0, "idle selection frames do not read document viewport geometry");
+  for (let click = 0; click < 2; click++) { host.pointer("pointerdown", ...linkPoint); host.pointer("pointerup", ...linkPoint); }
+  assert(reads > 0, "selected text refreshes the live canvas viewport");
+  let replacementReads = 0;
+  host.canvas = { getBoundingClientRect() { replacementReads++; return { left: 100, top: 80, right: 600, bottom: 500 }; } };
+  controller.updateOverlay(); assert.equal(replacementReads, 1, "existing selection overlays follow a backend's replacement canvas");
+});
+
+// Exercise the real overlay's client-coordinate containment and drag handlers
+// with a small DOM host, without a browser or a frame loop.
+{
+  class Element extends EventTarget {
+    children = []; style = {}; textContent = ""; offsetWidth = 64; offsetHeight = 30; captures = new Set();
+    appendChild(child) { child.parent = this; this.children.push(child); }
+    remove() { this.parent.children = this.parent.children.filter(child => child !== this); }
+    contains(child) { return this === child || this.children.some(item => item.contains(child)); }
+    setPointerCapture(id) { this.captures.add(id); }
+    hasPointerCapture(id) { return this.captures.has(id); }
+  }
+  class Window extends EventTarget {
+    innerWidth = 600; innerHeight = 400; listeners = new Set(); frameRequests = 0;
+    addEventListener(type, listener, options = {}) {
+      super.addEventListener(type, listener, options);
+      const item = { type, listener }; this.listeners.add(item);
+      options.signal?.addEventListener("abort", () => this.listeners.delete(item), { once: true });
+    }
+    requestAnimationFrame() { this.frameRequests++; throw new Error("Selection overlays must not run a frame loop."); }
+  }
+  const window = new Window(), document = { createElement: () => new Element(), body: new Element() };
+  const originalGlobals = new Map(["window", "document", "Node"].map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  Object.defineProperty(globalThis, "window", { value: window, configurable: true });
+  Object.defineProperty(globalThis, "document", { value: document, configurable: true });
+  Object.defineProperty(globalThis, "Node", { value: Element, configurable: true });
+  let overlay, legacy;
+  const drags = [], copies = [], callbacks = { onHandleDragStart: (...args) => drags.push(["start", ...args]),
+    onHandleDragMove: (...args) => drags.push(["move", ...args]), onHandleDragEnd: () => drags.push(["end"]),
+    onCopyClick: () => copies.push("copy"), onContextMenuCopy: () => copies.push("menu copy") };
+  try {
+    let viewport = { left: 100, top: 60, right: 500, bottom: 350 };
+    let canvas = { getBoundingClientRect: () => viewport };
+    overlay = createSelectionOverlay(callbacks, () => canvas?.getBoundingClientRect() ?? null);
+    const container = document.body.children[0], [start, end, copy, menu] = container.children;
+    menu.offsetWidth = 120; menu.offsetHeight = 34;
+    assert.match(container.style.cssText, /z-index:20;/, "text controls stay below application toolbars and sidebars");
+    overlay.showHandles({ x: 90, y: 40, heightPx: 12 }, { x: 510, y: 355, heightPx: 12 });
+    assert.equal(container.style.clipPath, "inset(60px 100px 50px 100px)");
+    assert.deepEqual([start.style.left, start.style.top, end.style.left, end.style.top], ["68px", "40px", "510px", "355px"],
+      "viewport clipping keeps selection handles in their original client coordinates");
+    const emit = (element, type, values = {}) => {
+      const event = new Event(type, { cancelable: true }); Object.assign(event, { pointerId: 17, clientX: 90, clientY: 40, ...values });
+      element.dispatchEvent(event); return event;
+    };
+    assert.equal(emit(start, "pointerdown").defaultPrevented, true); assert(start.hasPointerCapture(17));
+    overlay.showCopyButton(110, 70);
+    assert.deepEqual([copy.style.left, copy.style.top], ["108px", "78px"], "Copy flips below and stays inside the canvas near its top edge");
+    overlay.showCopyButton(490, 345);
+    assert.deepEqual([copy.style.left, copy.style.top], ["428px", "307px"], "Copy stays clear of adjacent HTML at the canvas edge");
+    overlay.showContextMenu(490, 340);
+    assert.deepEqual([menu.style.left, menu.style.top], ["376px", "306px"], "the context menu flips and clamps to the canvas rather than the window");
+    viewport = { left: 220, top: 100, right: 260, bottom: 130 }; overlay.refreshViewport();
+    assert.deepEqual([copy.style.maxWidth, copy.style.maxHeight, menu.style.maxWidth, menu.style.maxHeight], ["24px", "14px", "32px", "22px"],
+      "small document viewports constrain popup dimensions");
+    assert.deepEqual([copy.style.left, copy.style.top, menu.style.left, menu.style.top], ["228px", "108px", "224px", "104px"]);
+    assert(start.hasPointerCapture(17), "refreshing a clipped viewport retains the active handle's pointer capture");
+    emit(start, "pointermove", { clientX: 40, clientY: 20 }); emit(start, "pointerup");
+    assert.deepEqual(drags, [["start", "start", 17], ["move", "start", 40, 20], ["end"]], "clipped handle drags preserve their existing event contract");
+    canvas = { getBoundingClientRect: () => ({ left: 20, top: 40, right: 180, bottom: 160 }) }; overlay.refreshViewport();
+    assert.equal(container.style.clipPath, "inset(40px 420px 240px 20px)", "canvas replacement refreshes clipping without recreating the overlay");
+    assert.deepEqual([copy.style.left, menu.style.left], ["108px", "56px"], "visible popups reclamp when the rendering canvas changes");
+    canvas = { getBoundingClientRect: () => ({ left: -40, top: -50, right: 200, bottom: 250 }) }; overlay.refreshViewport();
+    assert.equal(container.style.clipPath, "inset(0px 400px 150px 0px)", "canvas clipping intersects the browser viewport");
+    canvas = { getBoundingClientRect: () => ({ left: 10.2, top: 20.1, right: 10.8, bottom: 20.7 }) }; overlay.refreshViewport();
+    for (const element of [copy, menu]) {
+      assert(Number.parseFloat(element.style.left) >= 10.2 && Number.parseFloat(element.style.top) >= 20.1, "fractional tiny viewports retain their actual client origin");
+      assert(Number.parseFloat(element.style.maxWidth) <= .600000000001 && Number.parseFloat(element.style.maxHeight) <= .600000000001,
+        "popup boxes stay bounded even when the visible canvas is less than a pixel wide");
+    }
+    assert(Number.parseFloat(copy.style.paddingLeft) * 2 <= Number.parseFloat(copy.style.maxWidth));
+    assert(Number.parseFloat(copy.style.paddingTop) * 2 <= Number.parseFloat(copy.style.maxHeight));
+    assert(Number.parseFloat(menu.style.padding) * 2 <= Number.parseFloat(menu.style.maxWidth), "minimum popup padding cannot defeat tiny viewport constraints");
+    canvas = null; overlay.refreshViewport(); assert.equal(container.style.visibility, "hidden", "a detached canvas hides selection controls");
+    canvas = { getBoundingClientRect: () => ({ left: 700, top: 10, right: 800, bottom: 100 }) }; overlay.refreshViewport();
+    assert.equal(container.style.visibility, "hidden", "a fully offscreen canvas has no interactive overlay area");
+    canvas = { getBoundingClientRect: () => ({ left: 100, top: 60, right: 500, bottom: 350 }) }; overlay.refreshViewport();
+    assert.equal(container.style.visibility, "visible");
+    emit(copy, "click"); emit(menu.children[0], "click"); assert.deepEqual(copies, ["copy", "menu copy"]);
+    assert.equal(window.listeners.size, 0, "context-menu dismissal listeners still detach after copying");
+    overlay.showContextMenu(150, 100);
+    const escape = new Event("keydown"); Object.assign(escape, { key: "Escape" }); window.dispatchEvent(escape);
+    assert.equal(menu.style.display, "none"); assert.equal(window.listeners.size, 0);
+    legacy = createSelectionOverlay(callbacks);
+    const defaultContainer = document.body.children[1], defaultCopy = defaultContainer.children[2];
+    legacy.showCopyButton(0, 0);
+    assert.equal(defaultContainer.style.clipPath, "inset(0px 0px 0px 0px)", "legacy direct consumers default to the window viewport");
+    assert.deepEqual([defaultCopy.style.left, defaultCopy.style.top], ["8px", "8px"]);
+    assert.equal(window.frameRequests, 0, "containment adds no animation loop");
+  } finally {
+    overlay?.dispose(); legacy?.dispose(); assert.equal(window.listeners.size, 0);
+    for (const [name, descriptor] of originalGlobals) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor); else delete globalThis[name];
+    }
+  }
+}
 
 console.log("text selection title-block fields, joined runs, partial/reverse drags, words, visual reading order and annotation clicks passed");

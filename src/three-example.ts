@@ -13,6 +13,8 @@ import { waitForLoad } from "./loadCancellation";
 import { warmViewerRendering } from "./viewerRenderWarmup";
 import { createThreeExampleLoadDiagnostics } from "./threeExampleLoadDiagnostics";
 import { createViewerPrintAction, type ViewerPrintAction, type ViewerPrintDocument } from "./viewerPrint";
+import { createViewerFileDropController } from "./viewerFileDrop";
+import { initializeToolbarIcons, setToolbarIconButton, toolbarIconMarkup } from "./toolbarIcons";
 import { WebGPURenderer } from "three/webgpu";
 import { MapControls } from "three/addons/controls/MapControls.js";
 
@@ -75,7 +77,6 @@ import {
 const canvas = document.querySelector<HTMLCanvasElement>("#viewport");
 const panel = document.querySelector<HTMLDivElement>("#panel");
 const togglePanelButton = document.querySelector<HTMLButtonElement>("#toggle-panel");
-const togglePanelIcon = document.querySelector<HTMLSpanElement>("#toggle-panel-icon");
 const openButton = document.querySelector<HTMLButtonElement>("#open-file");
 const fileInput = document.querySelector<HTMLInputElement>("#file-input");
 const exampleDropdownContainer = document.querySelector<HTMLDivElement>("#example-dropdown");
@@ -132,7 +133,6 @@ if (
   !canvas ||
   !panel ||
   !togglePanelButton ||
-  !togglePanelIcon ||
   !openButton ||
   !fileInput ||
   !exampleDropdownContainer ||
@@ -187,10 +187,12 @@ if (
   throw new Error("Three example UI is missing required DOM elements.");
 }
 
+initializeToolbarIcons(document);
+exampleSelect.insertAdjacentHTML("afterbegin", toolbarIconMarkup("examples"));
+
 let canvasElement = canvas;
 const panelElement = panel;
 const togglePanelButtonElement = togglePanelButton;
-const togglePanelIconElement = togglePanelIcon;
 const openButtonElement = openButton;
 const fileInputElement = fileInput;
 const downloadDataButtonElement = downloadDataButton;
@@ -356,6 +358,7 @@ const textSelection = createTextSelectionController({
 
 let lastLoadedSource: File | string | null = null;
 let pdfEditor: import("./editorUi").EditorUi | null = null;
+let editorFrameListener: (() => void) | null = null;
 let editorInitialization: AbortController | null = null;
 const editorModeButton = document.querySelector<HTMLButtonElement>("#editor-mode")!;
 const printPdfButton = document.querySelector<HTMLButtonElement>("#print-pdf")!;
@@ -505,6 +508,7 @@ annotationInteraction = createAnnotationInteractionController({
 initializeBackendSelect();
 const reader = createReaderViewport({
   getCanvas: () => canvasElement,
+  settingsPanel: panelElement,
   layouts: [
     { value: "reader", label: "Reader" },
     { value: "grid", label: "Grid" },
@@ -543,16 +547,32 @@ function setThreeEditing(active: boolean): void {
   for (const control of [ocrTextCheckboxElement, pageStreamingCheckboxElement, compressScansCheckboxElement]) control.disabled = active || Boolean(pdfEditor) || currentPdfObject?.sourceKind !== "pdf";
   const layout = document.querySelector<HTMLSelectElement>(".reader-layout"); if (layout) layout.disabled = active;
   for (const button of pageLayoutButtons) button.disabled = active;
-  editorModeButton.textContent = active ? "View PDF" : "Edit PDF"; editorModeButton.setAttribute("aria-pressed", String(active));
+  setToolbarIconButton(editorModeButton, active ? "view" : "edit", active ? "View PDF" : "Edit PDF"); editorModeButton.setAttribute("aria-pressed", String(active));
   viewerPrintAction?.refresh();
 }
 
 async function togglePdfEditing(): Promise<void> {
   if (editorInitialization) { editorInitialization.abort(); return; }
-  if (sourceLoadController || pageLayoutWarmingUp) { setStatus("Wait for the document or renderer change to finish before entering Edit mode."); return; }
-  if (!currentPdfObject) { setStatus("Open a PDF or HEP before entering Edit mode."); return; }
-  editorModeButton.textContent = "Cancel editing setup"; editorModeButton.setAttribute("aria-busy", "true");
+  try {
+    const editor = await ensureThreeEditor();
+    const controller = editorInitialization = new AbortController();
+    try { await editor.setEditing(!editor.isEditing()); clearLoadedStatus(); }
+    finally { if (editorInitialization === controller) editorInitialization = null; viewerPrintAction?.refresh(); }
+  } catch (error) {
+    if (!(error instanceof DOMException && error.name === "AbortError")) setStatus(`Could not enter Edit mode: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function ensureThreeEditor(signal?: AbortSignal): Promise<import("./editorUi").EditorUi> {
+  signal?.throwIfAborted();
+  if (editorInitialization || sourceLoadController || pageLayoutWarmingUp || backendChangeActive)
+    throw new Error("Wait for the document or renderer change to finish before editing the document.");
+  if (!currentPdfObject) throw new Error("Open a PDF or HEP before editing the document.");
+  if (pdfEditor) return pdfEditor;
+  setToolbarIconButton(editorModeButton, "cancel", "Cancel editing setup"); editorModeButton.setAttribute("aria-busy", "true");
   const controller = editorInitialization = new AbortController();
+  const abort = (): void => controller.abort(signal?.reason);
+  signal?.addEventListener("abort", abort, { once: true });
   try {
     if (!pdfEditor) {
       setStatus("Preparing full-quality editing data…");
@@ -562,6 +582,8 @@ async function togglePdfEditing(): Promise<void> {
         sourceOptions: currentPdfObject.sourceOptions };
       let editedSource: typeof originalSource | null = null;
       pdfEditor = await createEditorUi({
+        layerControlsContainer: pdfLayersContainer ?? undefined,
+        showLayerControls: () => setPanelCollapsed(false),
         getCanvas: () => canvasElement, getScene: () => currentPdfObject?.sceneData ?? null,
         getSource: () => ({ pdf: currentPdfObject?.sourceKind === "pdf" ? currentPdfObject.sourceBytes : undefined,
           password: currentPdfObject?.sourceOptions?.password, label: currentPdfObject?.sourceLabel ?? "document" }),
@@ -606,14 +628,17 @@ async function togglePdfEditing(): Promise<void> {
         },
         clientToScenePoint: (x, y, pageIndex) => currentPdfObject?.clientToScenePoint(camera, x, y, canvasElement, pageIndex) ?? null,
         sceneToClientPoint: (x, y, pageIndex) => currentPdfObject?.sceneToClientPoint(camera, x, y, canvasElement, pageIndex) ?? null,
+        subscribeToFrames(listener) {
+          editorFrameListener = listener;
+          return () => { if (editorFrameListener === listener) editorFrameListener = null; };
+        },
+        requestFrame: requestRender,
         setEditing: setThreeEditing, onStatus: setStatus, onBusyChange: () => viewerPrintAction?.refresh()
       }, controller.signal);
     }
-    await pdfEditor.setEditing(!pdfEditor.isEditing()); clearLoadedStatus();
-  } catch (error) {
-    if (!controller.signal.aborted) setStatus(`Could not enter Edit mode: ${error instanceof Error ? error.message : String(error)}`);
-  } finally { if (editorInitialization === controller) editorInitialization = null; editorModeButton.removeAttribute("aria-busy");
-    editorModeButton.textContent = pdfEditor?.isEditing() ? "View PDF" : "Edit PDF"; if (!pdfEditor) currentPdfObject?.resumePageLoading(); viewerPrintAction?.refresh(); }
+    controller.signal.throwIfAborted(); return pdfEditor;
+  } finally { signal?.removeEventListener("abort", abort); if (editorInitialization === controller) editorInitialization = null; editorModeButton.removeAttribute("aria-busy");
+    setToolbarIconButton(editorModeButton, pdfEditor?.isEditing() ? "view" : "edit", pdfEditor?.isEditing() ? "View PDF" : "Edit PDF"); if (!pdfEditor) currentPdfObject?.resumePageLoading(); viewerPrintAction?.refresh(); }
 }
 
 function discardThreeEditor(): boolean {
@@ -868,6 +893,7 @@ function renderFrame(now: number = performance.now()): void {
   }
   renderedFrameSerial += 1;
   resolveRenderedFrameWaiters();
+  editorFrameListener?.();
   profile?.endFrame();
   if (profile && !profile.enabled) { captureGlCalls?.dispose(); captureGlCalls = null; }
   if (controlsChanged || pageLayoutAnimating) {
@@ -1403,42 +1429,21 @@ window.addEventListener("pointerdown", (event) => {
   syncTouchRotateVisibility();
 }, { signal: lifetimeSignal });
 
-window.addEventListener("dragenter", (event) => {
-  event.preventDefault();
-  isDropDragActive = true;
-  refreshDropIndicator();
-}, { signal: lifetimeSignal });
-
-window.addEventListener("dragover", (event) => {
-  event.preventDefault();
-  if (!isDropDragActive) {
-    isDropDragActive = true;
-    refreshDropIndicator();
-  }
-}, { signal: lifetimeSignal });
-
-window.addEventListener("dragleave", (event) => {
-  if (event.target === document.documentElement || event.target === document.body) {
-    isDropDragActive = false;
-    refreshDropIndicator();
-  }
-}, { signal: lifetimeSignal });
-
-window.addEventListener("drop", (event) => {
-  event.preventDefault();
-  isDropDragActive = false;
-  refreshDropIndicator();
-
-  const files = Array.from(event.dataTransfer?.files || []);
-  const supported = files.find((file) => isPdfFile(file) || isHepFile(file));
-
-  if (!supported) {
-    setStatus("Dropped file is not a supported PDF or HEP file.");
-    return;
-  }
-
-  void loadSupportedFile(supported);
-}, { signal: lifetimeSignal });
+const fileDropController = createViewerFileDropController({
+  document, signal: lifetimeSignal,
+  getDocument: () => currentPdfObject ? { identity: currentPdfObject.sourceBytes ?? readerDocumentIdentity ?? currentPdfObject, label: currentPdfObject.sourceLabel } : null,
+  isEditing: () => pdfEditor?.isEditing() ?? false,
+  isBusy: () => sourceLoadController !== null || editorInitialization !== null || editorSceneApplicationActive ||
+    backendChangeActive || pageLayoutWarmingUp || activeHepExportController !== null || fileInputElement.disabled || Boolean(pdfEditor?.isBusy?.()),
+  replace: (file, signal) => loadSource(file, { signal }),
+  async attach(files, signal) { await (await ensureThreeEditor(signal)).attachDocuments(files, signal); },
+  async insertImages(files, client, signal) {
+    if (!pdfEditor?.isEditing()) throw new Error("Enter Edit mode before dropping images onto the document.");
+    await pdfEditor.dropImages(files, client, signal);
+  },
+  setDragging(active) { isDropDragActive = active; refreshDropIndicator(); },
+  setStatus
+});
 
 pageBackgroundColorInputElement.addEventListener("input", applyPageBackgroundFromControls, { signal: lifetimeSignal });
 pageBackgroundOpacitySliderElement.addEventListener("input", () => {
@@ -1793,6 +1798,7 @@ function disposeExample(): void {
     return;
   }
   lifetimeAbortController.abort();
+  fileDropController.dispose();
   loadToken += 1;
   sourceLoadController?.abort();
   activeHepExportController?.abort();
@@ -1838,13 +1844,16 @@ function readThreeObjectOptions(): Omit<HeprThreeObjectOptions, "rendererType"> 
 
 async function loadSource(
   source: File | string,
-  options: { pdfDownloadHint?: PdfDownloadSource | null } = {}
-): Promise<void> {
-  if (!discardThreeEditor()) return;
+  options: { pdfDownloadHint?: PdfDownloadSource | null; signal?: AbortSignal } = {}
+): Promise<boolean> {
+  options.signal?.throwIfAborted();
+  if (!discardThreeEditor()) return false;
   cancelActiveHepExport();
   const activeLoadToken = ++loadToken;
   sourceLoadController?.abort();
   const controller = new AbortController();
+  const abort = (): void => controller.abort(options.signal?.reason);
+  options.signal?.addEventListener("abort", abort, { once: true });
   sourceLoadController = controller;
   const backend = readBackendMode();
   const sourceLabel = typeof source === "string" ? source : source.name;
@@ -1916,13 +1925,13 @@ async function loadSource(
     if (activeLoadToken !== loadToken) {
       nextObject.dispose();
       pendingObject = null;
-      return;
+      return false;
     }
     const downloadablePdf = await resolveDownloadablePdfSource(
       source, nextObject, options.pdfDownloadHint ?? null, controller.signal
     );
     controller.signal.throwIfAborted();
-    if (activeLoadToken !== loadToken) return;
+    if (activeLoadToken !== loadToken) return false;
     updateLoadingProgress(activeLoadToken, {
       value: 1,
       stage: "first-render",
@@ -1958,7 +1967,7 @@ async function loadSource(
       prepared: Boolean(initialLayout), pageCount: nextObject.pageCount
     });
     controller.signal.throwIfAborted();
-    if (activeLoadToken !== loadToken) return;
+    if (activeLoadToken !== loadToken) return false;
     loadDiagnostics.checkpoint(activeLoadToken, "renderer-prepare-start");
     preparedBackend = await prepareThreeRendererBackend(backend, controller.signal);
     const submitRenderer = preparedBackend?.renderer ?? renderer;
@@ -1975,7 +1984,7 @@ async function loadSource(
     await nextObject.compileForThreeRenderer(submitRenderer, submitCamera, controller.signal);
     loadDiagnostics.checkpoint(activeLoadToken, "shader-compile-ready", nextObject, submitRenderer);
     controller.signal.throwIfAborted();
-    if (activeLoadToken !== loadToken) return;
+    if (activeLoadToken !== loadToken) return false;
     if (preparedBackend) {
       loadDiagnostics.checkpoint(activeLoadToken, "preview-submit-start");
       const previewScene = new THREE.Scene();
@@ -1997,13 +2006,13 @@ async function loadSource(
     setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
     requestRender();
     await waitForLoad(waitForNextRenderedFrame(activeLoadToken), controller.signal);
-    if (activeLoadToken !== loadToken) return;
+    if (activeLoadToken !== loadToken) return false;
     const firstSubmitMs = performance.now() - firstSubmitStart;
     loadDiagnostics.checkpoint(activeLoadToken, "first-frame-ready", nextObject, renderer);
     setLoadingProgress(true, "Warming rendering…");
     loadDiagnostics.checkpoint(activeLoadToken, "warmup-start");
     await warmThreeRenderer(activeLoadToken, controller.signal);
-    if (activeLoadToken !== loadToken) return;
+    if (activeLoadToken !== loadToken) return false;
     loadDiagnostics.checkpoint(activeLoadToken, "warmup-ready");
     const totalLoadMs = performance.now() - loadStart;
     lastLoadTimingText = formatLoadTiming(totalLoadMs, lodTiming.elapsedMs, lodTiming.buildCount, firstSubmitMs, objectReadyMs);
@@ -2011,11 +2020,12 @@ async function loadSource(
     else clearLoadedStatus();
     updateSceneMetrics(nextObject);
     loadDiagnostics.finish(activeLoadToken, "complete");
+    return true;
   } catch (error) {
     loadDiagnostics.finish(activeLoadToken, controller.signal.aborted ? "cancelled" : "failed",
       error instanceof Error ? error.message : String(error));
     if (activeLoadToken !== loadToken) {
-      return;
+      return false;
     }
     const message = error instanceof Error ? error.message : String(error);
     if (currentPdfObject === previousPdfObject) {
@@ -2024,7 +2034,9 @@ async function loadSource(
       setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
     }
     setStatus(`Failed to load source: ${message}`);
+    return false;
   } finally {
+    options.signal?.removeEventListener("abort", abort);
     if (pendingObject && pendingObject !== currentPdfObject) pendingObject.dispose();
     preparedBackend?.renderer.dispose();
     if (activeLoadToken === loadToken) {
@@ -2391,8 +2403,8 @@ function clearLoadedStatus(): void {
 function setPanelCollapsed(collapsed: boolean): void {
   panelElement.classList.toggle("collapsed", collapsed);
   togglePanelButtonElement.setAttribute("aria-expanded", String(!collapsed));
-  togglePanelButtonElement.title = "Close settings";
-  togglePanelIconElement.textContent = "×";
+  setToolbarIconButton(togglePanelButtonElement, "close", "Close settings");
+  reader.settingsChanged();
 }
 
 function updateThreeBackendSelectDisabledState(): void {
@@ -2425,7 +2437,7 @@ function setLoadControlsEnabled(enabled: boolean): void {
 function setDownloadDataButtonState(hasParsedData: boolean, isBusy = false): void {
   downloadDataButtonElement.hidden = !hasParsedData;
   downloadDataButtonElement.disabled = !hasParsedData || isBusy;
-  downloadDataButtonElement.textContent = isBusy ? "Preparing HEP..." : "Download HEP";
+  setToolbarIconButton(downloadDataButtonElement, "download-hep", isBusy ? "Preparing HEP..." : "Download HEP");
   viewerPrintAction?.refresh();
 }
 
@@ -2433,11 +2445,14 @@ function setDownloadPdfButtonState(hasPdf: boolean, isBusy = false): void {
   downloadPdfButtonElement.hidden = !hasPdf;
   downloadPdfButtonElement.disabled =
     !hasPdf || isBusy || activeHepExportController !== null;
-  downloadPdfButtonElement.textContent = isBusy ? "Preparing PDF..." : "Download PDF";
+  setToolbarIconButton(downloadPdfButtonElement, "download-pdf", isBusy ? "Preparing PDF..." : "Download PDF");
 }
 
 function refreshDropIndicator(): void {
   const shouldShow = isDropDragActive || !currentPdfObject;
+  dropIndicatorElement.textContent = pdfEditor?.isEditing()
+    ? "Drop PDF/HEP documents to replace or attach, or images onto a page"
+    : currentPdfObject ? "Drop PDF/HEP documents to replace or attach" : "Drop PDF or HEP files to open";
   dropIndicatorElement.classList.toggle("active", shouldShow);
   dropIndicatorElement.classList.toggle("dragging", isDropDragActive);
 }

@@ -1,4 +1,6 @@
 import "./editorUi.css";
+import "./editorContextMenu.css";
+import "./toolbarIcons.css";
 import { openEditorSession } from "./editorSession";
 import type { EditorColor, EditorMatrix, EditorObject, EditorObjectInput, EditorSelectionFrame, EditorSession, EditorState, EditorTextObject } from "./editorTypes";
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
@@ -7,21 +9,29 @@ import { createEditorAppServices } from "./editorAppServices";
 import { triggerBrowserDownload, formatPdfDownloadFilename } from "./downloadUtils";
 import type { EditorSignature } from "./editorSignatures";
 import { showSignatureDialog } from "./editorSignatureUi";
+import { editorSignaturePlacement } from "./editorSignaturePlacement";
+import { findEditorPdfFormOverlaps } from "./editorPdfFormOverlap";
+import { chooseEditorPdfFormExport } from "./editorPdfFormExportUi";
 import { appendEditorInkSamples, editorInkCaptureTolerance } from "./editorInkCapture";
 import { commitEditorText, hasPendingEditorTextChanges, normalizeEditorTextColor, readRichTextRuns, type EditorTextDraftBaseline } from "./editorRichText";
 import type { EditorFont } from "./editorFonts";
 import { editorIconButton } from "./editorToolbarIcons";
-import { createEditorFieldControl, createEditorFieldOptions, editorFieldDraftSignature, flushEditorFieldDrafts, hasPendingEditorFields, setEditorFieldControlValue, styleEditorFieldControl, type EditorFieldControl } from "./editorFormControls";
+import { canEditEditorField, createEditorFieldControl, createEditorFieldOptions, editorFieldDraftSignature, flushEditorFieldDrafts, hasPendingEditorFields, setEditorFieldControlValue, styleEditorFieldControl, type EditorFieldControl } from "./editorFormControls";
 import { editorBoundsClickHit, editorFieldClientGeometry, pickEditorMetadataAnnotation, transformEditorAnnotationText } from "./editorCoordinates";
-import { applyEditorOpacity, editorStyledSelection, validateEditorOpacity } from "./editorProperties";
+import { applyEditorFillOpacity, applyEditorOpacity, editorFillSelection, editorStyledSelection, validateEditorOpacity } from "./editorProperties";
 import { createEditorInteractionController } from "./editorInteraction";
 import { LoadProgressReporter } from "./loadProgress";
 import { createEditorPdfProtectionState, showEditorPdfPasswordDialog, type EditorPdfPasswordDialog } from "./editorPdfProtectionUi";
-import { insertEditorPdfFiles, showEditorPagesDialog, type EditorPagesDialog } from "./editorPagesUi";
+import { insertEditorDocumentFiles, insertEditorPdfFiles, showEditorPagesDialog, type EditorPagesDialog } from "./editorPagesUi";
 import type { LoadProgressCallback } from "./loadProgress";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import { editorFrameCenter, editorFrameClientGeometry, editorFrameResizeMatrix, editorFrameScaleMatrix, editorFrameSize } from "./editorSelectionGeometry";
 import { printPdfBlob } from "./pdfPrint";
+import { getEditorAnnotationFrameTransform, getEditorAnnotationSource } from "./editorScene";
+import { droppedFileKind } from "./documentDropFiles";
+import { waitForLoad } from "./loadCancellation";
+import { createEditorLayerControls } from "./editorLayerControls";
+import { createEditorContextMenu } from "./editorContextMenu";
 
 export interface EditorUiHost {
   getCanvas(): HTMLCanvasElement;
@@ -33,6 +43,13 @@ export interface EditorUiHost {
   getSource(): { pdf?: Uint8Array; password?: string; label: string };
   clientToScenePoint(x: number, y: number, pageIndex?: number): PrimitivePoint | null;
   sceneToClientPoint(x: number, y: number, pageIndex?: number): PrimitivePoint | null;
+  /** Notify synchronously after the document's draw/submission, including camera-only frames. */
+  subscribeToFrames?(listener: () => void): () => void;
+  /** Schedule a document frame when newly created controls need their initial placement. */
+  requestFrame?(): void;
+  /** Optional dock beside the canvas. Custom hosts without a dock use a dialog. */
+  layerControlsContainer?: HTMLElement;
+  showLayerControls?(): void;
   setEditing(active: boolean): void;
   onModeChange?(active: boolean): void;
   onStatus?(message: string): void;
@@ -45,10 +62,13 @@ export interface EditorUi {
   isDirty(): boolean;
   confirmDocumentChange(): boolean;
   save(kind: "pdf" | "flatten" | "hep" | "print"): Promise<void>;
+  attachDocuments(files: readonly File[], signal?: AbortSignal): Promise<void>;
+  dropImages(files: readonly File[], client: { x: number; y: number }, signal?: AbortSignal): Promise<void>;
   dispose(): void;
 }
 
 type Tool = "select" | "pan" | "form" | "text" | "rectangle" | "ellipse" | "line" | "arrow" | "polygon" | "polyline" | "ink" | "signature" | "image";
+type EditorImageData = Omit<Extract<EditorObjectInput, { kind: "image" }>, "pageIndex" | "x" | "y" | "width" | "height">;
 type PointerGesture = { id: number; start: PrimitivePoint; startClient: PrimitivePoint; last: PrimitivePoint; points: [number, number][]; bounds: Bounds | null; frame?: EditorSelectionFrame; action: "draw" | "marquee" | "move" | "resize" | "rotate"; additive: boolean; handle?: string; freeResize?: boolean; scaleText?: boolean };
 interface PresentedScene {
   sourceScene: VectorScene;
@@ -89,19 +109,25 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   let currentSourceScene = session.sourceScene;
   let latestScene = session.sourceScene;
   let currentState = session.getState(), presented: PresentedScene | null = null;
+  let pendingFieldFocus: { id: string; sourceScene: VectorScene } | null = null;
   let requestedPreview: EditorMatrix | null = null;
   let scenePreparation: AbortController | null = null, sceneApplication: Promise<void> | null = null;
   const document = host.getCanvas().ownerDocument, window = document.defaultView!;
   let active = false, disposed = false, tool: Tool = "select", toolRequest = 0, frame = 0;
-  let objectOpacity = 1;
+  let releaseFrameListener: (() => void) | null = null;
+  let objectOpacity = 1, fillOpacity = 1;
+  let opacityControlSelection = "";
   let renderRevision = 0, operation: AbortController | null = null, running = false;
   let previewFrame = 0, previewRunning = false, previewPending = false;
   let picker: ScenePrimitivePicker | null = null;
   let picking: AbortController | null = null;
   const fontFaces = new Map<string, FontFace>();
   const fontFaceLoads = new Map<string, Promise<void>>();
-  let signature: EditorSignature | null = null, pendingImage: Omit<Extract<EditorObjectInput, { kind: "image" }>, "pageIndex" | "x" | "y" | "width" | "height"> | null = null;
-  let activeText: { element: HTMLDivElement; objectId?: string; sourceAnnotationId?: string; pageIndex: number; x: number; y: number; width: number; height: number; transform: EditorMatrix; opacity?: number; lineHeight?: number; baseline: EditorTextDraftBaseline } | null = null;
+  let signature: EditorSignature | null = null, pendingImage: EditorImageData | null = null;
+  let signatureHover: PrimitivePoint | null = null;
+  let activeText: { element: HTMLDivElement; objectId?: string; sourceAnnotationId?: string; layerId?: string | null; hiddenHeight?: number; pageIndex: number; x: number; y: number; width: number; height: number; transform: EditorMatrix; opacity?: number; lineHeight?: number; baseline: EditorTextDraftBaseline } | null = null;
+  let draftLayerRevision = -1;
+  let draftLayers = new Map<string, boolean>();
   let textRequest = 0;
   let pointer: PointerGesture | null = null;
   let pendingPick: { id: number; point: PrimitivePoint; client: PrimitivePoint; lastClient: PrimitivePoint; released: boolean; canceled: boolean } | null = null;
@@ -119,7 +145,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     ${editorIconButton("tool", "polygon", "Draw a polygon (double-click to finish)")}
     ${editorIconButton("tool", "polyline", "Draw a polyline (double-click to finish)")}
     ${editorIconButton("tool", "ink", "Draw with the pencil")}
-    ${editorIconButton("action", "signatures", "Create or reuse a handwritten signature")}
+    ${editorIconButton("action", "signatures", "Create or reuse a handwritten signature", 'aria-pressed="false"')}
     ${editorIconButton("action", "image", "Import an image (PNG, JPEG or WebP)")}
     ${editorIconButton("action", "undo", "Undo (Ctrl/Cmd+Z)")}
     ${editorIconButton("action", "redo", "Redo (Ctrl/Cmd+Shift+Z)")}
@@ -128,19 +154,20 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     ${editorIconButton("action", "group", "Group selected objects")}
     ${editorIconButton("action", "ungroup", "Ungroup selected objects")}
   </div><div class="hepr-editor-properties">
-    <label>Color <input data-prop="color" type="color" value="#111111"></label><label>Opacity <input data-prop="opacity" type="number" value="1" min="0" max="1" step="any" aria-label="Object opacity"></label><label>Width <input data-prop="stroke" type="number" value="2" min="0" step="any"></label>
+    <label>Color <input data-prop="color" type="color" value="#111111"></label><label class="hepr-editor-opacity">Color opacity <input data-prop="opacity" type="number" value="1" min="0" max="1" step="0.1" aria-label="Color opacity"><input data-opacity-slider="opacity" type="range" value="1" min="0" max="1" step="0.1" aria-label="Color opacity slider"></label><label>Width <input data-prop="stroke" type="number" value="2" min="0" step="any"></label>
     <label><input data-prop="fill-enabled" type="checkbox"> Fill</label><input data-prop="fill" type="color" value="#ffff00" aria-label="Fill color">
+    <label class="hepr-editor-opacity">Fill opacity <input data-prop="fill-opacity" type="number" value="1" min="0" max="1" step="0.1" aria-label="Fill opacity"><input data-opacity-slider="fill-opacity" type="range" value="1" min="0" max="1" step="0.1" aria-label="Fill opacity slider"></label>
     <label>Font <select data-prop="font" aria-label="Font family"><option value="">Liberation Sans</option><option value="bundled:serif">Liberation Serif</option><option value="bundled:mono">Liberation Mono</option></select></label>${editorIconButton("action", "font", "Import a TTF or OTF font")}${editorIconButton("action", "local-fonts", "Choose installed fonts")}
     <label>Size <input data-prop="font-size" type="number" value="12" min="0.1" step="any"></label>
     <button type="button" data-style="bold" aria-pressed="false" title="Bold" aria-label="Bold"><b>B</b></button><button type="button" data-style="italic" aria-pressed="false" title="Italic" aria-label="Italic"><i>I</i></button>
     <button type="button" data-style="underline" aria-pressed="false" title="Underline" aria-label="Underline"><u>U</u></button><button type="button" data-style="strikethrough" aria-pressed="false" title="Strikethrough" aria-label="Strikethrough"><s>S</s></button>
     <label>Align <select data-prop="align"><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></label>
-    <button type="button" data-action="apply-text" title="Apply text changes" hidden>Apply text</button><button type="button" data-action="cancel-text" title="Discard text changes" hidden>Cancel text</button>
+    ${editorIconButton("action", "apply-text", "Apply text changes", "hidden")}${editorIconButton("action", "cancel-text", "Discard text changes", "hidden")}
   </div><div class="hepr-editor-transform">
     <span data-selection>No selection</span><label>X <input data-transform="x" type="number" step="any"></label><label>Y <input data-transform="y" type="number" step="any"></label>
     <label>W <input data-transform="width" type="number" min="0.001" step="any"></label><label>H <input data-transform="height" type="number" min="0.001" step="any"></label><label>Rotate ° <input data-transform="rotation" type="number" step="any" value="0"></label>
-    <button type="button" data-action="pages" title="Rotate, remove or insert PDF pages">Pages</button><button type="button" data-action="pdf-password" title="Keep, remove or change PDF password protection">PDF password</button><button type="button" data-action="save-pdf" title="Save an editable PDF (Ctrl/Cmd+S)">Save PDF</button><button type="button" data-action="flatten" title="Save a flattened PDF copy">Flattened PDF</button><button type="button" data-action="save-hep" title="Save the edited document as HEP">Save HEP</button><button type="button" data-action="print" title="Print the edited document">Print</button>
-    <button type="button" data-action="cancel-operation" title="Cancel the current operation" hidden>Cancel</button><span data-status role="status" aria-live="polite"></span>
+    ${editorIconButton("action", "layers", "Add, edit, reorder or remove PDF layers")}${editorIconButton("action", "pages", "Rotate, remove or insert PDF pages")}${editorIconButton("action", "pdf-password", "Keep, remove or change PDF password protection")}${editorIconButton("action", "save-pdf", "Save an editable PDF (Ctrl/Cmd+S)")}${editorIconButton("action", "flatten", "Save a flattened PDF copy")}${editorIconButton("action", "save-hep", "Save the edited document as HEP")}${editorIconButton("action", "print", "Print the edited document")}
+    ${editorIconButton("action", "cancel-operation", "Cancel the current operation", "hidden")}<span data-status role="status" aria-live="polite"></span>
   </div><div class="hepr-editor-help">Ctrl/Cmd + click toggles objects; Shift + click adds them. Drag empty space to select fully contained objects. Corner resizing keeps proportions; hold Shift to resize freely. Double-click a new textbox to edit it; resizing changes wrapping, Alt + resize scales text. Escape cancels.</div>`;
   const overlay = document.createElement("div"); overlay.className = "hepr-editor-overlay"; overlay.dataset.tool = tool;
   const graphic = document.createElementNS(SVG_NS, "svg"); graphic.classList.add("hepr-editor-graphic");
@@ -150,8 +177,86 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   const query = <T extends HTMLElement>(selector: string): T => toolbar.querySelector<T>(selector)!;
   const property = (name: string): HTMLInputElement => query(`[data-prop="${name}"]`);
   const status = query<HTMLSpanElement>("[data-status]");
-  function setStatus(text: string): void { status.textContent = text; if (!active) host.onStatus?.(text); }
+  function setStatus(text: string): void {
+    status.textContent = text; if (!active) host.onStatus?.(text);
+  }
+  function opacitySlider(name: "opacity" | "fill-opacity"): HTMLInputElement {
+    return query(`[data-opacity-slider="${name}"]`);
+  }
+  function syncOpacityControls(name: "opacity" | "fill-opacity", value: number | null, disabled: boolean): void {
+    const number = property(name), slider = opacitySlider(name);
+    number.disabled = slider.disabled = disabled; number.value = value === null ? "" : String(value);
+    number.placeholder = value === null ? "Mixed" : "";
+    slider.value = String(value ?? .5);
+    if (value === null) slider.setAttribute("aria-valuetext", "Mixed values; adjust to set all selected objects");
+    else slider.removeAttribute("aria-valuetext");
+  }
+  function updateOpacityControls(state: EditorState): void {
+    const selectionKey = JSON.stringify(state.selection), selectionChanged = selectionKey !== opacityControlSelection;
+    opacityControlSelection = selectionKey;
+    const styled = editorStyledSelection(session), fills = editorFillSelection(session, styled);
+    for (const name of ["opacity", "fill-opacity"] as const) {
+      if (!selectionChanged && (document.activeElement === property(name) || document.activeElement === opacitySlider(name))) continue;
+      const ids = name === "opacity" ? styled : fills;
+      const values = ids.map(id => {
+        const object = session.getObject(id);
+        return name === "fill-opacity" && (object.kind === "shape" || object.kind === "ink" || object.kind === "signature")
+          ? object.fillOpacity ?? object.opacity ?? 1 : object.opacity ?? 1;
+      });
+      const disabled = tool === "select" && state.selection.length > 0 && ids.length === 0;
+      if (name === "opacity" && activeText) syncOpacityControls(name, activeText.opacity ?? objectOpacity, false);
+      else if (values.length) {
+        const common = values.every(value => value === values[0]); syncOpacityControls(name, common ? values[0] : null, disabled);
+        if (common) { if (name === "opacity") objectOpacity = values[0]; else fillOpacity = values[0]; }
+      } else syncOpacityControls(name, name === "opacity" ? objectOpacity : fillOpacity, disabled);
+    }
+  }
+  function opacityInput(event: Event): void {
+    if (structuralRunning) return;
+    const input = event.target as HTMLInputElement, name = input.dataset.opacitySlider ?? input.dataset.prop;
+    if (name !== "opacity" && name !== "fill-opacity") return;
+    const value = input.value.trim() ? Number(input.value) : NaN;
+    if (!Number.isFinite(value) || value < 0 || value > 1) return;
+    if (input.dataset.opacitySlider) { property(name).value = input.value; property(name).placeholder = ""; }
+    else opacitySlider(name).value = input.value;
+    opacitySlider(name).removeAttribute("aria-valuetext");
+  }
+  function changeOpacity(input: HTMLInputElement): boolean {
+    const name = input.dataset.opacitySlider ?? input.dataset.prop;
+    if (name !== "opacity" && name !== "fill-opacity") return false;
+    try {
+      const value = validateEditorOpacity(input.value.trim() ? Number(input.value) : NaN);
+      if (name === "opacity") {
+        objectOpacity = value;
+        if (activeText) activeText.opacity = value;
+        else if (editorStyledSelection(session).length) commit(() => applyEditorOpacity(session, value));
+      } else {
+        fillOpacity = value;
+        if (!activeText && editorFillSelection(session).length) commit(() => applyEditorFillOpacity(session, value));
+      }
+      syncOpacityControls(name, value, input.disabled);
+    } catch (error) { report(error); syncOpacityControls(name, name === "opacity" ? objectOpacity : fillOpacity, input.disabled); }
+    return true;
+  }
   const report = (error: unknown): void => { if (!(error instanceof DOMException && error.name === "AbortError")) setStatus(message(error)); };
+  const layerDialog = host.layerControlsContainer ? null : document.createElement("dialog");
+  if (layerDialog) {
+    layerDialog.className = "hepr-editor-layer-dialog"; layerDialog.setAttribute("aria-label", "Edit PDF layers");
+    const close = document.createElement("button"); close.type = "button"; close.textContent = "Close";
+    close.addEventListener("click", () => layerDialog.close(), { signal: lifetime.signal });
+    layerDialog.append(close); document.body.append(layerDialog);
+  }
+  const layerControls = createEditorLayerControls({ container: host.layerControlsContainer ?? layerDialog!, session, onError: report,
+    change(change) {
+      if (structuralRunning || running) throw new Error("Wait for the current document operation to finish.");
+      if (pointer || pendingPick) cancelPointerGesture();
+      const revision = session.getState().revision;
+      change(); if (session.getState().revision !== revision) void refreshScene();
+    } });
+  const contextMenu = createEditorContextMenu(document, {
+    canRun: action => canOpenContextMenu() && session.canReorderSelection(action),
+    run: action => { if (canOpenContextMenu()) commit(() => session.reorderSelection(action)); }, onError: report
+  });
   const styleEnabled = (name: string): boolean => query(`[data-style="${name}"]`).getAttribute("aria-pressed") === "true";
   function pageAt(point: PrimitivePoint): number {
     const rects = session.sourceScene.pageRects;
@@ -183,8 +288,13 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     return !pointer && (sceneApplication !== null || presented !== null &&
       (presented.sourceScene !== session.sourceScene || presented.revision !== currentState.revision || presented.delta !== null));
   }
-  function updateGeometry(): void {
+  function updateGeometry(fromFrame = false): void {
     const canvas = host.getCanvas(), rect = canvas.getBoundingClientRect();
+    const toolbarInset = rect.width <= 700 ? 2 : 8;
+    const toolbarLeft = `${rect.left + toolbarInset}px`, toolbarWidth = `${Math.max(0, rect.width - toolbarInset * 2)}px`;
+    if (toolbar.style.left !== toolbarLeft) toolbar.style.left = toolbarLeft;
+    if (toolbar.style.right !== "auto") toolbar.style.right = "auto";
+    if (toolbar.style.width !== toolbarWidth) toolbar.style.width = toolbarWidth;
     overlay.style.left = `${rect.left}px`; overlay.style.top = `${rect.top}px`;
     overlay.style.width = `${rect.width}px`; overlay.style.height = `${rect.height}px`;
     graphic.setAttribute("viewBox", `0 0 ${rect.width} ${rect.height}`);
@@ -225,18 +335,24 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       const points = polygon.points.map(([x, y]) => host.sceneToClientPoint(x, y, polygon!.pageIndex)).filter((p): p is PrimitivePoint => p !== null);
       svg("polyline", { points: points.map(p => `${p.x - rect.left},${p.y - rect.top}`).join(" "), fill: "none", stroke: property("color").value, "stroke-width": 2 });
     }
-    for (const element of fields.querySelectorAll<HTMLElement>("[data-field-id]")) {
+    if (tool === "signature" && signature && signatureHover && !running && !isSceneSettling()) drawSignatureGhost(rect);
+    // A camera may already have its next requested pose between document draws.
+    // Gesture chrome keeps its RAF, but field controls only follow a drawn pose.
+    if (!host.subscribeToFrames || fromFrame) for (const element of fields.querySelectorAll<HTMLElement>("[data-field-id]")) {
       const annotation = latestScene.annotations?.find(item => item.id === element.dataset.fieldId);
-      const geometry = annotation && editorFieldClientGeometry(annotation, latestScene.pdfPages,
-        (point, pageIndex) => host.sceneToClientPoint(point.x, point.y, pageIndex));
-      const bounds = !geometry && annotation && sceneBoundsToClient(annotation.bounds, annotation.pageIndex);
-      element.hidden = !geometry && !bounds;
+      const source = annotation && (getEditorAnnotationSource(latestScene, annotation.id) ?? annotation);
+      const sourcePresented = !presented || presented.sourceScene === session.sourceScene;
+      const geometry = sourcePresented && source && editorFieldClientGeometry(source, latestScene.pdfPages,
+        (point, pageIndex) => host.sceneToClientPoint(point.x, point.y, pageIndex), getEditorAnnotationFrameTransform(latestScene, source.id));
+      const bounds = sourcePresented && !geometry && annotation && sceneBoundsToClient(annotation.bounds, annotation.pageIndex);
+      element.hidden = (!geometry && !bounds) || !session.isAnnotationVisible(element.dataset.fieldId!);
       if (geometry) Object.assign(element.style, { left: `${geometry.origin.x - rect.left}px`, top: `${geometry.origin.y - rect.top}px`,
         width: `${geometry.width}px`, height: `${geometry.height}px`, transformOrigin: "0 0", transform: `matrix(${geometry.transform.join(",")})` });
       else if (bounds) Object.assign(element.style, { left: `${bounds.minX - rect.left}px`, top: `${bounds.minY - rect.top}px`,
         width: `${bounds.maxX - bounds.minX}px`, height: `${bounds.maxY - bounds.minY}px`, transformOrigin: "0 0", transform: "none" });
     }
-    if (activeText) {
+    focusPendingField();
+    if (activeText && updateTextVisibility()) {
       const [pageX, pageY] = [session.sourceScene.pageRects[activeText.pageIndex * 4], session.sourceScene.pageRects[activeText.pageIndex * 4 + 1]];
       const [a, b, c, d, e, f] = activeText.transform;
       const project = (x: number, y: number) => host.sceneToClientPoint(pageX + a * x + c * y + e, pageY + b * x + d * y + f, activeText!.pageIndex);
@@ -247,8 +363,51 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       }
     }
   }
+  function updateTextVisibility(): boolean {
+    if (!activeText) return false;
+    let visible: boolean;
+    if (activeText.objectId) {
+      try { visible = session.isObjectVisible(activeText.objectId); }
+      catch (error) { if (!(error instanceof RangeError)) throw error; cancelText(); return false; }
+    }
+    else if (activeText.sourceAnnotationId) visible = session.isAnnotationVisible(activeText.sourceAnnotationId);
+    else {
+      const revision = session.getLayerRevision();
+      if (revision !== draftLayerRevision) {
+        draftLayerRevision = revision; draftLayers = new Map(session.getLayers().map(layer => [layer.id, layer.defaultVisible]));
+        for (const removal of session.getLayerEdits().removals) if (activeText.layerId === removal.id) activeText.layerId = removal.targetLayerId;
+        if (activeText.layerId && !draftLayers.has(activeText.layerId)) activeText.layerId = null;
+      }
+      visible = !activeText.layerId || draftLayers.get(activeText.layerId) !== false;
+    }
+    if (!visible && !activeText.element.hidden) activeText.hiddenHeight = Math.max(activeText.height, activeText.element.scrollHeight);
+    if (visible) activeText.hiddenHeight = undefined;
+    activeText.element.hidden = !visible;
+    return visible;
+  }
   function tick(): void { if (active && !disposed) { updateGeometry(); frame = window.requestAnimationFrame(tick); } }
+  function signaturePlacementAt(point: PrimitivePoint) {
+    if (!signature) return null;
+    const pageIndex = pageAt(point); if (pageIndex < 0) return null;
+    const page = session.sourceScene.pageRects, width = Math.min(180, (page[pageIndex * 4 + 2] - page[pageIndex * 4]) * .4);
+    return { ...editorSignaturePlacement(signature, pageLocal(point, pageIndex), width), pageIndex };
+  }
+  function drawSignatureGhost(rect: DOMRect): void {
+    if (!signatureHover || signatureHover.x < rect.left || signatureHover.y < rect.top || signatureHover.x > rect.right || signatureHover.y > rect.bottom) return;
+    const point = host.clientToScenePoint(signatureHover.x, signatureHover.y), placement = point && signaturePlacementAt(point);
+    if (!placement) return;
+    const { transform: [a, , , d, e, f], pageIndex, scale } = placement;
+    const pages = session.sourceScene.pageRects, pageX = pages[pageIndex * 4], pageY = pages[pageIndex * 4 + 1];
+    const project = (x: number, y: number) => host.sceneToClientPoint(pageX + e + a * x, pageY + f + d * y, pageIndex);
+    const origin = project(0, 0), x = project(1, 0), y = project(0, 1);
+    if (!origin || !x || !y) return;
+    svg("path", { d: placement.path, fill: "none", stroke: property("color").value,
+      "stroke-width": Number(property("stroke").value) / scale, "stroke-linecap": "round", "stroke-linejoin": "round",
+      opacity: objectOpacity * .45, class: "hepr-editor-signature-ghost", "aria-hidden": "true",
+      transform: `matrix(${x.x - origin.x} ${x.y - origin.y} ${y.x - origin.x} ${y.y - origin.y} ${origin.x - rect.left} ${origin.y - rect.top})` });
+  }
   function updateState(state: EditorState): void {
+    contextMenu.close();
     currentState = state;
     updatePointerCursor();
     query<HTMLButtonElement>('[data-action="undo"]').disabled = !state.canUndo;
@@ -260,18 +419,14 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       const input = query<HTMLInputElement>(`[data-transform="${name}"]`); input.disabled = !bounds;
       if (document.activeElement !== input) input.value = value == null ? "" : Number(value.toFixed(3)).toString();
     }
-    if (!activeText && document.activeElement !== property("opacity")) {
-      const styled = editorStyledSelection(session), values = styled.map(id => session.getObject(id).opacity ?? 1);
-      property("opacity").disabled = tool === "select" && state.selection.length > 0 && styled.length === 0;
-      if (values.length) { const common = values.every(value => value === values[0]); property("opacity").value = common ? String(values[0]) : "";
-        property("opacity").placeholder = common ? "" : "Mixed"; if (common) objectOpacity = values[0]; }
-    }
+    if (!state.previewing) updateOpacityControls(state);
     if (!running) setStatus(state.previewing ? "Transform preview" : hasUnsavedChanges() ? "Unsaved changes" : "Saved");
     host.onModeChange?.(active);
   }
   const unsubscribe = session.subscribe(updateState);
   async function synchronizeDocumentSource(): Promise<void> {
     if (currentSourceScene === session.sourceScene) return;
+    pendingFieldFocus = null;
     currentSourceScene = session.sourceScene; latestScene = currentSourceScene;
     picking?.abort(); picker?.dispose(); picker = null;
     await host.documentChanged?.(currentSourceScene, { pdf: session.sourcePdf, password: source.password, label: source.label });
@@ -303,7 +458,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         acknowledged = true; latestScene = scene; presented = snapshot; updatePointerCursor();
         if (tool === "form") updateFieldPaint();
         // Preserve focused field drafts; only reposition existing controls.
-        if (active) updateGeometry();
+        if (active) updateGeometry(true);
       };
       try {
         await host.applyScene(scene, signal, publish); signal.throwIfAborted();
@@ -361,19 +516,23 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   function setTool(next: Tool): void {
     if (structuralRunning) return;
+    contextMenu.close();
+    pendingFieldFocus = null;
     if (activeText) void finishText();
     else textRequest++;
-    cancelPointerGesture(); polygon = null; tool = next; toolRequest++;
-    for (const button of toolbar.querySelectorAll<HTMLButtonElement>("[data-tool]")) button.setAttribute("aria-pressed", String(button.dataset.tool === next));
+    cancelPointerGesture(); polygon = null; signatureHover = null; tool = next; toolRequest++;
+    for (const button of toolbar.querySelectorAll<HTMLButtonElement>('[data-tool], [data-action="signatures"]'))
+      button.setAttribute("aria-pressed", String(button.dataset.tool === next || button.dataset.action === "signatures" && next === "signature"));
     overlay.dataset.tool = next; fields.hidden = next !== "form";
-    if (next !== "select") property("opacity").disabled = false;
+    updateOpacityControls(currentState);
     if (next === "form") renderFields();
     updateGeometry();
   }
   function renderFields(): void {
     fields.replaceChildren(); fieldDrafts.clear();
     const appearances = getSceneAnnotationRuns(latestScene);
-    for (const annotation of latestScene.annotations ?? []) {
+    for (const currentAnnotation of latestScene.annotations ?? []) {
+      const annotation = getEditorAnnotationSource(latestScene, currentAnnotation.id) ?? currentAnnotation;
       const name = annotation.field?.name;
       const input = createEditorFieldControl(document, annotation, name ? session.getFieldValues().get(name) : undefined,
         value => commit(() => {
@@ -381,18 +540,21 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
           for (const [control] of fieldDrafts) {
             const sibling = latestScene.annotations?.find(item => item.id === control.dataset.fieldId);
             if (!sibling || sibling.field?.name !== name) continue;
-            setEditorFieldControlValue(control, sibling, value); fieldDrafts.set(control, editorFieldDraftSignature(control));
+            setEditorFieldControlValue(control, getEditorAnnotationSource(latestScene, sibling.id) ?? sibling, value); fieldDrafts.set(control, editorFieldDraftSignature(control));
           }
-        }), { usePdfAppearance: annotation.hasAppearance || Boolean(appearances.get(annotation.id)?.length) });
+        }), { usePdfAppearance: currentAnnotation.hasAppearance || Boolean(appearances.get(annotation.id)?.length) });
       if (input) {
+        input.hidden = Boolean(host.subscribeToFrames);
         fieldDrafts.set(input, editorFieldDraftSignature(input)); fields.append(input);
         const choices = createEditorFieldOptions(document, annotation, input); if (choices) fields.append(choices);
         if (annotation.field?.textStyle) void editorServices.fonts.resolve(annotation.field.textStyle).then(async font => {
           await activateFont(font);
-          if (input.parentElement === fields) styleEditorFieldControl(input, annotation, JSON.stringify(font.id));
+          const current = latestScene.annotations?.find(item => item.id === annotation.id);
+          if (input.parentElement === fields && current) styleEditorFieldControl(input, getEditorAnnotationSource(latestScene, current.id) ?? current, JSON.stringify(font.id));
         }).catch(report);
       }
     }
+    if (active) host.requestFrame?.();
   }
   function updateFieldPaint(): void {
     const annotations = new Map(latestScene.annotations?.map(annotation => [annotation.id, annotation]));
@@ -403,26 +565,68 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       else delete control.dataset.pdfAppearance;
     }
   }
+  function fieldAtClientPoint(client: PrimitivePoint): string | null {
+    for (const annotation of [...(latestScene.annotations ?? [])].reverse()) {
+      if (!canEditEditorField(annotation) || !session.isAnnotationVisible(annotation.id)) continue;
+      const source = getEditorAnnotationSource(latestScene, annotation.id) ?? annotation;
+      const geometry = editorFieldClientGeometry(source, latestScene.pdfPages,
+        (point, pageIndex) => host.sceneToClientPoint(point.x, point.y, pageIndex), getEditorAnnotationFrameTransform(latestScene, annotation.id));
+      if (geometry) {
+        const [a, b, c, d] = geometry.transform, determinant = a * d - b * c;
+        const x = client.x - geometry.origin.x, y = client.y - geometry.origin.y;
+        const localX = (d * x - c * y) / determinant, localY = (a * y - b * x) / determinant;
+        if (localX >= 0 && localX <= geometry.width && localY >= 0 && localY <= geometry.height) return annotation.id;
+      } else {
+        const bounds = sceneBoundsToClient(annotation.bounds, annotation.pageIndex);
+        if (bounds && client.x >= bounds.minX && client.x <= bounds.maxX && client.y >= bounds.minY && client.y <= bounds.maxY) return annotation.id;
+      }
+    }
+    return null;
+  }
+  function focusPendingField(): void {
+    const pending = pendingFieldFocus; if (!pending) return;
+    if (!active || disposed || tool !== "form" || pending.sourceScene !== session.sourceScene) { pendingFieldFocus = null; return; }
+    const control = [...fieldDrafts.keys()].find(input => input.dataset.fieldId === pending.id);
+    if (!control) { pendingFieldFocus = null; return; }
+    if (fields.hidden || control.hidden) return;
+    pendingFieldFocus = null; control.focus({ preventScroll: true });
+  }
   async function pick(point: PrimitivePoint, client: PrimitivePoint): Promise<string | null> {
     const objects = session.getObjects(), edits = session.getSourceEdits();
+    const layerEdits = session.getLayerEdits(), reordered = layerEdits.stackingChanged || layerEdits.objectOrderChanged;
+    const candidates: { id: string; rank: number }[] = [];
+    const candidate = (id: string, rank = session.getObjectPaintRank(id)): void => { candidates.push({ id, rank }); };
     const changed = new Set(edits.filter(edit => edit.deleted || edit.transform.some((value, index) => value !== IDENTITY[index])).map(edit => `${edit.ref.kind}:${edit.ref.index}`));
     for (let i = objects.length - 1; i >= 0; i--) {
       const object = objects[i];
+      if (!session.isObjectVisible(object.id)) continue;
       if (object.kind === "source" && !object.isClone && !object.primitives.some(ref => changed.has(`${ref.kind}:${ref.index}`))) continue;
       const bounds = session.getObjectBounds(objects[i].id);
-      if (editorBoundsClickHit(bounds, point, client, p => host.sceneToClientPoint(p.x, p.y, object.pageIndex))) return objects[i].id;
+      if (editorBoundsClickHit(bounds, point, client, p => host.sceneToClientPoint(p.x, p.y, object.pageIndex))) {
+        if (!reordered) return object.id;
+        candidate(object.id);
+      }
     }
     const appearanceRuns = getSceneAnnotationRuns(session.sourceScene);
-    const annotationId = pickEditorMetadataAnnotation(latestScene.annotations ?? [], point,
+    const annotationId = pickEditorMetadataAnnotation((latestScene.annotations ?? []).filter(annotation => session.isAnnotationVisible(annotation.id)), point,
       annotation => session.getObjectBounds(`annotation:${annotation.id}`),
       annotation => appearanceRuns.get(annotation.id)?.some(run => run.count > 0) ?? false);
-    if (annotationId) return `annotation:${annotationId}`;
+    if (annotationId) {
+      if (!reordered) return `annotation:${annotationId}`;
+      candidate(`annotation:${annotationId}`);
+    }
     picker ??= new ScenePrimitivePicker(session.sourceScene);
     picking?.abort(); const controller = picking = new AbortController();
     try {
-      const hit = await picker.pick({ point, clientPoint: client, isVisible: ref => !changed.has(`${ref.kind}:${ref.index}`),
+      const hit = await picker.pick({ point, clientPoint: client, isVisible: ref => !changed.has(`${ref.kind}:${ref.index}`) && session.isPrimitiveVisible(ref),
+        resolvePaintRank: reordered ? ref => session.getPrimitivePaintRank(ref) : undefined,
         project: p => host.sceneToClientPoint(p.x, p.y), unproject: p => host.clientToScenePoint(p.x, p.y), signal: AbortSignal.any([lifetime.signal, controller.signal]) });
-      return hit ? `source:${hit.primitive.kind}:${hit.primitive.index}` : null;
+      if (hit) {
+        const id = `source:${hit.primitive.kind}:${hit.primitive.index}`;
+        if (!reordered) return id;
+        candidate(id, session.getPrimitivePaintRank(hit.primitive));
+      }
+      return candidates.reduce<{ id: string; rank: number } | null>((best, item) => !best || item.rank > best.rank ? item : best, null)?.id ?? null;
     } finally { if (picking === controller) picking = null; }
   }
   function dragMatrix(p: PointerGesture, point: PrimitivePoint): EditorMatrix {
@@ -480,7 +684,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       return;
     }
     if (tool === "text") { await startText(point); return; }
-    if (tool === "signature") { if (signature) placeSignature(point); return; }
+    if (tool === "signature") { signatureHover = event.pointerType === "touch" ? null : client; if (signature) placeSignature(point); return; }
     if (tool === "image") { if (pendingImage) placeImage(point); return; }
     let action: PointerGesture["action"] = "draw";
     if (tool === "select") {
@@ -517,6 +721,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     overlay.setPointerCapture?.(event.pointerId);
   }
   function pointerMove(event: PointerEvent): void {
+    if (active && tool === "signature") signatureHover = event.pointerType === "touch" ? null : { x: event.clientX, y: event.clientY };
     if (pendingPick?.id === event.pointerId) pendingPick.lastClient = { x: event.clientX, y: event.clientY };
     if (!pointer || event.pointerId !== pointer.id) return;
     const point = host.clientToScenePoint(event.clientX, event.clientY, pointer.action !== "draw" && pointer.action !== "marquee" ? pointer.frame?.pageIndex : undefined); if (!point) return;
@@ -573,13 +778,13 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       const pageIndex = pageAt(p.start), [x, y] = pageLocal({ x: Math.min(p.start.x, p.last.x), y: Math.min(p.start.y, p.last.y) }, pageIndex);
       if (pageIndex < 0) return;
       let object: EditorObjectInput;
-      if (tool === "ink") object = { kind: "ink", pageIndex, opacity: objectOpacity, paths: [p.points.map(([px, py]) => pageLocal({ x: px, y: py }, pageIndex))],
+      if (tool === "ink") object = { kind: "ink", pageIndex, opacity: objectOpacity, fillOpacity, paths: [p.points.map(([px, py]) => pageLocal({ x: px, y: py }, pageIndex))],
         smoothing: editorInkCaptureTolerance(p.start, point => host.sceneToClientPoint(point.x, point.y, pageIndex)),
         color: property("color").value, strokeWidth: Number(property("stroke").value), fill: property("fill-enabled").checked ? property("fill").value : null };
       else object = { kind: "shape", pageIndex, shape: tool as "rectangle" | "ellipse" | "line" | "arrow", x, y,
         width: Math.abs(p.last.x - p.start.x), height: Math.abs(p.last.y - p.start.y),
         points: tool === "line" || tool === "arrow" ? [pageLocal(p.start, pageIndex), pageLocal(p.last, pageIndex)] : undefined,
-        opacity: objectOpacity, color: property("color").value, strokeWidth: Number(property("stroke").value), fill: property("fill-enabled").checked ? property("fill").value : null };
+        opacity: objectOpacity, fillOpacity, color: property("color").value, strokeWidth: Number(property("stroke").value), fill: property("fill-enabled").checked ? property("fill").value : null };
       commit(() => { const id = session.addObject(object); session.select([id]); });
     }
   }
@@ -588,7 +793,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     const p = polygon; polygon = null;
     const minX = Math.min(...p.points.map(point => point[0])), minY = Math.min(...p.points.map(point => point[1]));
     const [x, y] = pageLocal({ x: minX, y: minY }, p.pageIndex);
-    commit(() => { const id = session.addObject({ kind: "shape", shape: tool === "polyline" ? "polyline" : "polygon", pageIndex: p.pageIndex, opacity: objectOpacity, x, y,
+    commit(() => { const id = session.addObject({ kind: "shape", shape: tool === "polyline" ? "polyline" : "polygon", pageIndex: p.pageIndex, opacity: objectOpacity, fillOpacity, x, y,
       width: Math.max(...p.points.map(point => point[0])) - minX, height: Math.max(...p.points.map(point => point[1])) - minY,
       points: p.points.map(([px, py]) => pageLocal({ x: px, y: py }, p.pageIndex)), color: property("color").value,
       strokeWidth: Number(property("stroke").value), fill: property("fill-enabled").checked ? property("fill").value : null }); session.select([id]); });
@@ -613,13 +818,15 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (structuralRunning) return;
     const request = ++textRequest;
     const pageIndex = object?.pageIndex ?? pageAt(point); if (pageIndex < 0) return;
+    const layerId = object ? null : session.getActiveLayer();
+    if (!object && layerId && session.getLayers().find(layer => layer.id === layerId)?.defaultVisible === false) throw new Error("Show the active layer before creating a textbox.");
     const selectedFontId = object?.fontId ?? query<HTMLSelectElement>('[data-prop="font"]').value;
     const font = object && !selectedFontId ? await editorServices.fonts.loadBundled(object.fontFamily) : await selectedFont(selectedFontId);
     await activateFont(font); if (disposed || !active || request !== textRequest) return;
     if (object) {
       updateFonts(); query<HTMLSelectElement>('[data-prop="font"]').value = font.id;
       property("font-size").value = String(object.fontSize); property("color").value = normalizeEditorTextColor(colorCss(object.color));
-      objectOpacity = object.opacity ?? 1; property("opacity").value = String(objectOpacity); property("opacity").disabled = false;
+      objectOpacity = object.opacity ?? 1; syncOpacityControls("opacity", objectOpacity, false);
       query<HTMLSelectElement>('[data-prop="align"]').value = object.align ?? "left";
       for (const [name, enabled] of Object.entries({ bold: object.fontWeight === "bold" || Number(object.fontWeight) >= 600,
         italic: object.fontStyle === "italic" || object.fontStyle === "oblique", underline: Boolean(object.underline), strikethrough: Boolean(object.strikethrough) })) query(`[data-style="${name}"]`).setAttribute("aria-pressed", String(enabled));
@@ -643,11 +850,11 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       }
     } else element.textContent = object?.text ?? "";
     if (disposed || !active || request !== textRequest) return;
-    activeText = { element, objectId: sourceAnnotationId ? undefined : object?.id, sourceAnnotationId, pageIndex, x, y: object ? y : y - 50,
+    activeText = { element, objectId: sourceAnnotationId ? undefined : object?.id, sourceAnnotationId, layerId, pageIndex, x, y: object ? y : y - 50,
       width: object?.width ?? 220, height: object?.height ?? 50, transform: object?.transform ?? IDENTITY, opacity: object?.opacity ?? objectOpacity, lineHeight: object?.lineHeight,
       baseline: { html: element.innerHTML, align: element.style.textAlign, opacity: object?.opacity ?? objectOpacity } };
     overlay.append(element); query('[data-action="apply-text"]').hidden = false; query('[data-action="cancel-text"]').hidden = false;
-    updateGeometry(); element.focus(); activeText.baseline.html = element.innerHTML;
+    updateGeometry(); if (!element.hidden) element.focus(); activeText.baseline.html = element.innerHTML;
   }
   function cancelText(): void {
     textRequest++;
@@ -663,9 +870,10 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     const font = await selectedFont();
     if (disposed || activeText !== editing || request !== textRequest) return;
     const runs = readRichTextRuns(element, window, editorServices.fonts.list(), font?.id, font?.family);
-    const height = Math.max(editing.height, element.scrollHeight);
+    const height = Math.max(editing.height, element.scrollHeight, editing.hiddenHeight ?? 0);
     const object: Extract<EditorObjectInput, { kind: "text" }> = { kind: "text", pageIndex: editing.pageIndex, x: editing.x, y: editing.y + editing.height - height, width: editing.width,
       transform: editing.transform, opacity: editing.opacity, lineHeight: editing.lineHeight,
+      ...(!editing.objectId ? { layerId: editing.sourceAnnotationId ? null : editing.layerId ?? null } : {}),
       height, text, fontId: font?.id, fontFamily: font?.family,
       fontSize: Number(property("font-size").value), color: property("color").value, fontWeight: styleEnabled("bold") ? "bold" : "normal",
       fontStyle: styleEnabled("italic") ? "italic" : "normal", underline: styleEnabled("underline"), strikethrough: styleEnabled("strikethrough"),
@@ -695,15 +903,77 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     const input = document.createElement("input"); input.type = "file"; input.accept = accept;
     input.addEventListener("change", () => { const file = input.files?.[0]; if (file) void onFile(file).catch(report); }); input.click();
   }
-  async function importImage(file: File, request: number): Promise<void> {
-    const bitmap = await createImageBitmap(file);
+  async function decodeImage(file: File, isCurrent: () => boolean, signal?: AbortSignal): Promise<EditorImageData | null> {
+    signal?.throwIfAborted();
+    const pending = createImageBitmap(file);
+    let bitmap: ImageBitmap;
+    try { bitmap = await waitForLoad(pending, signal); }
+    catch (error) { void pending.then(value => value.close(), () => {}); throw error; }
     try {
-      if (disposed || !active || request !== toolRequest) return;
+      signal?.throwIfAborted(); if (!isCurrent()) return null;
       const canvas = document.createElement("canvas"); canvas.width = bitmap.width; canvas.height = bitmap.height;
       const context = canvas.getContext("2d"); if (!context) throw new Error("Image decoding is unavailable."); context.drawImage(bitmap, 0, 0);
-      pendingImage = { kind: "image", imageWidth: bitmap.width, imageHeight: bitmap.height, data: new Uint8Array(context.getImageData(0, 0, bitmap.width, bitmap.height).data) };
-      setTool("image"); setStatus("Click the page to place the image.");
+      return { kind: "image", imageWidth: bitmap.width, imageHeight: bitmap.height, data: new Uint8Array(context.getImageData(0, 0, bitmap.width, bitmap.height).data) };
     } finally { bitmap.close(); }
+  }
+  async function importImage(file: File, request: number): Promise<void> {
+    const image = await decodeImage(file, () => !disposed && active && request === toolRequest);
+    if (!image || disposed || !active || request !== toolRequest) return;
+    pendingImage = image; setTool("image"); setStatus("Click the page to place the image.");
+  }
+  async function dropImages(files: readonly File[], client: { x: number; y: number }, externalSignal?: AbortSignal): Promise<void> {
+    lifetime.signal.throwIfAborted(); externalSignal?.throwIfAborted();
+    if (!active) throw new Error("Switch to Edit mode before dropping images.");
+    if (running || structuralRunning) throw new Error("Wait for the current operation to finish.");
+    if (!files.length) return;
+    if (files.some(file => droppedFileKind(file) !== "image")) throw new TypeError("Drop PNG, JPEG or WebP images.");
+    const canvas = host.getCanvas(), rect = canvas.getBoundingClientRect();
+    if (!Number.isFinite(client.x) || !Number.isFinite(client.y) || client.x < rect.left || client.x > rect.right || client.y < rect.top || client.y > rect.bottom)
+      throw new Error("Drop images onto a document page.");
+    const sourceScene = session.sourceScene, point = host.clientToScenePoint(client.x, client.y), pageIndex = point ? pageAt(point) : -1;
+    if (!point || pageIndex < 0) throw new Error("Drop images onto a document page.");
+    const [x, y] = pageLocal(point, pageIndex), previousRequest = toolRequest;
+    const initialSignal = externalSignal ? AbortSignal.any([lifetime.signal, externalSignal]) : lifetime.signal;
+    flushEditorFieldDrafts(fieldDrafts);
+    if (hasPendingEditorFields(fieldDrafts)) throw new Error("Check the pending form value before adding images.");
+    if (activeText) await waitForLoad(finishText(), initialSignal);
+    initialSignal.throwIfAborted();
+    if (activeText) throw new Error("Finish the active textbox before adding images.");
+    if (!active || sourceScene !== session.sourceScene || previousRequest !== toolRequest) throw new DOMException("The image drop was superseded.", "AbortError");
+    if (running || structuralRunning) throw new Error("Wait for the current operation to finish.");
+    pendingImage = null; setTool("select");
+    const request = toolRequest, opacity = objectOpacity, ids: string[] = [];
+    let expectedRevision = session.revision;
+    running = true; updatePointerCursor(); host.onBusyChange?.(true);
+    operation?.abort(); const abort = new AbortController(); operation = abort;
+    const signal = AbortSignal.any([initialSignal, abort.signal]);
+    query('[data-action="cancel-operation"]').hidden = false;
+    const isCurrent = (): boolean => !disposed && active && request === toolRequest && sourceScene === session.sourceScene && expectedRevision === session.revision;
+    try {
+      for (let index = 0; index < files.length; index++) {
+        signal.throwIfAborted(); if (!isCurrent()) throw new DOMException("The image drop was superseded.", "AbortError");
+        setStatus(`Adding image ${index + 1} of ${files.length}…`);
+        const image = await decodeImage(files[index], isCurrent, signal);
+        signal.throwIfAborted(); if (!image || !isCurrent()) throw new DOMException("The image drop was superseded.", "AbortError");
+        const width = Math.min(240, (sourceScene.pageRects[pageIndex * 4 + 2] - sourceScene.pageRects[pageIndex * 4]) * .5);
+        const height = width * image.imageHeight / image.imageWidth;
+        cancelPointerGesture(false);
+        ids.push(session.addObject({ ...image, kind: "image", pageIndex, opacity, x, y: y - height, width, height }));
+        session.select(ids); expectedRevision = session.revision; void refreshScene();
+      }
+      setStatus(`${ids.length} ${ids.length === 1 ? "image" : "images"} added.`);
+    } catch (error) {
+      if (!disposed && (signal.aborted || error instanceof DOMException && error.name === "AbortError")) {
+        const retained = sourceScene === session.sourceScene && expectedRevision === session.revision ? ids.length : 0;
+        setStatus(retained ? `Image import cancelled; ${retained} ${retained === 1 ? "image remains" : "images remain"} added.` : "Image import cancelled.");
+      }
+      throw error;
+    } finally {
+      if (!disposed && ids.length) await refreshScene(lifetime.signal);
+      if (operation === abort) operation = null;
+      running = false;
+      if (!disposed) { updatePointerCursor(); query('[data-action="cancel-operation"]').hidden = true; host.onBusyChange?.(false); }
+    }
   }
   function placeImage(point: PrimitivePoint): void {
     if (!pendingImage) return; const pageIndex = pageAt(point), [x, y] = pageLocal(point, pageIndex), image = pendingImage;
@@ -711,10 +981,11 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     commit(() => { const id = session.addObject({ ...image, kind: "image", pageIndex, opacity: objectOpacity, x, y: y - height, width, height }); session.select([id]); }); setTool("select");
   }
   function placeSignature(point: PrimitivePoint): void {
-    if (!signature) return; const pageIndex = pageAt(point), [x, y] = pageLocal(point, pageIndex), asset = signature;
-    const width = Math.min(180, (session.sourceScene.pageRects[pageIndex * 4 + 2] - session.sourceScene.pageRects[pageIndex * 4]) * 0.4), scale = width / asset.width;
-    commit(() => { const id = session.addObject({ kind: "signature", pageIndex, opacity: objectOpacity,
-      paths: asset.paths.map(path => Array.from({ length: path.length / 2 }, (_, index) => [x + path[index * 2] * scale, y - path[index * 2 + 1] * scale] as [number, number])),
+    if (!signature) return;
+    const placement = signaturePlacementAt(point); if (!placement) return;
+    const { pageIndex, transform: [a, , , d, e, f], scale } = placement, asset = signature;
+    commit(() => { const id = session.addObject({ kind: "signature", pageIndex, opacity: objectOpacity, fillOpacity,
+      paths: asset.paths.map(path => Array.from({ length: path.length / 2 }, (_, index) => [e + path[index * 2] * a, f + path[index * 2 + 1] * d] as [number, number])),
       ...(asset.smoothing !== undefined ? { smoothing: asset.smoothing * Math.abs(scale) } : {}),
       color: property("color").value, strokeWidth: Number(property("stroke").value) }); session.select([id]); });
   }
@@ -732,6 +1003,21 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     query('[data-action="cancel-operation"]').hidden = false; setStatus(`Preparing ${kind === "hep" ? "HEP" : "PDF"}…`);
     try {
       if (wasPreviewing) await refreshScene(lifetime.signal);
+      let outputKind = kind;
+      if (kind === "pdf" && (session.sourcePdf || session.getLayerEdits?.().stackingChanged || session.getLayerEdits?.().objectOrderChanged)) {
+        const sourceScene = session.sourceScene, revision = session.getState().revision;
+        const committed = await session.getScene({ signal: abort.signal, preview: false });
+        const unchanged = (): boolean => sourceScene === session.sourceScene && revision === session.getState().revision;
+        if (!unchanged()) throw new Error("The document changed while preparing the export. Save again.");
+        const layerStacking = Boolean((session.getLayerEdits?.().stackingChanged || session.getLayerEdits?.().objectOrderChanged) &&
+          ((committed.annotations?.length ?? 0) || session.getObjects({ includeSource: false }).length));
+        if (layerStacking || (session.sourcePdf && findEditorPdfFormOverlaps(committed, session, { signal: abort.signal }).length)) {
+          const choice = await chooseEditorPdfFormExport(document, abort.signal, { layerStacking });
+          if (!choice) { setStatus("PDF export cancelled"); return; }
+          if (!unchanged()) throw new Error("The document changed while choosing the PDF format. Save again.");
+          outputKind = choice;
+        }
+      }
       const warnings: string[] = [], onWarning = (value: string): void => { warnings.push(value); setStatus(value); };
       const progress = new LoadProgressReporter(value => setStatus(`Preparing ${kind === "hep" ? "HEP" : "PDF"}… ${Math.round(value.value * 100)}%`));
       let blob: Blob;
@@ -740,26 +1026,28 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         blob = await writeScenePdf(await session.getScene({ signal: abort.signal, preview: false, onProgress: progress.child(0, .4).toCallback() }),
           { signal: abort.signal, onWarning, onProgress: progress.child(.4, 1).toCallback() });
       } else blob = kind === "hep" ? await session.saveHep({ signal: abort.signal, onProgress: progress.toCallback() })
-        : await session.savePdf({ signal: abort.signal, flatten: kind === "flatten", protection, onWarning, onProgress: progress.toCallback() });
+        : await session.savePdf({ signal: abort.signal, flatten: outputKind === "flatten", protection, onWarning, onProgress: progress.toCallback() });
       abort.signal.throwIfAborted();
       if (kind === "print") printPdfBlob(blob, document, { filename: "edited-print.pdf", title: "Print edited PDF" });
-      else { const base = formatPdfDownloadFilename(source.label).replace(/\.pdf$/i, ""); triggerBrowserDownload(blob, `${base}${kind === "hep" ? "-edited.hep" : kind === "flatten" ? "-flattened.pdf" : "-edited.pdf"}`); }
+      else { const base = formatPdfDownloadFilename(source.label).replace(/\.pdf$/i, ""); triggerBrowserDownload(blob, `${base}${kind === "hep" ? "-edited.hep" : outputKind === "flatten" ? "-flattened.pdf" : "-edited.pdf"}`); }
       if (protection) pdfProtection.markSaved(protection);
       setStatus(warnings.length ? warnings.join(" ") : kind === "print" ? "Print-ready PDF opened" : hasUnsavedChanges() ? "Unsaved changes" : "Saved");
     } catch (error) { report(error); }
     finally { if (operation === abort) operation = null; running = false; updatePointerCursor(); query('[data-action="cancel-operation"]').hidden = true; host.onBusyChange?.(false); }
   }
-  async function runPageOperation(change: (options: { signal: AbortSignal; onProgress: LoadProgressCallback; onDiagnostic: (diagnostic: PdfDiagnostic) => void }) => Promise<void>): Promise<void> {
+  async function runPageOperation(change: (options: { signal: AbortSignal; onProgress: LoadProgressCallback; onDiagnostic: (diagnostic: PdfDiagnostic) => void }) => Promise<void>, externalSignal?: AbortSignal): Promise<void> {
+    lifetime.signal.throwIfAborted(); externalSignal?.throwIfAborted();
     if (running || structuralRunning) throw new Error("Wait for the current operation to finish.");
     flushEditorFieldDrafts(fieldDrafts);
     if (hasPendingEditorFields(fieldDrafts)) throw new Error("Check the pending form value before changing pages.");
     if (activeText) await finishText();
+    lifetime.signal.throwIfAborted(); externalSignal?.throwIfAborted();
     if (running || structuralRunning) throw new Error("Wait for the current operation to finish.");
     structuralRunning = running = true; toolbar.inert = overlay.inert = true;
     host.onBusyChange?.(true);
     polygon = null; textRequest++; cancelPointerGesture(false);
     operation?.abort(); const abort = new AbortController(); operation = abort;
-    const signal = AbortSignal.any([lifetime.signal, abort.signal]);
+    const signal = AbortSignal.any([lifetime.signal, abort.signal, ...(externalSignal ? [externalSignal] : [])]);
     query('[data-action="cancel-operation"]').hidden = false;
     const warnings: string[] = []; pagesDialog?.setWarnings(warnings);
     const onDiagnostic = (diagnostic: PdfDiagnostic): void => {
@@ -782,6 +1070,23 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if (!disposed) { pagesDialog?.refresh(); updateState(session.getState()); if (warnings.length) setStatus(warnings.join(" ")); }
     }
   }
+  async function attachDocuments(files: readonly File[], signal?: AbortSignal): Promise<void> {
+    lifetime.signal.throwIfAborted(); signal?.throwIfAborted(); if (!files.length) return;
+    const before = session.getPages().length, warnings: string[] = [];
+    try {
+      await runPageOperation(options => insertEditorDocumentFiles(session, files, session.getPages().length, { ...options,
+        onDiagnostic(diagnostic) { options.onDiagnostic(diagnostic); if (diagnostic.severity !== "info" && !warnings.includes(diagnostic.message)) warnings.push(diagnostic.message); }
+      }), signal);
+      const added = session.getPages().length - before;
+      setStatus([`${added} ${added === 1 ? "page" : "pages"} attached.`, ...warnings].join(" "));
+    } catch (error) {
+      if (!disposed && (signal?.aborted || error instanceof DOMException && error.name === "AbortError")) {
+        const added = session.getPages().length - before;
+        setStatus(added ? `Attachment cancelled; ${added} ${added === 1 ? "page remains" : "pages remain"} attached.` : "Attachment cancelled.");
+      }
+      throw error;
+    }
+  }
   toolbar.addEventListener("pointerdown", event => { if ((event.target as Element).closest("[data-style]")) event.preventDefault(); });
   toolbar.addEventListener("click", event => {
     if (structuralRunning) return;
@@ -789,6 +1094,9 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (button.dataset.tool) { setTool(button.dataset.tool as Tool); return; }
     if (button.dataset.style) { applyTextStyle(button.dataset.style); return; }
     switch (button.dataset.action) {
+      case "layers":
+        if (layerDialog && !layerDialog.open) layerDialog.showModal();
+        host.showLayerControls?.(); layerControls.show(); break;
       case "undo": changeHistory(false); break; case "redo": changeHistory(true); break;
       case "delete": commit(() => session.deleteSelection()); break; case "duplicate": commit(() => session.cloneSelection()); break;
       case "group": commit(() => session.groupSelection()); break; case "ungroup": commit(() => session.ungroupSelection()); break;
@@ -815,20 +1123,14 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         const request = ++toolRequest;
         chooseFile("image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp", file => importImage(file, request)); break;
       }
-      case "signatures": showSignatureDialog(document, value => { signature = value; setTool("signature"); setStatus("Click the page to place your signature."); }, report); break;
+      case "signatures": signatureHover = null; showSignatureDialog(document, value => { signature = value; setTool("signature"); setStatus("Click to place the signature centered on the cursor. Escape returns to Select."); }, report); break;
     }
   });
+  toolbar.addEventListener("input", opacityInput);
   toolbar.addEventListener("change", event => {
     if (structuralRunning) return;
     const input = event.target as HTMLInputElement;
-    if (input.dataset.prop === "opacity") {
-      try {
-        objectOpacity = validateEditorOpacity(input.value.trim() ? Number(input.value) : NaN);
-        if (activeText) activeText.opacity = objectOpacity;
-        else if (editorStyledSelection(session).length) commit(() => applyEditorOpacity(session, objectOpacity));
-      } catch (error) { report(error); input.value = String(objectOpacity); }
-      return;
-    }
+    if (changeOpacity(input)) return;
     if (input.dataset.transform) {
       transformProperty(input.dataset.transform, Number(input.value));
       if (input.dataset.transform === "rotation") input.value = "0";
@@ -857,8 +1159,37 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     }
   });
   overlay.addEventListener("pointerdown", event => { void pointerDown(event).catch(report); });
+  function canOpenContextMenu(): boolean {
+    return active && !disposed && !running && !structuralRunning && !activeText && !pointer && !pendingPick && tool === "select" && !isSceneSettling();
+  }
+  function showSelectionContextMenu(): void {
+    if (!canOpenContextMenu() || !session.getSelection().length) return;
+    const frame = session.getSelectionFrame(); if (!frame) return;
+    const center = editorFrameCenter(frame), point = host.sceneToClientPoint(center.x, center.y, frame.pageIndex);
+    if (point) contextMenu.show(point);
+  }
+  async function openContextMenu(event: MouseEvent): Promise<void> {
+    if (!canOpenContextMenu() || (event.target as Element).closest(".hepr-editor-field,.hepr-editor-text-input")) return;
+    event.preventDefault(); event.stopPropagation(); contextMenu.close();
+    const request = ++textRequest, target = event.target as Element, selection = session.getSelection();
+    if (selection.length && (target.getAttribute("data-selection-move") === "true" || target.getAttribute("data-handle"))) {
+      contextMenu.show({ x: event.clientX, y: event.clientY }); return;
+    }
+    const point = host.clientToScenePoint(event.clientX, event.clientY); if (!point) return;
+    const revision = session.revision, sourceScene = session.sourceScene, selectionKey = JSON.stringify(selection);
+    const before = host.sceneToClientPoint(point.x, point.y);
+    const id = await pick(point, { x: event.clientX, y: event.clientY });
+    if (!id || !canOpenContextMenu() || request !== textRequest || revision !== session.revision || sourceScene !== session.sourceScene || selectionKey !== JSON.stringify(session.getSelection())) return;
+    const after = host.sceneToClientPoint(point.x, point.y);
+    if (!before || !after || Math.abs(before.x - after.x) + Math.abs(before.y - after.y) > .1) return;
+    if (!selection.includes(id)) session.select([id]);
+    contextMenu.show({ x: event.clientX, y: event.clientY });
+  }
+  overlay.addEventListener("contextmenu", event => { void openContextMenu(event).catch(report); });
   overlay.addEventListener("pointermove", pointerMove); overlay.addEventListener("pointerup", pointerUp);
-  overlay.addEventListener("pointercancel", () => cancelPointerGesture());
+  overlay.addEventListener("pointerenter", pointerMove);
+  overlay.addEventListener("pointerleave", () => { signatureHover = null; });
+  overlay.addEventListener("pointercancel", () => { signatureHover = null; cancelPointerGesture(); });
   overlay.addEventListener("lostpointercapture", event => { if (pointer?.id === event.pointerId || pendingPick?.id === event.pointerId && !pendingPick.released) cancelPointerGesture(); });
   overlay.addEventListener("wheel", event => {
     if (activeText || (event.target as Element).closest(".hepr-editor-field")) return;
@@ -870,6 +1201,12 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (!active || running || isSceneSettling()) return;
     if (tool === "polygon" || tool === "polyline") { completePolygon(); return; }
     if (tool !== "select" || activeText) return;
+    const fieldId = fieldAtClientPoint({ x: event.clientX, y: event.clientY });
+    if (fieldId) {
+      cancelPointerGesture(); setTool("form");
+      pendingFieldFocus = { id: fieldId, sourceScene: session.sourceScene };
+      updateGeometry(); host.requestFrame?.(); return;
+    }
     const pageIndex = (event.target as Element).getAttribute("data-selection-move") === "true" ? session.getSelectionFrame()?.pageIndex : undefined;
     const point = host.clientToScenePoint(event.clientX, event.clientY, pageIndex); if (!point) return;
     cancelPointerGesture();
@@ -896,10 +1233,11 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if (event.key === "Escape" || (event.ctrlKey || event.metaKey) && /^[szd]$/i.test(event.key)) event.preventDefault();
       return;
     }
-    if (event.key === "Escape") { polygon = null; cancelPointerGesture(); cancelText(); operation?.abort(); session.select([]); return; }
+    if (event.key === "Escape") { polygon = null; cancelPointerGesture(); cancelText(); operation?.abort(); if (tool === "signature") setTool("select"); session.select([]); return; }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") { event.preventDefault(); void save("pdf"); return; }
     if ((event.target as Element | null)?.closest?.("dialog")) return;
     if (inputTarget(event.target)) return;
+    if ((event.key === "ContextMenu" || event.shiftKey && event.key === "F10") && canOpenContextMenu()) { event.preventDefault(); showSelectionContextMenu(); return; }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") { event.preventDefault(); changeHistory(event.shiftKey); }
     else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "d") { event.preventDefault(); commit(() => session.cloneSelection()); }
     else if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); commit(() => session.deleteSelection()); }
@@ -925,16 +1263,25 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   return {
     async setEditing(value) {
       if (disposed || structuralRunning || active === value) return;
+      contextMenu.close();
+      if (!value) pendingFieldFocus = null;
       if (!value) { flushEditorFieldDrafts(fieldDrafts); if (activeText) await finishText(); }
-      if (!value) { toolRequest++; cancelPointerGesture(); polygon = null; textRequest++; }
+      if (!value) { toolRequest++; cancelPointerGesture(); polygon = null; signatureHover = null; textRequest++; }
       active = value; toolbar.hidden = overlay.hidden = !value; document.body.classList.toggle("hepr-editing", value);
+      layerControls.setActive(value); if (!value) layerDialog?.close();
+      releaseFrameListener?.(); releaseFrameListener = null;
+      if (value) releaseFrameListener = host.subscribeToFrames?.(() => { if (active && !disposed) updateGeometry(true); }) ?? null;
       host.setEditing(value); host.onModeChange?.(value);
-      if (value) { await refreshScene(); tick(); } else window.cancelAnimationFrame(frame);
+      if (value) { updateGeometry(); await refreshScene(); tick(); } else window.cancelAnimationFrame(frame);
     },
-    isEditing: () => active, isBusy: () => running || structuralRunning, isDirty: hasUnsavedChanges, save, confirmDocumentChange,
+    isEditing: () => active, isBusy: () => running || structuralRunning, isDirty: hasUnsavedChanges, save, attachDocuments, dropImages, confirmDocumentChange,
     dispose() {
       if (disposed) return; disposed = true; active = false; cancelPointerGesture(false); lifetime.abort(); scenePreparation?.abort(); operation?.abort(); window.cancelAnimationFrame(frame); window.cancelAnimationFrame(previewFrame);
+      pendingFieldFocus = null;
+      releaseFrameListener?.(); releaseFrameListener = null;
       passwordDialog?.close(); pagesDialog?.close(true); pdfProtection.dispose();
+      contextMenu.dispose();
+      layerControls.dispose(); layerDialog?.remove();
       unsubscribe(); picker?.dispose(); interaction.dispose(); session.dispose(); editorServices.dispose(); toolbar.remove(); overlay.remove();
       for (const face of fontFaces.values()) document.fonts.delete(face); fontFaces.clear();
       document.body.classList.remove("hepr-editing"); host.setEditing(false); host.onModeChange?.(false);

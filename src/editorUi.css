@@ -1,4 +1,4 @@
-.hepr-editor-toolbar{position:fixed;z-index:31;top:var(--reader-toolbar-height,48px);left:8px;right:8px;padding:8px;background:rgba(255,255,255,.98);color:#172333;border:1px solid #c6ced9;border-radius:8px;box-shadow:0 4px 18px #0002;font:12px system-ui,sans-serif;max-height:36vh;overflow:auto}
+.hepr-editor-toolbar{position:fixed;z-index:24;top:var(--reader-toolbar-height,48px);box-sizing:border-box;min-width:0;padding:8px;background:rgba(255,255,255,.98);color:#172333;border:1px solid #c6ced9;border-radius:8px;box-shadow:0 4px 18px #0002;font:12px system-ui,sans-serif;max-height:36vh;overflow:auto}
 .hepr-editor-toolbar[hidden],.hepr-editor-overlay[hidden]{display:none}
 .hepr-editor-tools,.hepr-editor-properties,.hepr-editor-transform{display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin-bottom:5px}
 .hepr-editor-toolbar button,.hepr-editor-signature-dialog button{border:1px solid #b6c3d4;background:#f6f8fc;color:#172333;border-radius:4px;padding:5px 8px;cursor:pointer;font:inherit}
@@ -10,8 +10,9 @@
 .hepr-editor-icon{display:block;flex-shrink:0;pointer-events:none}
 .hepr-editor-toolbar label{display:inline-flex;align-items:center;gap:3px}
 .hepr-editor-toolbar input[type=number]{width:62px}.hepr-editor-toolbar input[type=color]{width:28px;height:26px;padding:1px}.hepr-editor-toolbar select{max-width:160px}
+.hepr-editor-toolbar .hepr-editor-opacity input[type=range]{width:84px;min-width:48px;margin:0;accent-color:#1765d7}
 .hepr-editor-help{color:#526174;font-size:11px}.hepr-editor-transform [data-status]{margin-left:auto;max-width:380px}
-.hepr-editor-overlay{--hepr-editor-rotate-cursor:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'%3E%3Cpath d='M24 12a9 9 0 1 0 1 8M24 5v7h-7' fill='none' stroke='white' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M24 12a9 9 0 1 0 1 8M24 5v7h-7' fill='none' stroke='%23111' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") 16 16,crosshair;--hepr-editor-pencil-cursor:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'%3E%3Cpath d='m5 26 2-8L23 2l6 6-16 16Z' fill='white' stroke='white' stroke-width='4' stroke-linejoin='round'/%3E%3Cpath d='m5 26 2-8L23 2l6 6-16 16Z' fill='white' stroke='%23111' stroke-width='2' stroke-linejoin='round'/%3E%3Cpath d='m7 18 6 6M20 5l6 6M5 26l5-1-4-4Z' stroke='%23111' fill='%23111'/%3E%3C/svg%3E") 5 26,crosshair;position:fixed;z-index:20;touch-action:none;pointer-events:auto;overflow:visible;cursor:crosshair}
+.hepr-editor-overlay{--hepr-editor-rotate-cursor:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'%3E%3Cpath d='M24 12a9 9 0 1 0 1 8M24 5v7h-7' fill='none' stroke='white' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M24 12a9 9 0 1 0 1 8M24 5v7h-7' fill='none' stroke='%23111' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") 16 16,crosshair;--hepr-editor-pencil-cursor:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'%3E%3Cpath d='m5 26 2-8L23 2l6 6-16 16Z' fill='white' stroke='white' stroke-width='4' stroke-linejoin='round'/%3E%3Cpath d='m5 26 2-8L23 2l6 6-16 16Z' fill='white' stroke='%23111' stroke-width='2' stroke-linejoin='round'/%3E%3Cpath d='m7 18 6 6M20 5l6 6M5 26l5-1-4-4Z' stroke='%23111' fill='%23111'/%3E%3C/svg%3E") 5 26,crosshair;position:fixed;z-index:20;touch-action:none;pointer-events:auto;overflow:hidden;overflow:clip;cursor:crosshair}
 .hepr-editor-overlay[data-tool=select]{cursor:default}.hepr-editor-overlay[data-tool=form]{pointer-events:none}
 .hepr-editor-overlay[data-tool=text]{cursor:text}
 .hepr-editor-overlay[data-tool=ink]{cursor:var(--hepr-editor-pencil-cursor)}
@@ -34,6 +35,8 @@
 .hepr-editor-overlay[data-busy=true] .hepr-editor-handle,.hepr-editor-overlay[data-busy=true] .hepr-editor-selection-hit,.hepr-editor-overlay[data-settling=true] .hepr-editor-handle{display:none;pointer-events:none}
 .hepr-editor-overlay[data-settling=true] .hepr-editor-selection-hit{cursor:inherit}
 .hepr-editor-marquee{fill:#2879f51a;stroke:#1765d7;stroke-width:1;stroke-dasharray:4 3}
+.hepr-editor-signature-ghost{pointer-events:none}
+.hepr-editor-form-export-dialog{border:1px solid #b6c3d4;border-radius:10px;padding:18px;max-width:min(540px,90vw);max-height:85vh;overflow:auto;font:14px system-ui,sans-serif;color:#172333}.hepr-editor-form-export-dialog::backdrop{background:#17233366}.hepr-editor-form-export-dialog h2{margin:0 0 14px;font-size:20px}.hepr-editor-form-export-dialog p{line-height:1.5}.hepr-editor-form-export-dialog>div{display:flex;flex-wrap:wrap;gap:8px}.hepr-editor-form-export-dialog button{font:inherit;padding:6px 10px;cursor:pointer}
 .hepr-editor-field{position:absolute;box-sizing:border-box;min-width:0;min-height:0;margin:0;padding:1px;background:#eff6ff;color:#111;border:0;border-radius:0;outline:1px solid #3979cf88;outline-offset:-1px;pointer-events:auto;font:400 12px sans-serif;appearance:none;resize:none}
 .hepr-editor-field[data-pdf-appearance=true]:not(:focus){background:#3979cf14;color:transparent!important;-webkit-text-fill-color:transparent}
 .hepr-editor-field:focus{background:#eff6ff;outline:1px solid #1765d7;-webkit-text-fill-color:currentColor}
@@ -55,5 +58,26 @@ input.hepr-editor-field,textarea.hepr-editor-field{cursor:text}select.hepr-edito
 .hepr-editor-password-dialog{border:1px solid #b6c3d4;border-radius:10px;padding:18px;max-width:min(480px,90vw);font:14px system-ui,sans-serif;color:#172333}.hepr-editor-password-dialog::backdrop{background:#17233366}
 .hepr-editor-password-dialog h2{margin:0 0 14px;font-size:20px}.hepr-editor-password-dialog label{display:block;margin:10px 0}.hepr-editor-password-dialog input,.hepr-editor-password-dialog select{box-sizing:border-box;width:100%;margin-top:4px;font:inherit;padding:5px}.hepr-editor-password-dialog button{margin-right:8px;padding:5px 10px;font:inherit}.hepr-editor-password-dialog [role=alert]{color:#a21b1b}
 .hepr-editor-pages-dialog{border:1px solid #b6c3d4;border-radius:10px;padding:18px;width:min(620px,90vw);max-height:85vh;overflow:auto;font:14px system-ui,sans-serif;color:#172333}.hepr-editor-pages-dialog::backdrop{background:#17233366}.hepr-editor-pages-dialog h2{margin:0 0 14px;font-size:20px}.hepr-editor-pages-dialog button{margin:3px;padding:5px 8px;font:inherit}.hepr-editor-pages-dialog input,.hepr-editor-pages-dialog select{font:inherit}.hepr-editor-pages-dialog input[type=number]{width:60px}.hepr-editor-pages-dialog>label{display:block;margin:8px 0}.hepr-editor-pages-list{max-height:32vh;overflow:auto;margin:10px 0;border:1px solid #c6ced9;padding:6px}.hepr-editor-pages-list label{display:flex;align-items:center;gap:8px;padding:3px}.hepr-editor-pages-actions{display:flex;flex-wrap:wrap;gap:4px}
-@media(max-width:700px){.hepr-editor-toolbar{font-size:11px;max-height:42vh;left:2px;right:2px}.hepr-editor-toolbar button{padding:4px}.hepr-editor-help{display:none}.hepr-editor-transform [data-status]{max-width:100%}}
+@media(max-width:700px){.hepr-editor-toolbar{font-size:11px;max-height:42vh}.hepr-editor-toolbar button{padding:4px}.hepr-editor-help{display:none}.hepr-editor-transform [data-status]{max-width:100%}}
 @media print{.hepr-editor-toolbar,.hepr-editor-overlay{display:none!important}}
+.hepr-layer-editor-active>.pdf-layers{display:none}
+.hepr-editor-layers[hidden]{display:none}
+.hepr-editor-layers{font:12px system-ui,sans-serif;color:inherit;margin:8px 0}
+.hepr-editor-layers summary{font-weight:600;cursor:pointer}
+.hepr-editor-layers p,.hepr-editor-layer-selection{font-size:11px;line-height:1.4;opacity:.8}
+.hepr-editor-layers label{display:flex;align-items:center;gap:6px;margin:7px 0}
+.hepr-editor-layers label:has(select),.hepr-editor-layers label:has(input:not([type=checkbox])){flex-wrap:wrap}
+.hepr-editor-layers input:not([type=checkbox]),.hepr-editor-layers select{box-sizing:border-box;width:100%;min-width:0;padding:5px;font:inherit}
+.hepr-editor-layers button{font:inherit;padding:5px 7px;cursor:pointer}
+.hepr-editor-layers button:disabled{cursor:default;opacity:.5}
+.hepr-editor-layer-add,.hepr-editor-layer-actions{display:flex;align-items:center;gap:5px;margin:7px 0}
+.hepr-editor-layer-list{max-height:32vh;overflow:auto;border:1px solid #879bb244;border-radius:4px;padding:3px}
+.hepr-editor-layer-row{display:flex;align-items:center;gap:4px}
+.hepr-editor-layer-heading{font-weight:600;padding:5px 0;opacity:.8;overflow-wrap:anywhere}
+.hepr-editor-layer-row>button{flex:1;min-width:0;text-align:start;overflow-wrap:anywhere;border:1px solid transparent;border-radius:3px;background:transparent;color:inherit}
+.hepr-editor-layer-row>button[aria-pressed=true]{background:#2484ff26;border-color:#2484ff}
+.hepr-editor-layer-row>input{flex:none}
+.hepr-editor-layers fieldset{margin:10px 0;padding:7px;min-width:0;border:1px solid #879bb255;border-radius:4px}
+.hepr-editor-layers [role=status]{margin-top:7px;overflow-wrap:anywhere}
+.hepr-editor-layer-dialog{width:min(380px,90vw);max-height:85vh;overflow:auto;border:1px solid #b6c3d4;border-radius:10px;padding:16px;color:#172333;background:#fff}
+.hepr-editor-layer-dialog::backdrop{background:#17233366}

@@ -405,7 +405,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     onContextMenuCopy(): void {
       void copySelection();
     }
-  });
+  }, () => options.getCanvas()?.getBoundingClientRect() ?? null);
 
   function getSceneChecked(): VectorScene | null {
     const scene = adapter.getScene();
@@ -1287,6 +1287,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
       overlay.hide();
       return;
     }
+    overlay.refreshViewport();
 
     const midGesture = state === "mouseSelecting" || state === "touchSelecting";
     if (!selectionIsTouch) {

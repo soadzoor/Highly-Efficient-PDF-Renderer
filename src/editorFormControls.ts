@@ -6,6 +6,13 @@ export type EditorFieldControl = HTMLInputElement | HTMLTextAreaElement | HTMLSe
 let nextChoiceList = 0;
 const measureContexts = new WeakMap<Document, CanvasRenderingContext2D | null>();
 
+/** The widgets supported by the shared Fill controls; PDF actions stay inert. */
+export function canEditEditorField(annotation: SceneAnnotation): boolean {
+  const field = annotation.field;
+  if (annotation.subtype !== "Widget" || !field?.name || field.flags & 1 || !annotation.visibleInDefaultView) return false;
+  return field.type === "Tx" || field.type === "Ch" || field.type === "Btn" && !(field.flags & 65536);
+}
+
 /** Sizes are PDF-local units: the existing field matrix supplies zoom and UserUnit. */
 export function styleEditorFieldControl(control: EditorFieldControl, annotation: SceneAnnotation, fontFamily?: string): void {
   if (control.tagName === "INPUT" && /^(checkbox|radio)$/.test((control as HTMLInputElement).type)) return;
@@ -115,7 +122,7 @@ export function createEditorFieldControl(document: Document, annotation: SceneAn
   value: EditorFieldValue | undefined, onChange: (value: EditorFieldValue) => void,
   options: { usePdfAppearance?: boolean } = {}): EditorFieldControl | null {
   const field = annotation.field;
-  if (annotation.subtype !== "Widget" || !field?.name || field.flags & 1 || !annotation.visibleInDefaultView) return null;
+  if (!field?.name || !canEditEditorField(annotation)) return null;
   let input: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
   const current = value ?? field.value;
   let getValue: () => EditorFieldValue;

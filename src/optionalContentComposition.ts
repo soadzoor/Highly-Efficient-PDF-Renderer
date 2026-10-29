@@ -52,6 +52,6 @@ export function composeOptionalContent(pages: readonly (SceneOptionalContent | u
   }
   // Annotation layers are not PDF layers and never join the display order.
   for (const group of groups.values()) if (!orderGroups.has(group.id) && group.annotationId === undefined) order.push({ kind: "group", groupId: group.id });
-  return { data: groups.size ? { groups: [...groups.values()], conditions, order, radioGroups: [...radioGroups.values()] } : undefined, offsets,
+  return { data: groups.size || conditions.length ? { groups: [...groups.values()], conditions, order, radioGroups: [...radioGroups.values()] } : undefined, offsets,
     droppedAnnotationLayers };
 }

@@ -36,6 +36,7 @@ try {
   const { validateEditorOpacity, editorStyledSelection, applyEditorOpacity } = await import("../src/editorProperties.ts");
   const { LoadProgressReporter } = await import("../src/loadProgress.ts");
   const { appendEditorInkSamples, editorInkCaptureTolerance } = await import("../src/editorInkCapture.ts");
+  const { editorSignaturePlacement } = await import("../src/editorSignaturePlacement.ts");
   const { createEditorPdfProtectionState, editorPdfPasswordDraft, showEditorPdfPasswordDialog } = await import("../src/editorPdfProtectionUi.ts");
   const { parseEditorPageRange, insertEditorPdfFiles, showEditorPagesDialog } = await import("../src/editorPagesUi.ts");
   assert.deepEqual(parseEditorPageRange("3, 1-2, 2", 3), [0, 1, 2]);
@@ -266,11 +267,12 @@ try {
     transaction(label, apply) { editingEvents.push(["transaction", label]); apply(); },
     selectAnnotations(ids) { editingEvents.push(["annotations", ids]); }, deleteSelection() { editingEvents.push(["delete"]); },
     addObject(object) { editingEvents.push(["add", object]); return "new-text"; },
-    updateObject(id, object) { editingEvents.push(["update", id, object]); }, select(ids) { editingEvents.push(["select", ids]); }
+    updateObject(id, object) { editingEvents.push(["update", id, object]); }, select(ids) { editingEvents.push(["select", ids]); },
+    copyObjectLayerMembership(source, target) { editingEvents.push(["layers", source, target]); }
   };
   const newText = { kind: "text", pageIndex: 0, text: "Revised", x: 1, y: 2, width: 80, height: 30, fontSize: 12 };
   assert.equal(commitEditorText(textSession, newText, { sourceAnnotationId: "saved-FreeText" }), "new-text");
-  assert.deepEqual(editingEvents.map(event => event[0]), ["transaction", "annotations", "delete", "add", "select"], "saved textbox edits replace the source annotation in one undo transaction");
+  assert.deepEqual(editingEvents.map(event => event[0]), ["transaction", "annotations", "delete", "add", "layers", "select"], "saved textbox edits replace the source annotation and preserve exact layer membership in one undo transaction");
   editingEvents.length = 0;
   commitEditorText(textSession, null, { objectId: "existing-text" });
   assert.deepEqual(editingEvents.map(event => event[0]), ["transaction", "select", "delete", "select"], "clearing an existing textbox deletes it");
@@ -278,8 +280,22 @@ try {
   assert.deepEqual(editingEvents, [], "an empty new textbox does not modify the document");
 
   const uiSource = await readFile(new URL("../src/editorUi.ts", import.meta.url), "utf8");
+  const { editorIconButton } = await import("../src/editorToolbarIcons.ts");
+  const toolbarTemplate = uiSource.match(/toolbar\.innerHTML = (`[\s\S]*?`);/)?.[1];
+  assert(toolbarTemplate, "the editor exposes its actual toolbar markup");
+  const toolbarMarkup = vm.runInNewContext(toolbarTemplate, { editorIconButton });
+  for (const action of ["pages", "pdf-password", "save-pdf", "flatten", "save-hep", "print", "apply-text", "cancel-text", "cancel-operation"]) {
+    const button = toolbarMarkup.match(new RegExp(`<button\\b(?=[^>]*data-action="${action}")[^>]*>[\\s\\S]*?<\\/button>`))?.[0];
+    assert(button, `${action}: the action selector remains available`);
+    assert.match(button, /<svg\b[^>]*aria-hidden="true"/, `${action}: the editor action has a decorative vector icon`);
+    const title = button.match(/\btitle="([^"]+)"/)?.[1], label = button.match(/\baria-label="([^"]+)"/)?.[1];
+    assert(title && title === label, `${action}: native tooltip and accessible name describe the same action`);
+    assert.match(button, /<span\b[^>]*>[^<]+<\/span>/, `${action}: the icon retains a text caption for accessibility and fallback`);
+    const opening = button.slice(0, button.indexOf(">") + 1);
+    assert.equal(/\shidden(?:\s|>)/.test(opening), ["apply-text", "cancel-text", "cancel-operation"].includes(action), `${action}: contextual actions preserve their initial visibility`);
+  }
   const sourceLifecycle = [], changedScene = { id: "new-source" }, changedPdf = Uint8Array.of(9);
-  const sourceHost = vm.createContext({ currentSourceScene: { id: "old-source" }, latestScene: null, picker: { dispose: () => sourceLifecycle.push("dispose picker") },
+  const sourceHost = vm.createContext({ currentSourceScene: { id: "old-source" }, latestScene: null, pendingFieldFocus: { id: "old-field" }, picker: { dispose: () => sourceLifecycle.push("dispose picker") },
     picking: { abort: () => sourceLifecycle.push("cancel pick") }, session: { sourceScene: changedScene, sourcePdf: changedPdf },
     host: { documentChanged: async (scene, value) => { assert.equal(scene, changedScene); assert.equal(value.pdf, changedPdf); sourceLifecycle.push("document changed"); } },
     source: { password: "primary password", label: "primary.pdf" }, tool: "form", renderFields: () => sourceLifecycle.push("fields"), pagesDialog: { refresh: () => sourceLifecycle.push("pages") } });
@@ -287,6 +303,7 @@ try {
   await sourceHost.synchronizeDocumentSource(); await sourceHost.synchronizeDocumentSource();
   assert.deepEqual(sourceLifecycle, ["cancel pick", "dispose picker", "document changed", "fields", "pages"]);
   assert.equal(sourceHost.latestScene, changedScene); assert.equal(sourceHost.picker, null, "structural source swaps invalidate the old primitive picker exactly once");
+  assert.equal(sourceHost.pendingFieldFocus, null, "structural source swaps cancel pending focus on old widgets");
   const structuralEvents = [], structuralWarnings = [], structuralStatuses = []; let finishPageChange;
   const structuralHost = vm.createContext({ running: false, structuralRunning: false, fieldDrafts: new Map(), hasPendingEditorFields: () => false,
     flushEditorFieldDrafts: () => structuralEvents.push("fields"), activeText: {}, finishText: async () => structuralEvents.push("text"),
@@ -313,6 +330,36 @@ try {
   assert.equal(structuralHost.structuralRunning, false); assert.equal(structuralHost.toolbar.inert, false); assert.equal(structuralHost.overlay.inert, false);
   assert.deepEqual(structuralWarnings, [[], ["An imported named destination was detached."]], "the runner forwards actual diagnostic warnings once");
   assert.equal(structuralStatuses.at(-1), "An imported named destination was detached.", "completion retains the native page warning in toolbar status");
+  let attachedPageCount = 2;
+  const attachedFiles = [new File(["pdf"], "attached.pdf")], attachmentCalls = [];
+  Object.assign(structuralHost, { DOMException, active: false, session: { getState: () => ({}), getPages: () => Array.from({ length: attachedPageCount }) },
+    insertEditorDocumentFiles: async (session, files, at, options) => {
+      attachmentCalls.push({ files, at, signal: options.signal });
+      options.onDiagnostic({ code: "pages.navigation-detached", severity: "warning", message: "attached.pdf: An imported named destination was detached." });
+      attachedPageCount += 3;
+    } });
+  vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), "attachDocuments"), structuralHost);
+  await structuralHost.attachDocuments(attachedFiles);
+  assert.equal(attachmentCalls[0].at, 2, "attachment appends after the current last page");
+  assert.equal(attachmentCalls[0].files, attachedFiles); assert.equal(structuralHost.active, false, "attachment keeps a dormant editor in View mode");
+  assert.match(structuralStatuses.at(-1), /3 pages attached\..*attached\.pdf:/, "View-mode completion reports attached pages and actual import diagnostics");
+  const attachmentAbort = new AbortController();
+  structuralHost.insertEditorDocumentFiles = async (session, files, at, options) => {
+    attachedPageCount++; attachmentAbort.abort(); options.signal.throwIfAborted();
+  };
+  await assert.rejects(structuralHost.attachDocuments(attachedFiles, attachmentAbort.signal), { name: "AbortError" });
+  assert.equal(structuralStatuses.at(-1), "Attachment cancelled; 1 page remains attached.", "cancelled multi-file attachment reports previously committed pages in View mode");
+  assert.equal(structuralHost.structuralRunning, false); assert.equal(structuralHost.running, false);
+  const eventsBeforeAbortedAttachment = structuralEvents.length;
+  await assert.rejects(structuralHost.attachDocuments(attachedFiles, AbortSignal.abort()), { name: "AbortError" });
+  assert.equal(structuralEvents.length, eventsBeforeAbortedAttachment, "already-cancelled attachment cannot flush drafts or start document work");
+  structuralHost.session.getPages = () => { if (structuralHost.disposed) throw new Error("The session is disposed."); return Array.from({ length: attachedPageCount }); };
+  structuralHost.insertEditorDocumentFiles = async (session, files, at, options) => {
+    structuralHost.disposed = true; structuralHost.lifetime.abort(); options.signal.throwIfAborted();
+  };
+  const statusesBeforeDisposedAttachment = structuralStatuses.length;
+  await assert.rejects(structuralHost.attachDocuments(attachedFiles), { name: "AbortError" });
+  assert.equal(structuralStatuses.length, statusesBeforeDisposedAttachment, "a disposed attachment cannot read released pages or replace the next document's status");
   const focusedField = new Element("input"); focusedField.value = "initial"; focusedField.selectionStart = 2; focusedField.selectionEnd = 4;
   const focusedDocument = { activeElement: focusedField }; let finishCompile;
   const compilePending = new Promise(resolve => { finishCompile = resolve; });
@@ -379,15 +426,15 @@ try {
   let cancelledStructure = 0; keyHost.structuralRunning = true; keyHost.operation = { abort() { cancelledStructure++; } };
   keyHost.keydown({ key: "s", ctrlKey: true, preventDefault() {} }); keyHost.keydown({ key: "Escape", preventDefault() {} });
   assert.equal(cancelledStructure, 1); assert.deepEqual(savedFromFocus, ["pdf", "pdf"], "structural work blocks keyboard exports and allows cancellation");
-  const created = [], creationHost = vm.createContext({ objectOpacity: .375, tool: "rectangle", pendingPick: null, pointer: null,
+  const created = [], creationHost = vm.createContext({ objectOpacity: .375, fillOpacity: .6, tool: "rectangle", pendingPick: null, pointer: null,
     appendEditorInkSamples, editorInkCaptureTolerance, host: { clientToScenePoint: (x, y) => ({ x, y }), sceneToClientPoint: (x, y) => ({ x, y }) },
-    Math, clearPreview() {}, updatePointerCursor() {}, overlay: { releasePointerCapture() {} }, property: name => ({ value: name === "color" ? "#123456" : "2", checked: false }),
+    Math, editorSignaturePlacement, clearPreview() {}, updatePointerCursor() {}, overlay: { releasePointerCapture() {} }, property: name => ({ value: name === "color" ? "#123456" : "2", checked: false }),
     pageAt: () => 0, pageLocal: point => [point.x, point.y], setTool() {}, commit: apply => apply(),
-    signature: { width: 20, height: 10, paths: [[0, 0, 10, 10, 20, 0]] },
+    signature: { id: "signature", name: "Signature", width: 20, height: 10, paths: [[0, 0, 10, 10, 20, 0]] },
     pendingImage: { kind: "image", imageWidth: 1, imageHeight: 1, data: Uint8Array.of(1, 2, 3, 255) },
     session: { sourceScene: { pageRects: Float32Array.of(0, 0, 200, 300) }, addObject(object) { created.push(object); return "created"; }, select() {} }
   });
-  for (const name of ["placeImage", "placeSignature", "pointerUp"]) vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), name), creationHost);
+  for (const name of ["signaturePlacementAt", "placeImage", "placeSignature", "pointerUp"]) vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), name), creationHost);
   creationHost.placeImage({ x: 20, y: 60 }); creationHost.placeSignature({ x: 20, y: 60 });
   for (const tool of ["rectangle", "ink"]) {
     creationHost.tool = tool; creationHost.pointer = { id: 1, start: { x: 10, y: 20 }, last: { x: 40, y: 50 }, startClient: { x: 10, y: 20 },
@@ -396,6 +443,7 @@ try {
   }
   assert.deepEqual(created.map(object => object.kind), ["image", "signature", "shape", "ink"]);
   assert(created.every(object => object.opacity === .375), "creation tools carry the selected opacity into their editable objects");
+  assert(created.filter(object => object.kind !== "image").every(object => object.fillOpacity === .6), "fill-capable creation tools carry an independent fill opacity");
   creationHost.tool = "ink";
   creationHost.pointer = { id: 2, start: { x: 10, y: 10 }, last: { x: 10, y: 10 }, startClient: { x: 10, y: 10 },
     points: [[10, 10], [20, 10], [20, 20], [10, 10]], bounds: null, action: "draw" };
@@ -411,7 +459,7 @@ try {
   creationHost.pointerUp({ pointerId: 4, clientX: 9, clientY: 11, getCoalescedEvents: () => [] });
   assert.deepEqual(Array.from(created.at(-1).paths[0].at(-1)), [9, 11], "pencil release appends the actual final pen location");
   const textCreationHost = vm.createContext({ disposed: false, textRequest: 0,
-    activeText: { element: { innerText: "Opacity", scrollHeight: 20 }, pageIndex: 0, x: 5, y: 5, width: 100, height: 30, transform: [1, 0, 0, 1, 0, 0], opacity: .375 },
+    activeText: { element: { innerText: "Opacity", scrollHeight: 20 }, layerId: "draft-layer", pageIndex: 0, x: 5, y: 5, width: 100, height: 30, transform: [1, 0, 0, 1, 0, 0], opacity: .375 },
     selectedFont: async () => ({ id: "font", family: "Test" }), editorServices: { fonts: { list: () => [] } }, window: {},
     readRichTextRuns: () => [{ text: "Opacity", fontSize: 12 }], styleEnabled: () => false,
     property: name => ({ value: name === "font-size" ? "12" : "#123456" }), query: () => ({ value: "left" }),
@@ -420,6 +468,7 @@ try {
   });
   vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), "finishText"), textCreationHost);
   await textCreationHost.finishText(); assert.equal(created.at(-1).kind, "text"); assert.equal(created.at(-1).opacity, .375);
+  assert.equal(created.at(-1).layerId, "draft-layer", "a new textbox keeps the active layer captured when typing began");
   const statuses = [], downloads = [], cancellationButton = { hidden: true };
   draftField.value = "Bob";
   const savedProtection = createEditorPdfProtectionState(); savedProtection.set({ mode: "remove" });

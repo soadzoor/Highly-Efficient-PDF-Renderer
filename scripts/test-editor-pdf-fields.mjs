@@ -13,12 +13,15 @@ try {
   const { NativePdfDocument } = await import("../src/pdf/nativeDocument.ts");
   const { NativePdfWriter } = await import("../src/pdf/nativeWriter.ts");
   const { NativePdfFormAppearanceRegistry, decodePdfString } = await import("../src/pdf/nativeForms.ts");
-  const { applyEditorPdfFields, removeEditorPdfWidget } = await import("../src/editorNativePdf.ts");
+  const { applyEditorPdfFields, readEditorFieldFrame, removeEditorPdfWidget } = await import("../src/editorNativePdf.ts");
   const { createEditorAppServices } = await import("../src/editorAppServices.ts");
   const { openEditorSession } = await import("../src/editorSession.ts");
   const { openPdf } = await import("../src/pdfSession.ts");
   const { createEditorFontRegistry } = await import("../src/editorFonts.ts");
   const { renderHeprPageToCanvas2d } = await import("../src/heprCanvas2dRenderer.ts");
+  const { getScenePrimitive, getSceneAnnotationRuns } = await import("../src/scenePrimitives.ts");
+  const { editorPoint, getEditorAnnotationSource, getEditorAnnotationFrameTransform, multiplyEditorMatrices } = await import("../src/editorScene.ts");
+  const { editorFieldClientGeometry } = await import("../src/editorCoordinates.ts");
   const bytes = formFixture(), original = bytes.slice(), warnings = [];
   const fonts = createEditorFontRegistry({ loadAsset: async url => new Uint8Array(await readFile(url)) });
   const document = await NativePdfDocument.open({ kind: "bytes", bytes });
@@ -149,6 +152,102 @@ try {
   assert.equal(decoratedReopened.page.textIndex.text.replaceAll(" ", ""), "A", "nested appearance wrappers do not retain the previously filled text");
   assert.deepEqual(decoratedReopened.pixel(12, 72), decoratedBefore.pixel(12, 72), "decoration survives repeated save/reopen/fill");
 
+  async function compileFieldScene(bytes) {
+    const parser = await openPdf({ kind: "bytes", bytes });
+    try { return await parser.compileVectorPage(0, { optimization: "none" }); }
+    finally { await parser.close(); }
+  }
+  function fieldPoints(scene, matrix = [1, 0, 0, 1, 0, 0]) {
+    const annotation = scene.annotations.find(annotation => annotation.field?.name === "Text"), points = [];
+    for (const run of getSceneAnnotationRuns(scene).get(annotation.id) ?? []) for (let index = run.first; index < run.first + run.count; index++) {
+      const primitive = getScenePrimitive(scene, { kind: run.kind, index });
+      for (let segmentIndex = 0; segmentIndex < primitive.segmentCount; segmentIndex++) {
+        const segment = primitive.getSegment(segmentIndex);
+        for (const point of [segment.start, segment.end, ...(segment.control ? [segment.control] : [])]) points.push(editorPoint(matrix, point.x, point.y));
+      }
+    }
+    return points;
+  }
+  function closeCoordinates(actual, expected, message) {
+    assert.equal(actual.length, expected.length, `${message}: coordinate count`);
+    actual.forEach((value, index) => assert(Math.abs(value - expected[index]) < .002, `${message}: ${index}: ${value} vs ${expected[index]}`));
+  }
+  async function assertReopenedFieldUi(bytes, scene, value, transform, expectedPoints) {
+    const services = await createEditorAppServices({ sourcePdf: bytes, loadFontAsset: async url => new Uint8Array(await readFile(url)) });
+    const editor = await openEditorSession(scene, services.sessionOptions);
+    try {
+      const id = scene.annotations.find(annotation => annotation.field?.name === "Text").id;
+      editor.setFieldValue("Text", value);
+      const updated = await editor.getScene(), source = getEditorAnnotationSource(updated, id);
+      assert(source, "reopened field controls recover their native logical plane");
+      closeCoordinates(source.pdfGeometry.rect, [10, 70, 50, 90], "typing retains original native field dimensions");
+      const geometry = editorFieldClientGeometry(source, updated.pdfPages, point => point, getEditorAnnotationFrameTransform(updated, id));
+      assert(geometry); assert.equal(geometry.width, 40); assert.equal(geometry.height, 20);
+      closeCoordinates([geometry.origin.x, geometry.origin.y], editorPoint(transform, 10, 90), "reopened controls retain the transformed field origin");
+      closeCoordinates(geometry.transform, [transform[0], transform[1], -transform[2], -transform[3], 0, 0], "reopened controls retain oriented axes after typing");
+      closeCoordinates(fieldPoints(updated).flat(), expectedPoints, "reopened editor applies the existing appearance placement exactly once");
+    } finally { editor.dispose(); services.dispose(); }
+  }
+  const angle = Math.PI / 6, c = Math.cos(angle), s = Math.sin(angle);
+  for (const [mkRotation, decoratedText, delta] of [
+    [0, false, [c, s, -s, c, 44, -4]], [90, false, [1, .2, .3, .8, -20, 5]],
+    [180, false, [0, 1, -1, 0, 100, 30]], [270, false, [c, s, -s, c, 44, -4]],
+    [0, true, [1, .2, .3, .8, -20, 5]]
+  ]) {
+    const input = formFixture({ mkRotation, decoratedText }), source = await compileFieldScene(input);
+    const services = await createEditorAppServices({ sourcePdf: input, loadFontAsset: async url => new Uint8Array(await readFile(url)) });
+    const baseline = await openEditorSession(source, services.sessionOptions), editor = await openEditorSession(source, services.sessionOptions);
+    let transformed;
+    const expected = new Map();
+    try {
+      for (const value of ["A", "B"]) { baseline.setFieldValue("Text", value); expected.set(value, fieldPoints(await baseline.getScene(), delta).flat()); }
+      editor.setFieldValue("Text", "B");
+      editor.selectAnnotations([source.annotations.find(annotation => annotation.field?.name === "Text").id]);
+      editor.transformSelection(delta);
+      transformed = new Uint8Array(await (await editor.savePdf()).arrayBuffer());
+    } finally { baseline.dispose(); editor.dispose(); services.dispose(); }
+    for (const value of ["A", "B"]) {
+      const document = await NativePdfDocument.open({ kind: "bytes", bytes: transformed }, { repair: "off" });
+      try {
+        const field = (await new NativePdfFormAppearanceRegistry(document).listPageAnnotations(0)).find(annotation => annotation.widget?.fullyQualifiedName === "Text");
+        const frame = await readEditorFieldFrame(document, field);
+        assert(frame, "transformed fields retain a recognizable ordinary appearance frame");
+        closeCoordinates(frame.rect, [10, 70, 50, 90], "reopened field keeps its original logical rectangle");
+        closeCoordinates(frame.transform, delta, "reopened field keeps its affine placement");
+        const writer = new NativePdfWriter(document);
+        await applyEditorPdfFields(writer, new Map([["Text", value]]), fonts);
+        transformed = await writer.save();
+      } finally { await document.close(); }
+      const filled = await compileFieldScene(transformed);
+      closeCoordinates(fieldPoints(filled).flat(), expected.get(value), `MK/R ${mkRotation}: typing after save/reopen preserves rotated, scaled and decorated field geometry`);
+      assert.equal(filled.annotations.find(annotation => annotation.field?.name === "Text").field.value, value);
+      await assertReopenedFieldUi(transformed, filled, value, delta, expected.get(value));
+    }
+    if (mkRotation === 0 && !decoratedText) {
+      const previous = await compileFieldScene(transformed), services = await createEditorAppServices({ sourcePdf: transformed,
+        loadFontAsset: async url => new Uint8Array(await readFile(url)) }), editor = await openEditorSession(previous, services.sessionOptions);
+      const secondDelta = [1, .1, 0, 1, 3, -4];
+      try {
+        editor.selectAnnotations([previous.annotations.find(annotation => annotation.field?.name === "Text").id]);
+        editor.transformSelection(secondDelta); transformed = new Uint8Array(await (await editor.savePdf()).arrayBuffer());
+      } finally { editor.dispose(); services.dispose(); }
+      const document = await NativePdfDocument.open({ kind: "bytes", bytes: transformed });
+      try {
+        const field = (await new NativePdfFormAppearanceRegistry(document).listPageAnnotations(0)).find(annotation => annotation.widget?.fullyQualifiedName === "Text");
+        const frame = await readEditorFieldFrame(document, field);
+        closeCoordinates(frame.rect, [10, 70, 50, 90], "nested transformed appearances recover the initial logical rectangle");
+        closeCoordinates(frame.transform, multiplyEditorMatrices(secondDelta, delta), "nested transformed appearances compose their placements");
+        const writer = new NativePdfWriter(document); await applyEditorPdfFields(writer, new Map([["Text", "A"]]), fonts); transformed = await writer.save();
+      } finally { await document.close(); }
+      // The first expected A geometry already includes delta; apply only the second transform.
+      const expectedPoints = expected.get("A"), twice = [];
+      for (let index = 0; index < expectedPoints.length; index += 2) twice.push(...editorPoint(secondDelta, expectedPoints[index], expectedPoints[index + 1]));
+      const twiceFilled = await compileFieldScene(transformed);
+      closeCoordinates(fieldPoints(twiceFilled).flat(), twice, "typing after a second saved transform preserves both placements");
+      await assertReopenedFieldUi(transformed, twiceFilled, "A", multiplyEditorMatrices(secondDelta, delta), twice);
+    }
+  }
+
   // Fill and add another annotation on the same page: the preservation saver
   // must retain the already rewritten direct-widget /Annots array.
   const services = await createEditorAppServices({ sourcePdf: bytes,
@@ -246,7 +345,7 @@ try {
   console.log("PDF fields: values, choices, radios, shared/direct widgets, appearances, validation and integrated save/reopen passed.");
 } finally { hooks.deregister(); }
 
-function formFixture({ directAcro = false, indirectArrays = false, decoratedText = false, standardType1 = false } = {}) {
+function formFixture({ directAcro = false, indirectArrays = false, decoratedText = false, standardType1 = false, mkRotation = 0 } = {}) {
   const ap = "/AP << /N 8 0 R >>", button = "/AP << /N << /Off 8 0 R /Yes 9 0 R >> >>";
   const direct = `<< /Type /Annot /Subtype /Widget /FT /Btn /T (Direct) /V /Off /AS /Off /Rect [75 10 95 30] ${button} >>`;
   const fields = "[11 0 R 12 0 R 13 0 R 14 0 R 15 0 R 18 0 R 22 0 R 23 0 R 24 0 R 25 0 R 29 0 R]";
@@ -263,7 +362,7 @@ function formFixture({ directAcro = false, indirectArrays = false, decoratedText
     { number: 8, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 20 20] /Resources << >>", "") },
     { number: 9, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 20 20] /Resources << >>", "0 0 0 rg 3 3 14 14 re f") },
     { number: 10, body: acro },
-    { number: 11, body: `<< /Type /Annot /Subtype /Widget /FT /Tx /T (Text) /V (A) /MaxLen 2 /Rect [10 70 50 90] ${standardType1 ? "/DA (/TiRo 10 Tf 0 g)" : ""} ${decoratedText ? "/AP << /N 32 0 R >>" : ap} >>` },
+    { number: 11, body: `<< /Type /Annot /Subtype /Widget /FT /Tx /T (Text) /V (A) /MaxLen 2 /Rect [10 70 50 90] ${mkRotation ? `/MK << /R ${mkRotation} >>` : ""} ${standardType1 ? "/DA (/TiRo 10 Tf 0 g)" : ""} ${decoratedText ? "/AP << /N 32 0 R >>" : ap} >>` },
     { number: 12, body: `<< /Type /Annot /Subtype /Widget /FT /Tx /T (ReadOnly) /Ff 1 /V (A) /Rect [55 70 95 90] ${ap} >>` },
     { number: 13, body: `<< /Type /Annot /Subtype /Widget /FT /Ch /T (Choice) /Opt [[(A) (A)] [(B) (B)]] /V (A) /I [0] /Rect [10 40 50 60] ${ap} >>` },
     { number: 14, body: `<< /Type /Annot /Subtype /Widget /FT /Btn /T (Check) /V /Off /AS /Off /Rect [55 40 75 60] ${button} >>` },

@@ -1,10 +1,13 @@
 import "./readerViewport.css";
+import "./viewerWorkspace.css";
+import "./toolbarIcons.css";
 import { WebGlPdfRenderer } from "./webGlPdfRenderer";
 import type { RendererApi } from "./rendererTypes";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { RetainedPageReplay } from "./retainedPageReplay";
 import { createDefaultOptionalContentSnapshot } from "./optionalContent";
 import type { ThumbnailPixels } from "./thumbnailTypes";
+import { toolbarButton } from "./toolbarIcons";
 import {
   READER_ACTUAL_SIZE_ZOOM, READER_MARGIN, readerCaptureAnchor, readerContentMetrics,
   readerFitZoom, readerPageAtPoint, readerRestoreAnchor, readerScrollFromView,
@@ -20,6 +23,7 @@ export interface ReaderViewportSnapshot {
 }
 export interface ReaderViewportOptions {
   getCanvas(): HTMLCanvasElement;
+  settingsPanel?: HTMLElement;
   layouts: readonly { value: string; label: string }[];
   onLayoutChange(layout: string): void | Promise<void>;
   onViewChange(view: ReaderView): void;
@@ -45,22 +49,22 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     <div class="reader-primary-controls"></div>
     <label class="reader-layout-label">Layout <select class="reader-layout" aria-label="Page layout"></select></label>
     <div class="reader-reading-controls">
-      <button type="button" data-reader="thumbnails" aria-label="Toggle page thumbnails" aria-expanded="false">▤</button>
-      <button type="button" data-reader="previous" aria-label="Previous page">‹</button>
+      ${toolbarButton("thumbnails", "Toggle page thumbnails", 'data-reader="thumbnails" aria-expanded="false"')}
+      ${toolbarButton("previous", "Previous page", 'data-reader="previous"')}
       <input class="reader-page-number" type="number" min="1" value="1" aria-label="Page number" />
       <span class="reader-page-count">/ 0</span>
-      <button type="button" data-reader="next" aria-label="Next page">›</button>
-      <button type="button" data-reader="zoom-out" aria-label="Zoom out">−</button>
+      ${toolbarButton("next", "Next page", 'data-reader="next"')}
+      ${toolbarButton("zoom-out", "Zoom out", 'data-reader="zoom-out"')}
       <input class="reader-zoom" type="text" inputmode="decimal" value="100%" aria-label="Zoom percentage" />
-      <button type="button" data-reader="zoom-in" aria-label="Zoom in">+</button>
-      <button type="button" data-reader="fit-width">Fit Width</button>
-      <button type="button" data-reader="fit-page">Fit Page</button>
+      ${toolbarButton("zoom-in", "Zoom in", 'data-reader="zoom-in"')}
+      ${toolbarButton("fit-width", "Fit Width", 'data-reader="fit-width"')}
+      ${toolbarButton("fit-page", "Fit Page", 'data-reader="fit-page"')}
     </div>
-    <button type="button" data-reader="find">Find</button>
-    <button type="button" data-reader="settings">Settings</button>
-    <button type="button" data-reader="hide-toolbar" aria-controls="reader-toolbar" aria-expanded="true">Hide toolbar</button>
+    ${toolbarButton("find", "Find text in the document (Ctrl/Cmd+F)", 'data-reader="find"')}
+    ${toolbarButton("settings", "Settings", 'data-reader="settings"')}
+    ${toolbarButton("hide-toolbar", "Hide toolbar", 'data-reader="hide-toolbar" aria-controls="reader-toolbar" aria-expanded="true"')}
     <span class="reader-announcement" role="status" aria-live="polite"></span>
-  </div><button type="button" class="reader-toolbar-restore" data-reader="show-toolbar" aria-controls="reader-toolbar" aria-expanded="false" hidden>Show toolbar</button><div class="reader-workspace">
+  </div>${toolbarButton("show-toolbar", "Show toolbar", 'data-reader="show-toolbar" aria-controls="reader-toolbar" aria-expanded="false" hidden', "reader-toolbar-restore")}<div class="reader-workspace viewer-workspace">
     <aside class="reader-thumbnails" aria-label="Page thumbnails" hidden></aside>
     <div class="reader-scroll" tabindex="0" role="region" aria-label="Document pages">
       <div class="reader-surface"></div>
@@ -72,6 +76,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   const showToolbar = query<HTMLButtonElement>('[data-reader="show-toolbar"]');
   const scroller = query<HTMLDivElement>(".reader-scroll"), surface = query<HTMLDivElement>(".reader-surface");
   const sidebar = query<HTMLElement>(".reader-thumbnails");
+  const settingsButton = query<HTMLButtonElement>('[data-reader="settings"]');
   const layoutSelect = query<HTMLSelectElement>(".reader-layout");
   const pageInput = query<HTMLInputElement>(".reader-page-number"), zoomInput = query<HTMLInputElement>(".reader-zoom");
   const pageCount = query<HTMLSpanElement>(".reader-page-count");
@@ -90,6 +95,12 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   for (const selector of [".package-version", "#open-file", "#example-dropdown"]) {
     const element = document.querySelector<HTMLElement>(selector);
     if (element) primary.append(element);
+  }
+  if (options.settingsPanel) {
+    options.settingsPanel.classList.add("viewer-settings");
+    query<HTMLElement>(".reader-workspace").append(options.settingsPanel);
+    if (options.settingsPanel.id) settingsButton.setAttribute("aria-controls", options.settingsPanel.id);
+    settingsButton.setAttribute("aria-expanded", String(!options.settingsPanel.classList.contains("collapsed")));
   }
   document.body.append(shell);
   document.body.classList.add("has-reader-toolbar");
@@ -221,6 +232,11 @@ export function createReaderViewport(options: ReaderViewportOptions) {
       present();
     }
     updateThumbnails();
+  }
+  function settingsChanged(): void {
+    if (!options.settingsPanel) return;
+    settingsButton.setAttribute("aria-expanded", String(!options.settingsPanel.classList.contains("collapsed")));
+    cancelActiveGesture(); resize();
   }
   function stopInertia(): void { if (inertiaFrame) window.cancelAnimationFrame(inertiaFrame); inertiaFrame = 0; }
   function updateToolbarOffset(): void {
@@ -547,7 +563,10 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   scroller.addEventListener("wheel", event => {
     stopInertia();
     if (!active || event.defaultPrevented || event.ctrlKey || event.metaKey) return;
-    if (metrics.surfaceWidth <= scroller.scrollWidth + 1 && metrics.surfaceHeight <= scroller.scrollHeight + 1) return;
+    // Editor overlays forward wheel events to the canvas. Synthetic events have
+    // no browser scroll default, so apply their deltas even without compression.
+    const forwarded = !event.isTrusted && event.target === attachedCanvas;
+    if (!forwarded && metrics.surfaceWidth <= scroller.scrollWidth + 1 && metrics.surfaceHeight <= scroller.scrollHeight + 1) return;
     event.preventDefault();
     const unit = event.deltaMode === 1 ? 16 : 1;
     const left = event.shiftKey && !event.deltaX ? event.deltaY : event.deltaX;
@@ -612,5 +631,5 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     announcement.textContent = "";
   }
   return { setDocument, setLayout, getView, setView, goToPage, resize, canvasChanged,
-    invalidateThumbnails, snapshot, restore, dispose, isActive, cancelActiveGesture };
+    invalidateThumbnails, snapshot, restore, dispose, isActive, cancelActiveGesture, settingsChanged };
 }

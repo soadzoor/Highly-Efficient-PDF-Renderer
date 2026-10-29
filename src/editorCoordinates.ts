@@ -3,18 +3,23 @@ import type { SceneAnnotation, ScenePdfPage } from "./annotationData";
 import type { Bounds } from "./pdfVectorExtractor";
 import type { EditorMatrix } from "./editorTypes";
 
-/** Project an input's native PDF axes, retaining page rotation, crop and UserUnit. */
+/** Project native PDF axes through page placement and any editor transform. */
 export function editorFieldClientGeometry(annotation: SceneAnnotation, pages: readonly ScenePdfPage[] | undefined,
-  project: (point: PrimitivePoint, pageIndex: number) => PrimitivePoint | null):
+  project: (point: PrimitivePoint, pageIndex: number) => PrimitivePoint | null, sceneTransform?: EditorMatrix):
   { origin: PrimitivePoint; width: number; height: number; transform: EditorMatrix } | null {
   const rect = annotation.pdfGeometry?.rect, matrix = pages?.find(page => page.pageIndex === annotation.pageIndex)?.pdfToScene;
   if (!rect || rect.length !== 4 || !rect.every(Number.isFinite) || !matrix || matrix.length !== 6 || !matrix.every(Number.isFinite)) return null;
+  if (sceneTransform && (sceneTransform.length !== 6 || !sceneTransform.every(Number.isFinite))) return null;
   const minX = Math.min(rect[0], rect[2]), maxX = Math.max(rect[0], rect[2]), minY = Math.min(rect[1], rect[3]), maxY = Math.max(rect[1], rect[3]);
   const width = maxX - minX, height = maxY - minY;
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
   const [a, b, c, d, e, f] = matrix;
   const map = (x: number, y: number): PrimitivePoint | null => {
-    const point = { x: a * x + c * y + e, y: b * x + d * y + f };
+    let point = { x: a * x + c * y + e, y: b * x + d * y + f };
+    if (sceneTransform) {
+      const [ta, tb, tc, td, te, tf] = sceneTransform;
+      point = { x: ta * point.x + tc * point.y + te, y: tb * point.x + td * point.y + tf };
+    }
     if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return null;
     const result = project(point, annotation.pageIndex);
     return result && Number.isFinite(result.x) && Number.isFinite(result.y) ? result : null;

@@ -10,9 +10,11 @@ import { compileEditorObjectGeometry } from "./editorSceneObjects";
 import { openPdf, type NativeVectorPdfSession } from "./pdfSession";
 import { NativePdfDocument } from "./pdf/nativeDocument";
 import { NativePdfWriter } from "./pdf/nativeWriter";
-import { applyEditorPdfFields, saveEditorNativePdf } from "./editorNativePdf";
-import { transformWholeEditorScene, getEditorAnnotationTransform, multiplyEditorMatrices } from "./editorScene";
+import { applyEditorPdfFields, readEditorFieldFrame, saveEditorNativePdf } from "./editorNativePdf";
+import { transformWholeEditorScene, getEditorAnnotationTransform, getEditorAnnotationSource, getEditorAnnotationFrameTransform,
+  multiplyEditorMatrices, invertEditorMatrix, editorTransformBounds, retainEditorAnnotationPlacements, setEditorAnnotationSource } from "./editorScene";
 import { ScenePageViews } from "./scenePageViews";
+import { remapEditorPaintIdentity, composeEditorPaintIdentity } from "./editorPaintIdentity";
 import { extractEditorFieldAppearance, replaceEditorFieldAppearances } from "./editorFieldPaintOrder";
 import { NativePdfFormAppearanceRegistry } from "./pdf/nativeForms";
 import { NativePdfAnnotationMetadataRegistry } from "./pdf/nativeAnnotations";
@@ -71,7 +73,9 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
     signal?.throwIfAborted();
     const targets = (scene.annotations ?? []).filter(annotation => annotation.field?.name && values.has(annotation.field.name));
     const partition = new ScenePageViews(scene);
-    const pages = Array.from({ length: scene.pageCount }, (_, i) => partition.extract(i).scene);
+    const pages = Array.from({ length: scene.pageCount }, (_, i) => {
+      const view = partition.extract(i); remapEditorPaintIdentity(scene, view.scene, view.primitives); return view.scene;
+    });
     const additions: Map<string, VectorScene | null>[] = Array.from({ length: scene.pageCount }, () => new Map());
     let parser: NativeVectorPdfSession | undefined;
     if (options.sourcePdf) {
@@ -99,7 +103,9 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
           }
         } else for (const annotation of annotations) {
           if (annotation.flags & (1 | 2 | 32)) { additions[index].set(annotation.id, null); continue; }
-          const field = annotation.field!, value = values.get(field.name!)!, r = annotation.bounds;
+          const source = getEditorAnnotationSource(scene, annotation.id) ?? annotation;
+          const delta = getEditorAnnotationFrameTransform(scene, annotation.id) ?? [1, 0, 0, 1, 0, 0];
+          const field = annotation.field!, value = values.get(field.name!)!, r = source.bounds;
           const x = r.minX - origin[0], y = r.minY - origin[1], width = r.maxX - r.minX, height = r.maxY - r.minY;
           let object: EditorObject;
           if (field.type === "Btn") {
@@ -116,15 +122,17 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
           geometry.drawRuns = (geometry.drawRuns ?? defaultVectorDrawRuns(geometry)).map(run => ({ ...run,
             optionalContent: layers.condition(run.optionalContent, annotation.id) }));
           geometry.optionalContent = layers.build();
-          additions[index].set(annotation.id, transformWholeEditorScene(geometry, [1, 0, 0, 1, ...origin], signal));
+          additions[index].set(annotation.id, transformWholeEditorScene(geometry, multiplyEditorMatrices(delta, [1, 0, 0, 1, ...origin]), signal));
         }
       }
     } finally { await parser?.close(); }
     const preserveNonText = !options.sourcePdf ? new Set(targets.filter(annotation => annotation.field?.type === "Tx").map(annotation => annotation.id)) : undefined;
-    const result = composeOverlappingVectorScenes(pages.map((page, index) => replaceEditorFieldAppearances(page, additions[index], { preserveNonText, signal })));
+    const updatedPages = pages.map((page, index) => replaceEditorFieldAppearances(page, additions[index], { preserveNonText, signal }));
+    const result = composeOverlappingVectorScenes(updatedPages); composeEditorPaintIdentity(updatedPages, result);
     result.annotations = scene.annotations?.map(annotation => annotation.field?.name && values.has(annotation.field.name)
       ? { ...annotation, field: { ...annotation.field, value: values.get(annotation.field.name)! } } : annotation);
     result.pdfPages = scene.pdfPages; result.sourcePdfByteLength = scene.sourcePdfByteLength; result.pagesPerRow = scene.pagesPerRow;
+    retainEditorAnnotationPlacements(scene, result);
     return result;
   };
   const sessionOptions: EditorSessionOptions = {
@@ -147,17 +155,30 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
         const optional = await createNativeOptionalContentRegistry(document, { signal });
         const registry = new NativePdfAnnotationMetadataRegistry(document, forms, optional, options.onDiagnostic ?? (() => {}), true);
         const fields = new Map<string, NonNullable<NonNullable<VectorScene["annotations"]>[number]["field"]>>();
+        const frames = new Map<string, NonNullable<Awaited<ReturnType<typeof readEditorFieldFrame>>>>();
         const sourcePages = new Set(scene.annotations.filter(annotation => annotation.field).map(annotation => annotation.sourcePageIndex));
         const styles = createEditorFieldAppearanceReader(document, fonts, await getMissingFontResolver(), options.onDiagnostic);
         for (const page of sourcePages) {
           for (const annotation of await registry.getPageAnnotations(page, signal)) if (annotation.field) fields.set(annotation.id, annotation.field);
           for (const annotation of await forms.listPageAnnotations(page, signal)) {
-            const field = fields.get(annotation.id), textStyle = field && await styles.read(annotation, signal);
+            const field = fields.get(annotation.id), frame = field && await readEditorFieldFrame(document, annotation, signal);
+            const textStyle = field && await styles.read(frame ? { ...annotation, rectangle: frame.rect } : annotation, signal);
             if (field && textStyle) fields.set(annotation.id, { ...field, textStyle });
+            if (frame) frames.set(annotation.id, frame);
           }
         }
-        return { ...scene, annotations: scene.annotations.map(annotation => fields.has(annotation.id)
+        const result = { ...scene, annotations: scene.annotations.map(annotation => fields.has(annotation.id)
           ? { ...annotation, field: fields.get(annotation.id) } : annotation) };
+        retainEditorAnnotationPlacements(scene, result);
+        for (const annotation of result.annotations) {
+          const frame = frames.get(annotation.id), mapping = scene.pdfPages?.find(page => page.pageIndex === annotation.pageIndex)?.pdfToScene;
+          if (!frame || !mapping) continue;
+          const [minX, minY, maxX, maxY] = frame.rect;
+          const original = { ...annotation, pdfGeometry: { ...annotation.pdfGeometry, rect: frame.rect },
+            bounds: editorTransformBounds({ minX, minY, maxX, maxY }, mapping) };
+          setEditorAnnotationSource(result, original, multiplyEditorMatrices(mapping, multiplyEditorMatrices(frame.transform, invertEditorMatrix(mapping))));
+        }
+        return result;
       } finally { await document.close(); }
     },
     savePdf: (scene, session, saveOptions) => saveEditorNativePdf(scene, session, saveOptions, { fonts, password: options.password, compileObject })

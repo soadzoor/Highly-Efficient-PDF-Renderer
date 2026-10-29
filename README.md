@@ -18,7 +18,7 @@ Open the [standalone viewer](https://soadzoor.github.io/Highly-Efficient-PDF-Ren
 - **Multiple pages:** load a whole PDF or selected pages, arranged in a grid.
 - **Search and selection:** find text, highlight matches, and copy selections on desktop and touch devices.
 - **Drawing selection:** select drawing elements, inspect their geometry and layer membership, and temporarily recolor vectors.
-- **PDF editing:** switch from View to Edit to fill forms, add rich text, vector markups, handwritten signatures and images; select and transform multiple objects, undo changes, and save PDF/HEP or print. Editing loads on demand. See [editing](docs/manual.md#editing-documents).
+- **PDF editing:** switch from View to Edit to fill forms, add rich text, vector markups, handwritten signatures and images; manage PDF layers and their stacking, select and transform multiple objects, undo changes, and save PDF/HEP or print. Editing loads on demand. See [editing](docs/manual.md#editing-documents).
 - **PDF layers:** toggle optional content in the main viewer, inspect layer dependencies when picking geometry, or use the shared library APIs.
 - **Reusable documents:** export `.hep` files with geometry, images, and a searchable text index to skip PDF parsing on subsequent loads.
 - **Fast thumbnails:** prepare one PDF/HEP page for its requested pixel size, with cancellation, lossless WebP output, and reusable thumbnail-to-HEP sessions.

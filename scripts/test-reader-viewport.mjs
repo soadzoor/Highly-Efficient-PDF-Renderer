@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { registerHooks } from "node:module";
+import { readFile } from "node:fs/promises";
+import { registerHooks, stripTypeScriptTypes } from "node:module";
+import vm from "node:vm";
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
 
 const gpu = { instances: [], copies: [] };
@@ -10,7 +12,7 @@ const hooks = registerHooks({
       ? `${specifier}.ts` : specifier, context);
   },
   load(url, context, next) {
-    if (url.endsWith("/readerViewport.css")) return { format: "module", shortCircuit: true, source: "export {};" };
+    if (url.endsWith("/readerViewport.css") || url.endsWith("/viewerWorkspace.css") || url.endsWith("/toolbarIcons.css")) return { format: "module", shortCircuit: true, source: "export {};" };
     if (url.endsWith("/webGlPdfRenderer.ts")) return { format: "module", shortCircuit: true, source: `
       export class WebGlPdfRenderer {
         constructor(canvas) { this.canvas=canvas; this.disposed=false; globalThis.__readerViewportGpu.instances.push(this); }
@@ -74,6 +76,7 @@ class Element {
   matches(selector) {
     if (selector.startsWith(".")) return this.classList.contains(selector.slice(1));
     if (selector.startsWith("#")) return this.id === selector.slice(1);
+    if (/^[a-z][\w:-]*$/i.test(selector)) return this.tagName === selector;
     const data = selector.match(/^(button)?\[data-reader(?:="([^"]+)")?\]$/);
     return !!data && (!data[1] || this.tagName === "button") && this.dataset.reader !== undefined && (!data[2] || this.dataset.reader === data[2]);
   }
@@ -81,6 +84,31 @@ class Element {
   set innerHTML(html) {
     this.replaceChildren();
     const create = (tag, className, parent = this) => { const node = this.ownerDocument.createElement(tag); node.className = className; parent.append(node); return node; };
+    const decode = text => text.replace(/&(amp|quot|lt|gt|#39);/g, (_, name) => ({ amp: "&", quot: '"', lt: "<", gt: ">", "#39": "'" })[name]);
+    const attributes = (node, markup) => {
+      for (const [, name, rawValue] of markup.matchAll(/([\w:-]+)(?:="([^"]*)")?/g)) {
+        const value = decode(rawValue ?? ""); node.setAttribute(name, value);
+        if (name === "class") node.className = value;
+        else if (name === "id" || name === "title") node[name] = value;
+        else if (name === "hidden") node.hidden = true;
+        else if (name.startsWith("data-")) node.dataset[name.slice(5).replace(/-([a-z])/g, (_, char) => char.toUpperCase())] = value;
+      }
+    };
+    const readerButton = (action, parent) => {
+      const match = html.match(new RegExp(`<button\\b([^>]*data-reader="${action}"[^>]*)>([\\s\\S]*?)</button>`));
+      assert(match, `Reader markup includes its ${action} button`);
+      const button = create("button", "", parent); attributes(button, match[1]);
+      const icon = match[2].match(/<svg\b([^>]*)>([\s\S]*?)<\/svg>/);
+      if (icon) {
+        const svg = create("svg", "", button); attributes(svg, icon[1]);
+        for (const [, tag, markup] of icon[2].matchAll(/<(path|line|rect|circle|ellipse|polyline|polygon)\b([^>]*)\/?\s*>/g)) attributes(create(tag, "", svg), markup);
+      }
+      for (const [, markup, text] of match[2].matchAll(/<span\b([^>]*)>([^<]*)<\/span>/g)) {
+        const caption = create("span", "", button); attributes(caption, markup); caption.textContent = decode(text);
+      }
+      button.textContent = decode(match[2].replace(/<[^>]+>/g, "")).trim();
+      return button;
+    };
     if (html.includes("reader-toolbar")) {
       const toolbar = create("div", "reader-toolbar");
       if (html.includes('id="reader-toolbar"')) toolbar.id = "reader-toolbar";
@@ -88,28 +116,11 @@ class Element {
       const reading = create("div", "reader-reading-controls", toolbar);
       const actions = ["thumbnails", "previous", "next", "zoom-out", "zoom-in", "fit-width", "fit-page", "find", "settings"];
       if (html.includes('data-reader="hide-toolbar"')) actions.push("hide-toolbar");
-      for (const action of actions) {
-        const button = create("button", "", toolbar); button.dataset.reader = action;
-        button.textContent = html.match(new RegExp(`<button\\b[^>]*data-reader="${action}"[^>]*>([^<]*)</button>`))?.[1] ?? "";
-        const markup = html.match(new RegExp(`<button\\b[^>]*data-reader="${action}"[^>]*>`))?.[0] ?? "";
-        for (const name of ["aria-controls", "aria-expanded"]) {
-          const attribute = markup.match(new RegExp(`${name}="([^"]+)"`));
-          if (attribute) button.setAttribute(name, attribute[1]);
-        }
-      }
+      for (const action of actions) readerButton(action, toolbar);
       create("input", "reader-page-number", reading); create("span", "reader-page-count", reading);
       create("input", "reader-zoom", reading); create("span", "reader-announcement", toolbar);
-      if (html.includes('data-reader="show-toolbar"')) {
-        const restore = create("button", "reader-toolbar-restore"); restore.dataset.reader = "show-toolbar";
-        const markup = html.match(/<button\b[^>]*data-reader="show-toolbar"[^>]*>/)[0];
-        restore.textContent = html.match(/<button\b[^>]*data-reader="show-toolbar"[^>]*>([^<]*)<\/button>/)?.[1] ?? "";
-        restore.hidden = /\bhidden\b/.test(markup);
-        for (const name of ["aria-controls", "aria-expanded"]) {
-          const attribute = markup.match(new RegExp(`${name}="([^"]+)"`));
-          if (attribute) restore.setAttribute(name, attribute[1]);
-        }
-      }
-      const workspace = create("div", "reader-workspace");
+      if (html.includes('data-reader="show-toolbar"')) readerButton("show-toolbar", this);
+      const workspace = create("div", "reader-workspace viewer-workspace");
       const sidebar = create("aside", "reader-thumbnails", workspace); sidebar.hidden = true;
       const scroller = create("div", "reader-scroll", workspace); create("div", "reader-surface", scroller);
     } else if (html.includes("reader-thumbnail-image")) {
@@ -130,7 +141,7 @@ class Element {
   }
   emit(type, values = {}) {
     const event = { type, target: this, button: 0, pointerType: "mouse", pointerId: 1,
-      ctrlKey: false, metaKey: false, shiftKey: false, deltaMode: 0, deltaX: 0, deltaY: 0, ...values,
+      isTrusted: true, ctrlKey: false, metaKey: false, shiftKey: false, deltaMode: 0, deltaX: 0, deltaY: 0, ...values,
       preventDefault() { this.defaultPrevented = true; } };
     for (let node = this; node; node = node.parentElement) {
       for (const { listener } of [...node.listeners.get(type) ?? []]) listener(event);
@@ -141,9 +152,11 @@ class Element {
   get clientWidth() {
     if (this.classList.contains("reader-scroll")) {
       const sidebar = this.ownerDocument.querySelector(".reader-thumbnails");
-      return this.ownerDocument.viewportWidth - (sidebar?.hidden ? 0 : this.ownerDocument.viewportWidth < 800 ? 152 : 180);
+      const settings = this.ownerDocument.querySelector(".viewer-settings");
+      return this.ownerDocument.viewportWidth - (sidebar?.clientWidth ?? 0) - (settings?.clientWidth ?? 0);
     }
-    if (this.classList.contains("reader-thumbnails")) return this.hidden ? 0 : this.ownerDocument.viewportWidth < 800 ? 152 : 180;
+    if (this.classList.contains("viewer-settings")) return this.classList.contains("collapsed") ? 0 : Math.min(360, this.ownerDocument.viewportWidth * .45);
+    if (this.classList.contains("reader-thumbnails")) return this.hidden ? 0 : Math.min(this.ownerDocument.viewportWidth * .25, this.ownerDocument.viewportWidth < 800 ? 152 : 180);
     return Number.parseFloat(this.style.width) || this.width;
   }
   get clientHeight() {
@@ -182,7 +195,7 @@ class Element {
         right:this.ownerDocument.viewportWidth,bottom:this.clientHeight };
     }
     const scroller = this.ownerDocument.querySelector(".reader-scroll");
-    const left = this.ownerDocument.viewportWidth - (scroller?.clientWidth ?? this.clientWidth);
+    const left = this.ownerDocument.querySelector(".reader-thumbnails")?.clientWidth ?? 0;
     const top = this.ownerDocument.querySelector(".reader-toolbar")?.clientHeight ?? 64;
     const width = Number.parseFloat(this.style.width) || scroller?.clientWidth || this.clientWidth;
     const height = Number.parseFloat(this.style.height) || scroller?.clientHeight || this.clientHeight;
@@ -230,11 +243,187 @@ async function until(predicate) { for (let i = 0; i < 100; i++) { if (predicate(
 function close(actual, expected, message) { assert(Math.abs(actual - expected) < 1e-7, `${message}: ${actual} != ${expected}`); }
 function deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; }
 
+const editorUiSource = await readFile(new URL("../src/editorUi.ts", import.meta.url), "utf8");
+const editorWheelStart = editorUiSource.indexOf('  overlay.addEventListener("wheel",'),
+  editorWheelEnd = editorUiSource.indexOf("\n  }, { passive: false });", editorWheelStart);
+assert(editorWheelStart >= 0 && editorWheelEnd > editorWheelStart, "the editor forwards wheel input through its overlay");
+const editorWheelSource = stripTypeScriptTypes(editorUiSource.slice(editorWheelStart, editorWheelEnd + "\n  }, { passive: false });".length));
+
+/** Run the production overlay bridge against the Reader's real event handlers. */
+function editorWheelBridge(env) {
+  const dispatches = []; let handler;
+  const context = vm.createContext({ activeText: null,
+    overlay: { addEventListener(type, listener) { assert.equal(type, "wheel"); handler = listener; } },
+    host: { getCanvas() {
+      const canvas = env.canvas;
+      canvas.dispatchEvent = event => {
+        const dispatched = canvas.emit(event.type, { ...event, isTrusted: false }); dispatches.push({ canvas, event: dispatched });
+        return !dispatched.defaultPrevented;
+      };
+      return canvas;
+    } },
+    WheelEvent: class { constructor(type, values) { this.type = type; Object.assign(this, values); } }
+  });
+  vm.runInContext(editorWheelSource, context);
+  return { context, dispatches, wheel(values = {}) {
+    const event = { target: { closest: () => null }, clientX: 350, clientY: 300, deltaX: 0, deltaY: 0, deltaZ: 0, deltaMode: 0,
+      ctrlKey: false, metaKey: false, shiftKey: false, ...values,
+      preventDefault() { this.defaultPrevented = true; }, stopPropagation() { this.propagationStopped = true; } };
+    handler(event); return event;
+  } };
+}
+
 try {
   const { createReaderViewport } = await import("../src/readerViewport.ts");
   const { READER_ACTUAL_SIZE_ZOOM, readerContentMetrics, readerViewFromScroll } = await import("../src/readerGeometry.ts");
   const { createViewerLinkNavigation, resolveAnnotationView } = await import("../src/viewerLinkNavigation.ts");
   const { createAnnotationInteractionController } = await import("../src/annotationInteraction.ts");
+  for (const width of [320, 700, 1000]) {
+    const env = environment(width), doc = env.document;
+    const settings = doc.createElement("aside"); settings.id = "hud";
+    const field = doc.createElement("input"); settings.append(field); doc.body.append(settings);
+    let changes = 0; field.addEventListener("change", () => changes++);
+    env.options.settingsPanel = settings;
+    env.options.onSettings = () => { settings.classList.toggle("collapsed"); reader.settingsChanged(); };
+    const reader = createReaderViewport(env.options), workspace = doc.querySelector(".reader-workspace");
+    const scroller = doc.querySelector(".reader-scroll"), settingsButton = doc.querySelector('[data-reader="settings"]');
+    assert.equal(settings.parentElement, workspace, "Settings is a workspace column, beside the document scroller");
+    assert.equal(workspace.children.at(-1), settings, "Settings is the rightmost column");
+    assert.equal(settings.querySelector("input"), field, "docking retains the existing controls and handlers");
+    field.emit("change"); assert.equal(changes, 1);
+    assert.equal(settingsButton.getAttribute("aria-controls"), "hud");
+    assert.equal(settingsButton.getAttribute("aria-expanded"), "true");
+    reader.setDocument({ identity: "docked-settings", pageRects: pageRects(8) }); reader.setLayout("reader");
+    reader.setView({ centerX: 0, centerY: -3000, zoom: 2 });
+    const original = reader.getView(), reserved = settings.clientWidth;
+    assert(scroller.clientWidth > 0, "a narrow window retains a document viewport alongside Settings and thumbnails");
+    assert.equal(env.canvas.getBoundingClientRect().right, width - reserved, "the canvas ends at the Settings boundary");
+    settings.emit("wheel", { deltaY: 100 });
+    assert.deepEqual(reader.getView(), original, "scrolling Settings does not scroll the document");
+    settingsButton.emit("click");
+    close(reader.getView().width, original.width + reserved, "closing Settings returns its width synchronously");
+    close(reader.getView().centerX, original.centerX, "closing Settings preserves the horizontal camera center");
+    close(reader.getView().centerY, original.centerY, "closing Settings preserves the reading position");
+    close(reader.getView().zoom, original.zoom, "closing Settings preserves manual zoom");
+    assert.equal(settingsButton.getAttribute("aria-expanded"), "false");
+    settingsButton.emit("click");
+    assert.deepEqual(reader.getView(), original, "reopening Settings restores viewport size without moving the document");
+    assert.equal(settingsButton.getAttribute("aria-expanded"), "true");
+    reader.setLayout("grid"); assert.equal(env.canvas.getBoundingClientRect().right, width - reserved);
+    assert.equal(scroller.clientWidth, width - reserved, "non-Reader layouts also reserve Settings space");
+    const replacement = env.replaceCanvas(); reader.canvasChanged();
+    assert.equal(settings.parentElement, workspace, "backend replacement retains the Settings column and controls");
+    assert.equal(replacement.getBoundingClientRect().right, width - reserved);
+    reader.setLayout("reader");
+    doc.querySelector('[data-reader="fit-width"]').emit("click");
+    const dockedZoom = reader.getView().zoom;
+    settingsButton.emit("click");
+    assert(reader.getView().zoom > dockedZoom, "Fit Width uses the document width gained by closing Settings");
+    settingsButton.emit("click"); close(reader.getView().zoom, dockedZoom, "Fit Width returns to the docked width");
+    doc.querySelector('[data-reader="hide-toolbar"]').emit("click");
+    assert.equal(settings.parentElement, workspace, "hiding the main toolbar retains the dock");
+    assert.equal(scroller.clientHeight, env.document.viewportHeight, "the dock and document use space released by the toolbar");
+    reader.dispose();
+  }
+  {
+    const env = environment(), reader = createReaderViewport(env.options);
+    for (const [action, label] of [
+      ["thumbnails", "Toggle page thumbnails"], ["previous", "Previous page"], ["next", "Next page"],
+      ["zoom-out", "Zoom out"], ["zoom-in", "Zoom in"], ["fit-width", "Fit Width"], ["fit-page", "Fit Page"],
+      ["find", "Find text in the document (Ctrl/Cmd+F)"], ["settings", "Settings"],
+      ["hide-toolbar", "Hide toolbar"], ["show-toolbar", "Show toolbar"]
+    ]) {
+      const button = env.document.querySelector(`[data-reader="${action}"]`);
+      assert(button, `${action} retains its interaction marker`);
+      assert(button.classList.contains("hepr-toolbar-icon-button"), `${action} uses the shared icon control style`);
+      assert.equal(button.dataset.toolbarIcon, action, `${action} retains its actual icon identity`);
+      assert.equal(button.title, label, `${action} explains its action on hover`);
+      assert.equal(button.getAttribute("aria-label"), label, `${action} has an accessible action label`);
+      const icon = button.querySelector("svg"), caption = button.querySelector("span");
+      assert(icon && icon.children.length > 0, `${action} contains actual vector icon geometry`);
+      assert(icon.children.some(node => node.tagName === "path" ? Boolean(node.getAttribute("d")) : node.attributes.size > 0),
+        `${action} keeps its vector drawing attributes`);
+      assert.equal(icon.getAttribute("aria-hidden"), "true", `${action} does not announce decorative icon geometry`);
+      assert(caption?.classList.contains("hepr-toolbar-button-label"), `${action} retains its visually hidden text caption`);
+      assert.equal(caption.textContent, label, `${action} keeps meaningful caption text`);
+      assert.equal(button.textContent, label, `${action} keeps its existing text and focus behavior`);
+    }
+    assert(env.document.querySelector('[data-reader="show-toolbar"]').classList.contains("reader-toolbar-restore"),
+      "the restore control retains its placement class alongside the shared icon class");
+    reader.dispose();
+  }
+  {
+    const env = environment(), reader = createReaderViewport(env.options), bridge = editorWheelBridge(env);
+    reader.setDocument({ identity: "editor-wheel-forwarding", pageRects: pageRects(8) }); reader.setLayout("reader");
+    const base = { centerX: 0, centerY: -3000, zoom: 2 }, scroller = env.document.querySelector(".reader-scroll");
+    for (const values of [{ deltaX: 12, deltaY: 80 }, { deltaX: 2, deltaY: 3, deltaMode: 1 },
+      { deltaX: .25, deltaY: 1, deltaMode: 2 }, { deltaY: 60, shiftKey: true }, { deltaX: 25, deltaY: 15, shiftKey: true }]) {
+      reader.setView(base); const before = reader.getView(), viewCount = env.views.length;
+      const wheel = bridge.wheel(values), deltaX = values.shiftKey && !values.deltaX ? values.deltaY : values.deltaX ?? 0,
+        deltaY = values.shiftKey && !values.deltaX ? 0 : values.deltaY;
+      const unitX = values.deltaMode === 2 ? before.width : values.deltaMode === 1 ? 16 : 1,
+        unitY = values.deltaMode === 2 ? before.height : values.deltaMode === 1 ? 16 : 1;
+      assert(wheel.defaultPrevented && wheel.propagationStopped, "the overlay consumes its original wheel event");
+      assert.equal(bridge.dispatches.at(-1).event.isTrusted, false);
+      assert(bridge.dispatches.at(-1).event.defaultPrevented, "Reader applies forwarded wheel scrolling explicitly");
+      close(reader.getView().centerX, before.centerX + deltaX * unitX / before.zoom, "forwarded wheel retains horizontal units and Shift mapping");
+      close(reader.getView().centerY, before.centerY - deltaY * unitY / before.zoom, "forwarded wheel retains vertical pixel/line/page units");
+      assert.equal(env.views.length, viewCount + 1, "one forwarded wheel presents exactly one camera update");
+      const after = reader.getView(); scroller.emit("scroll");
+      assert.deepEqual(reader.getView(), after, "readback of the resulting DOM scroll cannot apply the wheel twice");
+      assert.equal(env.views.length, viewCount + 1);
+    }
+    reader.setView(base); const beforeTrusted = reader.getView();
+    const trusted = env.canvas.emit("wheel", { deltaY: 90 });
+    assert(!trusted.defaultPrevented); assert.deepEqual(reader.getView(), beforeTrusted, "trusted uncompressed wheels retain browser scrolling");
+    scroller.scrollTop += 90; scroller.emit("scroll");
+    close(reader.getView().centerY, beforeTrusted.centerY - 90 / beforeTrusted.zoom, "native scroll presents its movement once");
+    const beforeOther = reader.getView(), other = scroller.emit("wheel", { isTrusted: false, deltaY: 90 });
+    assert(!other.defaultPrevented); assert.deepEqual(reader.getView(), beforeOther, "unrelated synthetic scroller events are not canvas forwards");
+    for (const modifiers of [{ ctrlKey: true, deltaMode: 1, deltaY: -3 }, { metaKey: true, deltaMode: 2, deltaY: -.1 }]) {
+      reader.setView(base); const before = reader.getView(), bounds = env.canvas.getBoundingClientRect(), viewCount = env.views.length;
+      bridge.wheel({ ...modifiers, clientX: bounds.left + before.width / 2, clientY: bounds.top + before.height / 2 });
+      const unit = modifiers.deltaMode === 1 ? 16 : before.height;
+      close(reader.getView().zoom, before.zoom * Math.exp(-modifiers.deltaY * unit * .002), "forwarded Ctrl/Meta wheels zoom exactly once");
+      close(reader.getView().centerX, before.centerX, "centered pinch zoom adds no horizontal wheel scrolling");
+      close(reader.getView().centerY, before.centerY, "centered pinch zoom adds no vertical wheel scrolling");
+      assert.equal(env.views.length, viewCount + 1);
+    }
+    const dispatchCount = bridge.dispatches.length, beforeNested = reader.getView();
+    for (const tagName of ["TEXTAREA", "SELECT"]) {
+      const wheel = bridge.wheel({ deltaY: 40, target: { tagName, closest: () => ({}) } });
+      assert(!wheel.defaultPrevented && !wheel.propagationStopped, `${tagName} retains its native wheel interaction`);
+    }
+    bridge.context.activeText = {};
+    assert(!bridge.wheel({ deltaY: 40 }).defaultPrevented, "active rich text retains the existing wheel exclusion");
+    bridge.context.activeText = null;
+    assert.equal(bridge.dispatches.length, dispatchCount); assert.deepEqual(reader.getView(), beforeNested);
+    reader.setLayout("grid"); const beforeGrid = reader.getView(), gridViews = env.views.length;
+    bridge.wheel({ deltaY: 80 });
+    assert.deepEqual(reader.getView(), beforeGrid); assert.equal(env.views.length, gridViews, "inactive Reader leaves Grid wheel ownership to its host");
+    reader.setLayout("reader"); reader.setView(base);
+    const oldCanvas = env.canvas; env.replaceCanvas(); reader.canvasChanged();
+    const beforeReplacement = reader.getView(); bridge.wheel({ deltaY: 80 });
+    assert.equal(bridge.dispatches.at(-1).canvas, env.canvas, "the editor bridge uses the live replacement canvas");
+    close(reader.getView().centerY, beforeReplacement.centerY - 80 / beforeReplacement.zoom, "replacement canvases keep forwarded scrolling");
+    const afterReplacement = reader.getView(); oldCanvas.emit("wheel", { isTrusted: false, deltaY: 80 });
+    assert.deepEqual(reader.getView(), afterReplacement, "detached canvases cannot scroll Reader");
+    reader.dispose(); const viewsAfterDispose = env.views.length; bridge.wheel({ deltaY: 80 });
+    assert.equal(env.views.length, viewsAfterDispose, "disposed Reader listeners cannot consume a late forwarded wheel");
+  }
+  {
+    const env = environment(700, 800, { browserScrollLimit: 5000 }), reader = createReaderViewport(env.options), bridge = editorWheelBridge(env);
+    reader.setDocument({ identity: "compressed-editor-wheel", pageRects: pageRects(40) }); reader.setLayout("reader");
+    reader.setView({ centerX: 0, centerY: -16000, zoom: 2 });
+    const before = reader.getView(), viewCount = env.views.length;
+    bridge.wheel({ deltaX: 20, deltaY: 120 });
+    close(reader.getView().centerX, before.centerX + 20 / before.zoom, "compressed forwarded wheels retain horizontal viewport pixels");
+    close(reader.getView().centerY, before.centerY - 120 / before.zoom, "compressed forwarded wheels retain vertical viewport pixels");
+    assert.equal(env.views.length, viewCount + 1);
+    const after = reader.getView(); env.document.querySelector(".reader-scroll").emit("scroll");
+    assert.deepEqual(reader.getView(), after); assert.equal(env.views.length, viewCount + 1, "compressed forwarding and DOM readback cannot double scroll");
+    reader.dispose();
+  }
   {
     const savedImageData = Object.getOwnPropertyDescriptor(globalThis, "ImageData");
     Object.defineProperty(globalThis, "ImageData", { configurable: true, value: class {

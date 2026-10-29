@@ -110,14 +110,15 @@ export async function compileEditorObjectGeometry(object: EditorObject, signal?:
     else { paths = [object.points?.length === 2 ? object.points : [[x, y], [x + width, y + height]]]; }
   }
   const color = object.color ?? 0x000000, width = object.strokeWidth ?? 1;
+  const fillOpacity = object.fillOpacity ?? opacity;
   const stroke = curves ? inkStroke(curves, color, width, signal) : buildStrokeScene(paths.map(points => ({ points, closed, color, width })));
   if (opacity !== 1) {
     stroke.primitiveMeta = stroke.primitiveMeta.slice();
     for (let i = 3; i < stroke.primitiveMeta.length; i += 4) stroke.primitiveMeta[i] = Math.floor(stroke.primitiveMeta[i] / 2) * 2 + opacity;
   }
   const fills = object.fill !== null && object.fill !== undefined ? curves
-    ? curves.flatMap((path, index) => paths[index].length >= 3 && path.length ? [inkFill(path, object.fill, opacity, signal)] : [])
-    : paths.filter(points => points.length >= 3).map(points => polygon(points, object.fill, opacity)) : [];
+    ? curves.flatMap((path, index) => paths[index].length >= 3 && path.length ? [inkFill(path, object.fill, fillOpacity, signal)] : [])
+    : paths.filter(points => points.length >= 3).map(points => polygon(points, object.fill, fillOpacity)) : [];
   if (object.kind === "shape" && object.shape === "arrow") {
     fills.push(polygon(editorArrowHeadPoints(object), color, opacity));
   }

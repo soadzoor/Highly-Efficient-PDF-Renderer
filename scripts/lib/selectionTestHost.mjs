@@ -12,6 +12,7 @@ export function installSelectionTestHost() {
     setPointerCapture() {}
     hasPointerCapture() { return false; }
     releasePointerCapture() {}
+    getBoundingClientRect() { return { left: 0, top: 0, right: globals.window.innerWidth, bottom: globals.window.innerHeight }; }
   }
   const listeners = new Map();
   const globals = {

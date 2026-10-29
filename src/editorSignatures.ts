@@ -1,3 +1,5 @@
+import { fitEditorInkPaths, simplifyEditorInkPaths, type EditorInkSegment, type InkPoint } from "./editorInkGeometry";
+
 /** A reusable handwritten signature. Points remain vectors in local coordinates. */
 export interface EditorSignature {
   id: string;
@@ -10,6 +12,13 @@ export interface EditorSignature {
 }
 
 const STORAGE_KEY = "hepr.signatures.v1";
+
+/** Library previews and placement use the same centerlines as rendering and PDF export. */
+export function getEditorSignatureInkPaths(signature: EditorSignature): EditorInkSegment[][] {
+  if (!validateEditorSignature(signature)) throw new TypeError("Invalid handwritten signature.");
+  return fitEditorInkPaths(signature.paths.map(path => Array.from({ length: path.length / 2 }, (_, index) =>
+    [path[index * 2], path[index * 2 + 1]] as InkPoint)), signature.smoothing ?? 0);
+}
 
 export function validateEditorSignature(value: unknown): value is EditorSignature {
   if (!value || typeof value !== "object") return false;
@@ -48,7 +57,7 @@ export function createEditorSignatureLibrary(storage: Pick<Storage, "getItem" | 
   };
 }
 
-/** Normalize captured screen points without discarding their original shape. */
+/** New smoothed captures share their total error budget between storage and curve fitting. */
 export function normalizeEditorSignature(paths: readonly (readonly number[])[], name: string, id: string, smoothing = 0): EditorSignature {
   if (!Number.isFinite(smoothing) || smoothing < 0) throw new TypeError("Invalid signature smoothing.");
   if (!Array.isArray(paths) || paths.some(path => !Array.isArray(path) || path.length % 2 !== 0)) throw new TypeError("Invalid signature path.");
@@ -60,7 +69,12 @@ export function normalizeEditorSignature(paths: readonly (readonly number[])[], 
     minX = Math.min(minX, path[i]); maxX = Math.max(maxX, path[i]);
     minY = Math.min(minY, path[i + 1]); maxY = Math.max(maxY, path[i + 1]);
   }
+  const storageTolerance = smoothing / 4, fittingTolerance = smoothing - storageTolerance;
+  const compact = smoothing > 0 ? simplifyEditorInkPaths(valid.map(path => Array.from({ length: path.length / 2 }, (_, index) =>
+    [path[index * 2], path[index * 2 + 1]] as InkPoint)), storageTolerance).map(path => {
+    const values = path.flat(); return values.length === 2 ? [...values, ...values] : values;
+  }) : valid;
   return { id, name: name.trim() || "Signature", width: Math.max(maxX - minX, 1), height: Math.max(maxY - minY, 1),
-    ...(smoothing > 0 ? { smoothing } : {}),
-    paths: valid.map(path => path.map((value, index) => value - (index % 2 ? minY : minX))) };
+    ...(fittingTolerance > 0 ? { smoothing: fittingTolerance } : {}),
+    paths: compact.map(path => path.map((value, index) => value - (index % 2 ? minY : minX))) };
 }

@@ -83,8 +83,8 @@ const draw = (canvas, points) => {
 
 try {
   const { createEditorSignaturePreview, showSignatureDialog } = await import("../src/editorSignatureUi.ts");
-  const { normalizeEditorSignature, validateEditorSignature, createEditorSignatureLibrary } = await import("../src/editorSignatures.ts");
-  const { fitEditorInkPaths, editorInkPathData } = await import("../src/editorInkGeometry.ts");
+  const { normalizeEditorSignature, validateEditorSignature, createEditorSignatureLibrary, getEditorSignatureInkPaths } = await import("../src/editorSignatures.ts");
+  const { editorInkPathData } = await import("../src/editorInkGeometry.ts");
   const { appendEditorInkSamples, editorInkCaptureTolerance } = await import("../src/editorInkCapture.ts");
 
   const capture = [[0, 0]], project = event => [event.clientX, event.clientY];
@@ -109,8 +109,11 @@ try {
 
   assert.throws(() => normalizeEditorSignature(rawPoints.flat(), "Capture", "invalid"), /signature path/i);
   const normalized = normalizeEditorSignature([rawPoints.flat()], "  Capture  ", "new", .35);
-  assert.equal(normalized.name, "Capture"); assert.equal(normalized.smoothing, .35);
-  assert.deepEqual(normalized.paths[0], rawPoints.flat().map((coordinate, index) => coordinate - (index % 2 ? 50 : 40)), "normalization retains every original sample");
+  assert.equal(normalized.name, "Capture"); assert.equal(normalized.smoothing, .35 - .35 / 4, "new captures reserve one quarter of the total tolerance for storage compaction");
+  assert(normalized.paths[0].length < rawPoints.length * 2, "smoothed normalization stores fewer points rather than raw samples plus duplicate curve data");
+  assert.deepEqual(normalized.paths[0].slice(0, 2), [0, 0]); assert.deepEqual(normalized.paths[0].slice(-2), [240, 0]);
+  const rawNormalized = normalizeEditorSignature([rawPoints.flat()], "Raw", "raw", 0);
+  assert.deepEqual(rawNormalized.paths[0], rawPoints.flat().map((coordinate, index) => coordinate - (index % 2 ? 50 : 40)), "disabling smoothing retains every original captured sample");
   assert.equal(normalizeEditorSignature(signature.paths, "Legacy", "legacy").smoothing, undefined, "legacy API calls retain their original polyline semantics");
   for (const invalid of [-1, Infinity, NaN, "0.3"]) {
     assert.equal(validateEditorSignature({ ...signature, smoothing: invalid }), false);
@@ -121,7 +124,7 @@ try {
   const preview = createEditorSignaturePreview(documentWith(storage()), normalized), previewPath = preview.children[0];
   assert.equal(preview.tagName, "SVG"); assert.equal(preview.attributes.get("preserveAspectRatio"), "xMidYMid meet");
   assert.equal(preview.attributes.get("aria-hidden"), "true"); assert.equal(preview.attributes.get("focusable"), "false");
-  assert.equal(previewPath.attributes.get("d"), editorInkPathData(fitEditorInkPaths([normalized.paths[0].reduce((points, _, index, values) => index % 2 ? points : [...points, [values[index], values[index + 1]]], [])], .35)), "library previews use the same canonical vectors as committed ink");
+  assert.equal(previewPath.attributes.get("d"), editorInkPathData(getEditorSignatureInkPaths(normalized)), "library previews use the same canonical vectors as committed ink");
   assert.match(previewPath.attributes.get("d"), /Q/); assert.doesNotMatch(previewPath.attributes.get("d"), /NaN|Infinity/);
   for (const [attribute, value] of [["fill", "none"], ["stroke", "currentColor"], ["stroke-linecap", "round"], ["stroke-linejoin", "round"], ["vector-effect", "non-scaling-stroke"]]) assert.equal(previewPath.attributes.get(attribute), value);
   const box = preview.attributes.get("viewBox").split(" ").map(Number);
@@ -159,13 +162,21 @@ try {
   send(canvas, "pointerdown", [200, 80]); send(canvas, "pointerup", [200, 80]);
   action(captureDialog, "use");
   assert.deepEqual(captures[0].paths, [[0, 0, 10, 5, 25, 20, 40, 40], [50, 30, 70, 35], [190, 60, 190, 60]], "pointerup includes the final sample, cancellation discards only matching active ink, and taps remain dots");
-  assert.equal(captures[0].smoothing, .35);
+  assert.equal(captures[0].smoothing, .75, "the checked capture uses a one-pixel total budget with the remaining fitting tolerance stored in the template");
 
   const toggledDocument = documentWith(storage()), toggled = [];
   showSignatureDialog(toggledDocument, item => toggled.push(item), error => assert.fail(String(error)));
   const toggledDialog = toggledDocument.body.children[0], toggledCanvas = toggledDialog.querySelector("canvas"), toggle = toggledDialog.querySelector("[data-signature-smooth]");
   draw(toggledCanvas, rawPoints); const initialFrame = frame(toggledCanvas);
   assert(initialFrame.some(command => command[0] === "quadraticCurveTo"), "completed handwriting previews its fitted curves");
+  const previewCapture = normalizeEditorSignature([rawPoints.flat()], "Preview", "preview", 1);
+  const previewCurves = getEditorSignatureInkPaths(previewCapture)[0];
+  const expectedCommands = [["moveTo", ...rawPoints[0]], ...previewCurves.map(segment => segment.control
+    ? ["quadraticCurveTo", segment.control[0] + 40, segment.control[1] + 50, segment.end[0] + 40, segment.end[1] + 50]
+    : ["lineTo", segment.end[0] + 40, segment.end[1] + 50])];
+  assert.deepEqual(initialFrame.filter(command => ["moveTo", "lineTo", "quadraticCurveTo"].includes(command[0])), expectedCommands,
+    "completed capture previews the compacted canonical template that Save/Use will place");
+
   for (let iteration = 0; iteration < 3; iteration++) {
     toggle.checked = false; toggle.dispatchEvent(new Event("change"));
     assert(!frame(toggledCanvas).some(command => command[0] === "quadraticCurveTo"), "turning smoothing off previews the raw captured polyline");
@@ -173,7 +184,7 @@ try {
     assert.deepEqual(frame(toggledCanvas), initialFrame, "repeated smoothing toggles derive from original capture without drift");
   }
   toggle.checked = false; toggle.dispatchEvent(new Event("change")); action(toggledDialog, "use");
-  assert.equal(toggled[0].smoothing, undefined); assert.deepEqual(toggled[0].paths, normalized.paths, "raw samples survive both smoothing states");
+  assert.equal(toggled[0].smoothing, undefined); assert.deepEqual(toggled[0].paths, rawNormalized.paths, "raw samples survive both smoothing states");
 
   const quotaStore = storage([signature]), quotaRaw = quotaStore.raw, quota = new DOMException("Storage full", "QuotaExceededError"); quotaStore.fail = quota;
   const quotaDocument = documentWith(quotaStore), quotaChosen = [], quotaErrors = [];

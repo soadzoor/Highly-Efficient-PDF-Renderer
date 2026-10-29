@@ -8,10 +8,39 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Added
 
+- Add independent fill opacity for editor shapes, ink and signatures, with
+  linked sliders and numeric inputs for color/fill opacity in 0.1 steps from
+  0 to 1. Preserve separate paint alpha in PDF/HEP output and retain the fill
+  when changing stroke opacity; slider drags commit one undoable change.
+- Add undoable PDF layer (OCG) management in the native and Three.js editor
+  Settings docks: create, rename, nest, reorder, remove while retaining artwork,
+  set saved visibility/locks, choose an active layer and assign selected content.
+  Retain compound memberships and portable fonts when editing or reassigning
+  reopened textboxes; hide text drafts and form controls with their layers
+  without discarding their contents.
+  Reordering also changes visual stacking while retaining unlayered paint slots
+  and atomic compositing groups. Add a Select-tool context menu to bring objects
+  to front/forward or send them backward/to back within each layer, with
+  multi-selection, undo/redo, matching picking and PDF/HEP persistence. Keep
+  drawing order and author models through page rotation, insertion and removal.
+  Preserve edited layers in PDF and HEP; offer a
+  flattened PDF copy for exact stacking across page graphics and editable
+  annotations/form widgets, whose paint passes differ in standard PDF readers.
+- Ask whether dropped PDF/HEP documents should replace the loaded document or
+  attach their pages at the end, in View or Edit in both viewers. Support ordered
+  multi-file drops, password-protected PDF imports and legacy HEP ZIP files;
+  attachment keeps current edits and supports Undo without leaving View.
+- Insert PNG, JPEG and WebP files dropped onto document pages in Edit, retaining
+  full image resolution and transparency with cancellation and stale-drop guards.
+- Double-click an editable form field with Select to activate Fill and focus the
+  clicked widget, including empty and transformed fields.
 - Show reusable signatures as selectable vector previews beside their names.
-  Add gentle quadratic fitting for new signatures and pencil drawings, keeping
-  endpoints, corners, pen lifts and loops. Preserve raw template compatibility
-  and use the same curves for previews, rendering and PDF/HEP output.
+  Fit compact quadratic curves for signatures and pencil drawings, straightening
+  sampling jitter while retaining endpoints, corners, pen lifts and loops.
+  Simplify stored points in new smoothed captures; retain raw template
+  compatibility and share curves between previews, rendering and PDF/HEP output.
+  Highlight the active signature tool and show a translucent placement preview
+  centered on the cursor, matching the placed copy's size, color and stroke.
 - Add an on-demand Edit mode to the native and Three.js viewers, with AcroForm
   filling, mixed-format textboxes and portable fonts, vector shapes and ink,
   reusable local handwritten signatures, image import, multi-selection,
@@ -39,8 +68,14 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Changed
 
-- Use compact vector icons for editor tools and common actions, with descriptive
-  hover titles, accessible labels and visible keyboard focus.
+- Dock Settings to the right of the document in the native, Three.js and room
+  detection demos, reserving canvas space instead of covering it. Closing
+  Settings restores document width; editing tools stay within the canvas column.
+- Share compact vector icons across View and Edit controls, including page and
+  password actions, PDF/HEP saves, flattening, printing, navigation, zoom, search
+  and downloads. Retain descriptive hover titles, accessible labels and keyboard
+  focus; mode and busy-state updates preserve icons without rebuilding unchanged
+  button contents. View icons do not load editing or font services.
 - Expose Print in the main native and Three.js toolbars in View as well as Edit.
   Preserve retained edits and loaded page selections; print unedited PDFs from
   their original resources and HEPs through the vector PDF writer. Reuse supplied
@@ -53,6 +88,30 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
+- Detect artwork that may overlap PDF form fields and offer editable or flattened
+  copies at save time. Explain Chrome's separate form-field rendering pass;
+  flattened copies keep artwork above fields, while editable copies retain fields
+  and annotations. Warn API callers without silently flattening their output.
+- Preserve stored butt and round stroke caps in rebuilt and flattened PDFs,
+  including dash gaps and zero-length strokes, instead of rounding every line.
+- Save added textboxes with PDFium-compatible font encodings, fixing rectangles
+  and displaced letters in Chrome. Retain embedded font bytes, Unicode mappings
+  and editable appearances; large textboxes share font programs across additional
+  encoding resources instead of truncating text or duplicating font data.
+  Paint combining-mark continuations as vector outlines while their cluster text
+  remains searchable, avoiding fallback control characters in independent readers.
+- Keep document selections, handles and editing controls inside the canvas and
+  below toolbars, Settings, thumbnails and menus in both viewers. Constrain
+  text-selection popups and annotation bubbles to the visible document viewport
+  while retaining captured drags beyond its edges.
+- Restore Reader wheel scrolling over the editor's Select and drawing overlays
+  in both viewers, retaining normal scroll distances and Ctrl/Cmd-wheel zoom.
+- Preserve form fields' local dimensions, rotation and scaling while typing and
+  regenerating appearances, including HEP-only editing. Retain transformed field
+  planes when reopening and filling PDFs saved by HEPR, without adding HEP data.
+- Align editable form controls with each document draw in native and Three.js
+  viewers so borders stay synchronized during zoom and pan. Preserve focused
+  inputs and drafts, and detach frame notifications in View mode.
 - Retain the final pen position, empty-coalesced-event samples, closed pencil
   loops and taps. Keep signature capture proportions consistent with its preview.
 - Match form input fonts to their PDF family, weight, color and point size,

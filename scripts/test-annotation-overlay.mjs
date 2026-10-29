@@ -312,5 +312,73 @@ try {
   manual.show(annotations[0]);
   turnedOff.add(annotations[0].id); manual.onFrame(); assert.equal(manualPanel.hidden, true);
   manual.dispose(); canvas.removeAttribute("data-hepr-annotation-hover");
+  {
+    const window = new Window(); window.innerWidth = 640; window.innerHeight = 400;
+    const document = { defaultView: window, createElement: () => new Element(document) }; document.body = new Element(document);
+    let viewport = { left: 120, top: 80, right: 420, bottom: 280 }, projection = { x: 0, y: 0 };
+    let canvas = new Element(document); canvas.getBoundingClientRect = () => viewport;
+    const comment = annotation(30, { minX: 230, minY: 140, maxX: 270, maxY: 180 });
+    const link = { ...comment, id: "bounded-link", subtype: "Link", action: { type: "URI", uri: "https://example.com/" } };
+    const scene = { ...createEmptyVectorScene(), annotations: [comment, link], pageCount: 1, pageRects: Float32Array.of(0, 0, 800, 500) };
+    const adapter = { getScene: () => scene, clientToScenePoint: (x, y) => ({ x: x - projection.x, y: y - projection.y }),
+      sceneToClientPoint: (x, y) => ({ x: x + projection.x, y: y + projection.y }) };
+    const overlay = createAnnotationOverlay({ getCanvas: () => canvas, adapter, pointerInteraction: false }), panel = document.body.children[0];
+    const contained = message => {
+      assert.equal(panel.hidden, false, message);
+      const left = Number.parseFloat(panel.style.left), top = Number.parseFloat(panel.style.top);
+      const width = Math.min(panel.offsetWidth, Number.parseFloat(panel.style.maxWidth)), height = Math.min(panel.offsetHeight, Number.parseFloat(panel.style.maxHeight));
+      assert(left >= Math.max(0, viewport.left) && top >= Math.max(0, viewport.top), `${message}: leading edges stay in the visible canvas`);
+      assert(left + width <= Math.min(window.innerWidth, viewport.right) && top + height <= Math.min(window.innerHeight, viewport.bottom),
+        `${message}: trailing edges stay in the visible canvas`);
+    };
+    overlay.show(comment); contained("comments stay within inset canvases");
+    assert.match(panel.style.cssText, /z-index:21(?:;|$)/, "popover stacking stays above document overlays and below application controls");
+    assert.match(panel.style.cssText, /box-sizing:border-box/, "size constraints include the popover border and padding");
+    assert.deepEqual([panel.style.maxWidth, panel.style.maxHeight], ["284px", "184px"]);
+    assert.deepEqual([panel.style.left, panel.style.top], ["232px", "192px"], "comments retain an 8px margin from the current canvas edges");
+    overlay.show(link, { x: 410, y: 270 }); contained("link previews stay within inset canvases");
+    assert.deepEqual([panel.style.left, panel.style.top], ["218px", "178px"], "link previews flip against canvas edges and retain their pointer offset");
+    assert.equal(panel.style.pointerEvents, "none"); assert.equal(panel.attributes.get("role"), "tooltip");
+
+    overlay.show(comment); window.innerWidth = 320; window.innerHeight = 220; overlay.onFrame();
+    contained("partly offscreen canvases are clipped to the browser window");
+    assert.deepEqual([panel.style.maxWidth, panel.style.maxHeight], ["184px", "124px"]);
+    assert.deepEqual([panel.style.left, panel.style.top], ["132px", "132px"]);
+    window.innerWidth = 240; overlay.onFrame();
+    assert.equal(panel.hidden, true, "anchors inside the canvas but outside the window do not leave detached popovers");
+    window.innerWidth = 640; window.innerHeight = 400; overlay.onFrame(); contained("clipped pins return when their anchor becomes visible again");
+
+    const previousCanvas = canvas; canvas = new Element(document);
+    canvas.getBoundingClientRect = () => ({ ...viewport, left: 200, top: 100, right: 400, bottom: 250 });
+    viewport = canvas.getBoundingClientRect(); overlay.sceneChanged(); overlay.onFrame();
+    contained("pinned comments use the replacement canvas viewport");
+    assert.deepEqual([panel.style.left, panel.style.top], ["212px", "162px"]);
+    assert.notEqual(canvas, previousCanvas);
+    canvas = null; overlay.onFrame(); assert.equal(panel.hidden, true, "a missing canvas hides its popover without throwing");
+    canvas = new Element(document); canvas.getBoundingClientRect = () => viewport; overlay.onFrame(); contained("a replacement canvas restores the same scene's pin");
+
+    viewport = { left: 200, top: 120, right: 260, bottom: 160 }; projection.y = -40; overlay.onFrame();
+    contained("narrow viewports constrain layout even when an offset-size measurement remains larger");
+    assert.deepEqual([panel.style.maxWidth, panel.style.maxHeight], ["44px", "24px"]);
+    assert.deepEqual([panel.style.left, panel.style.top], ["208px", "128px"]);
+    viewport = { left: 200.25, top: 120.25, right: 206.25, bottom: 124.25 }; projection = { x: -47, y: -58 }; overlay.onFrame();
+    contained("tiny fractional viewports degrade without overflowing their canvas");
+    assert.deepEqual([panel.style.maxWidth, panel.style.maxHeight], ["3px", "2px"]);
+    assert(Number.parseFloat(panel.style.paddingLeft) + Number.parseFloat(panel.style.paddingRight) + Number.parseFloat(panel.style.borderWidth) * 2 <= 3,
+      "tiny popover padding and borders fit inside the maximum width");
+    assert(Number.parseFloat(panel.style.paddingTop) + Number.parseFloat(panel.style.paddingBottom) + Number.parseFloat(panel.style.borderWidth) * 2 <= 2,
+      "tiny popover padding and borders fit inside the maximum height");
+    viewport = { left: -40, top: -20, right: 230, bottom: 170 }; window.innerWidth = 200; window.innerHeight = 150;
+    projection = { x: -150, y: -100 }; overlay.onFrame(); contained("negative canvas offsets use the visible window intersection");
+    assert.deepEqual([panel.style.maxWidth, panel.style.maxHeight], ["184px", "134px"]);
+    projection.x = -255; overlay.onFrame(); assert.equal(panel.hidden, true, "anchors beyond the visible left window edge are hidden");
+    projection = { x: -150, y: -100 }; viewport = { left: 800, top: 20, right: 900, bottom: 100 }; overlay.onFrame();
+    assert.equal(panel.hidden, true, "fully offscreen viewports are hidden");
+    viewport = { left: 100, top: 20, right: 100, bottom: 100 }; overlay.onFrame(); assert.equal(panel.hidden, true, "empty viewports are hidden");
+    viewport = { left: 0, top: 0, right: NaN, bottom: 100 }; overlay.onFrame(); assert.equal(panel.hidden, true, "invalid viewport geometry does not produce invalid CSS coordinates");
+    viewport = { left: 0, top: 0, right: 200, bottom: 150 }; overlay.onFrame(); contained("pins recover after temporary invalid viewport geometry");
+    assert.equal(window.frames.size, 0, "popover containment relies on host frames rather than adding an animation loop");
+    overlay.dispose(); assert.equal(document.body.children.length, 0);
+  }
   console.log("Annotation overlay: precise picking, safe HTML text, pinning, pointer-following links, cursor ownership, gestures, visibility, host-disabled annotations, projection and lifecycle passed.");
 } finally { hooks.deregister(); }

@@ -17,6 +17,8 @@ import { waitForLoad, yieldAfterPaint, yieldForLoad } from "./loadCancellation";
 import { warmViewerRendering } from "./viewerRenderWarmup";
 import type { ThumbnailSceneRenderer } from "./thumbnailRenderer";
 import { createViewerPrintAction, type ViewerPrintAction, type ViewerPrintDocument } from "./viewerPrint";
+import { createViewerFileDropController } from "./viewerFileDrop";
+import { initializeToolbarIcons, setToolbarIconButton, toolbarIconMarkup } from "./toolbarIcons";
 
 import { WebGlPdfRenderer, type DrawStats, type SceneStats, type ViewState } from "./webGlPdfRenderer";
 import {
@@ -91,7 +93,6 @@ import { buildRasterScenePreview } from "./pageRasterPreview";
 const canvas = document.querySelector<HTMLCanvasElement>("#viewport");
 const hudElement = document.querySelector<HTMLDivElement>("#hud");
 const toggleHudButton = document.querySelector<HTMLButtonElement>("#toggle-hud");
-const toggleHudIcon = document.querySelector<HTMLSpanElement>("#toggle-hud-icon");
 const openButton = document.querySelector<HTMLButtonElement>("#open-file");
 const exampleDropdownContainer = document.querySelector<HTMLDivElement>("#example-dropdown");
 const exampleSelect = document.querySelector<HTMLButtonElement>("#example-select");
@@ -143,7 +144,6 @@ if (
   !canvas ||
   !hudElement ||
   !toggleHudButton ||
-  !toggleHudIcon ||
   !openButton ||
   !exampleDropdownContainer ||
   !exampleSelect ||
@@ -194,10 +194,12 @@ if (
   throw new Error("Required UI elements are missing from index.html.");
 }
 
+initializeToolbarIcons(document);
+exampleSelect.insertAdjacentHTML("afterbegin", toolbarIconMarkup("examples"));
+
 let canvasElement = canvas;
 const hudPanelElement = hudElement;
 const toggleHudButtonElement = toggleHudButton;
-const toggleHudIconElement = toggleHudIcon;
 const openButtonElement = openButton;
 const exampleDropdown = createExampleDropdown({
   containerElement: exampleDropdownContainer,
@@ -241,8 +243,9 @@ const vectorOpacityInputElement = vectorOpacityInput;
 let renderer: RendererApi;
 let webGpuRendererClass: typeof import("./webGpuPdfRenderer").WebGpuPdfRenderer | null = null;
 let lastParsedScene: VectorScene | null = null;
-// The editor, its fonts, and its picking indexes are loaded only on an explicit Edit action.
+// Editing and document attachment load the editor, fonts and picking indexes on demand.
 let pdfEditor: import("./editorUi").EditorUi | null = null;
+let editorFrameListener: (() => void) | null = null;
 let editorInitialization: AbortController | null = null;
 const editorModeButton = document.querySelector<HTMLButtonElement>("#editor-mode")!;
 const printPdfButton = document.querySelector<HTMLButtonElement>("#print-pdf")!;
@@ -507,6 +510,7 @@ function onRendererFrame(stats: DrawStats): void {
   drawingSelection.onFrame();
   annotationInteraction?.onFrame();
   annotationOverlay.onFrame();
+  editorFrameListener?.();
 
   // Camera/interaction work stays per frame; formatting and replacing the HUD
   // text hundreds of times per second adds unnecessary browser work.
@@ -658,6 +662,7 @@ renderer = createWebGlRenderer(canvasElement);
 let readerThumbnailRenderer: ThumbnailSceneRenderer | undefined;
 readerViewport = createReaderViewport({
   getCanvas: () => canvasElement,
+  settingsPanel: hudPanelElement,
   layouts: [{ value: "reader", label: "Reader" }, { value: "grid", label: "Grid" }],
   onLayoutChange: changeNativeLayout,
   onViewChange: applyReaderView,
@@ -692,17 +697,33 @@ function setNativeEditing(active: boolean): void {
   textSelectionCheckbox!.disabled = active;
   for (const control of [ocrTextCheckbox!, pageStreamingCheckbox!, compressScansCheckbox!]) control.disabled = active || Boolean(pdfEditor) || lastLoadedSource?.kind !== "pdf";
   const layout = document.querySelector<HTMLSelectElement>(".reader-layout"); if (layout) layout.disabled = active;
-  editorModeButton.textContent = active ? "View PDF" : "Edit PDF";
+  setToolbarIconButton(editorModeButton, active ? "view" : "edit", active ? "View PDF" : "Edit PDF");
   editorModeButton.setAttribute("aria-pressed", String(active));
   viewerPrintAction?.refresh();
 }
 
 async function togglePdfEditing(): Promise<void> {
   if (editorInitialization) { editorInitialization.abort(); return; }
-  if (pendingSourceLoadCount > 0 || activeSceneLoadToken !== null || layoutChangeRunning || backendSwitcher?.isSwitchInFlight()) { setStatus("Wait for the document or renderer change to finish before entering Edit mode."); return; }
-  if (!lastParsedScene || !lastLoadedSource) { setStatus("Open a PDF or HEP before entering Edit mode."); return; }
-  editorModeButton.textContent = "Cancel editing setup"; editorModeButton.setAttribute("aria-busy", "true");
+  try {
+    const editor = await ensureNativeEditor();
+    const controller = editorInitialization = new AbortController();
+    try { await editor.setEditing(!editor.isEditing()); clearLoadedStatus(); }
+    finally { if (editorInitialization === controller) editorInitialization = null; viewerPrintAction?.refresh(); }
+  } catch (error) {
+    if (!(error instanceof DOMException && error.name === "AbortError")) setStatus(`Could not enter Edit mode: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function ensureNativeEditor(signal?: AbortSignal): Promise<import("./editorUi").EditorUi> {
+  signal?.throwIfAborted();
+  if (editorInitialization || pendingSourceLoadCount > 0 || activeSceneLoadToken !== null || layoutChangeRunning || backendSwitcher?.isSwitchInFlight())
+    throw new Error("Wait for the document or renderer change to finish before editing the document.");
+  if (!lastParsedScene || !lastLoadedSource) throw new Error("Open a PDF or HEP before editing the document.");
+  if (pdfEditor) return pdfEditor;
+  setToolbarIconButton(editorModeButton, "cancel", "Cancel editing setup"); editorModeButton.setAttribute("aria-busy", "true");
   const controller = editorInitialization = new AbortController();
+  const abort = (): void => controller.abort(signal?.reason);
+  signal?.addEventListener("abort", abort, { once: true });
   try {
     if (!pdfEditor) {
       setStatus("Preparing full-quality editing data…");
@@ -719,6 +740,8 @@ async function togglePdfEditing(): Promise<void> {
       const sourcePlacementMatches = (): boolean => nativeLayout === editSourceLayout &&
         (nativeLayout === "reader" || editSourceScene?.pagesPerRow === canonicalPagesPerRow);
       pdfEditor = await createEditorUi({
+        layerControlsContainer: document.querySelector<HTMLDivElement>("#pdf-layers")!,
+        showLayerControls: () => setHudCollapsed(false),
         getCanvas: () => canvasElement, getScene: () => lastParsedScene,
         getSource: () => ({ pdf: lastLoadedSource?.kind === "pdf" ? lastLoadedSource.bytes : undefined,
           password: lastLoadedPdfPassword, label: lastLoadedSource?.label ?? "document" }),
@@ -787,15 +810,17 @@ async function togglePdfEditing(): Promise<void> {
           const point = lastParsedScene && editSourceScene ? remapEditorPagePoint({ x, y }, editSourceScene.pageRects, lastParsedScene.pageRects, pageIndex) : null;
           return point ? renderer.sceneToClientPoint?.(point.x, point.y) ?? null : null;
         },
+        subscribeToFrames(listener) {
+          editorFrameListener = listener;
+          return () => { if (editorFrameListener === listener) editorFrameListener = null; };
+        },
+        requestFrame: () => renderer.requestFrame?.(),
         setEditing: setNativeEditing, onStatus: setStatus, onBusyChange: () => viewerPrintAction?.refresh()
       }, controller.signal);
     }
-    await pdfEditor.setEditing(!pdfEditor.isEditing());
-    clearLoadedStatus();
-  } catch (error) {
-    if (!controller.signal.aborted) setStatus(`Could not enter Edit mode: ${error instanceof Error ? error.message : String(error)}`);
-  } finally { if (editorInitialization === controller) editorInitialization = null; editorModeButton.removeAttribute("aria-busy");
-    editorModeButton.textContent = pdfEditor?.isEditing() ? "View PDF" : "Edit PDF"; if (!pdfEditor) activePdfPageLoader?.resume(); viewerPrintAction?.refresh(); }
+    controller.signal.throwIfAborted(); return pdfEditor;
+  } finally { signal?.removeEventListener("abort", abort); if (editorInitialization === controller) editorInitialization = null; editorModeButton.removeAttribute("aria-busy");
+    setToolbarIconButton(editorModeButton, pdfEditor?.isEditing() ? "view" : "edit", pdfEditor?.isEditing() ? "View PDF" : "Edit PDF"); if (!pdfEditor) activePdfPageLoader?.resume(); viewerPrintAction?.refresh(); }
 }
 
 function discardNativeEditor(): boolean {
@@ -1138,6 +1163,7 @@ downloadAllDataButtonElement.addEventListener("click", () => {
 });
 
 window.addEventListener("beforeunload", () => {
+  fileDropController.dispose();
   viewerPrintAction?.cancel();
   readerViewport?.dispose();
   drawCallMeter.dispose();
@@ -1232,49 +1258,28 @@ window.addEventListener("keydown", (event) => {
   }
 });
 
-window.addEventListener("dragenter", (event) => {
-  event.preventDefault();
-  isDropDragActive = true;
-  refreshDropIndicator();
-});
-
-window.addEventListener("dragover", (event) => {
-  event.preventDefault();
-  if (!isDropDragActive) {
-    isDropDragActive = true;
-    refreshDropIndicator();
-  }
-});
-
-window.addEventListener("dragleave", (event) => {
-  if (event.target === document.documentElement || event.target === document.body) {
-    isDropDragActive = false;
-    refreshDropIndicator();
-  }
-});
-
-window.addEventListener("drop", async (event) => {
-  event.preventDefault();
-  isDropDragActive = false;
-  refreshDropIndicator();
-
-  const files = Array.from(event.dataTransfer?.files || []);
-  const supported = files.find((file) => isPdfFile(file) || isHepFile(file));
-
-  if (!supported) {
-    setStatus("Dropped file is not a supported PDF or HEP file.");
-    return;
-  }
-
-  if (isPdfFile(supported)) {
-    await loadPdfFile(supported);
-  } else {
-    await loadHepFile(supported);
-  }
+const fileDropController = createViewerFileDropController({
+  document,
+  getDocument: () => lastParsedScene && lastLoadedSource ? { identity: lastLoadedSource.bytes, label: lastLoadedSource.label } : null,
+  isEditing: () => pdfEditor?.isEditing() ?? false,
+  isBusy: () => pendingSourceLoadCount > 0 || activeSceneLoadToken !== null || layoutChangeRunning ||
+    editorInitialization !== null || editorSceneApplicationActive || Boolean(backendSwitcher?.isSwitchInFlight()) ||
+    activeHepExportController !== null || isBatchExampleExportRunning || fileInputElement.disabled || Boolean(pdfEditor?.isBusy?.()),
+  replace: (file, signal) => isPdfFile(file) ? loadPdfFile(file, signal) : loadHepFile(file, signal),
+  async attach(files, signal) { await (await ensureNativeEditor(signal)).attachDocuments(files, signal); },
+  async insertImages(files, client, signal) {
+    if (!pdfEditor?.isEditing()) throw new Error("Enter Edit mode before dropping images onto the document.");
+    await pdfEditor.dropImages(files, client, signal);
+  },
+  setDragging(active) { isDropDragActive = active; refreshDropIndicator(); },
+  setStatus
 });
 
 function refreshDropIndicator(): void {
   const shouldShow = isDropDragActive || !lastParsedScene;
+  dropIndicatorElement.textContent = pdfEditor?.isEditing()
+    ? "Drop PDF/HEP documents to replace or attach, or images onto a page"
+    : lastParsedScene ? "Drop PDF/HEP documents to replace or attach" : "Drop PDF or HEP files to open";
   dropIndicatorElement.classList.toggle("active", shouldShow);
   dropIndicatorElement.classList.toggle("dragging", isDropDragActive);
 }
@@ -1423,16 +1428,17 @@ function isHepFile(file: File): boolean {
   );
 }
 
-async function loadPdfFile(file: File): Promise<void> {
-  if (!discardNativeEditor()) return;
+async function loadPdfFile(file: File, externalSignal?: AbortSignal): Promise<boolean> {
+  externalSignal?.throwIfAborted();
+  if (!discardNativeEditor()) return false;
   cancelActiveHepExport();
   const sourceLoadToken = beginSourceLoad();
-  const signal = sourceLoadController!.signal;
+  const signal = externalSignal ? AbortSignal.any([sourceLoadController!.signal, externalSignal]) : sourceLoadController!.signal;
   try {
     setStatus(`Reading ${file.name}...`);
     const buffer = await waitForLoad(file.arrayBuffer(), signal);
     if (!isCurrentSourceLoad(sourceLoadToken)) {
-      return;
+      return false;
     }
     const bytes = cloneSourceBytes(buffer);
     let password: string | undefined;
@@ -1456,11 +1462,13 @@ async function loadPdfFile(file: File): Promise<void> {
         });
         if (answer === null) {
           if (isCurrentSourceLoad(sourceLoadToken)) setStatus(`${file.name} was not opened: it needs a password.`);
-          return;
+          return false;
         }
         password = answer;
       }
     }
+    signal.throwIfAborted();
+    return isCurrentSourceLoad(sourceLoadToken) && lastLoadedSource?.bytes === bytes;
   } catch (error) {
     if (!signal.aborted && isCurrentSourceLoad(sourceLoadToken)) {
       setStatus(`Failed to read PDF: ${error instanceof Error ? error.message : String(error)}`);
@@ -1468,18 +1476,20 @@ async function loadPdfFile(file: File): Promise<void> {
   } finally {
     finishSourceLoad(sourceLoadToken);
   }
+  return false;
 }
 
-async function loadHepFile(file: File): Promise<void> {
-  if (!discardNativeEditor()) return;
+async function loadHepFile(file: File, externalSignal?: AbortSignal): Promise<boolean> {
+  externalSignal?.throwIfAborted();
+  if (!discardNativeEditor()) return false;
   cancelActiveHepExport();
   const sourceLoadToken = beginSourceLoad();
-  const signal = sourceLoadController!.signal;
+  const signal = externalSignal ? AbortSignal.any([sourceLoadController!.signal, externalSignal]) : sourceLoadController!.signal;
   try {
     setStatus(`Reading ${file.name}...`);
     const buffer = await waitForLoad(file.arrayBuffer(), signal);
     if (!isCurrentSourceLoad(sourceLoadToken)) {
-      return;
+      return false;
     }
     const bytes = cloneSourceBytes(buffer);
     await loadHepBuffer(createParseBuffer(bytes), file.name, {
@@ -1488,6 +1498,8 @@ async function loadHepFile(file: File): Promise<void> {
       signal,
       preserveView: false
     });
+    signal.throwIfAborted();
+    return isCurrentSourceLoad(sourceLoadToken) && lastLoadedSource?.bytes === bytes;
   } catch (error) {
     if (!signal.aborted && isCurrentSourceLoad(sourceLoadToken)) {
       setStatus(`Failed to read HEP file: ${error instanceof Error ? error.message : String(error)}`);
@@ -1495,6 +1507,7 @@ async function loadHepFile(file: File): Promise<void> {
   } finally {
     finishSourceLoad(sourceLoadToken);
   }
+  return false;
 }
 
 async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions): Promise<void> {
@@ -2222,7 +2235,7 @@ function combineVectorLodTimings(
 function setDownloadDataButtonState(hasParsedData: boolean, isBusy = false): void {
   downloadDataButtonElement.hidden = !hasParsedData;
   downloadDataButtonElement.disabled = !hasParsedData || isBusy || isBatchExampleExportRunning;
-  downloadDataButtonElement.textContent = isBusy ? "Preparing HEP..." : "Download HEP";
+  setToolbarIconButton(downloadDataButtonElement, "download-hep", isBusy ? "Preparing HEP..." : "Download HEP");
   viewerPrintAction?.refresh();
 }
 
@@ -2234,15 +2247,15 @@ function setDownloadPdfButtonState(hasPdf: boolean, isBusy = false): void {
     isBusy ||
     isBatchExampleExportRunning ||
     activeHepExportController !== null;
-  downloadPdfButtonElement.textContent = isBusy ? "Preparing PDF..." : "Download PDF";
+  setToolbarIconButton(downloadPdfButtonElement, "download-pdf", isBusy ? "Preparing PDF..." : "Download PDF");
 }
 
 function setDownloadAllDataButtonState(hasExamples: boolean, isBusy = false, progressText?: string): void {
   downloadAllDataButtonElement.hidden = !bulkHepExportEnabled;
   downloadAllDataButtonElement.disabled = !bulkHepExportEnabled || !hasExamples || isBusy;
-  downloadAllDataButtonElement.textContent = isBusy
+  setToolbarIconButton(downloadAllDataButtonElement, "download-all", isBusy
     ? progressText ?? "Exporting Example HEP Files..."
-    : "Download All Example HEP Files";
+    : "Download All Example HEP Files");
 }
 
 function setPrimaryLoadControlsEnabled(isEnabled: boolean): void {
@@ -2256,8 +2269,8 @@ function setPrimaryLoadControlsEnabled(isEnabled: boolean): void {
 function setHudCollapsed(collapsed: boolean): void {
   hudPanelElement.classList.toggle("collapsed", collapsed);
   toggleHudButtonElement.setAttribute("aria-expanded", String(!collapsed));
-  toggleHudButtonElement.title = "Close settings";
-  toggleHudIconElement.textContent = "×";
+  setToolbarIconButton(toggleHudButtonElement, "close", "Close settings");
+  readerViewport?.settingsChanged();
 }
 
 async function downloadAllExampleHeps(): Promise<void> {

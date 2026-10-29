@@ -1,14 +1,29 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import { composeOverlappingVectorScenes } from "./pdfVectorExtractor";
-import { getScenePrimitive, getSceneAnnotationRuns, isScenePrimitiveVisible, type PrimitiveRef } from "./scenePrimitives";
-import { createDefaultOptionalContentSnapshot } from "./optionalContent";
+import { editorObjectHasVisiblePaint } from "./editorObjectOpacity";
+import { getScenePrimitive, getSceneAnnotationRuns, type PrimitiveRef } from "./scenePrimitives";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 import { PAGE_PRIMITIVE_KINDS, ScenePageViews, scenePrimitiveCounts } from "./scenePageViews";
 import type { ScenePaintNode } from "./scenePaintGraph";
 import type { EditorAnnotationEdit, EditorFieldValue, EditorMatrix, EditorObject, EditorObjectInput, EditorSession, EditorSessionOptions,
-  EditorSourceEdit, EditorSourceObject, EditorState, EditorSelectionFrame } from "./editorTypes";
+  EditorSourceEdit, EditorSourceObject, EditorState, EditorSelectionFrame, EditorLayerEdits, EditorStackingAction } from "./editorTypes";
+import { editorPaintIdentity, editorAuthoredOwner, setEditorPaintIdentity, remapEditorPaintIdentity, composeEditorPaintIdentity } from "./editorPaintIdentity";
+import { editorCloneOwner } from "./editorObjectOrder";
+import { editorLayerCatalog, editorLayer, createEditorLayer, updateEditorLayer, moveEditorLayer, setEditorLayerOrder, removeEditorLayer, importEditorLayerCondition } from "./editorLayers";
+import { getOptionalContentGroupIds, createDefaultOptionalContentSnapshot } from "./optionalContent";
+import { applyEditorSceneLayers, assignEditorGeometryLayer, refreshEditorSceneLayerDefaults, isEditorLayerCompositingUnit,
+  createEditorLayerVisibility, createEditorObjectOrderSchedule, reorderEditorSceneLayers, applyEditorObjectOrdering, detachEditorGeometryAnnotationLayers, captureEditorAnnotationLayerCondition } from "./editorLayerScene";
+
+interface LayerSnapshot {
+  catalog: EditorLayerEdits["catalog"];
+  removals: EditorLayerEdits["removals"];
+  sourceAssignments: Map<string, EditorLayerEdits["sourceAssignments"][number]>;
+  annotationAssignments: Map<string, string | null>;
+  stackingChanged: boolean;
+  objectOrder?: readonly string[];
+}
 import { bakeEditorAnnotationEdits, bakeEditorSourceScene, compactEditorScene, composeEditorPage, EDITOR_IDENTITY, editorMatrix, editorMatrixIsIdentity,
-  editorRefKey, editorTransformBounds, editorUnionBounds, invertEditorMatrix, multiplyEditorMatrices, transformWholeEditorScene } from "./editorScene";
+  editorRefKey, editorTransformBounds, editorUnionBounds, invertEditorMatrix, multiplyEditorMatrices, retainEditorAnnotationPlacements, transformWholeEditorScene } from "./editorScene";
 import { compileEditorObjectGeometry, editorArrowHeadPoints } from "./editorSceneObjects";
 import { waitForLoad } from "./loadCancellation";
 import { createLoadProgressReporter, type PDFLoadProgress } from "./loadProgress";
@@ -18,11 +33,26 @@ interface Snapshot {
   edits: Map<string, EditorSourceEdit>;
   annotationEdits: Map<string, EditorAnnotationEdit>;
   fields: Map<string, EditorFieldValue>;
+  layers: LayerSnapshot;
   selection: string[];
   selectionBasis?: EditorMatrix;
   identity: object;
 }
 function copy<T>(value: T): T { return structuredClone(value); }
+const orderRestorers = new WeakMap<EditorSession, (tokens: readonly string[], stackingChanged?: boolean) => void>();
+const orderReaders = new WeakMap<EditorSession, () => readonly string[]>();
+const orderedSourceReaders = new WeakMap<EditorSession, (options: { signal?: AbortSignal }) => Promise<VectorScene>>();
+/** Private document-reseed hook; order stays in editor snapshots, never scene/HEP data. */
+export function restoreEditorObjectOrder(session: EditorSession, tokens: readonly string[], stackingChanged?: boolean): void {
+  const restore = orderRestorers.get(session); if (!restore) throw new TypeError("Object order can only be restored to an editor runtime session."); restore(tokens, stackingChanged);
+}
+export function getEditorCurrentObjectOrder(session: EditorSession): readonly string[] {
+  const read = orderReaders.get(session); if (!read) throw new TypeError("Object order can only be read from an editor runtime session."); return read();
+}
+/** Capture only original content and source clones before ordinary author geometry is compiled. */
+export function getEditorOrderedSourceScene(session: EditorSession, options: { signal?: AbortSignal } = {}): Promise<VectorScene> {
+  const read = orderedSourceReaders.get(session); if (!read) throw new TypeError("Ordered source can only be read from an editor runtime session."); return read(options);
+}
 function finite(value: unknown, name: string, minimum?: number): asserts value is number {
   if (typeof value !== "number" || !Number.isFinite(value) || (minimum !== undefined && value < minimum)) throw new RangeError(`${name} must be a finite number${minimum === undefined ? "" : ` at least ${minimum}`}.`);
 }
@@ -31,6 +61,9 @@ function validateObject(object: EditorObject, pageCount: number): void {
   if (!Number.isSafeInteger(object.pageIndex) || object.pageIndex < 0 || object.pageIndex >= pageCount) throw new RangeError("Editor object references an unknown page.");
   editorMatrix(object.transform);
   if (object.opacity !== undefined) { finite(object.opacity, "Opacity", 0); if (object.opacity > 1) throw new RangeError("Opacity must not exceed one."); }
+  if ((object.kind === "shape" || object.kind === "ink" || object.kind === "signature") && object.fillOpacity !== undefined) {
+    finite(object.fillOpacity, "Fill opacity", 0); if (object.fillOpacity > 1) throw new RangeError("Fill opacity must not exceed one.");
+  }
   if (object.kind === "text" || object.kind === "shape" || object.kind === "image") {
     finite(object.x, "X"); finite(object.y, "Y"); finite(object.width, "Width", 0); finite(object.height, "Height", 0);
     if (![object.x, object.y, object.width, object.height].every(value => Number.isFinite(Math.fround(value)))) throw new RangeError("Editor bounds exceed the scene's representable coordinate range.");
@@ -62,7 +95,10 @@ function validateObject(object: EditorObject, pageCount: number): void {
 export function createEditorSession(sourceScene: VectorScene, options: EditorSessionOptions = {}): EditorSession {
   const pageCount = sourceScene.pageRects.length / 4;
   if (!Number.isInteger(pageCount) || pageCount < 1) throw new RangeError("An editor requires a complete scene with at least one page.");
-  let state: Snapshot = { objects: new Map(), edits: new Map(), annotationEdits: new Map(), fields: new Map(), selection: [], identity: {} };
+  const initialCatalog = editorLayerCatalog(sourceScene.optionalContent);
+  const initialLayers: LayerSnapshot = { catalog: initialCatalog, removals: [], sourceAssignments: new Map(), annotationAssignments: new Map(), stackingChanged: false };
+  let state: Snapshot = { objects: new Map(), edits: new Map(), annotationEdits: new Map(), fields: new Map(), layers: initialLayers, selection: [], identity: {} };
+  let activeLayer: string | null = null, nextLayerId = 0, layerRevision = 0;
   let savedIdentity = state.identity, revision = 0, disposed = false, nextId = 0, transactionDepth = 0, transactionStart: Snapshot | null = null;
   let previewTransform: EditorMatrix | null = null, previewSequence = 0;
   const undoStack: Snapshot[] = [], redoStack: Snapshot[] = [], listeners = new Set<(state: EditorState) => void>();
@@ -96,8 +132,9 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
   const emit = () => { const value = getState(); for (const listener of listeners) { try { listener(value); } catch { /* Observers cannot interrupt an edit. */ } } };
   const change = (operation: () => void) => {
     assertLive(); const before = state;
-    state = { objects: new Map(state.objects), edits: new Map(state.edits), annotationEdits: new Map(state.annotationEdits), fields: new Map(state.fields), selection: state.selection.slice(), selectionBasis: state.selectionBasis, identity: {} };
+    state = { ...state, objects: new Map(state.objects), edits: new Map(state.edits), annotationEdits: new Map(state.annotationEdits), fields: new Map(state.fields), selection: state.selection.slice(), selectionBasis: state.selectionBasis, identity: {} };
     try { operation(); } catch (error) { state = before; throw error; }
+    if (state.layers !== before.layers) layerRevision++;
     if (previewTransform) { previewTransform = null; previewSequence++; cache = null; }
     if (!transactionDepth) { undoStack.push(before); redoStack.length = 0; revision++; cache = null; emit(); }
   };
@@ -268,7 +305,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     const visit = (nodes: readonly ScenePaintNode[], path: string) => {
       nodes.forEach((node, index) => {
         if (node.kind !== "group" || !contains(node.children)) return;
-        if (node.softMask || node.knockout) { if (!promoted) promoted = { id: `source-group:${path}${index}`, nodes: [node] }; return; }
+        if (isEditorLayerCompositingUnit(node)) { if (!promoted) promoted = { id: `source-group:${path}${index}`, nodes: [node] }; return; }
         visit(node.children, `${path}${index}.`);
       });
     };
@@ -289,6 +326,151 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     }
     const id = `source:${editorRefKey(ref)}`; sourceObject(id); return id;
   };
+  const layerCache = new WeakMap<LayerSnapshot, EditorLayerEdits>();
+  const layerEdits = (snapshot = state): EditorLayerEdits => {
+    let result = layerCache.get(snapshot.layers);
+    if (!result) {
+      const layers = snapshot.layers;
+      result = { catalog: layers.catalog, catalogChanged: layers.catalog !== initialCatalog,
+        removals: layers.removals, removedLayerIds: layers.removals.map(value => value.id), stackingChanged: layers.stackingChanged,
+        objectOrderChanged: layers.objectOrder !== undefined, objectOrder: layers.objectOrder,
+        sourceAssignments: [...layers.sourceAssignments.values()],
+        annotationAssignments: [...layers.annotationAssignments].map(([id, layerId]) => ({ id, layerId })) };
+      layerCache.set(layers, result);
+    }
+    return result;
+  };
+  const visibilityCache = new WeakMap<LayerSnapshot, WeakMap<Snapshot["objects"], ReturnType<typeof createEditorLayerVisibility>>>();
+  const orderSchedules = new WeakMap<LayerSnapshot, { key: string; value: ReturnType<typeof createEditorObjectOrderSchedule> }>();
+  const sourceOrderOrigins = new WeakMap<EditorObject, number>(); let nextSourceOrderOrigin = 0;
+  const visibility = () => {
+    let objects = visibilityCache.get(state.layers); if (!objects) visibilityCache.set(state.layers, objects = new WeakMap());
+    let result = objects.get(state.objects);
+    if (!result) {
+      const layers = state.layers, edits = layerEdits(), models = [...state.objects.values()].filter(object => object.kind !== "group");
+      const additions = models.map(object => ({ id: object.id, pageIndex: object.pageIndex, layerIds: objectLayerIds(object.id),
+        layerCondition: object.layerCondition,
+        ...(object.kind === "source" && object.layerId === undefined && object.layerCondition === undefined ? { sourcePrimitives: object.primitives, sourceLayerEdits: objectLayerEdits(object.id) } : {}) }));
+      const excluded = new Set([...state.edits.values()].filter(edit => edit.deleted).map(edit => editorRefKey(edit.ref)).concat([...state.annotationEdits.values()].filter(edit => edit.deleted).map(edit => `annotation:${edit.id}`)));
+      // Positions, formatting and opacity cannot change sibling paint slots.
+      // Share the large source schedule across those undo snapshots instead of
+      // retaining another complete unit/rank table for every object movement.
+      const layout = JSON.stringify([models.map((object, index) => {
+        let origin: number | undefined;
+        if (object.kind === "source") { const source = geometryOrigins.get(object) ?? object; origin = sourceOrderOrigins.get(source); if (origin === undefined) sourceOrderOrigins.set(source, origin = ++nextSourceOrderOrigin); }
+        return [object.id, object.pageIndex, additions[index].layerIds, object.layerCondition, origin];
+      }), [...excluded].sort()]);
+      result = createEditorLayerVisibility(sourceScene, edits, additions, excluded, () => {
+        let cached = orderSchedules.get(layers);
+        if (!cached || cached.key !== layout) { cached = { key: layout, value: createEditorObjectOrderSchedule(sourceScene, edits, additions, excluded) }; orderSchedules.set(layers, cached); }
+        return cached.value;
+      });
+      objects.set(state.objects, result); }
+    return result;
+  };
+  const remapLayer = (id: string): string | null => {
+    let result: string | null = id;
+    for (const removal of state.layers.removals) if (result === removal.id) result = removal.targetLayerId;
+    return result;
+  };
+  const sourceLayerIds = (ref: PrimitiveRef, captured?: EditorLayerEdits): string[] => {
+    const assignment = captured ? captured.sourceAssignments.find(value => editorRefKey(value.ref) === editorRefKey(ref)) : state.layers.sourceAssignments.get(editorRefKey(ref)), info = getScenePrimitive(sourceScene, ref);
+    const annotationAssignment = info.annotationId ? captured ? captured.annotationAssignments.find(value => value.id === info.annotationId)?.layerId : state.layers.annotationAssignments.get(info.annotationId) : undefined;
+    const assigned = assignment ? assignment.layerId : annotationAssignment;
+    return assigned !== undefined ? assigned === null ? [] : [remapLayer(assigned)].filter((id): id is string => id !== null) : [...new Set(info.optionalContent.layerIds.map(remapLayer)
+      .filter((id): id is string => id !== null && state.layers.catalog.groups.some(group => group.id === id && !group.annotationId)))];
+  };
+  const objectLayerIds = (id: string): string[] => {
+    const object = internalObject(id);
+    if (object.kind === "group") return [...new Set(object.children.flatMap(objectLayerIds))];
+    if (object.layerCondition !== undefined) return getOptionalContentGroupIds(state.layers.catalog, object.layerCondition).filter(id => !state.layers.catalog.groups.find(group => group.id === id)?.annotationId);
+    if (object.kind !== "source" || state.objects.has(id)) {
+      if (object.layerId !== undefined) return object.layerId === null ? [] : [object.layerId];
+      if (object.kind !== "source") return [];
+    }
+    const captured = state.objects.has(id) ? cloneLayers.get(geometryOrigins.get(object) ?? object) : undefined;
+    if (object.primitives.length) return [...new Set(object.primitives.flatMap(ref => sourceLayerIds(ref, captured)))];
+    const assigned = object.annotationId ? state.layers.annotationAssignments.get(object.annotationId) : undefined;
+    if (assigned !== undefined) return assigned === null ? [] : [assigned];
+    const annotation = sourceScene.annotations?.find(value => value.id === object.annotationId);
+    return getOptionalContentGroupIds(state.layers.catalog, annotation?.optionalContent).filter(id => !state.layers.catalog.groups.find(group => group.id === id)?.annotationId);
+  };
+  const conditionVisibility = new WeakMap<LayerSnapshot, ReturnType<typeof createDefaultOptionalContentSnapshot>>();
+  const visibleCondition = (index: number): boolean => {
+    let snapshot = conditionVisibility.get(state.layers);
+    if (!snapshot) { snapshot = createDefaultOptionalContentSnapshot({ ...sourceScene, optionalContent: state.layers.catalog }); conditionVisibility.set(state.layers, snapshot); }
+    return snapshot.conditions[index] !== 0;
+  };
+  const objectVisible = (id: string): boolean => {
+    const object = internalObject(id);
+    if (objectDeleted(object)) return false;
+    if (object.kind === "group") return object.children.some(objectVisible);
+    if (object.kind !== "source" || state.objects.has(id)) {
+      if (!editorObjectHasVisiblePaint(object)) return false;
+      if (object.layerCondition !== undefined) return visibleCondition(object.layerCondition);
+      if (object.layerId !== undefined) return object.layerId === null || editorLayer(state.layers.catalog, object.layerId).defaultVisible;
+      if (object.kind !== "source") return true;
+    }
+    if (object.annotationId && !object.primitives.length) return visibility().isAnnotationVisible(object.annotationId);
+    const sourceVisibility = state.objects.has(id) ? cloneVisibility(objectLayerEdits(id)) : visibility();
+    return object.primitives.some(ref => (state.objects.has(id) || !state.edits.get(editorRefKey(ref))?.deleted) && sourceVisibility.isPrimitiveVisible(ref));
+  };
+  const objectLayerCondition = (id: string): { catalog: EditorLayerEdits["catalog"]; condition?: number } => {
+    const object = internalObject(id), catalog = state.layers.catalog;
+    if (object.kind === "group") throw new TypeError("A temporary group may contain several different layer memberships.");
+    if (object.layerCondition !== undefined) return { catalog, condition: object.layerCondition };
+    if (object.layerId !== undefined || object.kind !== "source") {
+      if (object.layerId == null) return { catalog };
+      const conditions = [...catalog.conditions, { kind: "group" as const, groupId: object.layerId }];
+      return importEditorLayerCondition(catalog, { ...catalog, conditions }, conditions.length - 1);
+    }
+    if (!object.annotationId) throw new TypeError("Exact membership copying requires an annotation or an authored object.");
+    return captureEditorAnnotationLayerCondition(sourceScene, objectLayerEdits(id), object.annotationId);
+  };
+  const validateObjectLayer = (object: EditorObject): void => {
+    if (object.layerCondition !== undefined) {
+      if (object.kind === "group") throw new TypeError("Assign layer membership to a temporary group's contents.");
+      importEditorLayerCondition(state.layers.catalog, state.layers.catalog, object.layerCondition);
+      delete object.layerId;
+    } else if (object.layerId != null) editorLayer(state.layers.catalog, object.layerId);
+  };
+  const catalogChange = (catalog: EditorLayerEdits["catalog"], stacking = false): void => {
+    if (catalog === state.layers.catalog && !stacking) return;
+    change(() => { state.layers = { ...state.layers, catalog, stackingChanged: state.layers.stackingChanged || stacking };
+      state.selection = state.selection.filter(objectVisible); state.selectionBasis = undefined; });
+  };
+  const cloneLayers = new WeakMap<EditorObject, EditorLayerEdits>();
+  const cloneEditCache = new WeakMap<LayerSnapshot, WeakMap<EditorLayerEdits, EditorLayerEdits>>();
+  const cloneVisibilities = new WeakMap<EditorLayerEdits, ReturnType<typeof createEditorLayerVisibility>>();
+  const cloneVisibility = (edits: EditorLayerEdits) => {
+    let result = cloneVisibilities.get(edits); if (!result) { result = createEditorLayerVisibility(sourceScene, edits); cloneVisibilities.set(edits, result); } return result;
+  };
+  const objectLayerEdits = (id: string, snapshot = state): EditorLayerEdits => {
+    const object = snapshot.objects.get(id) ?? sourceObject(id), captured = cloneLayers.get(geometryOrigins.get(object) ?? object);
+    if (!captured || object.kind !== "source") return layerEdits(snapshot);
+    let entries = cloneEditCache.get(snapshot.layers); if (!entries) cloneEditCache.set(snapshot.layers, entries = new WeakMap());
+    let result = entries.get(captured);
+    if (!result) {
+      const retarget = (id: string | null): string | null => { for (const removal of snapshot.layers.removals) if (id === removal.id) id = removal.targetLayerId; return id; };
+      result = { ...layerEdits(snapshot), objectOrder: captured.objectOrder, objectOrderChanged: captured.objectOrderChanged,
+        sourceAssignments: captured.sourceAssignments.map(value => ({ ...value, layerId: retarget(value.layerId) })),
+        annotationAssignments: captured.annotationAssignments.map(value => ({ ...value, layerId: retarget(value.layerId) })) };
+      entries.set(captured, result);
+    }
+    return result;
+  };
+  const appliedLayers = new WeakMap<LayerSnapshot, Promise<VectorScene>>();
+  const appliedCloneLayers = new WeakMap<EditorLayerEdits, Promise<VectorScene>>();
+  const appliedLayerSource = (snapshot: Snapshot, signal: AbortSignal): Promise<VectorScene> => {
+    let result = appliedLayers.get(snapshot.layers);
+    if (!result) {
+      const edits = layerEdits(snapshot);
+      result = !edits.catalogChanged && !edits.objectOrderChanged && !edits.sourceAssignments.length && !edits.annotationAssignments.length
+        ? Promise.resolve(sourceScene) : applyEditorSceneLayers(sourceScene, edits, { signal: lifetime.signal, onDiagnostic: options.onDiagnostic });
+      appliedLayers.set(snapshot.layers, result); void result.catch(() => appliedLayers.delete(snapshot.layers));
+    }
+    return waitForLoad(result, signal);
+  };
   const selection = (ids: readonly string[], selectionOptions: { additive?: boolean; toggle?: boolean } = {}) => {
     assertLive(); const valid = [...new Set(ids.map(id => {
       const match = /^source:(stroke|fill|text|raster|gradient-fill|gradient-stroke):(\d+)$/.exec(id);
@@ -299,6 +481,24 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     if (previewTransform) { previewTransform = null; previewSequence++; cache = null; }
     const same = selected.size === state.selection.length && state.selection.every(id => selected.has(id));
     state = { ...state, selection: [...selected], selectionBasis: same ? state.selectionBasis : undefined }; emit();
+  };
+  const selectedPaintOwners = (): Set<string> => {
+    const owners = new Set<string>(), sourceIdentity = editorPaintIdentity(sourceScene);
+    for (const id of expand(state.selection)) {
+      if (!objectVisible(id)) continue;
+      const object = internalObject(id);
+      if (object.kind === "source" && !state.objects.has(id)) {
+        if (object.primitives.length) object.primitives.forEach(ref => owners.add(sourceIdentity(ref)));
+        else if (object.annotationId) owners.add(`annotation:${object.annotationId}`);
+      } else owners.add(id);
+    }
+    return owners;
+  };
+  const arrangeSelection = (action: EditorStackingAction) => {
+    assertLive();
+    if (!["send-to-back", "bring-to-front", "bring-forward", "send-backward"].includes(action)) throw new TypeError("Unknown stacking action.");
+    const owners = selectedPaintOwners();
+    return owners.size ? visibility().getObjectOrder().arrange(owners, action) : { changed: false, order: [] };
   };
   const session: EditorSession = {
     sourceScene, sourcePdf,
@@ -345,12 +545,10 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       const found = new Set<string>(), hit = (box: Bounds) => selectionOptions.intersects
         ? box.minX <= bounds.maxX && box.maxX >= bounds.minX && box.minY <= bounds.maxY && box.maxY >= bounds.minY
         : box.minX >= bounds.minX && box.maxX <= bounds.maxX && box.minY >= bounds.minY && box.maxY <= bounds.maxY;
-      for (const object of session.getObjects({ pageIndex: selectionOptions.pageIndex })) if (hit(objectBounds(object.id))) found.add(object.id);
+      for (const object of session.getObjects({ pageIndex: selectionOptions.pageIndex })) if (objectVisible(object.id) && hit(objectBounds(object.id))) found.add(object.id);
       const counts = scenePrimitiveCounts(sourceScene);
-      const visibility = createDefaultOptionalContentSnapshot(sourceScene);
       for (const annotation of sourceScene.annotations ?? []) {
-        if (!annotation.visibleInDefaultView || annotation.subtype === "Popup" || (annotation.flags & (1 | 2 | 32)) !== 0 ||
-          (annotation.optionalContent !== undefined && visibility.conditions[annotation.optionalContent] !== 1) ||
+        if (!session.isAnnotationVisible(annotation.id) || annotation.subtype === "Popup" ||
           (selectionOptions.pageIndex !== undefined && annotation.pageIndex !== selectionOptions.pageIndex)) continue;
         if ((getSceneAnnotationRuns(sourceScene).get(annotation.id)?.length ?? 0) > 0) continue;
         const id = `annotation:${annotation.id}`, object = sourceObject(id);
@@ -358,7 +556,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       }
       for (const kind of PAGE_PRIMITIVE_KINDS) for (let index = 0; index < counts[kind]; index++) {
         const ref = { kind, index }, edit = state.edits.get(editorRefKey(ref)); if (edit?.deleted) continue;
-        if (!isScenePrimitiveVisible(sourceScene, ref, condition => condition === undefined || visibility.conditions[condition] === 1)) continue;
+        if (!session.isPrimitiveVisible(ref)) continue;
         if (selectionOptions.pageIndex !== undefined) { sourcePartition ??= new ScenePageViews(sourceScene); if (sourcePartition.owners[kind][index] !== selectionOptions.pageIndex) continue; }
         if (hit(editorTransformBounds(getScenePrimitive(sourceScene, ref).bounds, edit?.transform ?? EDITOR_IDENTITY))) found.add(promoteSource(ref));
       }
@@ -368,24 +566,35 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       assertLive(); const id = input.id ?? nextObjectId();
       if (!sourceIdIsDeleted(id) || state.objects.has(id) || sourceObjects.has(id) || /^(source:|annotation:|source-group:)/.test(id)) throw new RangeError("Editor object ID already exists or is reserved.");
       const object = copy({ ...input, id, transform: input.transform ?? EDITOR_IDENTITY }) as EditorObject;
+      if (object.kind !== "source" && object.kind !== "group") {
+        if (object.layerId === undefined && object.layerCondition === undefined) {
+          object.layerId = session.getActiveLayer();
+          if (object.layerId !== null && !editorLayer(state.layers.catalog, object.layerId).defaultVisible) throw new Error("Show the active layer before adding content.");
+        }
+      }
+      validateObjectLayer(object);
       if (object.kind === "text" && object.runs !== undefined) object.text = object.runs.map(run => run.text).join("");
       validateObject(object, pageCount);
       if (object.kind === "source") { object.isClone = true; for (const ref of object.primitives) getScenePrimitive(sourceScene, ref); }
       if (object.kind === "group") object.children.forEach(internalObject);
-      change(() => { state.objects.set(id, object); state.selection = [id]; state.selectionBasis = undefined; }); return id;
+      if (object.kind === "source") cloneLayers.set(object, layerEdits());
+      change(() => { state.objects.set(id, object); if (object.layerId != null || object.layerCondition !== undefined) state.layers = { ...state.layers }; state.selection = [id]; state.selectionBasis = undefined; }); return id;
     },
     updateObject(id, patch) {
       assertLive(); const original = internalObject(id);
       if (!state.objects.has(id) && original.kind === "source") throw new TypeError("Original content is updated through selection transforms.");
       const object = copy({ ...original, ...patch, id, kind: original.kind }) as EditorObject;
+      if (Object.hasOwn(patch, "layerId") && !Object.hasOwn(patch, "layerCondition")) delete object.layerCondition;
       if (object.kind === "text") {
         if (Object.hasOwn(patch, "text") && !Object.hasOwn(patch, "runs")) delete object.runs;
         if (object.runs !== undefined) object.text = object.runs.map(run => run.text).join("");
       }
       validateObject(object, pageCount);
+      validateObjectLayer(object);
       if (object.kind === "group") throw new TypeError("Use group and ungroup operations to change group membership.");
       if (Object.keys(patch).every(key => key === "transform" || key === "pageIndex")) geometryOrigins.set(object, geometryOrigins.get(original) ?? original);
-      change(() => state.objects.set(id, object));
+      const inherited = cloneLayers.get(original); if (inherited) cloneLayers.set(object, inherited);
+      change(() => { state.objects.set(id, object); if (object.layerId !== original.layerId || object.layerCondition !== original.layerCondition) state.layers = { ...state.layers }; });
     },
     transformSelection(input) {
       const matrix = editorMatrix(input); if (editorMatrixIsIdentity(matrix) || !state.selection.length) return;
@@ -401,6 +610,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     deleteSelection() {
       if (!state.selection.length) return;
       change(() => {
+        if (expand(state.selection).some(id => objectLayerIds(id).length)) state.layers = { ...state.layers };
         const selectedGroups = new Set<string>();
         const collectGroups = (id: string) => { const object = internalObject(id); if (object.kind !== "group") return;
           selectedGroups.add(id); object.children.forEach(collectGroups); };
@@ -440,7 +650,8 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
             clone.transform = matrices[0];
           }
           if (clone.kind === "source") clone.isClone = true;
-          change(() => state.objects.set(clone.id, clone)); clones.push(clone.id);
+          if (clone.kind === "source") cloneLayers.set(clone, cloneLayers.get(geometryOrigins.get(original) ?? original) ?? layerEdits());
+          change(() => { state.objects.set(clone.id, clone); if (objectLayerIds(id).length) state.layers = { ...state.layers }; }); clones.push(clone.id);
         }
         state.selection = clones; state.selectionBasis = clones.length > 1 ? basis : undefined;
         session.transformSelection([1, 0, 0, 1, offset[0], offset[1]]);
@@ -471,6 +682,110 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     getFieldValues() { return new Map([...state.fields].map(([name, value]) => [name, copy(value)])); },
     getSourceEdits() { return [...state.edits.values()].map(copy); },
     getAnnotationEdits() { return [...state.annotationEdits.values()].map(copy); },
+    getLayers() { assertLive(); return copy(state.layers.catalog.groups.filter(group => group.annotationId === undefined)); },
+    getLayerOrder() { assertLive(); return copy(state.layers.catalog.order); },
+    createLayer(input) {
+      assertLive(); let id: string;
+      do { id = `editor:layer:${++nextLayerId}`; } while (state.layers.catalog.groups.some(group => group.id === id) || state.layers.removals.some(value => value.id === id));
+      catalogChange(createEditorLayer(state.layers.catalog, id, input)); return id;
+    },
+    updateLayer(id, patch) { assertLive(); catalogChange(updateEditorLayer(state.layers.catalog, id, patch)); },
+    moveLayer(id, position) {
+      assertLive(); const catalog = moveEditorLayer(state.layers.catalog, id, position);
+      if (catalog !== state.layers.catalog) catalogChange(catalog, true);
+    },
+    setLayerOrder(order) {
+      assertLive(); const catalog = setEditorLayerOrder(state.layers.catalog, order);
+      if (catalog !== state.layers.catalog) catalogChange(catalog, true);
+    },
+    canReorderSelection(action) { return arrangeSelection(action).changed; },
+    reorderSelection(action) {
+      const result = arrangeSelection(action); if (!result.changed) return;
+      change(() => { state.layers = { ...state.layers, objectOrder: result.order }; });
+    },
+    removeLayer(id, removal = {}) {
+      assertLive(); const targetLayerId = removal.targetLayerId ?? null;
+      const catalog = removeEditorLayer(state.layers.catalog, id, targetLayerId);
+      change(() => {
+        const sourceAssignments = new Map([...state.layers.sourceAssignments].map(([key, value]) => [key, value.layerId === id ? { ...value, layerId: targetLayerId } : value]));
+        const annotationAssignments = new Map([...state.layers.annotationAssignments].map(([key, value]) => [key, value === id ? targetLayerId : value]));
+        state.layers = { ...state.layers, catalog, sourceAssignments, annotationAssignments,
+          removals: [...state.layers.removals, { id, targetLayerId }] };
+        for (const [key, object] of state.objects) if (object.layerId === id) {
+          const next = { ...object, layerId: targetLayerId }; state.objects.set(key, next);
+          const inherited = cloneLayers.get(object); if (inherited) cloneLayers.set(next, inherited);
+          geometryOrigins.set(next, geometryOrigins.get(object) ?? object);
+        }
+        state.selection = state.selection.filter(objectVisible); state.selectionBasis = undefined;
+      });
+      if (activeLayer === id) { activeLayer = targetLayerId; emit(); }
+    },
+    getActiveLayer() { assertLive(); return activeLayer !== null && state.layers.catalog.groups.some(group => group.id === activeLayer) ? activeLayer : null; },
+    setActiveLayer(id) { assertLive(); if (id !== null) editorLayer(state.layers.catalog, id); if (id !== activeLayer) { activeLayer = id; emit(); } },
+    getObjectLayerIds(id) { assertLive(); return objectLayerIds(id); },
+    getObjectLayerCondition(id) { assertLive(); return copy(objectLayerCondition(id)); },
+    copyObjectLayerMembership(sourceId, targetId) {
+      assertLive(); const source = objectLayerCondition(sourceId), target = internalObject(targetId);
+      if (!state.objects.has(targetId) || target.kind === "group" || objectDeleted(target)) throw new TypeError("Layer membership can be copied onto an authored object.");
+      const imported = importEditorLayerCondition(state.layers.catalog, source.catalog, source.condition);
+      const next: EditorObject = { ...target, layerId: null, layerCondition: imported.condition };
+      if (imported.condition !== undefined) delete next.layerId;
+      change(() => {
+        state.layers = { ...state.layers, catalog: imported.catalog }; state.objects.set(targetId, next);
+        geometryOrigins.set(next, geometryOrigins.get(target) ?? target);
+        const inherited = cloneLayers.get(target); if (inherited) cloneLayers.set(next, inherited);
+        state.selection = state.selection.filter(objectVisible); state.selectionBasis = undefined;
+      });
+    },
+    assignObjectsToLayer(input, layerId) {
+      assertLive(); if (layerId !== null) editorLayer(state.layers.catalog, layerId);
+      const ids = expand(input), source = new Map<string, EditorSourceObject>();
+      for (const id of ids) {
+        const object = internalObject(id); if (objectDeleted(object)) throw new RangeError("A deleted object cannot be assigned to a layer.");
+        if (object.kind !== "source" || state.objects.has(id)) continue;
+        if (!object.primitives.length) source.set(id, object);
+        for (const ref of object.primitives) { const promoted = internalObject(promoteSource(ref)); if (promoted.kind === "source") source.set(promoted.id, promoted); }
+      }
+      change(() => {
+        const sourceAssignments = new Map(state.layers.sourceAssignments), annotationAssignments = new Map(state.layers.annotationAssignments);
+        for (const object of source.values()) {
+          if (object.annotationId) annotationAssignments.set(object.annotationId, layerId);
+          for (const ref of object.primitives) {
+            sourceAssignments.set(editorRefKey(ref), { ref: { ...ref }, layerId });
+            const annotation = getScenePrimitive(sourceScene, ref).annotationId; if (annotation) annotationAssignments.set(annotation, layerId);
+          }
+        }
+        for (const id of ids) {
+          const object = internalObject(id); if (object.kind === "source" && !state.objects.has(id)) continue;
+          const next = { ...object, layerId }; delete next.layerCondition; state.objects.set(id, next);
+          geometryOrigins.set(next, geometryOrigins.get(object) ?? object);
+          const inherited = cloneLayers.get(object); if (inherited) cloneLayers.set(next, inherited);
+        }
+        state.layers = { ...state.layers, sourceAssignments, annotationAssignments };
+        state.selection = state.selection.filter(objectVisible); state.selectionBasis = undefined;
+      });
+    },
+    assignSelectionToLayer(layerId) { session.assignObjectsToLayer(state.selection, layerId); },
+    getLayerObjects(id) {
+      assertLive(); editorLayer(state.layers.catalog, id);
+      return session.getObjects({ includeSource: true }).filter(object => object.kind !== "group" && objectLayerIds(object.id).includes(id)).map(object => object.id);
+    },
+    selectLayerContents(id) { selection(session.getLayerObjects(id).filter(objectVisible)); },
+    getLayerEdits() { assertLive(); return copy(layerEdits()); },
+    getObjectLayerEdits(id) { assertLive(); return copy(objectLayerEdits(id)); },
+    getLayerRevision() { assertLive(); return layerRevision; },
+    isObjectVisible(id) { assertLive(); return objectVisible(id); },
+    isPrimitiveVisible(ref) { assertLive(); return !state.edits.get(editorRefKey(ref))?.deleted && visibility().isPrimitiveVisible(ref); },
+    isAnnotationVisible(id) { assertLive(); return !state.annotationEdits.get(id)?.deleted && visibility().isAnnotationVisible(id); },
+    getPrimitivePaintRank(ref) { assertLive(); return visibility().getPrimitivePaintRank(ref); },
+    getObjectPaintRank(id) {
+      assertLive(); const object = internalObject(id), ranks = visibility();
+      if (object.kind === "group") return object.children.reduce((maximum, child) => objectVisible(child) ? Math.max(maximum, session.getObjectPaintRank(child)) : maximum, -1);
+      if (object.kind === "source" && !state.objects.has(id)) return object.primitives.length
+        ? object.primitives.reduce((maximum, ref) => !state.edits.get(editorRefKey(ref))?.deleted && ranks.isPrimitiveVisible(ref) ? Math.max(maximum, ranks.getPrimitivePaintRank(ref)) : maximum, -1)
+        : ranks.getObjectPaintRank(object.annotationId ? `annotation:${object.annotationId}` : id);
+      return ranks.getObjectPaintRank(id);
+    },
     getPages() {
       assertLive();
       return Array.from({ length: pageCount }, (_, index) => {
@@ -484,15 +799,15 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     async removePages() { throw new Error("Page operations require an editor document session."); },
     async insertPdf() { throw new Error("Page operations require an editor document session."); },
     transaction(_label, operation) {
-      assertLive(); const before = state, outer = transactionDepth === 0; if (outer) transactionStart = before; transactionDepth++;
-      try { operation(); } catch (error) { state = before; throw error; }
+      assertLive(); const before = state, beforeLayers = layerRevision, outer = transactionDepth === 0; if (outer) transactionStart = before; transactionDepth++;
+      try { operation(); } catch (error) { state = before; layerRevision = beforeLayers; throw error; }
       finally { transactionDepth--; if (outer) {
         if (state.identity !== transactionStart!.identity) { undoStack.push(transactionStart!); redoStack.length = 0; revision++; cache = null; emit(); }
         transactionStart = null;
       } }
     },
-    undo() { assertLive(); previewTransform = null; previewSequence++; const previous = undoStack.pop(); if (!previous) { emit(); return false; } redoStack.push(state); state = previous; revision++; cache = null; emit(); return true; },
-    redo() { assertLive(); previewTransform = null; previewSequence++; const next = redoStack.pop(); if (!next) { emit(); return false; } undoStack.push(state); state = next; revision++; cache = null; emit(); return true; },
+    undo() { assertLive(); previewTransform = null; previewSequence++; const previous = undoStack.pop(); if (!previous) { emit(); return false; } redoStack.push(state); if (previous.layers !== state.layers) layerRevision++; state = previous; revision++; cache = null; emit(); return true; },
+    redo() { assertLive(); previewTransform = null; previewSequence++; const next = redoStack.pop(); if (!next) { emit(); return false; } undoStack.push(state); if (next.layers !== state.layers) layerRevision++; state = next; revision++; cache = null; emit(); return true; },
     markSaved() { assertLive(); savedIdentity = state.identity; emit(); },
     subscribe(listener) { assertLive(); listeners.add(listener); return () => listeners.delete(listener); },
     async getScene(compileOptions = {}) {
@@ -502,11 +817,15 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       const completeMeta = { sourceType: "scene" as const, unit: "pages" as const, processed: pageCount, total: pageCount, pageCount };
       const preview = compileOptions.preview !== false, startedPreview = preview ? previewSequence : -1;
       const committedSnapshot = state, capturedPreview = previewTransform, startedRevision = revision;
+      const objectOrder = committedSnapshot.layers.objectOrder || committedSnapshot.layers.stackingChanged ? visibility().getObjectOrder() : undefined;
       const includeObjects = compileOptions.includeObjects !== false;
+      const sourceCopiesOnly = (compileOptions as { sourceCopiesOnly?: boolean }).sourceCopiesOnly === true;
+      const useFullCache = includeObjects && !sourceCopiesOnly;
       signal.throwIfAborted(); progress.report(0, { ...compileMeta, unit: "pages", processed: 0, total: pageCount }); signal.throwIfAborted();
-      if (includeObjects && cache?.revision === startedRevision && cache.previewSequence === startedPreview) { const cachedScene = cache.scene; progress.complete(completeMeta); return cachedScene; }
+      if (useFullCache && cache?.revision === startedRevision && cache.previewSequence === startedPreview) { const cachedScene = cache.scene; progress.complete(completeMeta); return cachedScene; }
       const snapshot = preview && capturedPreview ? transformedSnapshot(committedSnapshot, capturedPreview) : committedSnapshot;
-      let base = bakeEditorSourceScene(sourceScene, [...snapshot.edits.values()], signal, options.onDiagnostic);
+      const layeredSource = await appliedLayerSource(snapshot, signal);
+      let base = bakeEditorSourceScene(layeredSource, [...snapshot.edits.values()], signal, options.onDiagnostic);
       const metadataOnly = [...snapshot.annotationEdits.values()].filter(edit => !(getSceneAnnotationRuns(sourceScene).get(edit.id)?.length));
       base = bakeEditorAnnotationEdits(base, metadataOnly);
       progress.report(.15, compileMeta); signal.throwIfAborted();
@@ -515,14 +834,17 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         base = await options.compileFields(base, snapshot.fields, signal);
       }
       signal.throwIfAborted(); progress.report(.3, compileMeta); signal.throwIfAborted();
-      const additions = includeObjects ? [...snapshot.objects.values()].filter(object => object.kind !== "group") : [];
+      const additions = includeObjects ? [...snapshot.objects.values()].filter(object => object.kind !== "group" && (!sourceCopiesOnly || object.kind === "source")) : [];
       if (!additions.length) {
-        if (includeObjects && revision === startedRevision && (!preview || previewSequence === startedPreview) && !disposed) cache = { revision, previewSequence: startedPreview, scene: base };
+        base = reorderEditorSceneLayers(base, layerEdits(snapshot));
+        if (objectOrder) base = applyEditorObjectOrdering(base, objectOrder);
+        base = await refreshEditorSceneLayerDefaults(base, { signal, onDiagnostic: options.onDiagnostic });
+        if (useFullCache && revision === startedRevision && (!preview || previewSequence === startedPreview) && !disposed) cache = { revision, previewSequence: startedPreview, scene: base };
         progress.complete(completeMeta); return base;
       }
       const partition = new ScenePageViews(base), pages: VectorScene[] = [];
       for (let index = 0; index < pageCount; index++) {
-        signal.throwIfAborted(); pages.push(partition.extract(index).scene);
+        signal.throwIfAborted(); const view = partition.extract(index); remapEditorPaintIdentity(base, view.scene, view.primitives); pages.push(view.scene);
         progress.report(.3 + .15 * (index + 1) / pageCount, { ...compileMeta, pageIndex: index, unit: "pages", processed: index + 1, total: pageCount });
       }
       const pageAdditions: VectorScene[][] = Array.from({ length: pageCount }, () => []);
@@ -532,10 +854,19 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         if (object.kind === "source") {
           const keep = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind => [kind, new Set<number>()])) as Record<PrimitiveRef["kind"], Set<number>>;
           for (const ref of object.primitives) keep[ref.kind].add(ref.index);
-          geometry = transformWholeEditorScene(compactEditorScene(sourceScene, keep), object.transform, signal, options.onDiagnostic);
+          const cloneEdits = objectLayerEdits(object.id, snapshot);
+          let clonePromise = appliedCloneLayers.get(cloneEdits);
+          if (!clonePromise) {
+            clonePromise = applyEditorSceneLayers(sourceScene, cloneEdits, { signal: lifetime.signal, onDiagnostic: options.onDiagnostic })
+              .then(scene => cloneEdits.objectOrderChanged ? applyEditorObjectOrdering(scene, createEditorObjectOrderSchedule(sourceScene, cloneEdits, [])) : scene);
+            appliedCloneLayers.set(cloneEdits, clonePromise); void clonePromise.catch(() => appliedCloneLayers.delete(cloneEdits));
+          }
+          const cloneSource = await waitForLoad(clonePromise, signal);
+          geometry = transformWholeEditorScene(compactEditorScene(cloneSource, keep), object.transform, signal, options.onDiagnostic);
           geometry.pageCount = 1; geometry.pageRects = sourceScene.pageRects.slice(object.pageIndex * 4, object.pageIndex * 4 + 4);
           geometry.pageTextRanges = Uint32Array.of(0, geometry.textInstanceCount); geometry.pagePrimitiveRanges = undefined;
           geometry.pdfPages = undefined; geometry.annotations = undefined;
+          geometry = detachEditorGeometryAnnotationLayers(geometry);
           geometry.markedContent = undefined; geometry.structureElements = undefined;
           if (geometry.textIndex) geometry.textIndex = { version: 2, pages: [geometry.textIndex.pages[object.pageIndex]] };
           geometry.rasterLayers = geometry.rasterLayers.map(layer => ({ ...layer, pageIndex: 0 }));
@@ -553,6 +884,10 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
           geometry = await waitForLoad(promise, signal); signal?.throwIfAborted(); const origin = pageOrigin(object.pageIndex);
           geometry = transformWholeEditorScene(geometry, multiplyEditorMatrices([1, 0, 0, 1, ...origin], object.transform), signal, options.onDiagnostic);
         }
+        geometry = assignEditorGeometryLayer(geometry, snapshot.layers.catalog, object.layerId, object.layerCondition);
+        if (object.kind === "source" && object.layerId === undefined && object.layerCondition === undefined) {
+          const identity = editorPaintIdentity(geometry); setEditorPaintIdentity(geometry, ref => editorCloneOwner(object.id, identity(ref)));
+        } else setEditorPaintIdentity(geometry, editorAuthoredOwner(object.id));
         pageAdditions[object.pageIndex].push(geometry);
         progress.report(.45 + .4 * (objectIndex + 1) / additions.length, { ...compileMeta, pageIndex: object.pageIndex });
       }
@@ -562,9 +897,14 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         progress.report(.85 + .12 * (index + 1) / pageCount, { ...compileMeta, pageIndex: index, unit: "pages", processed: index + 1, total: pageCount });
         return composed;
       });
-      const result = composeOverlappingVectorScenes(composedPages); signal.throwIfAborted();
+      let result = composeOverlappingVectorScenes(composedPages); signal.throwIfAborted();
+      composeEditorPaintIdentity(composedPages, result);
+      retainEditorAnnotationPlacements(base, result);
       result.pagesPerRow = sourceScene.pagesPerRow; result.sourcePdfByteLength = sourceScene.sourcePdfByteLength;
-      if (revision === startedRevision && (!preview || previewSequence === startedPreview) && !disposed) cache = { revision, previewSequence: startedPreview, scene: result };
+      result = reorderEditorSceneLayers(result, layerEdits(snapshot));
+      if (objectOrder) result = applyEditorObjectOrdering(result, objectOrder);
+      result = await refreshEditorSceneLayerDefaults(result, { signal, onDiagnostic: options.onDiagnostic });
+      if (useFullCache && revision === startedRevision && (!preview || previewSequence === startedPreview) && !disposed) cache = { revision, previewSequence: startedPreview, scene: result };
       progress.complete(completeMeta); return result;
     },
     async savePdf(saveOptions = {}) {
@@ -574,6 +914,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       saveOptions.signal!.throwIfAborted();
       const progress = createLoadProgressReporter(saveOptions.onProgress), compileProgress = progress.child(0, .4), persistenceProgress = progress.child(.4, 1);
       const snapshot = state, targetRevision = revision, snapshotObjects = new Map(sourceObjects);
+      const snapshotLayerRevision = layerRevision, snapshotActiveLayer = session.getActiveLayer();
       const snapshotStatus = { ...getState(), previewing: false };
       const scene = await session.getScene({ ...saveOptions, preview: false,
         onProgress: payload => compileProgress.report(payload.value, { ...payload, stage: payload.stage === "complete" ? "compile" : payload.stage }) });
@@ -605,6 +946,16 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         getFieldValues: () => new Map([...snapshot.fields].map(([name, value]) => [name, copy(value)])),
         getSourceEdits: () => [...snapshot.edits.values()].map(copy),
         getAnnotationEdits: () => [...snapshot.annotationEdits.values()].map(copy),
+        getLayers: () => withSnapshot(() => session.getLayers()), getLayerOrder: () => withSnapshot(() => session.getLayerOrder()),
+        getLayerEdits: () => copy(layerEdits(snapshot)), getLayerRevision: () => snapshotLayerRevision,
+        getObjectLayerEdits: id => copy(objectLayerEdits(id, snapshot)),
+        getObjectLayerCondition: id => withSnapshot(() => copy(objectLayerCondition(id))),
+        getActiveLayer: () => snapshotActiveLayer, getObjectLayerIds: id => withSnapshot(() => objectLayerIds(id)),
+        getLayerObjects: id => withSnapshot(() => session.getLayerObjects(id)),
+        isObjectVisible: id => withSnapshot(() => objectVisible(id)), isPrimitiveVisible: ref => withSnapshot(() => session.isPrimitiveVisible(ref)),
+        isAnnotationVisible: id => withSnapshot(() => session.isAnnotationVisible(id)), getPrimitivePaintRank: ref => withSnapshot(() => session.getPrimitivePaintRank(ref)),
+        getObjectPaintRank: id => withSnapshot(() => session.getObjectPaintRank(id)),
+        canReorderSelection: action => withSnapshot(() => session.canReorderSelection(action)), reorderSelection: readOnly,
         getPages: () => withSnapshot(() => session.getPages()),
         async getScene(sceneOptions = {}) {
           sceneOptions.signal?.throwIfAborted(); saveOptions.signal?.throwIfAborted();
@@ -624,6 +975,8 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
           createLoadProgressReporter(sceneOptions.onProgress).complete({ sourceType: "scene", unit: "pages", processed: pageCount, total: pageCount, pageCount }); return result;
         },
         select: readOnly, selectPrimitives: readOnly, selectAnnotations: readOnly, selectArea: readOnly,
+        createLayer: readOnly, updateLayer: readOnly, moveLayer: readOnly, setLayerOrder: readOnly, removeLayer: readOnly,
+        setActiveLayer: readOnly, assignObjectsToLayer: readOnly, assignSelectionToLayer: readOnly, selectLayerContents: readOnly, copyObjectLayerMembership: readOnly,
         addObject: readOnly, updateObject: readOnly, transformSelection: readOnly, setPreviewTransform: readOnly,
         deleteSelection: readOnly, cloneSelection: readOnly, groupSelection: readOnly, ungroupSelection: readOnly,
         setFieldValue: readOnly, transaction: readOnly, undo: readOnly, redo: readOnly, markSaved: readOnly,
@@ -662,7 +1015,17 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       saveOptions.signal?.throwIfAborted(); progress.complete({ sourceType: "hep", unit: "pages", processed: pageCount, total: pageCount, pageCount });
       if (!disposed && revision === targetRevision) session.markSaved(); return blob;
     },
-    dispose() { if (disposed) return; disposed = true; lifetime.abort(); listeners.clear(); undoStack.length = redoStack.length = 0; sourceObjects.clear(); cache = null; frameCache = null; sourcePartition = null; state = { objects: new Map(), fields: new Map(), edits: new Map(), annotationEdits: new Map(), selection: [], identity: {} }; }
+    dispose() { if (disposed) return; disposed = true; lifetime.abort(); listeners.clear(); undoStack.length = redoStack.length = 0; sourceObjects.clear(); cache = null; frameCache = null; sourcePartition = null; state = { objects: new Map(), fields: new Map(), edits: new Map(), annotationEdits: new Map(), layers: initialLayers, selection: [], identity: {} }; }
   };
+  orderReaders.set(session, () => { assertLive(); return [...visibility().getObjectOrder().order]; });
+  orderedSourceReaders.set(session, options => session.getScene({ ...options, preview: false, sourceCopiesOnly: true } as NonNullable<Parameters<EditorSession["getScene"]>[0]>));
+  orderRestorers.set(session, (tokens, stackingChanged = state.layers.stackingChanged) => {
+    assertLive();
+    for (const token of tokens) {
+      const value = JSON.parse(token); if (!Array.isArray(value) || value.length !== 2 || typeof value[0] !== "string" || (value[1] !== null && typeof value[1] !== "string")) throw new TypeError("Invalid restored object-order token.");
+    }
+    const order = tokens.length ? [...new Set(tokens)] : undefined;
+    if (JSON.stringify(order) !== JSON.stringify(state.layers.objectOrder) || stackingChanged !== state.layers.stackingChanged) change(() => { state.layers = { ...state.layers, objectOrder: order, stackingChanged }; });
+  });
   return session;
 }

@@ -83,6 +83,14 @@ try {
       { number: 6, body: tinyPdfStream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", Uint8Array.of(128)) }]),
     [[2, 2], [15, 15], [40, 40], [75, 12], [50, 8], [4, 8]], "ordered vectors, alpha, image mask, clips and stroke");
   near(pixel(ordered.after, 40, 40), [128, 0, 128, 255], 3, "hole exposes the earlier translucent fill");
+  const caps = await roundTrip(fixture(
+    "0 0 0 RG 10 w 0 J 30 20 m 70 20 l S 1 J 30 50 m 70 50 l S " +
+    "0 J [10 10] 0 d 20 80 m 80 80 l S"),
+    [[27, 20], [31, 20], [73, 20], [27, 50], [73, 50], [26, 54], [18, 80], [28, 80], [32, 80]],
+    "source butt/round caps and butt-capped dash ends");
+  near(pixel(caps.after, 27, 20), [255, 255, 255, 255], 1, "butt caps cannot extend before their endpoint");
+  near(pixel(caps.after, 27, 50), [0, 0, 0, 255], 1, "round caps retain their endpoint disk");
+  near(pixel(caps.after, 32, 80), [255, 255, 255, 255], 1, "butt-capped dashes retain their gaps");
   await roundTrip(fixture("q 80 0 0 80 10 10 cm /Im Do Q", "/XObject << /Im 5 0 R >>", [
     { number: 5, body: tinyPdfStream("/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R /Interpolate false",
       Uint8Array.of(255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0)) },
@@ -191,10 +199,13 @@ try {
   }
   const dotScene = { ...createEmptyVectorScene(), pageCount: 1, pagesPerRow: 1,
     pageRects: Float32Array.of(0, 0, 100, 100), pageTextRanges: Uint32Array.of(0, 0),
-    segmentCount: 1, endpoints: Float32Array.of(50, 50, 50, 50), primitiveMeta: Float32Array.of(50, 50, 0, 1),
+    segmentCount: 1, endpoints: Float32Array.of(50, 50, 50, 50), primitiveMeta: Float32Array.of(50, 50, 0, 5),
     primitiveBounds: Float32Array.of(46, 46, 54, 54), styles: Float32Array.of(4, 0, 0, 0) };
   const [dotPage] = await read(new Uint8Array(await (await writeScenePdf(dotScene)).arrayBuffer()));
   near(pixel(await pixels(dotPage), 50, 50), [0, 0, 0, 255], 1, "degenerate round strokes retain their dot");
+  const [buttDotPage] = await read(new Uint8Array(await (await writeScenePdf({ ...dotScene,
+    primitiveMeta: Float32Array.of(50, 50, 0, 1) })).arrayBuffer()));
+  near(pixel(await pixels(buttDotPage), 50, 50), [255, 255, 255, 255], 1, "degenerate butt strokes remain unpainted");
 
   // A retained fallback resource may hold other page commands. Only its
   // canonical current raster slot belongs at this paint position.
