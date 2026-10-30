@@ -4,14 +4,20 @@ import { isPdfDictionary, isPdfName, isPdfRef, isPdfStream, isPdfString, pdfRefK
 import { decodePdfString } from "./pdf/nativeForms";
 import { computeNativePdfPageGeometry } from "./pdf/nativePageGeometry";
 import { createNativeOptionalContentRegistry } from "./pdf/nativeOptionalContent";
-import { invertEditorMatrix, multiplyEditorMatrices } from "./editorScene";
+import { editorPoint, invertEditorMatrix, multiplyEditorMatrices } from "./editorScene";
 import { createLoadProgressReporter, type LoadProgressCallback } from "./loadProgress";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
 
 export type PdfPageOperation =
   | { readonly kind: "rotate"; readonly pages: readonly number[]; readonly degrees: number }
   | { readonly kind: "remove"; readonly pages: readonly number[] }
+  | { readonly kind: "reorder"; readonly pages: readonly number[] }
+  | { readonly kind: "duplicate"; readonly pages: readonly number[]; readonly at: number }
+  | { readonly kind: "extract"; readonly pages: readonly number[] }
+  | { readonly kind: "crop"; readonly pages: readonly number[]; readonly box: PdfPageCropBox | null }
   | { readonly kind: "insert"; readonly at: number; readonly bytes: Uint8Array; readonly pages?: readonly number[]; readonly password?: string };
+/** Visible page coordinates in points, measured from its displayed lower left. */
+export interface PdfPageCropBox { readonly x: number; readonly y: number; readonly width: number; readonly height: number }
 export interface PdfPageOperationOptions {
   readonly password?: string;
   readonly signal?: AbortSignal;
@@ -27,12 +33,28 @@ export async function manipulatePdfPages(primaryBytes: Uint8Array, operation: Pd
   const progress = createLoadProgressReporter(options.onProgress);
   const diagnostic = (code: string, message: string) => options.onDiagnostic?.({ code, message, severity: "warning" });
   progress.report(0, { stage: "source", sourceType: "pdf" });
-  if (!operation || !["rotate", "remove", "insert"].includes(operation.kind)) throw new TypeError("Unknown PDF page operation.");
+  if (!operation || !["rotate", "remove", "insert", "reorder", "duplicate", "extract", "crop"].includes(operation.kind)) throw new TypeError("Unknown PDF page operation.");
   const request = operation.kind === "insert" ? { ...operation, pages: operation.pages ? [...operation.pages] : undefined }
+    : operation.kind === "crop" ? { ...operation, pages: [...operation.pages], box: operation.box ? { ...operation.box } : null }
     : { ...operation, pages: [...operation.pages] };
   const primary = await NativePdfDocument.open({ kind: "bytes", bytes: primaryBytes }, { password: options.password, signal: options.signal });
   let foreign: NativePdfDocument | undefined;
   try {
+    const nestedOptions = (start: number, end: number): PdfPageOperationOptions => ({ ...options,
+      onProgress: value => progress.report(start + value.value * (end - start), value) });
+    if (request.kind === "duplicate") {
+      const pages = [...validatePages(request.pages, primary.pages.length)];
+      if (!pages.length) throw new RangeError("Select at least one page to duplicate.");
+      return await manipulatePdfPages(primaryBytes, { kind: "insert", at: request.at, bytes: primaryBytes,
+        pages, password: options.password }, nestedOptions(.1, 1));
+    }
+    if (request.kind === "extract") {
+      const pages = [...validatePages(request.pages, primary.pages.length)];
+      if (!pages.length) throw new RangeError("Select at least one page to extract.");
+      const kept = [...pages].sort((a, b) => a - b), remove = primary.pages.map((_, index) => index).filter(index => !pages.includes(index));
+      const bytes = remove.length ? new Uint8Array(await (await manipulatePdfPages(primaryBytes, { kind: "remove", pages: remove }, nestedOptions(.1, .55))).arrayBuffer()) : primaryBytes;
+      return await manipulatePdfPages(bytes, { kind: "reorder", pages: pages.map(index => kept.indexOf(index)) }, nestedOptions(remove.length ? .55 : .1, 1));
+    }
     const writer = new NativePdfWriter(primary), root = primary.getWriterState().xref.trailers.map(trailer => trailer.get("Root")).find(isPdfRef);
     if (!root) throw new Error("The PDF catalog has no indirect reference.");
     const catalog = new Map(primary.catalog), pagesRoot = writer.add(null), blocked = new Set<string>();
@@ -66,10 +88,28 @@ export async function manipulatePdfPages(primaryBytes: Uint8Array, operation: Pd
       }
       for (const index of [...indices].sort((a, b) => b - a)) { if (slots[index].page.ref) blocked.add(pdfRefKey(slots[index].page.ref!)); slots.splice(index, 1); }
       if (catalog.has("StructTreeRoot")) diagnostic("pages.structure-detached", "Removed pages were detached from the PDF structure tree; tags or bookmarks targeting those pages may need review.");
-    } else {
+    } else if (request.kind === "reorder") {
+      const indices = [...validatePages(request.pages, slots.length)];
+      if (indices.length !== slots.length) throw new RangeError("A page order must contain every page exactly once.");
+      const ordered = indices.map(index => slots[index]); slots.splice(0, slots.length, ...ordered);
+    } else if (request.kind === "crop") {
+      const indices = [...validatePages(request.pages, slots.length)];
+      const changes = indices.map(index => {
+        if (request.box === null) return { index, box: [...slots[index].page.mediaBox] };
+        const { x, y, width, height } = request.box;
+        const geometry = computeNativePdfPageGeometry(slots[index].page), bounds = geometry.pageBounds;
+        if (![x, y, width, height].every(Number.isFinite) || x < 0 || y < 0 || width <= 0 || height <= 0 ||
+            x + width > bounds.maxX - bounds.minX + 1e-7 || y + height > bounds.maxY - bounds.minY + 1e-7) throw new RangeError("The crop rectangle must fit inside each selected visible page.");
+        const inverse = invertEditorMatrix(geometry.pageMatrix), points = [[x, y], [x + width, y], [x + width, y + height], [x, y + height]]
+          .map(([px, py]) => editorPoint(inverse, px + bounds.minX, py + bounds.minY));
+        return { index, box: [Math.min(...points.map(p => p[0])), Math.min(...points.map(p => p[1])), Math.max(...points.map(p => p[0])), Math.max(...points.map(p => p[1]))] };
+      });
+      for (const { index, box } of changes) slots[index].dictionary.set("CropBox", box);
+    } else if (request.kind === "insert") {
       if (!Number.isSafeInteger(request.at) || request.at < 0 || request.at > slots.length) throw new RangeError("The insertion position is outside the PDF.");
       foreign = await NativePdfDocument.open({ kind: "bytes", bytes: request.bytes }, { password: request.password, signal: options.signal });
-      if (foreign.catalog.has("Outlines")) diagnostic("pages.bookmarks-not-merged", "Imported document bookmarks were not merged; links between selected imported pages are preserved.");
+      const selfImport = request.bytes === primaryBytes;
+      if (!selfImport && foreign.catalog.has("Outlines")) diagnostic("pages.bookmarks-not-merged", "Imported document bookmarks were not merged; links between selected imported pages are preserved.");
       const indices = request.pages === undefined ? new Set(foreign.pages.map((_, index) => index)) : validatePages(request.pages, foreign.pages.length);
       if (!indices.size) throw new RangeError("Select at least one page to insert.");
       const selected = [...indices].map(index => foreign!.getPage(index)), refs = new Map<string, PdfRef>(), overrides = new Map<PdfDictionary, PdfDictionary>();
@@ -77,6 +117,35 @@ export async function manipulatePdfPages(primaryBytes: Uint8Array, operation: Pd
       const selectedReferences = new Set(selected.flatMap(page => page.ref ? [pdfRefKey(page.ref)] : []));
       const foreignLabels = await pageLabels(foreign, options.signal);
       const importedSlots: Slot[] = selected.map(page => { const ref = writer.add(null); if (page.ref) refs.set(pdfRefKey(page.ref), ref); return { ref, dictionary: materialize(page), page, label: foreignLabels[page.sourcePageIndex] }; });
+      if (selfImport) {
+        for (const page of foreign.pages) if (page.ref && !refs.has(pdfRefKey(page.ref))) refs.set(pdfRefKey(page.ref), page.ref);
+        const optional = await foreign.resolveValue(foreign.catalog.get("OCProperties"), options.signal);
+        const groups = isPdfDictionary(optional) ? await foreign.resolveValue(optional.get("OCGs"), options.signal) : undefined;
+        for (const group of Array.isArray(groups) ? groups : []) if (isPdfRef(group)) refs.set(pdfRefKey(group), group);
+        // Page copies need independent page/annotation/field dictionaries, but
+        // immutable content, fonts, images and appearance programs can stay
+        // shared. Later edits replace the affected page or appearance only.
+        const share = async (value: PdfValue | undefined): Promise<void> => {
+          options.signal?.throwIfAborted();
+          if (isPdfRef(value)) {
+            const key = pdfRefKey(value); if (refs.has(key)) return;
+            refs.set(key, value); await share(await foreign!.resolveObject(value, options.signal)); return;
+          }
+          if (isPdfStream(value)) await share(value.dictionary);
+          else if (isPdfDictionary(value)) { for (const child of value.values()) await share(child); }
+          else if (Array.isArray(value)) for (const child of value) await share(child);
+        };
+        for (const page of selected) {
+          await share(page.resources); await share(page.contents);
+          const annotations = await foreign.resolveValue(page.annotations, options.signal);
+          for (const item of Array.isArray(annotations) ? annotations : []) {
+            const annotation = await foreign.resolveValue(item, options.signal);
+            if (isPdfDictionary(annotation)) await share(annotation.get("AP"));
+          }
+        }
+        const acro = await foreign.resolveValue(foreign.catalog.get("AcroForm"), options.signal);
+        if (isPdfDictionary(acro)) await share(acro.get("DR"));
+      }
       const fields = await selectedFields(foreign, selected, options.signal, indices.size === foreign.pages.length); for (const [key, value] of fields.overrides) overrides.set(key, value);
       const foreignDestinations = await namedDestinations(foreign, options.signal);
       const warned = new Set<string>();
@@ -107,6 +176,7 @@ export async function manipulatePdfPages(primaryBytes: Uint8Array, operation: Pd
         if (Array.isArray(value)) { const array: PdfValue[] = []; for (const item of value) array.push(await importValue(item)); return array; }
         if (isPdfStream(value)) return { ...value, dictionary: await importValue(value.dictionary) as PdfDictionary };
         if (isPdfDictionary(value)) {
+          if (selfImport && isPdfName(value.get("Type"), "OCG")) return value;
           const original = value, source = overrides.get(value) ?? value, dictionary: PdfDictionary = new Map();
           for (const [key, item] of source) {
             if (key === "StructParents" || key === "StructParent") { warn("pages.structure-detached", "Imported page tags were detached from their original document structure; visual content and annotations are preserved."); continue; }
@@ -172,7 +242,7 @@ export async function manipulatePdfPages(primaryBytes: Uint8Array, operation: Pd
         const slot = importedSlots[index]; slot.dictionary.delete("Parent"); slot.dictionary = await importValue(slot.dictionary) as PdfDictionary;
         progress.report(.15 + .45 * (index + 1) / importedSlots.length, { stage: "pdf-page", sourceType: "pdf", unit: "pages", processed: index + 1, total: importedSlots.length, pageIndex: index, pageCount: importedSlots.length });
       }
-      await mergeLayers(primary, foreign, catalog, importValue, resolve, options.signal);
+      if (!selfImport) await mergeLayers(primary, foreign, catalog, importValue, resolve, options.signal);
       slots.splice(request.at, 0, ...importedSlots);
     }
     for (let index = 0; index < slots.length; index++) {

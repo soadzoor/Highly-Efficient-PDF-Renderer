@@ -598,7 +598,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
       return;
     }
 
-    const direct = execution.role === "invoked" && isTransparentBoundaryNoOp(execution);
+    const direct = execution.role === "invoked" && isTransparentBoundaryNoOp(execution, this.page);
     if (direct) {
       this.frames.push({
         execution,
@@ -821,7 +821,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
         `${path}.backdropPaintIndex`
       );
     }
-    if (execution.blendingColorSpaceIndex !== -1) {
+    if (!isCanvasWorkingBlendSpace(this.page, execution.blendingColorSpaceIndex)) {
       throw canvasError(
         HEPR_CANVAS_2D_ERROR_CODES.UnsupportedComposite,
         "Canvas2D cannot blend a group in an explicitly managed PDF color space.",
@@ -848,7 +848,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
       }
       return;
     }
-    if (!execution.isolated && !isTransparentBoundaryNoOp(execution)) {
+    if (!execution.isolated && !isTransparentBoundaryNoOp(execution, this.page)) {
       const only = execution.group.commands.length === 1
         ? execution.group.commands[0]
         : null;
@@ -4016,10 +4016,17 @@ function lineJoin(value: number): CanvasLineJoin {
   return "miter";
 }
 
-function isTransparentBoundaryNoOp(execution: HeprCompositeGroupExecution): boolean {
+/** Canonical device RGB already uses the Canvas2D renderer's sRGB working space.
+ * Calibrated, ICC, CMYK and other explicit spaces still need PDF group blending. */
+function isCanvasWorkingBlendSpace(page: HeprPageData, index: number): boolean {
+  return index === -1 || page.stores.colors.spaceKinds[index] === HEPR_COLOR_SPACE_KIND.DeviceRgb &&
+    page.stores.colors.componentCounts[index] === 3;
+}
+
+function isTransparentBoundaryNoOp(execution: HeprCompositeGroupExecution, page: HeprPageData): boolean {
   return execution.alpha === 1 && execution.blendMode === "Normal" &&
     execution.softMaskGroupIndex === -1 && execution.backdropPaintIndex === -1 &&
-    execution.blendingColorSpaceIndex === -1 && !execution.isolated && !execution.knockout;
+    isCanvasWorkingBlendSpace(page, execution.blendingColorSpaceIndex) && !execution.isolated && !execution.knockout;
 }
 
 function setCompositeOperation(

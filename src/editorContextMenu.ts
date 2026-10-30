@@ -7,8 +7,10 @@ export interface EditorContextMenu {
 }
 
 export type EditorClipboardAction = "copy" | "cut" | "paste";
+export type EditorObjectMenuAction = EditorClipboardAction | "duplicate";
 type MenuCommand = { kind: "stack"; action: EditorStackingAction; label: string } |
-  { kind: "clipboard"; action: EditorClipboardAction; label: string; key: string };
+  { kind: "clipboard"; action: EditorObjectMenuAction; label: string; key: string } |
+  { kind: "custom"; action: string; label: string; canRun(): boolean; run(): void | Promise<void> };
 
 const stackingActions: readonly { action: EditorStackingAction; label: string }[] = [
   { action: "bring-to-front", label: "Bring to front" },
@@ -25,23 +27,32 @@ export function createEditorContextMenu(document: Document, options: {
     canRun(action: EditorClipboardAction): boolean;
     run(action: EditorClipboardAction): void | Promise<void>;
   };
+  /** Complete object menu for stock editors; clipboard keeps older hosts compatible. */
+  objects?: {
+    canRun(action: EditorObjectMenuAction): boolean;
+    run(action: EditorObjectMenuAction): void | Promise<void>;
+  };
+  extra?: readonly { action: string; label: string; canRun(): boolean; run(): void | Promise<void> }[];
   onError?(error: unknown): void;
 }): EditorContextMenu {
   const window = document.defaultView;
-  const clipboard = options.clipboard;
+  const objects = options.objects, clipboard = objects ?? options.clipboard;
   const actions: readonly MenuCommand[] = [
     ...(clipboard ? [
+      ...(objects ? [{ kind: "clipboard" as const, action: "duplicate" as const, label: "Duplicate", key: "D" }] : []),
       { kind: "clipboard" as const, action: "copy" as const, label: "Copy", key: "C" },
       { kind: "clipboard" as const, action: "cut" as const, label: "Cut", key: "X" },
       { kind: "clipboard" as const, action: "paste" as const, label: "Paste", key: "V" }
     ] : []),
+    ...(options.extra ?? []).map(command => ({ ...command, kind: "custom" as const })),
     ...stackingActions.map(action => ({ ...action, kind: "stack" as const }))
   ];
-  const canRun = (command: MenuCommand): boolean => command.kind === "clipboard" ? clipboard!.canRun(command.action) : options.canRun(command.action);
+  const canRun = (command: MenuCommand): boolean => command.kind === "custom" ? command.canRun() : command.kind === "clipboard" ? objects ? objects.canRun(command.action)
+    : options.clipboard!.canRun(command.action as EditorClipboardAction) : options.canRun(command.action);
   const menu = document.createElement("div"); menu.className = "hepr-editor-context-menu"; menu.hidden = true; menu.tabIndex = -1;
   menu.setAttribute("role", "menu"); menu.setAttribute("aria-label", clipboard ? "Selected objects and layer drawing order" : "Drawing order within layer");
   const buttons = actions.map((command, index) => {
-    if (clipboard && index === 3) {
+    if ((clipboard || options.extra?.length) && index === (clipboard ? objects ? 4 : 3 : 0) + (options.extra?.length ?? 0)) {
       const separator = document.createElement("div"); separator.className = "hepr-editor-menu-separator";
       separator.setAttribute("role", "separator"); menu.append(separator);
     }
@@ -54,7 +65,8 @@ export function createEditorContextMenu(document: Document, options: {
       button.setAttribute("aria-keyshortcuts", `Control+${command.key} Meta+${command.key}`);
       const shortcut = document.createElement("span"); shortcut.className = "hepr-editor-menu-shortcut";
       shortcut.textContent = `Ctrl/Cmd+${command.key}`; shortcut.setAttribute("aria-hidden", "true"); button.append(shortcut);
-    } else { button.dataset.stackAction = action; button.title = `${label} within the layer`; }
+    } else if (command.kind === "custom") { button.dataset.customAction = action; button.title = label; }
+    else { button.dataset.stackAction = action; button.title = `${label} within the layer`; }
     button.setAttribute("role", "menuitem"); menu.append(button); return button;
   });
   const lifetime = new AbortController();
@@ -85,15 +97,16 @@ export function createEditorContextMenu(document: Document, options: {
   }
   menu.addEventListener("click", event => {
     const target = event.target as Element;
-    const button = target.closest<HTMLButtonElement>("[data-stack-action]") ?? target.closest<HTMLButtonElement>("[data-clipboard-action]");
+    const button = target.closest<HTMLButtonElement>("[data-stack-action]") ?? target.closest<HTMLButtonElement>("[data-clipboard-action]") ?? target.closest<HTMLButtonElement>("[data-custom-action]");
     if (!open || !button || button.disabled) return;
     event.stopPropagation();
-    const command = actions.find(item => item.kind === "clipboard" ? item.action === button.dataset.clipboardAction : item.action === button.dataset.stackAction);
+    const command = actions.find(item => item.kind === "custom" ? item.action === button.dataset.customAction : item.kind === "clipboard" ? item.action === button.dataset.clipboardAction : item.action === button.dataset.stackAction);
     if (!command) return;
     try {
       // Selection/history may have changed while the menu was open.
       if (!canRun(command)) { hide(true); return; }
-      hide(true); void Promise.resolve(command.kind === "clipboard" ? clipboard!.run(command.action) : options.run(command.action)).catch(error => options.onError?.(error));
+      hide(true); void Promise.resolve(command.kind === "custom" ? command.run() : command.kind === "clipboard" ? objects ? objects.run(command.action)
+        : options.clipboard!.run(command.action as EditorClipboardAction) : options.run(command.action)).catch(error => options.onError?.(error));
     } catch (error) { hide(true); options.onError?.(error); }
   }, { signal: lifetime.signal });
   menu.addEventListener("pointerdown", event => event.stopPropagation(), { signal: lifetime.signal });

@@ -413,7 +413,7 @@ class ScenePdfPageWriter {
   private async group(group: ScenePaintGroup, resources: Resources): Promise<string> {
     const childResources = new Resources(), content = await this.nodes(group.children, childResources);
     const form = await this.writer.stream(content, `/Type /XObject /Subtype /Form /BBox [${box(this.bounds)}] /Resources ${childResources.dictionary()} ` +
-      `/Group << /S /Transparency /CS /DeviceRGB /I ${group.isolated} /K ${group.knockout} >>`);
+      `/Group << /S /Transparency ${group.isolated ? "/CS /DeviceRGB " : ""}/I ${group.isolated} /K ${group.knockout} >>`);
     const mask = group.softMask ? await this.mask(group.softMask) : "";
     return `q\n${this.state(resources, group.alpha, group.blendMode, `${mask} /AIS ${group.alphaIsShape === true}`)}${resources.use("XObject", form)} Do\nQ\n`;
   }

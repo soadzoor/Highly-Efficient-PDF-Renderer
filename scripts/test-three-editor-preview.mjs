@@ -43,9 +43,9 @@ try {
       textGlyphSegmentsA: f([0, 0, 0, 0, 10, 0, 0, 0, 5, 10, 0, 0]), textGlyphSegmentsB: f([10, 0, 0, 0, 5, 10, 0, 0, 0, 0, 0, 0]),
       textInstanceCount: 2, textInstanceA: f([1, 0, 0, 1, 1, 0, 0, 1]), textInstanceB: f([15, 45, 0, 0, 65, 85, 0, 1]),
       textInstanceC: f([0, 0, 0, 1, 0, 0, 0, 1]), textClipRects: f([0, 0, 100, 100]),
-      clipPaths: [rectangle(), rectangle()], drawRuns: [
-        { kind: "stroke", first: 0, count: 1, clipIndex: 0 }, { kind: "fill", first: 0, count: 1, clipIndex: 0 },
-        { kind: "text", first: 0, count: 1, clipIndex: 0 }, { kind: "stroke", first: 1, count: 1, clipIndex: 1 },
+      clipPaths: [rectangle(), rectangle(), { parent: -1, fillRule: 0, edges: f([5, 5, 95, 5, 95, 5, 95, 95, 95, 95, 5, 95, 5, 95, 5, 5]) }], drawRuns: [
+        { kind: "stroke", first: 0, count: 1, clipIndex: 2 }, { kind: "fill", first: 0, count: 1, clipIndex: 2 },
+        { kind: "text", first: 0, count: 1, clipIndex: 2 }, { kind: "stroke", first: 1, count: 1, clipIndex: 1 },
         { kind: "fill", first: 1, count: 1, clipIndex: 1 }, { kind: "text", first: 1, count: 1, clipIndex: 1 },
         { kind: "stroke", first: 2, count: 1, clipIndex: 1 }
       ] });
@@ -54,6 +54,10 @@ try {
   const refs = ["stroke", "fill", "text"].map(kind => ({ kind, index: 0 }));
   const source = fixture(), pristine = structuredClone(source), prepared = prepareEditorTranslationPreview(source, refs, []);
   assert(prepared);
+  const viewportSource = { ...source, drawRuns: source.drawRuns.map(run => run.clipIndex === 2 ? { ...run, clipIndex: 0 } : run) };
+  const viewportPose = prepareEditorTranslationPreview(viewportSource, refs, []).translate(7, 8);
+  assert(!getEditorSceneTranslationHint(viewportPose).changedClips?.length, "a shared page-sized viewport remains fixed during an object translation");
+  assert.deepEqual(viewportPose.clipPaths[0], viewportSource.clipPaths[0]);
   const first = prepared.translate(0, 0), poses = [prepared.translate(350, -210), prepared.translate(-120, 80), prepared.translate(0, 0)];
   const texel = (texture, index) => Array.from(texture.image.data.subarray(index * 4, index * 4 + 4));
   const ids = (layer, attribute) => layer.mesh.children.filter(mesh => mesh.visible).flatMap(mesh =>
@@ -133,7 +137,7 @@ try {
         assert.deepEqual(texel(entry.text.textInstanceTextureB, 0), [pose.textInstanceB[0], pose.textInstanceB[1], 0, 0]);
         assert.deepEqual(texel(entry.text.textInstanceTextureB, 1), Array.from(first.textInstanceB.subarray(4, 8)).map((value, index) => index === 3 ? value + first.textGlyphCount : value));
         assert.deepEqual(texel(entry.text.textGlyphMetaTextureA, pose.textGlyphCount), Array.from(first.textClipRects), "untouched packed hard text clip stays unchanged");
-        assert.deepEqual(texel(clip, movedPayload), [dx, dy, 100 + dx, 100 + dy], "the private AA rectangle follows exact translated page coordinates");
+        assert.deepEqual(texel(clip, movedPayload), [5 + dx, 5 + dy, 95 + dx, 95 + dy], "the owned inset AA rectangle follows exact translated page coordinates");
         assert.deepEqual(texel(clip, originalPayload), Array.from(originals.at(-1).subarray(originalPayload * 4, originalPayload * 4 + 4)), "untouched AA clip remains unchanged");
         assert.equal(texel(entry.fill.fillSegmentTextureA, bandBase)[1], 0); assert.equal(texel(entry.fill.fillSegmentTextureA, cellBase)[1], 0);
         assert.deepEqual([texel(entry.fill.fillSegmentTextureA, bandBase + 1), texel(entry.fill.fillSegmentTextureA, cellBase + 1)], untouchedHeaders);

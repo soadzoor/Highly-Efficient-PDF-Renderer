@@ -12,6 +12,7 @@
 .hepr-editor-toolbar input[type=number]{width:62px}.hepr-editor-toolbar input[type=color]{width:28px;height:26px;padding:1px}.hepr-editor-toolbar select{max-width:160px}
 .hepr-editor-toolbar .hepr-editor-opacity input[type=range]{width:84px;min-width:48px;margin:0;accent-color:#1765d7}
 .hepr-editor-help{color:#526174;font-size:11px}.hepr-editor-transform [data-status]{margin-left:auto;max-width:380px}
+.hepr-editor-property-note{font-size:11px;color:#526174}.hepr-editor-properties [data-mixed=true]{outline:1px dashed #8c5e00;outline-offset:1px}
 .hepr-editor-overlay{--hepr-editor-rotate-cursor:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'%3E%3Cpath d='M24 12a9 9 0 1 0 1 8M24 5v7h-7' fill='none' stroke='white' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M24 12a9 9 0 1 0 1 8M24 5v7h-7' fill='none' stroke='%23111' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") 16 16,crosshair;--hepr-editor-pencil-cursor:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'%3E%3Cpath d='m5 26 2-8L23 2l6 6-16 16Z' fill='white' stroke='white' stroke-width='4' stroke-linejoin='round'/%3E%3Cpath d='m5 26 2-8L23 2l6 6-16 16Z' fill='white' stroke='%23111' stroke-width='2' stroke-linejoin='round'/%3E%3Cpath d='m7 18 6 6M20 5l6 6M5 26l5-1-4-4Z' stroke='%23111' fill='%23111'/%3E%3C/svg%3E") 5 26,crosshair;position:fixed;z-index:20;touch-action:none;pointer-events:auto;overflow:hidden;overflow:clip;cursor:crosshair}
 .hepr-editor-overlay[data-tool=select]{cursor:default}.hepr-editor-overlay[data-tool=form]{pointer-events:none}
 .hepr-editor-overlay[data-tool=text]{cursor:text}
@@ -33,6 +34,7 @@
 .hepr-editor-overlay[data-gesture=pick],.hepr-editor-overlay[data-busy=true],.hepr-editor-overlay[data-settling=true]:is([data-tool=select],[data-tool=text],[data-tool=image]){cursor:progress}
 .hepr-editor-overlay[data-busy=true] .hepr-editor-handle,.hepr-editor-overlay[data-busy=true] .hepr-editor-selection-hit,.hepr-editor-overlay[data-settling=true] .hepr-editor-handle{display:none;pointer-events:none}
 .hepr-editor-overlay[data-settling=true] .hepr-editor-selection-hit{cursor:inherit}
+.hepr-editor-overlay[data-camera-pan=true]{pointer-events:auto;cursor:grabbing!important}.hepr-editor-overlay[data-camera-pan=true] *{cursor:grabbing!important}
 .hepr-editor-marquee{fill:#2879f51a;stroke:#1765d7;stroke-width:1;stroke-dasharray:4 3}
 .hepr-editor-signature-ghost{pointer-events:none}
 .hepr-editor-form-export-dialog{border:1px solid #b6c3d4;border-radius:10px;padding:18px;max-width:min(540px,90vw);max-height:85vh;overflow:auto;font:14px system-ui,sans-serif;color:#172333}.hepr-editor-form-export-dialog::backdrop{background:#17233366}.hepr-editor-form-export-dialog h2{margin:0 0 14px;font-size:20px}.hepr-editor-form-export-dialog p{line-height:1.5}.hepr-editor-form-export-dialog>div{display:flex;flex-wrap:wrap;gap:8px}.hepr-editor-form-export-dialog button{font:inherit;padding:6px 10px;cursor:pointer}
@@ -101,3 +103,8 @@ input.hepr-editor-field,textarea.hepr-editor-field{cursor:text}select.hepr-edito
 .hepr-editor-layer-dialog{width:min(380px,90vw);max-height:85vh;overflow:auto;border:1px solid #b6c3d4;border-radius:10px;padding:16px;color:#172333;background:#fff}
 .hepr-editor-layer-dialog::backdrop{background:#17233366}
 @media(pointer:coarse){.hepr-editor-layer-columns,.hepr-editor-layer-row{grid-template-columns:36px minmax(0,1fr) 32px 32px}.hepr-editor-layer-row{min-height:44px}.hepr-editor-layer-row>.hepr-editor-layer-grip{align-self:stretch;min-height:40px}.hepr-editor-layer-row>input[type=checkbox]{width:20px;height:20px}}
+.hepr-editor-alignment-guide{stroke:#d927a0;stroke-width:1;stroke-dasharray:5 3;pointer-events:none}
+.hepr-editor-review-selection{fill:#1684ff;fill-opacity:.25;pointer-events:none}
+.hepr-editor-overlay[data-tool="highlight"],.hepr-editor-overlay[data-tool="underline-text"],.hepr-editor-overlay[data-tool="strikeout-text"]{cursor:text}
+.hepr-editor-overlay[data-tool="comment"]{cursor:crosshair}
+.hepr-editor-toolbar [data-recovery-status]{font-size:11px;color:#475569;max-width:25em;overflow-wrap:anywhere}

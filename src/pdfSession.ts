@@ -238,6 +238,11 @@ export interface NativeVectorPdfSession extends PdfSession {
 
 /** @internal Established-renderer controls which are intentionally absent from the page-native API. */
 export interface NativeVectorCompileOptions extends PdfCompileOptions {
+  /** Internal temporary-PDF editor provenance; never enabled by ordinary loading/HEP. */
+  readonly editorSourceProvenance?: boolean;
+  /** Temporary compiler snapshots, addressed by private paint MCIDs. @internal */
+  readonly onEditorSourceText?: (mcid: number, before: import("./pdf/nativeText").NativeEditorTextState,
+    after: import("./pdf/nativeText").NativeEditorTextState, glyphs: readonly import("./pdf/nativeText").NativeEditorSourceGlyph[]) => void;
   /** Internal, operation-local snapshot preparation. Never used for HEP compilation. */
   readonly thumbnailScale?: number;
   readonly thumbnailPixelSize?: ThumbnailStrokePixelSize;
@@ -1985,7 +1990,10 @@ class NativePdfSession implements NativeVectorPdfSession {
         if (context.font) {
           textCompiler.setFontResource(fontRegistry.resources[context.font.fontIndex], context.font.size);
         }
+        const capture = (options as NativeVectorCompileOptions).onEditorSourceText;
+        const before = capture && ["Tj", "TJ", "'", '"'].includes(operator) ? textCompiler.editorSourceState() : undefined;
         textCompiler.applyOperator(operator, operands, context.graphicsTransform);
+        if (before) capture!(context.editorSourceMcid ?? -1, before, textCompiler.editorSourceState(), textCompiler.editorSourceGlyphs(before.glyphCount));
         return emittedTextRuns;
       }
     };
@@ -2011,7 +2019,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       pageBounds,
       enableSegmentMerge: nativeVectorSegmentMergeEnabled(options),
       enableInvisibleCull: nativeVectorInvisibleCullEnabled(options),
-      ...(output === "display-program" && capturePaintSourceIdentities
+      ...((output === "display-program" && capturePaintSourceIdentities) || (options as NativeVectorCompileOptions).editorSourceProvenance
         ? { capturePaintSourceIdentities: true }
         : {}),
       textOperatorSink,
@@ -3260,7 +3268,10 @@ async function flattenNativeVectorFormOccurrences(
         if (context.font) {
           textCompiler.setFontResource(fontRegistry.resources[context.font.fontIndex], context.font.size);
         }
+        const capture = options.onEditorSourceText;
+        const before = capture && ["Tj", "TJ", "'", '"'].includes(operator) ? textCompiler.editorSourceState() : undefined;
         textCompiler.applyOperator(operator, operands, context.graphicsTransform);
+        if (before) capture!(context.editorSourceMcid ?? -1, before, textCompiler.editorSourceState(), textCompiler.editorSourceGlyphs(before.glyphCount));
         return emittedTextRuns;
       }
     };
@@ -3270,6 +3281,7 @@ async function flattenNativeVectorFormOccurrences(
     }
     const compiled = await compileVectorFormContent(await scopedContent(definition), {
       onDiagnostic: imageResources.onDiagnostic,
+      ...(options.editorSourceProvenance ? { capturePaintSourceIdentities: true } : {}),
       ...denseSourcePaintOptions(imageResources),
       pageMatrix: transform,
       pageBounds: clipBounds,
@@ -3400,6 +3412,8 @@ async function flattenNativeVectorFormOccurrences(
   const sourceOptionalContentIndices: number[] = [];
   const sourceAnnotationIndices: number[] = [];
   const sourceContentItems: number[] = [];
+  const editorItems = options.editorSourceProvenance ? [...(rootCompiled.vectorSceneData?.contentItems ?? [])] : undefined;
+  const editorItemIndexes = editorItems ? new Map(editorItems.map((item, index) => [item.mcid, index])) : undefined;
   // Form content's own MCIDs resolve through the Form's /StructParents, which
   // no compiled page carries; that paint keeps its caller's item instead.
   let ignoredFormContentItems = 0;
@@ -3493,8 +3507,13 @@ async function flattenNativeVectorFormOccurrences(
       const condition = optionalContent.combineMemberships(inheritedOptionalContent, sidecar.sourceOptionalContentIndices?.[offset / 2] ?? -1);
       const annotation = inheritedAnnotation >= 0 ? inheritedAnnotation : sidecar.sourceAnnotationIndices?.[offset / 2] ?? -1;
       const ownItem = sidecar.sourceContentItems?.[offset / 2] ?? -1;
-      if (occurrence.formDefinitionIndex !== -1 && ownItem >= 0 && kind !== DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT) ignoredFormContentItems += 1;
-      const item = occurrence.formDefinitionIndex === -1 ? ownItem : inheritedItem;
+      if (!options.editorSourceProvenance && occurrence.formDefinitionIndex !== -1 && ownItem >= 0 && kind !== DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT) ignoredFormContentItems += 1;
+      let item = occurrence.formDefinitionIndex === -1 ? ownItem : inheritedItem;
+      const editorItem = options.editorSourceProvenance && ownItem >= 0 ? sidecar.contentItems?.[ownItem] : undefined;
+      if (editorItems && editorItemIndexes && editorItem?.tag === "HEPRSourceOperation") {
+        if (!editorItemIndexes.has(editorItem.mcid)) { editorItemIndexes.set(editorItem.mcid, editorItems.length); editorItems.push(editorItem); }
+        item = editorItemIndexes.get(editorItem.mcid)!;
+      }
       if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH) {
         if (localIndex >= seenGlyphRuns.length || seenGlyphRuns[localIndex] !== 0) {
           throw invalidVectorFormEvent(pageIndex, "glyph", localIndex);
@@ -3735,7 +3754,7 @@ async function flattenNativeVectorFormOccurrences(
   await walkOccurrence(rootOccurrence);
   const accumulatedText = textAccumulator.build().compilation;
   const annotationIds = rootCompiled.vectorSceneData?.annotationIds;
-  const contentItems = rootCompiled.vectorSceneData?.contentItems;
+  const contentItems = editorItems ?? rootCompiled.vectorSceneData?.contentItems;
   const vectorSceneData: DensePdfVectorSceneData = Object.freeze({
     sourceEvents: Uint32Array.from(sourceEvents),
     ...(optionalContent.groupCount > 0 ? { sourceOptionalContentIndices: Int32Array.from(sourceOptionalContentIndices) } : {}),

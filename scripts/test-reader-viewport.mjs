@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { registerHooks, stripTypeScriptTypes } from "node:module";
+import { registerHooks } from "node:module";
 import vm from "node:vm";
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
+import { sourceFunction } from "./lib/sourceFunction.mjs";
 
 const gpu = { instances: [], copies: [] };
 globalThis.__readerViewportGpu = gpu;
@@ -244,15 +245,15 @@ function close(actual, expected, message) { assert(Math.abs(actual - expected) <
 function deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; }
 
 const editorUiSource = await readFile(new URL("../src/editorUi.ts", import.meta.url), "utf8");
-const editorWheelStart = editorUiSource.indexOf('  overlay.addEventListener("wheel",'),
-  editorWheelEnd = editorUiSource.indexOf("\n  }, { passive: false });", editorWheelStart);
-assert(editorWheelStart >= 0 && editorWheelEnd > editorWheelStart, "the editor forwards wheel input through its overlay");
-const editorWheelSource = stripTypeScriptTypes(editorUiSource.slice(editorWheelStart, editorWheelEnd + "\n  }, { passive: false });".length));
+const editorWheelRegistration = editorUiSource.match(/^  overlay\.addEventListener\("wheel", forwardWheel, \{ passive: false \}\);$/m)?.[0];
+assert(editorWheelRegistration, "the editor registers its real wheel forwarding handler");
+const editorWheelSource = sourceFunction(editorUiSource.replace(/^ {2}/gm, ""), "forwardWheel") + "\n" + editorWheelRegistration;
 
 /** Run the production overlay bridge against the Reader's real event handlers. */
 function editorWheelBridge(env) {
-  const dispatches = []; let handler;
-  const context = vm.createContext({ activeText: null,
+  const dispatches = []; let handler, cancellations = 0;
+  const context = vm.createContext({ activeText: null, pointer: null, pendingPick: null,
+    cancelPointerGesture() { cancellations++; context.pointer = context.pendingPick = null; },
     overlay: { addEventListener(type, listener) { assert.equal(type, "wheel"); handler = listener; } },
     host: { getCanvas() {
       const canvas = env.canvas;
@@ -265,7 +266,7 @@ function editorWheelBridge(env) {
     WheelEvent: class { constructor(type, values) { this.type = type; Object.assign(this, values); } }
   });
   vm.runInContext(editorWheelSource, context);
-  return { context, dispatches, wheel(values = {}) {
+  return { context, dispatches, get cancellations() { return cancellations; }, wheel(values = {}) {
     const event = { target: { closest: () => null }, clientX: 350, clientY: 300, deltaX: 0, deltaY: 0, deltaZ: 0, deltaMode: 0,
       ctrlKey: false, metaKey: false, shiftKey: false, ...values,
       preventDefault() { this.defaultPrevented = true; }, stopPropagation() { this.propagationStopped = true; } };
@@ -398,6 +399,13 @@ try {
     assert(!bridge.wheel({ deltaY: 40 }).defaultPrevented, "active rich text retains the existing wheel exclusion");
     bridge.context.activeText = null;
     assert.equal(bridge.dispatches.length, dispatchCount); assert.deepEqual(reader.getView(), beforeNested);
+    for (const gesture of ["pointer", "pendingPick"]) {
+      bridge.context[gesture] = { action: "move" }; const before = reader.getView();
+      bridge.wheel({ deltaY: 12 });
+      assert.equal(bridge.context[gesture], null, "camera navigation cancels the outstanding selection gesture");
+      close(reader.getView().centerY, before.centerY - 12 / before.zoom, "gesture cancellation still forwards wheel navigation exactly once");
+    }
+    assert.equal(bridge.cancellations, 2);
     reader.setLayout("grid"); const beforeGrid = reader.getView(), gridViews = env.views.length;
     bridge.wheel({ deltaY: 80 });
     assert.deepEqual(reader.getView(), beforeGrid); assert.equal(env.views.length, gridViews, "inactive Reader leaves Grid wheel ownership to its host");

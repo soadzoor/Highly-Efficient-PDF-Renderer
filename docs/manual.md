@@ -191,9 +191,12 @@ PNG/JPEG/WebP images use the separate image-import tool.
 
 **Save PDF** retains editable newly added annotations, including when starting
 from a HEP. Existing forms are preserved when the original source PDF is
-available. Source content transforms can rebuild the affected page's drawing
-content as vectors, reporting changes to its authoring structure. Unrelated pages
-and source document resources are preserved. A flattened PDF copy and PDF-based
+available. Source edits preserve unrelated drawing operations and resources,
+including the original character codes and fonts for supported text transforms.
+Editing one shared Form invocation keeps other copies unchanged. Inseparable
+operations or reordered ranges use their edited vector appearances with a
+diagnostic; exceptional ancestor clips or semantic replacement scopes can require
+a reported page-vector fallback. A flattened PDF copy and PDF-based
 printing are also available. If direct printing is unavailable, download the PDF
 and print it with your preferred PDF viewer.
 
@@ -218,23 +221,108 @@ protection, remove it, or set/replace the opening password and confirm it. Open 
 protected source with its current password first; it does not need to be entered
 again in the editor. These settings apply to both editable and flattened PDF
 saves. New protection uses AES-256. Passwords stay in memory and are not stored
-in `localStorage`. Protection changes remain unsaved until a PDF export succeeds;
-saving HEP or printing does not save these settings. HEP files remain unencrypted.
+in `localStorage`. The chosen output policy stays selected for subsequent PDF
+exports. A browser download does not confirm a completed disk write, and retains
+the document's local unsaved state. HEP files remain unencrypted.
 
 **Pages** opens page management. Select pages using checkboxes or page ranges,
 rotate them left/right by 90 degrees or by 180 degrees, or remove them. A document
-must retain at least one page. Choose PDFs to insert before/after a chosen page
-or at the end; selecting multiple files merges their pages in file order. Enter
-each imported PDF's password when prompted. Page operations support progress,
-cancellation, undo and redo alongside other edits. The destination keeps its
-existing PDF protection; the PDF password settings control exported copies.
-Current object and layer ordering stays intact during these page operations.
+must retain at least one page. Drag a selected page's grip with mouse, touch or
+pen to move the selected pages together; **Move up/down** or **Alt+Up/Down** on a
+page row moves the selection one position. Arrow keys and Home/End move row focus;
+Space toggles a focused row's selection.
+
+Choose PDFs to insert before/after a chosen page or at the end; selecting multiple
+files merges their pages in file order. **Duplicate selected** uses the same
+position controls and keeps each copy's author objects, groups and form values
+independent. **Extract selected PDF** downloads the selected pages in their current
+order without changing the open document or its unsaved-change state. Enter each
+imported PDF's password when prompted.
+
+**Crop visible page area** accepts Left, Bottom, Width and Height in points from
+the displayed lower-left corner. The rectangle must fit every selected page.
+**Use current page size** fills in the first selected page's current dimensions;
+**Reset crop** restores its media box. Cropping changes the visible boundary and
+retains hidden content; it is not redaction.
+
+Page changes support progress, cancellation, undo and redo alongside other edits.
+The destination keeps its existing PDF protection; the PDF password settings
+control exported copies. Current object and layer ordering stays intact during
+page operations.
 
 **Save HEP** stores the current appearance as ordinary compact scene data. It
 does not embed the original PDF, source font files or editing history. Reopening
 allows geometry transforms, but does not promise rich-text or form-authoring
 semantics. PDF export from a HEP rebuilds the document from the geometry, glyph
 outlines, Unicode mappings and images that remain; it needs no original PDF.
+
+### Layout, review and editing locks
+
+Hold the middle mouse button and drag to pan the camera while any editing tool
+is active. Release to resume that tool. This also works over selected artwork
+and does not create an undo step. Wheel scrolling and zooming remain available.
+Right-click with Select to **Duplicate**, **Copy**, **Cut**, **Paste**, change
+drawing order, **Lock**, **Unlock**, or **Edit comment** when supported.
+
+Use the six alignment icons with **Relative to: Selection** or **Page** to align
+visual bounds. Distribution makes equal gaps between three or more selected
+objects and keeps the outer objects fixed. Layout is applied separately on each
+page and supports Undo. The **Guides** toggle snaps movement near page boundaries,
+page centers, and known editable objects. Hold Alt/Option to bypass snapping.
+Unvisited source primitives are not exhaustively indexed for guides during a
+drag; selecting source artwork makes it available as a target.
+
+Choose **Highlight**, **Underline**, or **Strike out** and drag over searchable
+text to create an annotation following its glyph positions, including rotated
+text. **Comment** places a note; enter its text and optional author, then Apply.
+Double-click a review annotation or use **Edit comment** to edit its note.
+Comments support Ctrl/Cmd+Enter to apply and Escape to cancel. PDF saves retain
+standard annotation types, text quadrilaterals and explicit appearances. HEP
+retains their visual geometry without authoring semantics.
+
+**Lock** prevents moving, resizing, rotation, deletion and appearance changes to
+selected objects or groups. Locked objects remain selectable and copyable;
+**Unlock** restores editing. These editing locks are separate from a layer's
+**Lock visibility** setting. PDF annotation locks use standard annotation flags.
+Locks on ordinary source primitives remain in the session and local recovery;
+HEP does not add editing-lock metadata.
+
+Property controls show mixed values and disable changes that the selection does
+not support. Group appearance changes apply to supported descendants. Changing
+a drawing tool's defaults does not restyle the previous selection. Existing page
+text remains transform-only; the textbox tool creates editable new text.
+
+Downloads report **Download started** and keep local edits and recovery available
+because the browser may cancel its save dialog. Printing also retains the
+unsaved state. The reusable save APIs can mark a document saved after a host
+confirms its own file write.
+
+### Local recovery
+
+Edit mode checkpoints committed changes and unfinished text/form drafts in this
+browser's IndexedDB storage. Recovery runs after editing pauses, outside pointer
+previews and camera gestures. It stores the latest draft for each source document,
+including authoring models, fonts, fields, layers, editing locks and current pages;
+the original file and PDF/HEP format are unchanged. Undo history and the object
+clipboard are not stored.
+
+Reopen the same source and enter Edit to receive a **Restore**, **Discard**, or
+**Later** choice when a matching draft exists. **Later** keeps the older draft and
+pauses new checkpoints until you decide. **Recovery** opens the local draft list
+for restoration or deletion; another draft can be restored after opening its
+matching source. Restoring keeps added textboxes, images, shapes and handwriting
+editable, and applies the captured form values and page changes.
+
+Protected-source drafts encrypt their scene, authoring models and font bytes
+with the opening password. Passwords are never stored, and the source PDF must
+still open normally before recovery is applied. When no suitable password is
+available, recovery reports the problem instead of storing protected content in
+plaintext. Output-password changes must be entered again. Browser storage can
+be cleared or fill up; reported storage failures leave the active document intact.
+
+A completed recovery checkpoint is separate from exporting a PDF/HEP or writing
+a file. Browser-download exports report that the download started; the app cannot
+confirm whether the browser's save dialog was accepted.
 
 ### Layers
 
@@ -336,6 +424,23 @@ flattened PDF and HEP, reopen each, inspect text search and appearance, and prin
 using your browser and an independent PDF reader. Compare matched performance
 captures in default View mode and after editing; offline Canvas2D checks do not
 prove browser or GPU behavior.
+With each editing tool active, hold the middle button over the canvas, selected
+artwork and handles, drag, and release outside the canvas. Verify camera-only
+movement, no history entry, unchanged active tool, and cancellation on Escape,
+blur or mode/backend changes. Check Duplicate/Copy/Cut/Paste in the context menu,
+including current form appearances, imported textboxes, groups and hidden layers.
+Align and distribute rotated objects, then Undo once. Check snapping near page
+edges/centers and selected source artwork, including stationary Alt changes and
+the final pointer release. Lock objects/groups, verify edits are disabled while
+copy/unlock remain available, and distinguish editing locks from visibility locks.
+Highlight multi-line, Unicode and rotated searchable text; add, edit and cancel
+comments. Reopen PDF annotations in an independent reader and check their notes,
+quad positions and appearances; reopened HEP keeps their ordinary geometry.
+Reload the same source after editing text/form drafts and page/layer changes.
+Try Restore, Later, Discard and storage failure; verify protected drafts need the
+source password and no password is stored. Cancel the browser's download dialog
+and verify that local changes/recovery remain available. During export, verify
+that edits are blocked and Cancel/Escape remains usable.
 In both viewers with WebGL and WebGPU, close Settings and enter Edit with a large
 PDF or a slow tool download. Check that **Loading Edit mode** appears before tool
 loading and stays visible until the editable document is drawn. Check stage
@@ -411,6 +516,14 @@ correct. Save/reopen PDF and HEP after releasing and after cancelling a gesture.
 For performance comparisons, keep document, zoom, selection and backend matched;
 separate initial gesture preparation from repeated moves. Offline CPU timings
 and mocked uploads do not establish browser frame rates or GPU performance.
+In Pages, reorder nonadjacent selections with mouse, touch, pen and Alt+Up/Down.
+Cancel a drag with Escape and verify ordinary touch scrolling outside grips still
+works. Duplicate before the originals, then edit copied text, shapes, groups and
+shared form fields independently. Check Undo/Redo and extract selected pages;
+extraction must include current edits while leaving the active document unchanged.
+Crop and reset rotated/cropped pages with nondefault UserUnit, including objects
+crossing the new boundary; verify hidden content returns after Reset crop. Repeat
+with layer restacking, protected files, PDF/HEP saves and independent readers.
 Before entering Edit, print a PDF and a HEP from the main toolbar. Print a
 protected PDF using its existing unlock password, and check selected-page scope.
 After editing, return to View and print again; verify the retained changes are
@@ -469,11 +582,15 @@ then generate before/after PDF, baked HEP, rebuilt PDF, and comparison PNGs:
 ```sh
 npm install --prefix /tmp/hepr-editor-reference --no-audit --no-fund --ignore-scripts pdfjs-dist@6.4.299
 node scripts/check-editor-visuals.mjs /tmp/hepr-editor-validation
+node scripts/check-editor-pages-visuals.mjs /tmp/hepr-editor-pages-validation
+node scripts/check-editor-source-visuals.mjs /tmp/hepr-editor-source-validation
 ```
 
 The output includes `overview.png`, `book-overview.png`, `image-overview.png`,
 and JSON reports. These compare HEPR Canvas2D with pdf.js; they do not measure
-browser interaction or GPU rendering.
+browser interaction or GPU rendering. The source comparison also covers native
+glyph edits, independent shared Form invocations, images, clipping and stacking;
+the page comparison covers rotation, merging and PDF/HEP rebuilding.
 
 ## Loading documents
 

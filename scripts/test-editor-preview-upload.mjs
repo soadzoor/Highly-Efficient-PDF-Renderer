@@ -28,8 +28,10 @@ try {
     textGlyphMetaB: Float32Array.of(8, 12, 0, 0), textGlyphSegmentsA: Float32Array.of(0, 0, 0, 0, 8, 0, 0, 0, 0, 12, 0, 0),
     textGlyphSegmentsB: Float32Array.of(8, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0), textClipRects: Float32Array.of(0, 0, 100, 100),
     clipPaths: [{ parent: -1, fillRule: 0, edges: rectangle(0, 0, 100, 100) },
-      { parent: 0, fillRule: 0, edges: rectangle(5, 10, 80, 90) }, { parent: 0, fillRule: 0, edges: rectangle(5, 10, 80, 90) }] });
-  source.drawRuns = [...source.drawRuns.map(run => ({ ...run, clipIndex: 1 })), { kind: "text", first: 0, count: 2, clipIndex: 1 }];
+      { parent: 0, fillRule: 0, edges: rectangle(5, 10, 80, 90) }, { parent: 0, fillRule: 0, edges: rectangle(5, 10, 80, 90) },
+      { parent: -1, fillRule: 0, edges: rectangle(10, 15, 70, 75) }] });
+  source.drawRuns = [...source.drawRuns.map(run => ({ ...run, clipIndex: 3 })),
+    { kind: "text", first: 0, count: 1, clipIndex: 3 }, { kind: "text", first: 1, count: 1, clipIndex: 1 }];
   // Unchanged images/gradients must not disable an ordinary vector selection.
   source.rasterLayers = [{ matrix: Float32Array.of(5, 0, 0, 5, 120, 120), width: 1, height: 1, data: Uint8Array.of(255, 0, 0, 255) }];
   source.rasterLayers.push({ ...source.rasterLayers[0] });
@@ -51,6 +53,7 @@ try {
   const first = prepared.translate(3, 4), second = prepared.translate(75, -20), third = prepared.translate(0, 0);
   const hint = getEditorSceneTranslationHint(first), exclusive = new Set(hint.changedClips);
   assert(exclusive.size > 0);
+  for (const index of [0, 1, 2]) assert.deepEqual(second.clipPaths[index], source.clipPaths[index], "shared ancestor clips stay fixed while the owned inset clip moves");
   const packed = packVectorClips(first.clipPaths, undefined, { cells: true, exclusive });
   const headers = packed.slice(0, first.clipPaths.length * 4), plan = prepareEditorPreviewSceneUpdate(first, second); assert(plan);
   assert.deepEqual(editorPreviewFillCoverage(second, plan), vectorFillCoverageMetadata(second), "moved-only coverage equals a complete canonical recomputation");

@@ -86,16 +86,74 @@ try {
     assert.equal((await new NativePdfFormAppearanceRegistry(repeatedDocument).listPageAnnotations(5)).find(annotation => annotation.widget).widget.fullyQualifiedName, "Imported2.Unique");
   }
   finally { await repeatedDocument.close(); }
+  const markers = document => document.pages.map(page => decodePdfString(page.dictionary.get("Marker"), 0, 0));
+  const reordered = await open(await run(original, { kind: "reorder", pages: [2, 0, 1] }));
+  try {
+    assert.deepEqual(markers(reordered), ["main-2", "main-0", "main-1"]);
+    assert.deepEqual(reordered.pages.map(page => page.ref.objectNumber), [5, 3, 4], "reorder preserves native page references");
+    const registry = new NativePdfFormAppearanceRegistry(reordered), annotations = await registry.listPageAnnotations(1), link = annotations.find(annotation => annotation.subtype === "Link");
+    assert.equal(link.dictionary.get("Dest")[0].objectNumber, reordered.pages[2].ref.objectNumber, "links retain target identity after reorder");
+    assert.equal((await createNativeOptionalContentRegistry(reordered)).listGroups().length, 1);
+    assert.equal((await registry.listPageAnnotations(2)).find(annotation => annotation.widget).widget.fullyQualifiedName, "Name");
+  } finally { await reordered.close(); }
+  const duplicated = await open(await run(original, { kind: "duplicate", pages: [1, 0], at: 1 }));
+  try {
+    assert.deepEqual(markers(duplicated), ["main-0", "main-1", "main-0", "main-1", "main-2"]);
+    assert.equal((await createNativeOptionalContentRegistry(duplicated)).listGroups().length, 1, "page copies reuse existing global layers");
+    assert.deepEqual(duplicated.pages[2].resources, duplicated.pages[0].resources, "copies share unchanged resource graphs");
+    assert.deepEqual(duplicated.pages[2].contents, duplicated.pages[0].contents, "copies share unchanged content streams");
+    const registry = new NativePdfFormAppearanceRegistry(duplicated);
+    assert.equal((await registry.listPageAnnotations(1)).find(annotation => annotation.widget).widget.fullyQualifiedName, "Imported1.Name", "copies have independent shared field owners");
+    assert.equal((await registry.listPageAnnotations(2)).find(annotation => annotation.widget).widget.fullyQualifiedName, "Imported1.Name");
+    const copied = (await registry.listPageAnnotations(2)).find(annotation => annotation.subtype === "Link");
+    assert.equal(copied.dictionary.get("Dest")[0].objectNumber, duplicated.pages[1].ref.objectNumber, "copied internal links target copied pages");
+    const toOriginal = (await registry.listPageAnnotations(1)).find(annotation => annotation.subtype === "Link"), destination = await duplicated.resolveDictionary(toOriginal.dictionary.get("A"));
+    assert.equal(destination.get("D")[0].objectNumber, duplicated.pages[4].ref.objectNumber, "copied links to unselected pages retain original targets");
+  } finally { await duplicated.close(); }
+  const extracted = await open(await run(original, { kind: "extract", pages: [2, 0] }));
+  try {
+    assert.deepEqual(markers(extracted), ["main-2", "main-0"]);
+    const registry = new NativePdfFormAppearanceRegistry(extracted);
+    assert.equal((await registry.listPageAnnotations(1)).find(annotation => annotation.widget).widget.fullyQualifiedName, "Name");
+    assert.equal((await createNativeOptionalContentRegistry(extracted)).listGroups().length, 1);
+  } finally { await extracted.close(); }
+  for (const rotation of [0, 90, 180, 270]) {
+    const input = await run(original, { kind: "rotate", pages: [0], degrees: rotation - 90 });
+    const old = await open(input), croppedBytes = await run(input, { kind: "crop", pages: [0], box: { x: 10, y: 20, width: 70, height: 90 } }), cropped = await open(croppedBytes);
+    try {
+      const before = computeNativePdfPageGeometry(old.pages[0]), after = computeNativePdfPageGeometry(cropped.pages[0]), transform = multiplyEditorMatrices(after.pageMatrix, invertEditorMatrix(before.pageMatrix));
+      assert.equal(after.pageBounds.maxX - after.pageBounds.minX, 70); assert.equal(after.pageBounds.maxY - after.pageBounds.minY, 90);
+      assert.deepEqual(transform.slice(0, 4), [1, 0, 0, 1]); assert.deepEqual(transform.slice(4), [-10, -20], "crop origin uses displayed lower-left points including rotation and UserUnit");
+      assert.deepEqual(await cropped.getDecodedPageContents(0), await old.getDecodedPageContents(0), "cropping retains hidden vector content");
+      const reset = await open(await run(croppedBytes, { kind: "crop", pages: [0], box: null }));
+      try { assert.deepEqual(reset.pages[0].cropBox, [0, 0, 200, 160]); } finally { await reset.close(); }
+    } finally { await old.close(); await cropped.close(); }
+  }
+  const { manipulatePdfPages: lazyPageOperation } = await import("../src/editorApi.ts");
+  for (const operation of [manipulatePdfPages, lazyPageOperation]) {
+    const box = { x: 0, y: 0, width: 50, height: 60 }, request = { kind: "crop", pages: [0], box };
+    const pending = operation(original, request); box.width = 999; box.height = 999; request.pages.push(1);
+    const cropped = await open(new Uint8Array(await (await pending).arrayBuffer()));
+    try {
+      const geometry = computeNativePdfPageGeometry(cropped.pages[0]);
+      assert.deepEqual([geometry.pageBounds.maxX - geometry.pageBounds.minX, geometry.pageBounds.maxY - geometry.pageBounds.minY], [50, 60], "direct and lazy APIs snapshot mutable crop geometry before awaiting");
+      assert.deepEqual(cropped.pages[1].cropBox, [20, 30, 180, 130], "later selection mutations do not crop extra pages");
+    } finally { await cropped.close(); }
+  }
   const protect = async (bytes, password) => { const document = await open(bytes); try { return await new NativePdfWriter(document).save(undefined, { protection: { mode: "password", password, ownerPassword: password + " owner" } }); } finally { await document.close(); } };
   const protectedMain = await protect(original, "main secret"), protectedForeign = await protect(foreign, "foreign secret");
   const protectedMerged = await run(protectedMain, { kind: "insert", at: 3, bytes: protectedForeign, pages: [0], password: "foreign secret" }, { password: "main secret" });
   for (const password of ["main secret", "main secret owner"]) { const document = await open(protectedMerged, password); try { assert.equal(document.pages.length, 4); assert.equal((await document.getDecodedPageContents(3)).length, 1); } finally { await document.close(); } }
   await assert.rejects(open(protectedMerged, "foreign secret"), error => error.code === "encrypted");
+  for (const request of [{ kind: "reorder", pages: [2, 1, 0] }, { kind: "duplicate", pages: [0], at: 0 }, { kind: "extract", pages: [1] }, { kind: "crop", pages: [0], box: { x: 5, y: 7, width: 50, height: 60 } }]) {
+    const document = await open(await run(protectedMain, request, { password: "main secret" }), "main secret");
+    try { assert((await document.getDecodedPageContents(0)).length); } finally { await document.close(); }
+  }
   const oldHeader = original.slice(); oldHeader.set(new TextEncoder().encode("%PDF-1.3"));
   const upgraded = await open(await run(oldHeader, { kind: "insert", at: 3, bytes: foreign, pages: [0] }));
   try { assert.equal(upgraded.catalog.get("Version").value, "1.7", "catalog declares imported optional-content/transparency capabilities"); }
   finally { await upgraded.close(); }
-  for (const request of [{ kind: "remove", pages: [0, 1, 2] }, { kind: "remove", pages: [0, 0] }, { kind: "rotate", pages: [3], degrees: 90 }, { kind: "rotate", pages: [0], degrees: 45 }, { kind: "insert", at: 4, bytes: foreign }, { kind: "insert", at: 0, bytes: foreign, pages: [0, 0] }]) await assert.rejects(run(original, request), RangeError);
+  for (const request of [{ kind: "remove", pages: [0, 1, 2] }, { kind: "remove", pages: [0, 0] }, { kind: "reorder", pages: [0, 1] }, { kind: "duplicate", pages: [], at: 0 }, { kind: "extract", pages: [] }, { kind: "crop", pages: [0], box: { x: 0, y: 0, width: 999, height: 1 } }, { kind: "rotate", pages: [3], degrees: 90 }, { kind: "rotate", pages: [0], degrees: 45 }, { kind: "insert", at: 4, bytes: foreign }, { kind: "insert", at: 0, bytes: foreign, pages: [0, 0] }]) await assert.rejects(run(original, request), RangeError);
   await assert.rejects(run(original, { kind: "rotate", pages: [0], degrees: 90 }, { signal: AbortSignal.abort() }), { name: "AbortError" });
   assert.deepEqual(original, before, "native page operations do not mutate caller bytes");
   console.log("Native PDF pages: rotation geometry/text metadata, removal/shared fields, selected-page imports/fonts/forms/links/layers, encryption and cancellation passed.");

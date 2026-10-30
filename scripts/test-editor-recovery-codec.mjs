@@ -1,0 +1,37 @@
+import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
+const hooks = registerHooks({ resolve(s, c, n) { return n(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? s + ".ts" : s, c); } });
+try {
+  const { encodeEditorRecoveryGraph, decodeEditorRecoveryGraph, createEditorRecoveryCodec } = await import("../src/editorRecoveryCodec.ts");
+  const buffer = new ArrayBuffer(32), floats = new Float32Array(buffer, 4, 3), bytes = new Uint8Array(buffer);
+  floats.set([1.25, -0, NaN]);
+  const graph = { title: "árvíztűrő 日本語 secret-document", floats, bytes, map: new Map(), set: new Set(["a", 2]), none: undefined, infinity: Infinity, big: 123n };
+  graph.self = graph; graph.map.set(graph, floats);
+  Object.defineProperty(graph, "__proto__", { value: "literal", enumerable: true });
+  const decoded = decodeEditorRecoveryGraph(encodeEditorRecoveryGraph(graph));
+  assert.equal(decoded.title, graph.title); assert.equal(decoded.self, decoded); assert.equal(decoded.floats.buffer, decoded.bytes.buffer);
+  assert.equal(decoded.map.get(decoded), decoded.floats); assert(Object.is(decoded.floats[1], -0)); assert(Number.isNaN(decoded.floats[2]));
+  assert.equal(decoded.infinity, Infinity); assert.equal(decoded.big, 123n); assert.equal(decoded.__proto__, "literal"); assert.equal(Object.getPrototypeOf(decoded), Object.prototype);
+  assert.throws(() => encodeEditorRecoveryGraph({ execute() {} }), /executable/);
+  assert.throws(() => decodeEditorRecoveryGraph(new Uint8Array(8)), /Invalid recovery/);
+  const pooled = new Uint8Array(1024); pooled.set(new TextEncoder().encode("unrelated-secret-memory")); pooled.set([1, 2, 3], 101);
+  const narrow = decodeEditorRecoveryGraph(encodeEditorRecoveryGraph({ pixels: pooled.subarray(101, 104) }));
+  assert.deepEqual([...narrow.pixels], [1, 2, 3]); assert(narrow.pixels.buffer.byteLength < pooled.buffer.byteLength);
+  assert(!new TextDecoder().decode(new Uint8Array(narrow.pixels.buffer)).includes("unrelated-secret"), "pooled source buffers never leak unrelated bytes into recovery");
+  const snapshot = { format: "hepr-editor-recovery", version: 1, sourceScene: {}, fonts: [], data: graph };
+  const plain = createEditorRecoveryCodec(); const envelope = await plain.encode(snapshot, { text: "Draft" });
+  assert(!envelope.encrypted); assert.equal((await plain.decode(envelope)).draft.text, "Draft");
+  const protectedCodec = createEditorRecoveryCodec({ protected: true, password: "correct-horse" });
+  const protectedEnvelope = await protectedCodec.encode(snapshot);
+  assert(protectedEnvelope.encrypted); assert.equal(protectedEnvelope.iv.length, 12); assert.equal(protectedEnvelope.salt.length, 16);
+  assert(!new TextDecoder().decode(protectedEnvelope.payload).includes("secret-document")); assert(!JSON.stringify(protectedEnvelope).includes("correct-horse"));
+  assert.equal((await protectedCodec.decode(protectedEnvelope)).snapshot.data.title, graph.title);
+  const again = await protectedCodec.encode(snapshot); assert.notDeepEqual(again.iv, protectedEnvelope.iv, "every checkpoint has an independent nonce");
+  await assert.rejects(createEditorRecoveryCodec({ protected: true }).decode(protectedEnvelope), /password/);
+  await assert.rejects(createEditorRecoveryCodec({ password: "wrong-password" }).decode(protectedEnvelope), /could not be unlocked/);
+  const damaged = structuredClone(protectedEnvelope); damaged.payload[0] ^= 1;
+  await assert.rejects(protectedCodec.decode(damaged), /could not be unlocked/);
+  await assert.rejects(protectedCodec.decode(envelope), /unencrypted recovery/);
+  await assert.rejects(createEditorRecoveryCodec({ protected: true }).encode(snapshot), /password/);
+  console.log("Recovery codec: binary typed/shared/cyclic data, Unicode, encrypted snapshots, nonce uniqueness, password failures and tampering passed.");
+} finally { hooks.deregister(); }

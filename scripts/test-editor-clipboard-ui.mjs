@@ -1,3 +1,4 @@
+import { editorUiTestContext } from "./lib/editorUiTestContext.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
@@ -9,8 +10,9 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 function harness() {
   const calls = [], buttons = new Map(), selection = ["shape"], statuses = [], errors = [];
   let available = false;
-  const context = vm.createContext({ AbortController, AbortSignal, DOMException,
+  const context = editorUiTestContext({ AbortController, AbortSignal, DOMException,
     active: true, disposed: false, running: false, clipboardRunning: false, structuralRunning: false,
+    cameraPan: { isPanning: () => false, cancel() {} },
     activeText: null, pointer: null, pendingPick: null, polygon: null, tool: "select", textRequest: 0,
     layerDialog: {}, operation: null, lifetime: new AbortController(),
     query(selector) { if (!buttons.has(selector)) buttons.set(selector, {}); return buttons.get(selector); },
@@ -30,6 +32,7 @@ function harness() {
       canPaste: () => available,
       async copySelection(options) { options.signal.throwIfAborted(); calls.push("copy"); available = true; return 1; },
       async cutSelection(options) { options.signal.throwIfAborted(); calls.push("cut"); available = true; selection.length = 0; return 1; },
+      async duplicateSelection(options) { options.signal.throwIfAborted(); calls.push("duplicate"); selection.splice(0, selection.length, "duplicated"); return selection; },
       pasteSelection(options) { calls.push(["paste", options && Array.from(options.offset)]); selection.splice(0, selection.length, "pasted"); return selection; }
     }
   });
@@ -64,6 +67,13 @@ function harness() {
   const refresh = h.calls.find(call => Array.isArray(call) && call[0] === "refresh");
   assert(refresh); assert.deepEqual(refresh.slice(2), [false, true], "cut waits for its committed replacement frame");
   assert.equal(h.context.running, false);
+}
+{
+  const h = harness(); assert(h.key("d").prevented); await flush();
+  assert(h.calls.includes("duplicate")); assert(!h.calls.includes("copy"));
+  assert.equal(h.context.session.canPaste(), false, "duplicate never overwrites the user's clipboard");
+  assert.match(h.statuses.at(-1), /Duplicated 1 object/);
+  assert(h.calls.some(call => Array.isArray(call) && call[0] === "refresh"));
 }
 for (const patch of [{ active: false }, { disposed: true }, { activeText: {} }, { pointer: {} }, { pendingPick: {} },
   { polygon: {} }, { running: true }, { structuralRunning: true }, { isSceneSettling: () => true }]) {

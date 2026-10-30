@@ -1,3 +1,4 @@
+import { editorUiTestContext } from "./lib/editorUiTestContext.mjs";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import { readFile } from "node:fs/promises";
@@ -35,7 +36,7 @@ try {
     visibleInDefaultView: true, hasAppearance: true, flags: 0, bounds: { minX: 0, minY: index * 30, maxX: 100, maxY: index * 30 + 20 },
     field: { type: "Tx", name, flags: 0, value } });
   const sourceScene = { annotations: [widget("first", "Text", "Old", 0), widget("shared", "Text", "Old", 1), widget("other", "Other", "Keep", 2)] };
-  const context = vm.createContext({ ...controls, AbortController, AbortSignal,
+  const context = editorUiTestContext({ ...controls, AbortController, AbortSignal,
     pendingDrawings: { capture() {}, acknowledge() {} },
     document, fields, fieldDrafts: new Map(), fieldPaintCache: null, latestScene: sourceScene, tool: "form", active: true,
     disposed: false, structuralRunning: false, pointer: null, pendingPick: null, lifetime: new AbortController(),
@@ -44,7 +45,7 @@ try {
     // Canonical source metadata intentionally retains the original values.
     getEditorAnnotationSource: (_scene, id) => sourceScene.annotations.find(annotation => annotation.id === id),
     getSceneAnnotationRuns: () => new Map(), report: error => errors.push(error),
-    session: { sourceScene, getState: () => ({ revision, selection: [], previewing: false }), getSelectionFrame: () => null,
+    session: { isObjectLocked: () => false, sourceScene, getState: () => ({ revision, selection: [], previewing: false }), getSelectionFrame: () => null,
       getFieldValues: () => new Map(values), setFieldValue(name, value) { values.set(name, value); revision++; },
       getScene() {
         const job = deferred(), snapshot = new Map(values);

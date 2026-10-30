@@ -20,6 +20,7 @@ import { createViewerPrintAction, type ViewerPrintAction, type ViewerPrintDocume
 import { createViewerFileDropController } from "./viewerFileDrop";
 import { initializeToolbarIcons, setToolbarIconButton, toolbarIconMarkup } from "./toolbarIcons";
 import { createEditorSetupLoading, type EditorSetupLoadingHandle } from "./editorSetupLoading";
+import { panEditorReader } from "./editorHostPan";
 import "./editorSetupLoading.css";
 
 import { WebGlPdfRenderer, type DrawStats, type SceneStats, type ViewState } from "./webGlPdfRenderer";
@@ -756,13 +757,17 @@ async function ensureNativeEditor(signal?: AbortSignal, setup?: EditorSetupLoadi
       let editSourceScene: VectorScene | null = null, initialEditScene: VectorScene | null = null;
       let editSourceLayout = originalLayout;
       let pendingEditorSource: { pdf?: Uint8Array; password?: string; label: string } | null = null;
+      let editorPanRenderer: typeof renderer | undefined;
       const sourcePlacementMatches = (): boolean => nativeLayout === editSourceLayout &&
         (nativeLayout === "reader" || editSourceScene?.pagesPerRow === canonicalPagesPerRow);
       pdfEditor = await createEditorUi({
         layerControlsContainer: document.querySelector<HTMLDivElement>("#pdf-layers")!,
         showLayerControls: () => setHudCollapsed(false),
         getCanvas: () => canvasElement, getScene: () => lastParsedScene,
-        getSource: () => ({ pdf: lastLoadedSource?.kind === "pdf" ? lastLoadedSource.bytes : undefined,
+        beginCameraPan() { if (readerViewport?.isActive()) readerViewport.cancelActiveGesture(); else { editorPanRenderer = renderer; renderer.beginPanInteraction(); } },
+        panCameraByPixels(dx, dy) { if (!panEditorReader(readerViewport, dx, dy)) renderer.panByPixels(dx, dy); },
+        endCameraPan() { if (editorPanRenderer === renderer) editorPanRenderer.endPanInteraction(); editorPanRenderer = undefined; },
+        getSource: () => ({ bytes: lastLoadedSource?.bytes, pdf: lastLoadedSource?.kind === "pdf" ? lastLoadedSource.bytes : undefined,
           password: lastLoadedPdfPassword, label: lastLoadedSource?.label ?? "document" }),
         async prepareScene(signal, onProgress) {
           const source = lastLoadedSource!;
@@ -844,7 +849,7 @@ async function ensureNativeEditor(signal?: AbortSignal, setup?: EditorSetupLoadi
           return () => { if (editorFrameListener === listener) editorFrameListener = null; };
         },
         requestFrame: () => renderer.requestFrame?.(),
-        setEditing: setNativeEditing, onStatus: setStatus, onBusyChange: () => viewerPrintAction?.refresh(),
+        setEditing: setNativeEditing, onStatus: setStatus, onBusyChange: () => { updateBackendSelectDisabledState(); viewerPrintAction?.refresh(); },
         onSetupProgress: progress => { if (!controller.signal.aborted) loading.report(progress); }
       }, controller.signal);
     }

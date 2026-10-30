@@ -6,6 +6,7 @@ import { createReaderViewport, type ReaderView } from "./readerViewport";
 import { computeReaderPageRects, readerContentMetrics, readerFitZoom, readerViewFromScroll } from "./readerGeometry";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { getEditorSceneTranslationHint } from "./editorScenePreview";
+import { panEditorReader, editorPerspectivePanDelta } from "./editorHostPan";
 import { createAnnotationOverlay, isLinkAnnotation } from "./annotationOverlay";
 import { createAnnotationInteractionController, type AnnotationInteractionController } from "./annotationInteraction";
 import { createThreeAnnotationInteractionAdapter } from "./threeAnnotationInteraction";
@@ -605,7 +606,17 @@ async function ensureThreeEditor(signal?: AbortSignal, setup?: EditorSetupLoadin
         layerControlsContainer: pdfLayersContainer ?? undefined,
         showLayerControls: () => setPanelCollapsed(false),
         getCanvas: () => canvasElement, getScene: () => currentPdfObject?.sceneData ?? null,
-        getSource: () => ({ pdf: currentPdfObject?.sourceKind === "pdf" ? currentPdfObject.sourceBytes : undefined,
+        beginCameraPan() { if (reader.isActive()) reader.cancelActiveGesture(); },
+        panCameraByPixels(dx, dy) {
+          if (panEditorReader(reader, dx, dy)) return;
+          camera.updateMatrixWorld(true);
+          const delta = editorPerspectivePanDelta(camera.matrixWorld.elements, camera.position.distanceTo(controls.target),
+            camera.fov, camera.zoom, canvasElement.getBoundingClientRect().height, dx, dy);
+          camera.position.add(new THREE.Vector3(...delta)); controls.target.add(new THREE.Vector3(...delta));
+          camera.updateMatrixWorld(true); controls.update(); requestRender();
+        },
+        endCameraPan() { requestRender(); },
+        getSource: () => ({ bytes: currentPdfObject?.sourceBytes, pdf: currentPdfObject?.sourceKind === "pdf" ? currentPdfObject.sourceBytes : undefined,
           password: currentPdfObject?.sourceOptions?.password, label: currentPdfObject?.sourceLabel ?? "document" }),
         async prepareScene(signal, onProgress) {
           const object = currentPdfObject!; object.pausePageLoading();
@@ -670,7 +681,7 @@ async function ensureThreeEditor(signal?: AbortSignal, setup?: EditorSetupLoadin
           return () => { if (editorFrameListener === listener) editorFrameListener = null; };
         },
         requestFrame: requestRender,
-        setEditing: setThreeEditing, onStatus: setStatus, onBusyChange: () => viewerPrintAction?.refresh(),
+        setEditing: setThreeEditing, onStatus: setStatus, onBusyChange: () => { updateThreeBackendSelectDisabledState(); viewerPrintAction?.refresh(); },
         onSetupProgress: progress => { if (!controller.signal.aborted) loading.report(progress); }
       }, controller.signal);
     }

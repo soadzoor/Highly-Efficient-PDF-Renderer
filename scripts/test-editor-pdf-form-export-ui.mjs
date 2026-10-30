@@ -1,6 +1,7 @@
+import { editorUiTestContext } from "./lib/editorUiTestContext.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { registerHooks } from "node:module";
+import { registerHooks, stripTypeScriptTypes } from "node:module";
 import vm from "node:vm";
 import { sourceFunction } from "./lib/sourceFunction.mjs";
 
@@ -35,6 +36,7 @@ try {
   const { chooseEditorPdfFormExport } = await import("../src/editorPdfFormExportUi.ts");
   const { findEditorPdfFormOverlaps } = await import("../src/editorPdfFormOverlap.ts");
   const { LoadProgressReporter } = await import("../src/loadProgress.ts");
+  const { waitForLoad } = await import("../src/loadCancellation.ts");
   for (const action of ["pdf", "flatten", "cancel", "escape", "close", "abort"]) {
     const document = documentHost(), abort = new AbortController(), pending = chooseEditorPdfFormExport(document, abort.signal);
     const dialog = document.dialogs[0]; assert(dialog.open);
@@ -65,7 +67,7 @@ try {
       getObjectBounds: () => ({ minX: 10, minY: 38, maxX: 80, maxY: 42 }),
       async savePdf(options) { saves.push(options); return new Blob(["PDF"], { type: "application/pdf" }); } };
     const protection = { mode: "password", password: "opening password" }, cancel = { hidden: true };
-    const context = vm.createContext({ session, document, LoadProgressReporter, findEditorPdfFormOverlaps, chooseEditorPdfFormExport,
+    const context = editorUiTestContext({ session, document, LoadProgressReporter, findEditorPdfFormOverlaps, chooseEditorPdfFormExport,
       structuralRunning: false, running: false, activeText: null, passwordDialog: null, fieldDrafts: new Map(), operation: null,
       flushEditorFieldDrafts() {}, hasPendingEditorFields: () => false, finishText: async () => {}, cancelPointerGesture() {}, updatePointerCursor() {},
       pdfProtection: { get: () => protection, markSaved: value => marked.push(value) }, hasUnsavedChanges: () => true,
@@ -84,9 +86,9 @@ try {
     await pending;
     const saved = choice === "pdf" || choice === "flatten";
     assert.equal(h.saves.length, saved ? 1 : 0); assert.equal(h.downloads.length, saved ? 1 : 0);
-    assert.equal(h.marked.length, saved ? 1 : 0, "cancel does not mark output protection saved");
+    assert.equal(h.marked.length, 0, "browser downloads keep local protection settings and recovery pending");
     if (saved) {
-      assert.equal(h.saves[0].flatten, choice === "flatten"); assert.equal(h.saves[0].protection, h.protection);
+      assert.equal(h.saves[0].markSaved, false); assert.equal(h.saves[0].flatten, choice === "flatten"); assert.equal(h.saves[0].protection, h.protection);
       assert.equal(h.downloads[0].name, choice === "flatten" ? "form-flattened.pdf" : "form-edited.pdf");
     } else assert(h.statuses.includes("PDF export cancelled"));
     assert.deepEqual(h.errors, []); assert.deepEqual(h.busy, [true, false]); assert(!h.context.running && h.cancel.hidden);
@@ -101,6 +103,76 @@ try {
     assert.equal(h.saves.length, 0); assert.equal(h.downloads.length, 0);
     assert.match(h.errors[0].message, /document changed/i, "a stale export choice cannot serialize a different document");
     assert(!h.context.running && h.cancel.hidden);
+  }
+  {
+    const h = harness({ sourcePdf: false, overlap: false }), listeners = new Map(); let finish, mutations = 0, tools = 0;
+    h.context.toolbar.addEventListener = (name, listener) => listeners.set(name, listener);
+    h.context.active = true; h.context.pointer = h.context.pendingPick = null;
+    h.context.inputTarget = target => Boolean(target.input); h.context.setTool = () => tools++;
+    h.context.session.savePdf = async options => { h.saves.push(options); return new Promise(resolve => { finish = resolve; }); };
+    for (const name of ["commit", "keydown", "toolbarInput", "changeAppearance", "changeOpacity", "applyTextStyle", "preventBusyInput"])
+      vm.runInContext(sourceFunction(source.replace(/^ {2}/gm, ""), name), h.context);
+    const clickStart = source.indexOf('  toolbar.addEventListener("click",'), clickEnd = source.indexOf("  function toolbarInput", clickStart);
+    vm.runInContext(stripTypeScriptTypes(source.slice(clickStart, clickEnd)), h.context);
+    const saving = h.context.save("pdf"); assert(h.context.running && h.context.overlay.inert);
+    await h.context.save("pdf"); assert.equal(h.saves.length, 1, "a second save cannot flush drafts or serialize another snapshot");
+    h.context.commit(() => mutations++);
+    const control = { dataset: { prop: "color" }, value: "#abcdef" };
+    h.context.changeAppearance(control); h.context.applyTextStyle("bold"); h.context.toolbarInput({ target: control });
+    assert(h.context.changeOpacity({ dataset: { prop: "opacity" }, value: ".2" }));
+    listeners.get("click")({ target: { closest: () => ({ dataset: { tool: "rectangle" } }) } });
+    const key = { key: "Delete", target: { input: true }, preventDefault() { this.prevented = true; } }; h.context.keydown(key); assert(key.prevented);
+    const input = { preventDefault() { this.prevented = true; } }; h.context.preventBusyInput(input); assert(input.prevented);
+    assert.equal(mutations, 0, "field/property/history commits are blocked while output is serialized"); assert.equal(tools, 0);
+    listeners.get("click")({ target: { closest: () => ({ dataset: { action: "cancel-operation" } }) } });
+    assert(h.context.operation.signal.aborted, "Cancel remains available in the toolbar");
+    finish(new Blob(["PDF"])); await saving;
+    assert.equal(h.downloads.length, 0); assert(!h.context.running && !h.context.savePreparing && !h.context.overlay.inert && h.cancel.hidden);
+  }
+  for (const cancel of [false, true]) {
+    const h = harness({ sourcePdf: false, overlap: false }); let resolveDraft, commits = 0;
+    const draft = new Promise(resolve => { resolveDraft = resolve; });
+    Object.assign(h.context, { active: true, activeText: { element: { innerText: "Draft text" } }, pointer: null, pendingPick: null, textRequest: 1,
+      waitForLoad, readTextDraft: () => draft, refreshScene: async () => {}, commitEditorText: () => commits++,
+      inputTarget: () => false, cancelText() { h.context.activeText = null; } });
+    for (const name of ["commit", "finishText", "keydown"]) vm.runInContext(sourceFunction(source.replace(/^ {2}/gm, ""), name), h.context);
+    const saving = h.context.save("pdf"); assert(h.context.savePreparing && h.context.overlay.inert); assert.equal(h.saves.length, 0);
+    await h.context.save("pdf"); assert.equal(h.saves.length, 0);
+    if (cancel) { h.context.keydown({ key: "Escape", preventDefault() {} }); await saving; }
+    resolveDraft({ kind: "text", text: "Draft text" }); await saving; await tick();
+    assert.equal(commits, cancel ? 0 : 1, "draft finishing is atomic and a canceled late font/draft result cannot commit");
+    assert.equal(h.saves.length, cancel ? 0 : 1); assert(!h.context.running && !h.context.savePreparing && !h.context.overlay.inert && h.cancel.hidden);
+    if (cancel) assert(h.context.activeText, "canceling export preparation keeps the unfinished text available");
+  }
+  {
+    const h = harness({ sourcePdf: false, overlap: false });
+    Object.assign(h.context, { activeText: { element: { innerText: "Invalid text draft" } }, pointer: null, pendingPick: null, textRequest: 1,
+      readTextDraft: async () => ({ kind: "text", text: "Invalid text draft" }), refreshScene: async () => {},
+      commitEditorText: () => { throw new Error("Invalid textbox font size"); }, cancelText() { h.context.activeText = null; } });
+    for (const name of ["commit", "finishText"]) vm.runInContext(sourceFunction(source.replace(/^ {2}/gm, ""), name), h.context);
+    await h.context.save("pdf"); assert(h.context.activeText, "failed text validation keeps the editing draft intact");
+    assert.equal(h.saves.length, 0); assert.match(h.errors[0].message, /font size/); assert(!h.context.overlay.inert && !h.context.savePreparing);
+  }
+  {
+    const h = harness({ sourcePdf: false, overlap: false });
+    h.session.savePdf = async options => {
+      options.onDiagnostic({ severity: "info", code: "trace", message: "Informational trace" });
+      options.onDiagnostic({ severity: "warning", code: "editor.pdf-source-operation-appearance", message: "Source appearance retained with a bounded fallback" });
+      options.onWarning("Source appearance retained with a bounded fallback");
+      options.onDiagnostic({ severity: "error", code: "approximate", message: "Unsupported appearance approximated" });
+      return new Blob(["PDF"]);
+    };
+    await h.context.save("pdf");
+    const final = h.statuses.at(-1); assert(final.includes("Source appearance retained") && final.includes("Unsupported appearance approximated"));
+    assert.equal(final.split("Source appearance retained").length, 2, "warning and diagnostic callbacks share deduplicated retained export notices");
+    assert(!final.includes("Informational trace"));
+  }
+  {
+    const h = harness({ sourcePdf: false, overlap: false }); let finish;
+    h.session.savePdf = async () => new Promise(resolve => { finish = resolve; });
+    const saving = h.context.save("pdf"); h.revise(); finish(new Blob(["PDF"])); await saving;
+    assert.equal(h.downloads.length, 0); assert.match(h.errors[0].message, /document changed/i, "external edits cannot turn an older serialization into the reported current export");
+    assert(!h.context.overlay.inert && !h.context.running);
   }
   console.log("PDF form export choice: explicit formats, overlap-only prompting, cancellation, protection, filenames and stale-document guards passed.");
 } finally { hooks.deregister(); }

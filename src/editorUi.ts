@@ -1,5 +1,8 @@
 import "./editorUi.css";
 import "./editorContextMenu.css";
+import "./editorPagesUi.css";
+import "./editorReviewUi.css";
+import "./editorRecoveryUi.css";
 import "./toolbarIcons.css";
 import { openEditorSession } from "./editorSession";
 import type { EditorColor, EditorMatrix, EditorObject, EditorObjectInput, EditorSelectionFrame, EditorSession, EditorState, EditorTextObject } from "./editorTypes";
@@ -21,7 +24,9 @@ import type { EditorFont } from "./editorFonts";
 import { editorIconButton } from "./editorToolbarIcons";
 import { canEditEditorField, createEditorFieldControl, createEditorFieldOptions, editorFieldDraftSignature, flushEditorFieldDrafts, hasPendingEditorFields, setEditorFieldControlValue, styleEditorFieldControl, updateEditorFieldControlAppearance, type EditorFieldControl } from "./editorFormControls";
 import { editorBoundsClickHit, editorFieldClientGeometry, pickEditorMetadataAnnotation, transformEditorAnnotationText } from "./editorCoordinates";
-import { applyEditorFillOpacity, applyEditorOpacity, editorFillSelection, editorStyledSelection, validateEditorOpacity } from "./editorProperties";
+import { applyEditorFillOpacity, applyEditorOpacity, applyEditorPropertyPatch, editorFillSelection, editorPropertySelection, editorStyledSelection, validateEditorOpacity } from "./editorProperties";
+import { createEditorPropertyControls } from "./editorPropertyControls";
+import { createEditorCameraPan } from "./editorCameraPan";
 import { createEditorInteractionController } from "./editorInteraction";
 import { LoadProgressReporter } from "./loadProgress";
 import { createEditorPdfProtectionState, showEditorPdfPasswordDialog, type EditorPdfPasswordDialog } from "./editorPdfProtectionUi";
@@ -35,7 +40,11 @@ import { droppedFileKind } from "./documentDropFiles";
 import { waitForLoad, yieldAfterPaint } from "./loadCancellation";
 import type { EditorSetupProgress } from "./editorSetupLoading";
 import { createEditorLayerControls } from "./editorLayerControls";
-import { createEditorContextMenu, type EditorClipboardAction } from "./editorContextMenu";
+import { createEditorContextMenu, type EditorObjectMenuAction } from "./editorContextMenu";
+import { alignEditorSelection, distributeEditorSelection, createEditorAlignmentSnap, type EditorAlignment, type EditorAlignmentGuide } from "./editorLayout";
+import { createEditorReviewController, isEditorReviewTool, type EditorReviewTool } from "./editorReviewUi";
+import { createEditorRecovery, editorRecoveryDocumentKey, type EditorRecoveryController } from "./editorRecovery";
+import { showEditorRecoveryDialog } from "./editorRecoveryUi";
 
 export interface EditorUiHost {
   getCanvas(): HTMLCanvasElement;
@@ -44,13 +53,17 @@ export interface EditorUiHost {
   /** Acknowledge the matching draw before resolving, so selection chrome can follow the submitted scene. */
   applyScene(scene: VectorScene, signal: AbortSignal, onPresented?: () => void, options?: { preview?: boolean }): void | Promise<void>;
   documentChanged?(scene: VectorScene, source: { pdf?: Uint8Array; password?: string; label: string }): void | Promise<void>;
-  getSource(): { pdf?: Uint8Array; password?: string; label: string };
+  getSource(): { bytes?: Uint8Array; pdf?: Uint8Array; password?: string; label: string };
   clientToScenePoint(x: number, y: number, pageIndex?: number): PrimitivePoint | null;
   sceneToClientPoint(x: number, y: number, pageIndex?: number): PrimitivePoint | null;
   /** Notify synchronously after the document's draw/submission, including camera-only frames. */
   subscribeToFrames?(listener: () => void): () => void;
   /** Schedule a document frame when newly created controls need their initial placement. */
   requestFrame?(): void;
+  /** Camera-only navigation uses CSS pixel drag displacement and never enters document history. */
+  beginCameraPan?(): void;
+  panCameraByPixels?(deltaX: number, deltaY: number): void;
+  endCameraPan?(): void;
   /** Optional dock beside the canvas. Custom hosts without a dock use a dialog. */
   layerControlsContainer?: HTMLElement;
   showLayerControls?(): void;
@@ -72,7 +85,7 @@ export interface EditorUi {
   dispose(): void;
 }
 
-type Tool = "select" | "pan" | "form" | "text" | "rectangle" | "ellipse" | "line" | "arrow" | "polygon" | "polyline" | "ink" | "signature" | "image";
+type Tool = "select" | "pan" | "form" | "text" | "rectangle" | "ellipse" | "line" | "arrow" | "polygon" | "polyline" | "ink" | "signature" | "image" | EditorReviewTool;
 type EditorImageData = Omit<Extract<EditorObjectInput, { kind: "image" }>, "pageIndex" | "x" | "y" | "width" | "height">;
 type EditorInkInput = Extract<EditorObjectInput, { kind: "ink" }>;
 type EditorShapeInput = Extract<EditorObjectInput, { kind: "shape" }>;
@@ -86,6 +99,7 @@ interface PresentedScene {
   frame: EditorSelectionFrame | null;
   delta: EditorMatrix | null;
   drawings?: EditorPendingDrawingFrame;
+  guides?: readonly EditorAlignmentGuide[];
 }
 const IDENTITY: EditorMatrix = [1, 0, 0, 1, 0, 0];
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -139,7 +153,16 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   let opacityControlSelection = "";
   let rotationDraft: { selection: readonly string[]; sourceScene: VectorScene } | null = null;
   let renderRevision = 0, operation: AbortController | null = null, running = false;
+  let savePreparing = false;
   let clipboardRunning = false;
+  let recovery: EditorRecoveryController | undefined, recoveryKey = "", recoveryOffered = false;
+  let recoveryDialog: { close(): void } | null = null, recoveryNotice = "", exportedRevision = -1;
+  let recoveryRunning = false;
+  let discardRecovery = false;
+  let alignmentSnap: ReturnType<typeof createEditorAlignmentSnap> = null;
+  let requestedGuides: readonly EditorAlignmentGuide[] = [];
+  let drawingDefaults: { color: string; opacity: number } | null = null;
+  const reviewDefaults = new Map<string, { color: string; opacity: number }>();
   let previewGeneration = 0, previewQueued = false, previewRunning = false, previewPending = false;
   let picker: ScenePrimitivePicker | null = null;
   let picking: AbortController | null = null;
@@ -160,6 +183,11 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     ${editorIconButton("tool", "pan", "Pan the document")}
     ${editorIconButton("tool", "form", "Fill PDF form fields")}
     ${editorIconButton("tool", "text", "Add a text box")}
+    ${editorIconButton("tool", "highlight", "Highlight selected text")}
+    ${editorIconButton("tool", "underline-text", "Underline selected text")}
+    ${editorIconButton("tool", "strikeout-text", "Strike out selected text")}
+    ${editorIconButton("tool", "comment", "Add a comment")}
+    ${editorIconButton("action", "edit-comment", "Edit the selected review comment")}
     ${editorIconButton("tool", "rectangle", "Draw a rectangle")}
     ${editorIconButton("tool", "ellipse", "Draw an ellipse")}
     ${editorIconButton("tool", "line", "Draw a line")}
@@ -178,6 +206,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     ${editorIconButton("action", "delete", "Delete selected objects")}
     ${editorIconButton("action", "group", "Group selected objects")}
     ${editorIconButton("action", "ungroup", "Ungroup selected objects")}
+    ${editorIconButton("action", "lock", "Lock selected objects against editing")}
+    ${editorIconButton("action", "unlock", "Unlock selected objects")}
   </div><div class="hepr-editor-properties">
     <label>Color <input data-prop="color" type="color" value="#111111"></label><label class="hepr-editor-opacity">Color opacity <input data-prop="opacity" type="number" value="1" min="0" max="1" step="0.1" aria-label="Color opacity"><input data-opacity-slider="opacity" type="range" value="1" min="0" max="1" step="0.1" aria-label="Color opacity slider"></label><label>Width <input data-prop="stroke" type="number" value="2" min="0" step="any"></label>
     <label><input data-prop="fill-enabled" type="checkbox"> Fill</label><input data-prop="fill" type="color" value="#ffff00" aria-label="Fill color">
@@ -187,12 +217,16 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     <button type="button" data-style="bold" aria-pressed="false" title="Bold" aria-label="Bold"><b>B</b></button><button type="button" data-style="italic" aria-pressed="false" title="Italic" aria-label="Italic"><i>I</i></button>
     <button type="button" data-style="underline" aria-pressed="false" title="Underline" aria-label="Underline"><u>U</u></button><button type="button" data-style="strikethrough" aria-pressed="false" title="Strikethrough" aria-label="Strikethrough"><s>S</s></button>
     <label>Align <select data-prop="align"><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></label>
-    ${editorIconButton("action", "apply-text", "Apply text changes", "hidden")}${editorIconButton("action", "cancel-text", "Discard text changes", "hidden")}
+    ${editorIconButton("action", "apply-text", "Apply text changes", "hidden")}${editorIconButton("action", "cancel-text", "Discard text changes", "hidden")}<span data-properties-note class="hepr-editor-property-note" role="status"></span>
   </div><div class="hepr-editor-transform">
     <span data-selection>No selection</span><label>X <input data-transform="x" type="number" step="any"></label><label>Y <input data-transform="y" type="number" step="any"></label>
     <label>W <input data-transform="width" type="number" min="0.001" step="any"></label><label>H <input data-transform="height" type="number" min="0.001" step="any"></label><label>Rotate ° <input data-transform="rotation" type="number" step="any" title="Selection angle in degrees. Drag rotation snaps within 5° of multiples of 45°, including 0°. Hold Alt/Option to disable snapping."></label>
-    ${editorIconButton("action", "layers", "Add, edit, reorder or remove PDF layers")}${editorIconButton("action", "pages", "Rotate, remove or insert PDF pages")}${editorIconButton("action", "pdf-password", "Keep, remove or change PDF password protection")}${editorIconButton("action", "save-pdf", "Save an editable PDF (Ctrl/Cmd+S)")}${editorIconButton("action", "flatten", "Save a flattened PDF copy")}${editorIconButton("action", "save-hep", "Save the edited document as HEP")}${editorIconButton("action", "print", "Print the edited document")}
-    ${editorIconButton("action", "cancel-operation", "Cancel the current operation", "hidden")}<span data-status role="status" aria-live="polite"></span>
+    <label>Relative to <select data-layout-reference><option value="selection">Selection</option><option value="page">Page</option></select></label>
+    ${(["left", "center", "right", "top", "middle", "bottom"] as const).map(value => editorIconButton("action", `align-${value}`, `Align ${value}`)).join("")}
+    ${editorIconButton("action", "distribute-horizontal", "Distribute horizontal gaps")}${editorIconButton("action", "distribute-vertical", "Distribute vertical gaps")}
+    ${editorIconButton("action", "guides", "Snap movement to page and object alignment guides; hold Alt/Option to bypass", 'aria-pressed="true"')}
+    ${editorIconButton("action", "layers", "Add, edit, reorder or remove PDF layers")}${editorIconButton("action", "pages", "Organize, crop or extract PDF pages")}${editorIconButton("action", "pdf-password", "Keep, remove or change PDF password protection")}${editorIconButton("action", "save-pdf", "Download an editable PDF (Ctrl/Cmd+S)")}${editorIconButton("action", "flatten", "Download a flattened PDF copy")}${editorIconButton("action", "save-hep", "Download the edited document as HEP")}${editorIconButton("action", "print", "Print the edited document")}${editorIconButton("action", "recovery", "Manage local recovery drafts")}
+    ${editorIconButton("action", "cancel-operation", "Cancel the current operation", "hidden")}<span data-status role="status" aria-live="polite"></span><span data-recovery-status role="status" aria-live="polite"></span>
   </div><div class="hepr-editor-help">Ctrl/Cmd + click toggles objects; Shift + click adds them. Drag empty space to select fully contained objects. Corner resizing keeps proportions; hold Shift to resize freely. Rotation snaps within 5° of multiples of 45°, including 0°; hold Alt/Option to disable snapping. Double-click a new textbox to edit it; resizing changes wrapping, Alt + resize scales text. Escape cancels.</div>`;
   const overlay = document.createElement("div"); overlay.className = "hepr-editor-overlay"; overlay.dataset.tool = tool;
   const graphic = document.createElementNS(SVG_NS, "svg"); graphic.classList.add("hepr-editor-graphic");
@@ -205,6 +239,12 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   const query = <T extends HTMLElement>(selector: string): T => toolbar.querySelector<T>(selector)!;
   const property = (name: string): HTMLInputElement => query(`[data-prop="${name}"]`);
   const status = query<HTMLSpanElement>("[data-status]");
+  const appearanceControls = createEditorPropertyControls({ session, control: name => property(name),
+    style: name => query<HTMLButtonElement>(`[data-style="${name}"]`), focused: () => document.activeElement,
+    note: query("[data-properties-note]") });
+  function updateAppearanceControls(): void {
+    appearanceControls.refresh(activeText ? "draft" : tool === "select" && session.getSelection().length ? "selection" : "defaults");
+  }
   function setStatus(text: string): void {
     status.textContent = text; if (!active) host.onStatus?.(text);
   }
@@ -222,7 +262,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   function updateOpacityControls(state: EditorState): void {
     const selectionKey = JSON.stringify(state.selection), selectionChanged = selectionKey !== opacityControlSelection;
     opacityControlSelection = selectionKey;
-    const styled = editorStyledSelection(session), fills = editorFillSelection(session, styled);
+    const styled = tool === "select" && !activeText ? editorStyledSelection(session) : [], fills = editorFillSelection(session, styled);
     for (const name of ["opacity", "fill-opacity"] as const) {
       if (!selectionChanged && (document.activeElement === property(name) || document.activeElement === opacitySlider(name))) continue;
       const ids = name === "opacity" ? styled : fills;
@@ -235,12 +275,11 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if (name === "opacity" && activeText) syncOpacityControls(name, activeText.opacity ?? objectOpacity, false);
       else if (values.length) {
         const common = values.every(value => value === values[0]); syncOpacityControls(name, common ? values[0] : null, disabled);
-        if (common) { if (name === "opacity") objectOpacity = values[0]; else fillOpacity = values[0]; }
       } else syncOpacityControls(name, name === "opacity" ? objectOpacity : fillOpacity, disabled);
     }
   }
   function opacityInput(event: Event): void {
-    if (structuralRunning) return;
+    if (structuralRunning || running || savePreparing) return;
     const input = event.target as HTMLInputElement, name = input.dataset.opacitySlider ?? input.dataset.prop;
     if (name !== "opacity" && name !== "fill-opacity") return;
     const value = input.value.trim() ? Number(input.value) : NaN;
@@ -252,18 +291,20 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   function changeOpacity(input: HTMLInputElement): boolean {
     const name = input.dataset.opacitySlider ?? input.dataset.prop;
     if (name !== "opacity" && name !== "fill-opacity") return false;
+    if (structuralRunning || running || savePreparing) return true;
     try {
       const value = validateEditorOpacity(input.value.trim() ? Number(input.value) : NaN);
+      const selectionMode = tool === "select" && session.getSelection().length > 0 && !activeText;
       if (name === "opacity") {
-        objectOpacity = value;
-        if (activeText) activeText.opacity = value;
-        else if (editorStyledSelection(session).length) commit(() => applyEditorOpacity(session, value));
+        if (activeText) { activeText.opacity = value; recovery?.draftChanged(); }
+        else if (selectionMode) { if (editorStyledSelection(session).length) commit(() => applyEditorOpacity(session, value)); }
+        else objectOpacity = value;
       } else {
-        fillOpacity = value;
-        if (!activeText && editorFillSelection(session).length) commit(() => applyEditorFillOpacity(session, value));
+        if (selectionMode) { if (editorFillSelection(session).length) commit(() => applyEditorFillOpacity(session, value)); }
+        else fillOpacity = value;
       }
       syncOpacityControls(name, value, input.disabled);
-    } catch (error) { report(error); syncOpacityControls(name, name === "opacity" ? objectOpacity : fillOpacity, input.disabled); }
+    } catch (error) { report(error); syncOpacityControls(name, name === "opacity" ? activeText?.opacity ?? objectOpacity : fillOpacity, input.disabled); }
     return true;
   }
   const report = (error: unknown): void => { if (!(error instanceof DOMException && error.name === "AbortError")) setStatus(message(error)); };
@@ -276,7 +317,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   const layerControls = createEditorLayerControls({ container: host.layerControlsContainer ?? layerDialog!, session, onError: report,
     change(change) {
-      if (structuralRunning || running) throw new Error("Wait for the current document operation to finish.");
+      if (structuralRunning || running || savePreparing) throw new Error("Wait for the current document operation to finish.");
       if (pointer || pendingPick) cancelPointerGesture();
       const revision = session.getState().revision;
       change(); if (session.getState().revision !== revision) void refreshScene();
@@ -284,8 +325,34 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   const contextMenu = createEditorContextMenu(document, {
     canRun: action => canOpenContextMenu() && session.canReorderSelection(action),
     run: action => { if (canOpenContextMenu()) commit(() => session.reorderSelection(action)); },
-    clipboard: { canRun: canUseClipboard, run: runClipboard }, onError: report
+    objects: {
+      canRun: canUseClipboard, run: runClipboard
+    }, extra: [
+      { action: "lock", label: "Lock", canRun: () => canOpenContextMenu() && session.getSelection().some(id => !session.isObjectLocked(id)), run: () => commit(() => session.setObjectsLocked(session.getSelection(), true)) },
+      { action: "unlock", label: "Unlock", canRun: () => canOpenContextMenu() && selectionLocked(), run: () => commit(() => session.setObjectsLocked(session.getSelection(), false)) },
+      { action: "edit-comment", label: "Edit comment", canRun: () => canOpenContextMenu() && canEditComment(), run: () => review.editSelection() }
+    ], onError: report
   });
+  const cameraPan = createEditorCameraPan({ overlay, getCanvas: host.getCanvas,
+    canPan: () => active && !disposed && !running && !savePreparing && !structuralRunning && Boolean(host.panCameraByPixels),
+    begin() { contextMenu.close(); cancelPointerGesture(); signatureHover = null; updatePolygonPreview(); host.beginCameraPan?.(); },
+    pan: (dx, dy) => host.panCameraByPixels?.(dx, dy), end: () => host.endCameraPan?.(),
+    onStateChange: () => host.onBusyChange?.(running || savePreparing || structuralRunning || cameraPan.isPanning())
+  });
+  const review = createEditorReviewController({ overlay, session, getScene: () => latestScene,
+    canEdit: () => active && !disposed && !running && !structuralRunning && !activeText && !pointer && !pendingPick && !cameraPan.isPanning() && !isSceneSettling(),
+    toScene: (x, y) => host.clientToScenePoint(x, y), toClient: (x, y) => host.sceneToClientPoint(x, y),
+    style: () => ({ color: property("color").value, opacity: objectOpacity }),
+    change(change) { change(); void refreshScene(); }, added: ids => { for (const id of ids) pendingDrawings.add(id); }, onError: report,
+    onDraftChange: () => recovery?.draftChanged()
+  });
+  function selectionLocked(): boolean { return session.getSelection().some(id => session.isObjectLocked(id)); }
+  function canEditComment(): boolean {
+    const selection = session.getSelection(); if (selection.length !== 1 || selectionLocked()) return false;
+    const object = session.getObject(selection[0]);
+    return object.kind === "shape" && Boolean(object.review) || object.kind === "source" && Boolean(object.annotationId && latestScene.annotations?.some(annotation =>
+      annotation.id === object.annotationId && ["Text", "Highlight", "Underline", "StrikeOut"].includes(annotation.subtype)));
+  }
   const styleEnabled = (name: string): boolean => query(`[data-style="${name}"]`).getAttribute("aria-pressed") === "true";
   function pageAt(point: PrimitivePoint): number {
     const rects = session.sourceScene.pageRects;
@@ -328,6 +395,12 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     overlay.style.width = `${rect.width}px`; overlay.style.height = `${rect.height}px`;
     graphic.setAttribute("viewBox", `0 0 ${rect.width} ${rect.height}`);
     graphic.replaceChildren();
+    review.updateOverlay();
+    const reviewPreview = review.preview();
+    if (reviewPreview) for (let i = 0; i + 3 < reviewPreview.length; i += 4) {
+      const b = sceneBoundsToClient({ minX: reviewPreview[i], minY: reviewPreview[i + 1], maxX: reviewPreview[i + 2], maxY: reviewPreview[i + 3] });
+      if (b) svg("rect", { x: b.minX - rect.left, y: b.minY - rect.top, width: b.maxX - b.minX, height: b.maxY - b.minY, class: "hepr-editor-review-selection" });
+    }
     const display = displayedSelection(), selection = display.frame;
     updateRotationValue(selection, display.delta);
     if (selection && tool === "select" && !running && !activeText) {
@@ -338,18 +411,24 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         const handleAngle = (dx !== 0 || dy !== 0 ? Math.atan2(dy, dx)
           : Math.atan2(corners[3].y - corners[0].y, corners[3].x - corners[0].x)) * 180 / Math.PI;
         const framePoints = corners.map(point => `${point.x},${point.y}`).join(" ");
-        svg("polygon", { points: framePoints, class: "hepr-editor-selection-hit", "data-selection-move": "true" });
+        const locked = selectionLocked();
+        if (!locked) svg("polygon", { points: framePoints, class: "hepr-editor-selection-hit", "data-selection-move": "true" });
         svg("polygon", { points: framePoints, class: "hepr-editor-selection" });
-        for (const [index, name] of ["nw", "ne", "se", "sw"].entries()) {
+        for (const [index, name] of (locked ? [] : ["nw", "ne", "se", "sw"]).entries()) {
           const point = corners[index], handle = svg("rect", { x: point.x - 4, y: point.y - 4, width: 8, height: 8,
             transform: `rotate(${handleAngle} ${point.x} ${point.y})`, "data-handle": name, class: "hepr-editor-handle" });
           handle.style.cursor = pointer ? "inherit" : geometry.cursors[index];
           if (pointer?.action === "resize" && pointer.handle === name) overlay.style.cursor = geometry.cursors[index];
         }
-        svg("line", { x1: geometry.rotationBase.x - rect.left, y1: geometry.rotationBase.y - rect.top,
+        if (!locked) svg("line", { x1: geometry.rotationBase.x - rect.left, y1: geometry.rotationBase.y - rect.top,
           x2: geometry.rotation.x - rect.left, y2: geometry.rotation.y - rect.top, class: "hepr-editor-selection" });
-        svg("circle", { cx: geometry.rotation.x - rect.left, cy: geometry.rotation.y - rect.top, r: 5, "data-handle": "rotate", class: "hepr-editor-handle" });
+        if (!locked) svg("circle", { cx: geometry.rotation.x - rect.left, cy: geometry.rotation.y - rect.top, r: 5, "data-handle": "rotate", class: "hepr-editor-handle" });
       }
+    }
+    if (pointer?.action === "move" && presented?.sourceScene === session.sourceScene) for (const guide of presented.guides ?? []) {
+      const a = host.sceneToClientPoint(guide.axis === "x" ? guide.value : guide.start, guide.axis === "x" ? guide.start : guide.value, pointer.frame?.pageIndex);
+      const b = host.sceneToClientPoint(guide.axis === "x" ? guide.value : guide.end, guide.axis === "x" ? guide.end : guide.value, pointer.frame?.pageIndex);
+      if (a && b) svg("line", { x1: a.x - rect.left, y1: a.y - rect.top, x2: b.x - rect.left, y2: b.y - rect.top, class: "hepr-editor-alignment-guide" });
     }
     for (const entry of pendingDrawings.visible()) drawDrawingPreview(entry.object, entry.geometry, rect);
     if (pointer) {
@@ -449,7 +528,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   function updateRotationValue(selection: EditorSelectionFrame | null, delta?: EditorMatrix, force = false): void {
     const input = query<HTMLInputElement>('[data-transform="rotation"]');
-    input.disabled = !selection || activeText !== null;
+    input.disabled = !selection || activeText !== null || selectionLocked();
     if (rotationDraft && (force || !selection || document.activeElement !== input || pointer !== null ||
         rotationDraft.sourceScene !== session.sourceScene || rotationDraft.selection.length !== currentState.selection.length ||
         rotationDraft.selection.some((id, index) => id !== currentState.selection[index]))) rotationDraft = null;
@@ -474,16 +553,22 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     query<HTMLButtonElement>('[data-action="undo"]').disabled = !state.canUndo;
     query<HTMLButtonElement>('[data-action="redo"]').disabled = !state.canRedo;
     query("[data-selection]").textContent = state.selection.length ? `${state.selection.length} selected` : "No selection";
-    for (const action of ["duplicate", "delete", "group", "ungroup", "copy", "cut"]) query<HTMLButtonElement>(`[data-action="${action}"]`).disabled = state.selection.length === 0;
+    for (const action of ["duplicate", "delete", "group", "ungroup", "copy", "cut", "lock", "unlock"]) query<HTMLButtonElement>(`[data-action="${action}"]`).disabled = !state.selection.length || action !== "copy" && action !== "unlock" && selectionLocked();
+    query<HTMLButtonElement>('[data-action="lock"]').disabled = !state.selection.some(id => !session.isObjectLocked(id));
+    query<HTMLButtonElement>('[data-action="unlock"]').disabled = !selectionLocked();
+    query<HTMLButtonElement>('[data-action="edit-comment"]').disabled = !canEditComment();
+    for (const button of toolbar.querySelectorAll<HTMLButtonElement>('[data-action^="align-"], [data-action^="distribute-"]')) button.disabled = !state.selection.length || selectionLocked();
     updateClipboardButtons();
+    if (tool === "form") for (const control of fieldDrafts.keys()) control.disabled = session.isObjectLocked(`annotation:${control.dataset.fieldId}`);
     const bounds = session.getSelectionBounds(), frame = session.getSelectionFrame(), size = frame && editorFrameSize(frame);
     for (const [name, value] of Object.entries({ x: bounds?.minX, y: bounds?.minY, width: size?.width, height: size?.height })) {
-      const input = query<HTMLInputElement>(`[data-transform="${name}"]`); input.disabled = !bounds;
+      const input = query<HTMLInputElement>(`[data-transform="${name}"]`); input.disabled = !bounds || selectionLocked();
       if (document.activeElement !== input) input.value = value == null ? "" : Number(value.toFixed(3)).toString();
     }
     if (!state.previewing) updateRotationValue(frame);
     if (!state.previewing) updateOpacityControls(state);
-    if (!running) setStatus(state.previewing ? "Transform preview" : hasUnsavedChanges() ? "Unsaved changes" : "Saved");
+    if (!state.previewing) updateAppearanceControls();
+    if (!running) setStatus(state.previewing ? "Transform preview" : hasUnsavedChanges() ? exportedRevision === state.revision ? "Exported; local changes kept" : "Unsaved changes" : "No unsaved changes");
     host.onModeChange?.(active);
   }
   const unsubscribe = session.subscribe(updateState);
@@ -504,7 +589,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if (disposed || revision !== renderRevision) return;
       const state = session.getState(), snapshot: PresentedScene = { sourceScene: session.sourceScene, revision: state.revision,
         selection: new Set(state.selection), frame: session.getSelectionFrame(), delta: preview && state.previewing ? requestedPreview : null,
-        drawings: pendingDrawings.capture() };
+        drawings: pendingDrawings.capture(), guides: preview ? requestedGuides : [] };
       const scene = await session.getScene({ signal, preview });
       if (disposed || revision !== renderRevision) return;
       // Preparing a newer pose can supersede older preparation. Once host
@@ -537,8 +622,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     } catch (error) { if (propagateError) throw error; report(error); }
     finally { if (scenePreparation === abort) scenePreparation = null; }
   }
-  function commit(change: () => void): void {
-    if (structuralRunning) return;
+  function commit(change: () => void, finishingSaveDraft = false): void {
+    if (disposed || structuralRunning || running || savePreparing && !finishingSaveDraft) return;
     if (pointer || pendingPick) cancelPointerGesture();
     try { change(); void refreshScene(); } catch (error) { report(error); }
   }
@@ -546,15 +631,16 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     commit(() => { if (redo) session.redo(); else session.undo(); if (tool === "form") renderFields(); });
   }
   function updateClipboardButtons(): void {
-    const unavailable = running || structuralRunning || activeText !== null;
-    for (const action of ["copy", "cut"]) query<HTMLButtonElement>(`[data-action="${action}"]`).disabled = unavailable || !session.getSelection().length;
+    const unavailable = running || savePreparing || structuralRunning || activeText !== null;
+    for (const action of ["copy", "cut", "duplicate"]) query<HTMLButtonElement>(`[data-action="${action}"]`).disabled = unavailable || !session.getSelection().length || action !== "copy" && selectionLocked();
     query<HTMLButtonElement>('[data-action="paste"]').disabled = unavailable || !session.canPaste();
   }
-  function canUseClipboard(action: EditorClipboardAction): boolean {
-    return active && !disposed && !running && !structuralRunning && !activeText && !pointer && !pendingPick && !polygon && !isSceneSettling() &&
-      (action === "paste" ? session.canPaste() : session.getSelection().length > 0);
+  function canUseClipboard(action: EditorObjectMenuAction): boolean {
+    return active && !disposed && !running && !savePreparing && !structuralRunning && !activeText && !pointer && !pendingPick && !polygon && !isSceneSettling() &&
+      !cameraPan.isPanning() &&
+      (action === "paste" ? session.canPaste() : session.getSelection().length > 0 && (action === "copy" || !selectionLocked()));
   }
-  async function runClipboard(action: EditorClipboardAction, inPlace = false): Promise<void> {
+  async function runClipboard(action: EditorObjectMenuAction, inPlace = false): Promise<void> {
     if (!canUseClipboard(action)) return;
     contextMenu.close();
     if (action === "paste") {
@@ -574,12 +660,13 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     const signal = AbortSignal.any([lifetime.signal, abort.signal]);
     clipboardRunning = running = true; updatePointerCursor(); updateClipboardButtons(); host.onBusyChange?.(true);
     query('[data-action="cancel-operation"]').hidden = false;
-    setStatus(action === "cut" ? "Cutting objects…" : "Copying objects…");
+    setStatus(action === "duplicate" ? "Duplicating objects…" : action === "cut" ? "Cutting objects…" : "Copying objects…");
     let copied = 0, failed = false;
     try {
-      copied = action === "cut" ? await session.cutSelection({ signal }) : await session.copySelection({ signal });
+      copied = action === "duplicate" ? (await session.duplicateSelection({ signal })).length
+        : action === "cut" ? await session.cutSelection({ signal }) : await session.copySelection({ signal });
       signal.throwIfAborted();
-      if (action === "cut" && copied) await refreshScene(signal, false, true);
+      if (action !== "copy" && copied) await refreshScene(signal, false, true);
     } catch (error) { failed = true; report(error); }
     finally {
       if (operation === abort) operation = null;
@@ -587,7 +674,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if (!disposed) {
         updatePointerCursor(); updateClipboardButtons(); query('[data-action="cancel-operation"]').hidden = true;
         if (signal.aborted) setStatus("Clipboard operation cancelled.");
-        else if (!failed && copied) setStatus(`${copied} ${copied === 1 ? "object" : "objects"} ${action === "cut" ? "cut" : "copied"}. Select a layer and paste.`);
+        else if (!failed && copied) setStatus(action === "duplicate" ? `Duplicated ${copied} ${copied === 1 ? "object" : "objects"}.`
+          : `${copied} ${copied === 1 ? "object" : "objects"} ${action === "cut" ? "cut" : "copied"}. Select a layer and paste.`);
       }
     }
   }
@@ -623,6 +711,9 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (pointer?.action !== "resize") overlay.style.cursor = "";
   }
   function cancelPointerGesture(restore = true): void {
+    cameraPan.cancel();
+    review.cancelGesture();
+    alignmentSnap = null; requestedGuides = [];
     const id = pointer?.id ?? pendingPick?.id;
     pointer = null;
     if (pendingPick) pendingPick.canceled = true; pendingPick = null;
@@ -631,16 +722,29 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     clearPreview(restore); updatePointerCursor();
   }
   function setTool(next: Tool): void {
-    if (structuralRunning) return;
+    if (structuralRunning || running || savePreparing) return;
     contextMenu.close();
     pendingFieldFocus = null;
-    if (activeText) void finishText();
-    else textRequest++;
+    if (activeText) {
+      const request = ++toolRequest;
+      void finishText().then(() => { if (!disposed && request === toolRequest) setTool(next); }).catch(report); return;
+    }
+    textRequest++;
+    // Restore creation controls before applying the next tool's own defaults.
+    appearanceControls.refresh("defaults");
+    if (isEditorReviewTool(tool)) reviewDefaults.set(tool, { color: property("color").value, opacity: objectOpacity });
+    if (!isEditorReviewTool(tool) && isEditorReviewTool(next)) drawingDefaults = { color: property("color").value, opacity: objectOpacity };
+    if (isEditorReviewTool(next)) {
+      const style = reviewDefaults.get(next) ?? { color: next === "highlight" || next === "comment" ? "#ffdc00" : "#e12727", opacity: next === "highlight" ? .35 : 1 };
+      property("color").value = style.color; objectOpacity = style.opacity;
+    } else if (isEditorReviewTool(tool) && drawingDefaults) { property("color").value = drawingDefaults.color; objectOpacity = drawingDefaults.opacity; drawingDefaults = null; }
     cancelPointerGesture(); polygon = null; signatureHover = null; tool = next; toolRequest++;
+    review.setTool(isEditorReviewTool(next) ? next : null);
     for (const button of toolbar.querySelectorAll<HTMLButtonElement>('[data-tool], [data-action="signatures"]'))
       button.setAttribute("aria-pressed", String(button.dataset.tool === next || button.dataset.action === "signatures" && next === "signature"));
     overlay.dataset.tool = next; fields.hidden = next !== "form";
     updateOpacityControls(currentState);
+    updateAppearanceControls();
     if (next === "form") renderFields();
     updateGeometry();
   }
@@ -666,8 +770,9 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
           updateFieldPaint();
         }), { usePdfAppearance: currentAnnotation.hasAppearance || Boolean(appearances.get(annotation.id)?.length) });
       if (input) {
+        input.disabled = session.isObjectLocked(`annotation:${annotation.id}`);
         input.hidden = Boolean(host.subscribeToFrames);
-        input.addEventListener("input", () => updateFieldPaint(input));
+        input.addEventListener("input", () => { updateFieldPaint(input); recovery?.draftChanged(); });
         fieldDrafts.set(input, editorFieldDraftSignature(input)); fields.append(input);
         const choices = createEditorFieldOptions(document, annotation, input); if (choices) fields.append(choices);
         if (annotation.field?.textStyle) void editorServices.fonts.resolve(annotation.field.textStyle).then(async font => {
@@ -690,7 +795,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   function fieldAtClientPoint(client: PrimitivePoint): string | null {
     for (const annotation of [...(latestScene.annotations ?? [])].reverse()) {
-      if (!canEditEditorField(annotation) || !session.isAnnotationVisible(annotation.id)) continue;
+      if (!canEditEditorField(annotation) || !session.isAnnotationVisible(annotation.id) || session.isObjectLocked(`annotation:${annotation.id}`)) continue;
       const source = getEditorAnnotationSource(latestScene, annotation.id) ?? annotation;
       const geometry = editorFieldClientGeometry(source, latestScene.pdfPages,
         (point, pageIndex) => host.sceneToClientPoint(point.x, point.y, pageIndex), getEditorAnnotationFrameTransform(latestScene, annotation.id));
@@ -753,7 +858,14 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     } finally { if (picking === controller) picking = null; }
   }
   function dragMatrix(p: PointerGesture, point: PrimitivePoint): EditorMatrix {
-    if (p.action === "move") return [1, 0, 0, 1, point.x - p.start.x, point.y - p.start.y];
+    if (p.action === "move") {
+      const matrix: EditorMatrix = [1, 0, 0, 1, point.x - p.start.x, point.y - p.start.y];
+      const projected = host.sceneToClientPoint(p.start.x, p.start.y, p.frame?.pageIndex);
+      const pixel = projected && host.clientToScenePoint(projected.x + 6, projected.y + 6, p.frame?.pageIndex);
+      const tolerance = pixel ? Math.max(Math.abs(pixel.x - p.start.x), Math.abs(pixel.y - p.start.y)) : 0;
+      const snapped = alignmentSnap?.snap(matrix, tolerance, p.freeRotation || query('[data-action="guides"]').getAttribute("aria-pressed") !== "true");
+      requestedGuides = snapped?.guides ?? []; return snapped?.matrix ?? matrix;
+    }
     const frame = p.frame ?? { bounds: p.bounds!, transform: IDENTITY };
     if (p.action === "rotate") {
       return editorFrameRotationDragMatrix(frame, p.start, point, p.freeRotation);
@@ -774,7 +886,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   function transformProperty(name: string, value: number): void {
     const bounds = session.getSelectionBounds(), frame = session.getSelectionFrame();
-    if (!bounds || !frame || !Number.isFinite(value)) return;
+    if (!bounds || !frame || !Number.isFinite(value) || selectionLocked()) return;
     if (name === "rotation") {
       commit(() => interaction.applyTransform(editorFrameRotationMatrix(frame, value)));
     } else if (name === "x" || name === "y") {
@@ -786,6 +898,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     }
   }
   function changeTransform(input: HTMLInputElement): void {
+    if (running || savePreparing || structuralRunning) return;
     if (input.value.trim() !== "") transformProperty(input.dataset.transform!, Number(input.value));
     if (input.dataset.transform === "rotation") {
       updateRotationValue(session.getSelectionFrame(), undefined, true);
@@ -818,15 +931,16 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     polygon.preview = { ...polygon.object, points, x: minX, y: minY, width: maxX - minX, height: maxY - minY };
   }
   async function pointerDown(event: PointerEvent): Promise<void> {
-    if (!active || running || activeText || pointer || pendingPick ||
+    if (!active || running || savePreparing || activeText || pointer || pendingPick ||
         isSceneSettling() && (!["ink", "rectangle", "ellipse", "line", "arrow", "polygon", "polyline", "signature"].includes(tool) || !presented || presented.sourceScene !== session.sourceScene) ||
-        tool === "pan" || tool === "form" || event.button !== 0 || (event.target as Element).closest(".hepr-editor-field")) return;
+        tool === "pan" || tool === "form" || isEditorReviewTool(tool) || event.button !== 0 || (event.target as Element).closest(".hepr-editor-field")) return;
     textRequest++;
     const targetHandle = tool === "select" ? (event.target as Element).getAttribute("data-handle") : null;
     const handleFrame = targetHandle && ["nw", "ne", "sw", "se", "rotate"].includes(targetHandle) ? session.getSelectionFrame() : null;
     const moveFrame = tool === "select" && !event.ctrlKey && !event.metaKey && !event.shiftKey &&
       (event.target as Element).getAttribute("data-selection-move") === "true" ? session.getSelectionFrame() : null;
     const gestureFrame = handleFrame ?? moveFrame;
+    if (gestureFrame && selectionLocked()) return;
     if (polygon) polygon.previousPointCount = undefined;
     const point = host.clientToScenePoint(event.clientX, event.clientY, gestureFrame?.pageIndex ?? polygon?.pageIndex); if (!point || tool !== "select" && pageAt(point) < 0) return;
     event.preventDefault(); event.stopPropagation();
@@ -858,14 +972,20 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         pendingPick = request;
         updatePointerCursor();
         overlay.setPointerCapture?.(event.pointerId);
+        const sourceScene = session.sourceScene, revision = session.revision;
+        const projection = host.sceneToClientPoint(point.x, point.y);
         let id: string | null;
         try { id = await pick(point, client); }
         catch (error) { if (pendingPick === request) cancelPointerGesture(); throw error; }
-        if (disposed || !active || running || tool !== "select" || request.canceled || pendingPick !== request) return;
+        if (disposed || !active || running || savePreparing || tool !== "select" || request.canceled || pendingPick !== request) return;
+        const currentProjection = host.sceneToClientPoint(point.x, point.y);
+        if (sourceScene !== session.sourceScene || revision !== session.revision || projection && (!currentProjection ||
+            Math.abs(currentProjection.x - projection.x) + Math.abs(currentProjection.y - projection.y) > .1)) { cancelPointerGesture(); return; }
         pendingPick = null; updatePointerCursor();
         if (id) {
           interaction.selectHit(id, event);
           if (additive) return;
+          if (selectionLocked()) return;
           action = "move";
         } else { interaction.selectHit(null, event); action = "marquee"; }
         if (request.released) {
@@ -887,6 +1007,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     const shape = drawingShape ? createShapeDraft(tool as EditorShapeInput["shape"], pageIndex) : undefined;
     pointer = { id: event.pointerId, start: point, startClient: client, last: point, points, ink, shape, bounds: session.getSelectionBounds(), frame: gestureFrame ?? session.getSelectionFrame() ?? undefined, action, additive, handle: handle ?? undefined,
       freeResize: event.shiftKey, scaleText: event.altKey, freeRotation: event.altKey };
+    alignmentSnap = action === "move" ? createEditorAlignmentSnap(session) : null;
     updateShapeGesture(pointer, point);
     updatePointerCursor();
     overlay.setPointerCapture?.(event.pointerId);
@@ -916,7 +1037,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   function transformModifiers(event: KeyboardEvent): void {
     if (!active || running || event.isComposing || !pointer?.bounds ||
-        !(pointer.action === "resize" && (event.key === "Shift" || event.key === "Alt") || pointer.action === "rotate" && event.key === "Alt")) return;
+        !(pointer.action === "resize" && (event.key === "Shift" || event.key === "Alt") || (pointer.action === "rotate" || pointer.action === "move") && event.key === "Alt")) return;
     pointer.freeResize = event.shiftKey; pointer.scaleText = event.altKey; pointer.freeRotation = event.altKey;
     const matrix = dragMatrix(pointer, pointer.last);
     if (matrix[0] * matrix[3] - matrix[1] * matrix[2] !== 0) { interaction.previewTransform(matrix); requestedPreview = matrix; queuePreview(); }
@@ -925,40 +1046,42 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   function pointerUp(event: PointerEvent): void {
     if (pendingPick?.id === event.pointerId) { pendingPick.released = true; pendingPick.lastClient = { x: event.clientX, y: event.clientY }; overlay.releasePointerCapture?.(event.pointerId); }
     const p = pointer; if (!p || event.pointerId !== p.id) return; pointer = null; updatePointerCursor();
-    if (p.action === "draw" && tool === "ink") {
-      const pageIndex = p.ink!.pageIndex;
-      appendEditorInkSamples(p.points, event, sample => {
-        const point = host.clientToScenePoint(sample.clientX, sample.clientY, pageIndex); return point ? pageLocal(point, pageIndex) : null;
-      });
-    }
-    if (p.action === "draw" && p.shape) {
-      p.last = host.clientToScenePoint(event.clientX, event.clientY, p.shape.pageIndex) ?? p.last;
-      updateShapeGesture(p, p.last);
-    }
-    if (p.action === "resize" || p.action === "rotate") {
-      p.last = host.clientToScenePoint(event.clientX, event.clientY, p.frame?.pageIndex) ?? p.last;
-      p.freeResize = event.shiftKey; p.scaleText = event.altKey; p.freeRotation = event.altKey;
-    }
-    clearPreview(true);
-    overlay.releasePointerCapture?.(event.pointerId);
-    const moved = Math.hypot(event.clientX - p.startClient.x, event.clientY - p.startClient.y) > 2;
-    if (p.action === "marquee") {
-      interaction.selectArea({ minX: Math.min(p.start.x, p.last.x), minY: Math.min(p.start.y, p.last.y), maxX: Math.max(p.start.x, p.last.x), maxY: Math.max(p.start.y, p.last.y) }, { shiftKey: p.additive });
-    } else if (p.action !== "draw") {
-      if (moved && p.bounds) {
-        const selection = session.getSelection(), object = selection.length === 1 ? session.getObject(selection[0]) : null;
-        const matrix = dragMatrix(p, p.last);
-        if (matrix[0] * matrix[3] - matrix[1] * matrix[2] === 0) return;
-        if (p.action === "resize" && object?.kind === "text" && !p.scaleText) {
-          const patch = resizeTextBox(p, object, matrix);
-          if (patch) commit(() => session.updateObject(object.id, patch));
-          else commit(() => interaction.applyTransform(matrix));
-        } else commit(() => interaction.applyTransform(matrix));
+    try {
+      if (p.action === "draw" && tool === "ink") {
+        const pageIndex = p.ink!.pageIndex;
+        appendEditorInkSamples(p.points, event, sample => {
+          const point = host.clientToScenePoint(sample.clientX, sample.clientY, pageIndex); return point ? pageLocal(point, pageIndex) : null;
+        });
       }
-    } else if (moved || tool === "ink") {
-      const object = p.ink ?? p.shape; if (!object) return;
-      commit(() => { const id = session.addObject(object); pendingDrawings.add(id); session.select([id]); });
-    }
+      if (p.action === "draw" && p.shape) {
+        p.last = host.clientToScenePoint(event.clientX, event.clientY, p.shape.pageIndex) ?? p.last;
+        updateShapeGesture(p, p.last);
+      }
+      if (p.action === "resize" || p.action === "rotate" || p.action === "move") {
+        p.last = host.clientToScenePoint(event.clientX, event.clientY, p.frame?.pageIndex) ?? p.last;
+        p.freeResize = event.shiftKey; p.scaleText = event.altKey; p.freeRotation = event.altKey;
+      }
+      clearPreview(true);
+      overlay.releasePointerCapture?.(event.pointerId);
+      const moved = Math.hypot(event.clientX - p.startClient.x, event.clientY - p.startClient.y) > 2;
+      if (p.action === "marquee") {
+        interaction.selectArea({ minX: Math.min(p.start.x, p.last.x), minY: Math.min(p.start.y, p.last.y), maxX: Math.max(p.start.x, p.last.x), maxY: Math.max(p.start.y, p.last.y) }, { shiftKey: p.additive });
+      } else if (p.action !== "draw") {
+        if (moved && p.bounds) {
+          const selection = session.getSelection(), object = selection.length === 1 ? session.getObject(selection[0]) : null;
+          const matrix = dragMatrix(p, p.last);
+          if (matrix[0] * matrix[3] - matrix[1] * matrix[2] === 0) return;
+          if (p.action === "resize" && object?.kind === "text" && !p.scaleText) {
+            const patch = resizeTextBox(p, object, matrix);
+            if (patch) commit(() => session.updateObject(object.id, patch));
+            else commit(() => interaction.applyTransform(matrix));
+          } else commit(() => interaction.applyTransform(matrix));
+        }
+      } else if (moved || tool === "ink") {
+        const object = p.ink ?? p.shape; if (!object) return;
+        commit(() => { const id = session.addObject(object); pendingDrawings.add(id); session.select([id]); });
+      }
+    } finally { alignmentSnap = null; requestedGuides = []; }
   }
   function completePolygon(doubleClick = false): void {
     // A double-click's second press finishes the first press's endpoint, even
@@ -985,18 +1108,17 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     return id && !id.startsWith("bundled:") ? editorServices.fonts.get(id) : editorServices.fonts.loadBundled(id === "bundled:serif" ? "Liberation Serif" : id === "bundled:mono" ? "Liberation Mono" : "Liberation Sans");
   }
   async function startText(point: PrimitivePoint, object?: EditorTextObject, sourceAnnotationId?: string): Promise<void> {
-    if (structuralRunning) return;
+    if (structuralRunning || running || savePreparing) return;
     const request = ++textRequest;
     const pageIndex = object?.pageIndex ?? pageAt(point); if (pageIndex < 0) return;
     const layerId = object ? null : session.getActiveLayer();
     if (!object && layerId && session.getLayers().find(layer => layer.id === layerId)?.defaultVisible === false) throw new Error("Show the active layer before creating a textbox.");
-    const selectedFontId = object?.fontId ?? query<HTMLSelectElement>('[data-prop="font"]').value;
-    const font = object && !selectedFontId ? await editorServices.fonts.loadBundled(object.fontFamily) : await selectedFont(selectedFontId);
-    await activateFont(font); if (disposed || !active || request !== textRequest) return;
+    const font = object ? await editorServices.fonts.resolve(object) : await selectedFont();
+    await activateFont(font); if (disposed || !active || running || savePreparing || request !== textRequest) return;
     if (object) {
       updateFonts(); query<HTMLSelectElement>('[data-prop="font"]').value = font.id;
       property("font-size").value = String(object.fontSize); property("color").value = normalizeEditorTextColor(colorCss(object.color));
-      objectOpacity = object.opacity ?? 1; syncOpacityControls("opacity", objectOpacity, false);
+      syncOpacityControls("opacity", object.opacity ?? 1, false);
       query<HTMLSelectElement>('[data-prop="align"]').value = object.align ?? "left";
       for (const [name, enabled] of Object.entries({ bold: object.fontWeight === "bold" || Number(object.fontWeight) >= 600,
         italic: object.fontStyle === "italic" || object.fontStyle === "oblique", underline: Boolean(object.underline), strikethrough: Boolean(object.strikethrough) })) query(`[data-style="${name}"]`).setAttribute("aria-pressed", String(enabled));
@@ -1005,6 +1127,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     const element = document.createElement("div"); element.className = "hepr-editor-text-input"; element.contentEditable = "true";
     element.setAttribute("role", "textbox"); element.setAttribute("aria-label", "Textbox text"); element.setAttribute("aria-multiline", "true");
     element.addEventListener("paste", event => { event.preventDefault(); document.execCommand("insertText", false, event.clipboardData?.getData("text/plain") ?? ""); });
+    element.addEventListener("input", () => recovery?.draftChanged());
     Object.assign(element.style, { fontFamily: `"${font.id}"`, fontSize: `${object?.fontSize ?? Number(property("font-size").value)}px`,
       color: object ? colorCss(object.color) : property("color").value, fontWeight: object?.fontWeight ?? (styleEnabled("bold") ? "bold" : "normal"),
       fontStyle: object?.fontStyle ?? (styleEnabled("italic") ? "italic" : "normal"), whiteSpace: "pre-wrap", textAlign: object?.align ?? query<HTMLSelectElement>('[data-prop="align"]').value,
@@ -1019,48 +1142,61 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
           textDecorationLine: [run.underline && "underline", run.strikethrough && "line-through"].filter(Boolean).join(" ") }); element.append(span);
       }
     } else element.textContent = object?.text ?? "";
-    if (disposed || !active || request !== textRequest) return;
+    if (disposed || !active || running || savePreparing || request !== textRequest) return;
     activeText = { element, objectId: sourceAnnotationId ? undefined : object?.id, sourceAnnotationId, layerId, pageIndex, x, y: object ? y : y - 50,
       width: object?.width ?? 220, height: object?.height ?? 50, transform: object?.transform ?? IDENTITY, opacity: object?.opacity ?? objectOpacity, lineHeight: object?.lineHeight,
       baseline: { html: element.innerHTML, align: element.style.textAlign, opacity: object?.opacity ?? objectOpacity } };
     overlay.append(element); query('[data-action="apply-text"]').hidden = false; query('[data-action="cancel-text"]').hidden = false;
     updateClipboardButtons();
+    updateAppearanceControls();
     updateGeometry(); if (!element.hidden) element.focus(); activeText.baseline.html = element.innerHTML;
   }
   function cancelText(): void {
+    const hadDraft = activeText !== null;
     textRequest++;
     activeText?.element.remove(); activeText = null;
     query('[data-action="apply-text"]').hidden = true; query('[data-action="cancel-text"]').hidden = true;
     updateClipboardButtons();
+    updateAppearanceControls();
+    if (hadDraft) recovery?.draftChanged();
   }
-  async function finishText(): Promise<void> {
+  async function finishText(signal?: AbortSignal, finishingSaveDraft = false): Promise<void> {
     if (!activeText) return;
+    signal?.throwIfAborted();
     const editing = activeText, element = editing.element;
     const request = textRequest;
     const text = element.innerText ?? element.textContent ?? "";
-    if (!text) { cancelText(); if (editing.objectId || editing.sourceAnnotationId) commit(() => { commitEditorText(session, null, editing); }); return; }
-    const font = await selectedFont();
-    if (disposed || activeText !== editing || request !== textRequest) return;
+    if (!text) {
+      if (editing.objectId || editing.sourceAnnotationId) commit(() => { commitEditorText(session, null, editing); cancelText(); }, finishingSaveDraft);
+      else cancelText();
+      return;
+    }
+    const object = await readTextDraft();
+    signal?.throwIfAborted();
+    if (!object || disposed || activeText !== editing || request !== textRequest) return;
+    commit(() => { commitEditorText(session, object, editing); cancelText(); }, finishingSaveDraft);
+  }
+  async function readTextDraft(): Promise<Extract<EditorObjectInput, { kind: "text" }> | null> {
+    const editing = activeText; if (!editing) return null;
+    const font = await selectedFont(), element = editing.element;
+    const text = element.innerText ?? element.textContent ?? "";
     const runs = readRichTextRuns(element, window, editorServices.fonts.list(), font?.id, font?.family);
     const height = Math.max(editing.height, element.scrollHeight, editing.hiddenHeight ?? 0);
-    const object: Extract<EditorObjectInput, { kind: "text" }> = { kind: "text", pageIndex: editing.pageIndex, x: editing.x, y: editing.y + editing.height - height, width: editing.width,
+    return { kind: "text", pageIndex: editing.pageIndex, x: editing.x, y: editing.y + editing.height - height, width: editing.width,
       transform: editing.transform, opacity: editing.opacity, lineHeight: editing.lineHeight,
       ...(!editing.objectId ? { layerId: editing.sourceAnnotationId ? null : editing.layerId ?? null } : {}),
       height, text, fontId: font?.id, fontFamily: font?.family,
       fontSize: Number(property("font-size").value), color: property("color").value, fontWeight: styleEnabled("bold") ? "bold" : "normal",
       fontStyle: styleEnabled("italic") ? "italic" : "normal", underline: styleEnabled("underline"), strikethrough: styleEnabled("strikethrough"),
       align: query<HTMLSelectElement>('[data-prop="align"]').value as "left" | "center" | "right", runs };
-    cancelText();
-    commit(() => { commitEditorText(session, object, editing); });
   }
   function applyTextStyle(name: string): void {
+    if (structuralRunning || running || savePreparing) return;
     const button = query(`[data-style="${name}"]`); button.setAttribute("aria-pressed", String(!styleEnabled(name)));
-    if (activeText) { activeText.element.focus(); document.execCommand(name === "strikethrough" ? "strikeThrough" : name); }
-    else {
+    if (activeText) { activeText.element.focus(); document.execCommand(name === "strikethrough" ? "strikeThrough" : name); recovery?.draftChanged(); }
+    else if (tool === "select") {
       const enabled = styleEnabled(name), patch: Partial<EditorTextObject> = name === "bold" ? { fontWeight: enabled ? "bold" : "normal" } : name === "italic" ? { fontStyle: enabled ? "italic" : "normal" } : name === "underline" ? { underline: enabled } : { strikethrough: enabled };
-      commit(() => session.transaction("Format text", () => {
-        for (const id of session.getSelection()) { const object = session.getObject(id); if (object.kind === "text") session.updateObject(id, { ...patch, runs: object.runs?.map(run => ({ ...run, ...patch })) }); }
-      }));
+      if (editorPropertySelection(session, "fontStyle").length) commit(() => { applyEditorPropertyPatch(session, patch); });
     }
   }
   function updateFonts(): void {
@@ -1070,6 +1206,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     }
     for (const font of editorServices.fonts.list()) { const option = document.createElement("option"); option.value = font.id; option.textContent = `${font.family} ${font.fontWeight >= 600 ? "Bold" : ""} ${font.fontStyle === "italic" ? "Italic" : ""}`.trim(); select.append(option); }
     select.value = selected;
+    updateAppearanceControls();
   }
   function chooseFile(accept: string, onFile: (file: File) => Promise<void>): void {
     const input = document.createElement("input"); input.type = "file"; input.accept = accept;
@@ -1096,7 +1233,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   async function dropImages(files: readonly File[], client: { x: number; y: number }, externalSignal?: AbortSignal): Promise<void> {
     lifetime.signal.throwIfAborted(); externalSignal?.throwIfAborted();
     if (!active) throw new Error("Switch to Edit mode before dropping images.");
-    if (running || structuralRunning) throw new Error("Wait for the current operation to finish.");
+    if (running || savePreparing || structuralRunning) throw new Error("Wait for the current operation to finish.");
     if (!files.length) return;
     if (files.some(file => droppedFileKind(file) !== "image")) throw new TypeError("Drop PNG, JPEG or WebP images.");
     const canvas = host.getCanvas(), rect = canvas.getBoundingClientRect();
@@ -1112,7 +1249,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     initialSignal.throwIfAborted();
     if (activeText) throw new Error("Finish the active textbox before adding images.");
     if (!active || sourceScene !== session.sourceScene || previousRequest !== toolRequest) throw new DOMException("The image drop was superseded.", "AbortError");
-    if (running || structuralRunning) throw new Error("Wait for the current operation to finish.");
+    if (running || savePreparing || structuralRunning) throw new Error("Wait for the current operation to finish.");
     pendingImage = null; setTool("select");
     const request = toolRequest, opacity = objectOpacity, ids: string[] = [];
     let expectedRevision = session.revision;
@@ -1162,59 +1299,75 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       color: property("color").value, strokeWidth: Number(property("stroke").value) }); pendingDrawings.add(id); session.select([id]); });
   }
   async function save(kind: "pdf" | "flatten" | "hep" | "print"): Promise<void> {
-    if (structuralRunning) return;
+    if (disposed || running || savePreparing || structuralRunning || recoveryRunning || recoveryDialog) return;
     if ((kind === "pdf" || kind === "flatten") && passwordDialog && !passwordDialog.apply()) return;
     flushEditorFieldDrafts(fieldDrafts);
     if (hasPendingEditorFields(fieldDrafts)) { setStatus("Check the pending form value before saving or printing."); return; }
-    if (activeText) await finishText();
-    if (running) return;
-    const protection = kind === "pdf" || kind === "flatten" ? pdfProtection.get() : undefined;
-    const wasPreviewing = session.getState().previewing;
-    cancelPointerGesture(false); running = true; updatePointerCursor(); host.onBusyChange?.(true);
     operation?.abort(); const abort = new AbortController(); operation = abort;
-    query('[data-action="cancel-operation"]').hidden = false; setStatus(`Preparing ${kind === "hep" ? "HEP" : "PDF"}…`);
+    const signal = AbortSignal.any([lifetime.signal, abort.signal]), previousInert = Boolean(overlay.inert);
+    savePreparing = true; overlay.inert = true; host.onBusyChange?.(true);
+    query('[data-action="cancel-operation"]').hidden = false;
     try {
-      if (wasPreviewing) await refreshScene(lifetime.signal);
+      if (activeText) await waitForLoad(finishText(signal, true), signal);
+      signal.throwIfAborted();
+      if (activeText) { setStatus("Check the active textbox before saving or printing."); return; }
+      if (!review.flushDraft()) return;
+      const protection = kind === "pdf" || kind === "flatten" ? pdfProtection.get() : undefined;
+      const wasPreviewing = session.getState().previewing;
+      cancelPointerGesture(false); running = true; savePreparing = false; updatePointerCursor(); updateClipboardButtons();
+      setStatus(`Preparing ${kind === "hep" ? "HEP" : "PDF"}…`);
+      if (wasPreviewing) await refreshScene(signal);
+      const sourceScene = session.sourceScene, revision = session.getState().revision;
+      const unchanged = (): boolean => sourceScene === session.sourceScene && revision === session.getState().revision;
       let outputKind = kind;
       if (kind === "pdf" && (session.sourcePdf || session.getLayerEdits?.().stackingChanged || session.getLayerEdits?.().objectOrderChanged)) {
-        const sourceScene = session.sourceScene, revision = session.getState().revision;
-        const committed = await session.getScene({ signal: abort.signal, preview: false });
-        const unchanged = (): boolean => sourceScene === session.sourceScene && revision === session.getState().revision;
+        const committed = await session.getScene({ signal, preview: false });
         if (!unchanged()) throw new Error("The document changed while preparing the export. Save again.");
         const layerStacking = Boolean((session.getLayerEdits?.().stackingChanged || session.getLayerEdits?.().objectOrderChanged) &&
           ((committed.annotations?.length ?? 0) || session.getObjects({ includeSource: false }).length));
-        if (layerStacking || (session.sourcePdf && findEditorPdfFormOverlaps(committed, session, { signal: abort.signal }).length)) {
-          const choice = await chooseEditorPdfFormExport(document, abort.signal, { layerStacking });
+        if (layerStacking || (session.sourcePdf && findEditorPdfFormOverlaps(committed, session, { signal }).length)) {
+          const choice = await chooseEditorPdfFormExport(document, signal, { layerStacking });
           if (!choice) { setStatus("PDF export cancelled"); return; }
           if (!unchanged()) throw new Error("The document changed while choosing the PDF format. Save again.");
           outputKind = choice;
         }
       }
-      const warnings: string[] = [], onWarning = (value: string): void => { warnings.push(value); setStatus(value); };
+      const warnings: string[] = [], onWarning = (value: string): void => {
+        if (!value || warnings.includes(value)) return;
+        warnings.push(value); setStatus(value);
+      };
+      const onDiagnostic = (diagnostic: PdfDiagnostic): void => { if (diagnostic.severity !== "info" && diagnostic.message) onWarning(diagnostic.message); };
       const progress = new LoadProgressReporter(value => setStatus(`Preparing ${kind === "hep" ? "HEP" : "PDF"}… ${Math.round(value.value * 100)}%`));
       let blob: Blob;
       if (kind === "print") {
         const { writeScenePdf } = await import("./editorPdfWriter");
-        blob = await writeScenePdf(await session.getScene({ signal: abort.signal, preview: false, onProgress: progress.child(0, .4).toCallback() }),
-          { signal: abort.signal, onWarning, onProgress: progress.child(.4, 1).toCallback() });
-      } else blob = kind === "hep" ? await session.saveHep({ signal: abort.signal, onProgress: progress.toCallback() })
-        : await session.savePdf({ signal: abort.signal, flatten: outputKind === "flatten", protection, onWarning, onProgress: progress.toCallback() });
-      abort.signal.throwIfAborted();
+        blob = await writeScenePdf(await session.getScene({ signal, preview: false, onProgress: progress.child(0, .4).toCallback() }),
+          { signal, onWarning, onProgress: progress.child(.4, 1).toCallback() });
+      } else blob = kind === "hep" ? await session.saveHep({ signal, markSaved: false, onProgress: progress.toCallback() })
+        : await session.savePdf({ signal, markSaved: false, flatten: outputKind === "flatten", protection, onWarning, onDiagnostic, onProgress: progress.toCallback() });
+      signal.throwIfAborted();
+      if (!unchanged()) throw new Error("The document changed while preparing the export. Save again.");
       if (kind === "print") printPdfBlob(blob, document, { filename: "edited-print.pdf", title: "Print edited PDF" });
       else { const base = formatPdfDownloadFilename(source.label).replace(/\.pdf$/i, ""); triggerBrowserDownload(blob, `${base}${kind === "hep" ? "-edited.hep" : outputKind === "flatten" ? "-flattened.pdf" : "-edited.pdf"}`); }
-      if (protection) pdfProtection.markSaved(protection);
-      setStatus(warnings.length ? warnings.join(" ") : kind === "print" ? "Print-ready PDF opened" : hasUnsavedChanges() ? "Unsaved changes" : "Saved");
+      if (kind !== "print") { exportedRevision = session.revision; await recovery?.flush(); }
+      setStatus([kind === "print" ? "Print-ready PDF opened" : "Download started; local edits and recovery draft kept.", ...warnings].join(" "));
     } catch (error) { report(error); }
-    finally { if (operation === abort) operation = null; running = false; updatePointerCursor(); query('[data-action="cancel-operation"]').hidden = true; host.onBusyChange?.(false); }
+    finally {
+      if (operation === abort) operation = null;
+      running = savePreparing = false; overlay.inert = previousInert || structuralRunning || recoveryRunning;
+      host.onBusyChange?.(false);
+      if (!disposed) { updatePointerCursor(); updateClipboardButtons(); query('[data-action="cancel-operation"]').hidden = true; }
+    }
   }
   async function runPageOperation(change: (options: { signal: AbortSignal; onProgress: LoadProgressCallback; onDiagnostic: (diagnostic: PdfDiagnostic) => void }) => Promise<void>, externalSignal?: AbortSignal): Promise<void> {
     lifetime.signal.throwIfAborted(); externalSignal?.throwIfAborted();
-    if (running || structuralRunning) throw new Error("Wait for the current operation to finish.");
+    if (running || savePreparing || structuralRunning) throw new Error("Wait for the current operation to finish.");
     flushEditorFieldDrafts(fieldDrafts);
     if (hasPendingEditorFields(fieldDrafts)) throw new Error("Check the pending form value before changing pages.");
     if (activeText) await finishText();
+    if (!review.flushDraft()) throw new Error("Apply or cancel the pending comment before changing pages.");
     lifetime.signal.throwIfAborted(); externalSignal?.throwIfAborted();
-    if (running || structuralRunning) throw new Error("Wait for the current operation to finish.");
+    if (running || savePreparing || structuralRunning) throw new Error("Wait for the current operation to finish.");
     structuralRunning = running = true; toolbar.inert = overlay.inert = true;
     host.onBusyChange?.(true);
     polygon = null; textRequest++; cancelPointerGesture(false);
@@ -1261,19 +1414,29 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   toolbar.addEventListener("pointerdown", event => { if ((event.target as Element).closest("[data-style]")) event.preventDefault(); });
   toolbar.addEventListener("click", event => {
-    if (structuralRunning) return;
     const button = (event.target as Element).closest<HTMLButtonElement>("button"); if (!button) return;
-    if (clipboardRunning) { if (button.dataset.action === "cancel-operation") operation?.abort(); return; }
+    if (running || savePreparing || structuralRunning) { if (button.dataset.action === "cancel-operation") operation?.abort(); return; }
     if (button.dataset.tool) { setTool(button.dataset.tool as Tool); return; }
     if (button.dataset.style) { applyTextStyle(button.dataset.style); return; }
+    if (button.dataset.action?.startsWith("align-")) {
+      commit(() => alignEditorSelection(session, button.dataset.action!.slice(6) as EditorAlignment, query<HTMLSelectElement>("[data-layout-reference]").value as "selection" | "page")); return;
+    }
+    if (button.dataset.action?.startsWith("distribute-")) {
+      commit(() => distributeEditorSelection(session, button.dataset.action === "distribute-horizontal" ? "horizontal" : "vertical")); return;
+    }
     switch (button.dataset.action) {
       case "layers":
         if (layerDialog && !layerDialog.open) layerDialog.showModal();
         host.showLayerControls?.(); layerControls.show(); break;
       case "undo": changeHistory(false); break; case "redo": changeHistory(true); break;
-      case "copy": case "cut": case "paste": void runClipboard(button.dataset.action); break;
-      case "delete": commit(() => session.deleteSelection()); break; case "duplicate": commit(() => session.cloneSelection()); break;
+      case "copy": case "cut": case "paste": case "duplicate": void runClipboard(button.dataset.action); break;
+      case "delete": commit(() => session.deleteSelection()); break;
       case "group": commit(() => session.groupSelection()); break; case "ungroup": commit(() => session.ungroupSelection()); break;
+      case "lock": commit(() => session.setObjectsLocked(session.getSelection(), true)); break;
+      case "unlock": commit(() => session.setObjectsLocked(session.getSelection(), false)); break;
+      case "edit-comment": try { review.editSelection(); } catch (error) { report(error); } break;
+      case "guides": button.setAttribute("aria-pressed", String(button.getAttribute("aria-pressed") !== "true")); break;
+      case "recovery": void openRecovery(); break;
       case "apply-text": void finishText().catch(report); break; case "cancel-text": cancelText(); break;
       case "cancel-operation": operation?.abort(); break;
       case "pages":
@@ -1282,6 +1445,13 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
           rotate: (indices, degrees) => runPageOperation(options => session.rotatePages(indices, degrees, options)),
           remove: indices => runPageOperation(options => session.removePages(indices, options)),
           insert: (files, at) => runPageOperation(options => insertEditorPdfFiles(session, files, at, options)),
+          reorder: order => runPageOperation(options => session.reorderPages(order, options)),
+          duplicate: (indices, at) => runPageOperation(options => session.duplicatePages(indices, { ...options, at })),
+          crop: (indices, box) => runPageOperation(options => session.cropPages(indices, box, options)),
+          extract: indices => runPageOperation(async options => {
+            const blob = await session.extractPages(indices, options); options.signal.throwIfAborted();
+            triggerBrowserDownload(blob, `${formatPdfDownloadFilename(source.label).replace(/\.pdf$/i, "")}-pages.pdf`);
+          }),
           cancel: () => operation?.abort(), onError: report, onClose: () => { pagesDialog = null; }
         });
         break;
@@ -1301,44 +1471,56 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     }
   });
   function toolbarInput(event: Event): void {
+    if (running || savePreparing || structuralRunning) return;
     const input = event.target as HTMLInputElement;
     if (input.dataset.transform === "rotation") rotationDraft = { selection: currentState.selection, sourceScene: session.sourceScene };
     else opacityInput(event);
   }
   toolbar.addEventListener("input", toolbarInput);
-  toolbar.addEventListener("change", event => {
-    if (structuralRunning) return;
-    const input = event.target as HTMLInputElement;
-    if (changeOpacity(input)) return;
-    if (input.dataset.transform) {
-      changeTransform(input);
-    } else if (activeText) {
+  function preventBusyInput(event: InputEvent): void {
+    if (running || savePreparing || structuralRunning) event.preventDefault();
+  }
+  toolbar.addEventListener("beforeinput", preventBusyInput);
+  overlay.addEventListener("beforeinput", preventBusyInput);
+  function changeAppearance(input: HTMLInputElement): void {
+    if (running || savePreparing || structuralRunning) return;
+    if (activeText) {
       activeText.element.focus();
       if (input.dataset.prop === "color") document.execCommand("foreColor", false, input.value);
       if (input.dataset.prop === "font") {
-        void selectedFont(input.value).then(async font => { await activateFont(font); document.execCommand("fontName", false, font.id); }).catch(report);
+        const editing = activeText;
+        void selectedFont(input.value).then(async font => { await activateFont(font);
+          if (disposed || running || savePreparing || structuralRunning || activeText !== editing) return;
+          document.execCommand("fontName", false, font.id); recovery?.draftChanged(); }).catch(report);
       }
       if (input.dataset.prop === "font-size") applySelectionCss(document, "fontSize", `${Number(input.value)}px`);
       if (input.dataset.prop === "align") activeText.element.style.textAlign = input.value;
-    } else {
-      const selection = session.getSelection(); if (!selection.length) return;
+      recovery?.draftChanged();
+    } else if (tool === "select") {
+      const selection = session.getSelection(); if (!selection.length || input.value === "__mixed__") return;
       const patch: Partial<EditorObject> = input.dataset.prop === "color" ? { color: input.value } : input.dataset.prop === "stroke" ? { strokeWidth: Number(input.value) } :
         input.dataset.prop === "fill" || input.dataset.prop === "fill-enabled" ? { fill: property("fill-enabled").checked ? property("fill").value : null } : {};
       if (input.dataset.prop === "font-size") Object.assign(patch, { fontSize: Number(input.value) });
       if (input.dataset.prop === "align") Object.assign(patch, { align: input.value });
-      if (input.dataset.prop === "font") void selectedFont(input.value).then(font => commit(() => session.transaction("Change font", () => {
-        for (const id of selection) { const object = session.getObject(id); if (object.kind === "text") session.updateObject(id, { fontId: font.id, fontFamily: font.family,
-          runs: object.runs?.map(run => ({ ...run, fontId: font.id, fontFamily: font.family })) }); }
-      }))).catch(report);
-      if (Object.keys(patch).length) commit(() => session.transaction("Change appearance", () => {
-        for (const id of selection) { const object = session.getObject(id); if (object.kind !== "source") session.updateObject(id, object.kind === "text"
-          ? { ...patch, runs: object.runs?.map(run => ({ ...run, ...patch } as typeof run)) } : patch); }
-      }));
+      if (input.dataset.prop === "font" && editorPropertySelection(session, "fontId", selection).length)
+        void selectedFont(input.value).then(font => commit(() => { applyEditorPropertyPatch(session, { fontId: font.id, fontFamily: font.family }, selection); })).catch(report);
+      const propertyName = input.dataset.prop === "stroke" ? "strokeWidth" : input.dataset.prop === "font-size" ? "fontSize"
+        : input.dataset.prop === "fill-enabled" ? "fill" : input.dataset.prop;
+      if (Object.keys(patch).length && ["color", "strokeWidth", "fill", "fontSize", "align"].includes(propertyName ?? "") &&
+          editorPropertySelection(session, propertyName as "color" | "strokeWidth" | "fill" | "fontSize" | "align", selection).length)
+        commit(() => { applyEditorPropertyPatch(session, patch, selection); });
     }
+  }
+  toolbar.addEventListener("change", event => {
+    if (running || savePreparing || structuralRunning) return;
+    const input = event.target as HTMLInputElement;
+    if (changeOpacity(input)) return;
+    if (input.dataset.transform) changeTransform(input);
+    else changeAppearance(input);
   });
   overlay.addEventListener("pointerdown", event => { void pointerDown(event).catch(report); });
   function canOpenContextMenu(): boolean {
-    return active && !disposed && !running && !structuralRunning && !activeText && !pointer && !pendingPick && tool === "select" && !isSceneSettling();
+    return active && !disposed && !running && !structuralRunning && !activeText && !pointer && !pendingPick && tool === "select" && !isSceneSettling() && !cameraPan.isPanning();
   }
   function showSelectionContextMenu(): void {
     if (!canOpenContextMenu()) return;
@@ -1380,12 +1562,14 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   overlay.addEventListener("pointerleave", () => { signatureHover = null; updatePolygonPreview(); });
   overlay.addEventListener("pointercancel", () => { signatureHover = null; cancelPointerGesture(); });
   overlay.addEventListener("lostpointercapture", event => { if (pointer?.id === event.pointerId || pendingPick?.id === event.pointerId && !pendingPick.released) cancelPointerGesture(); });
-  overlay.addEventListener("wheel", event => {
+  function forwardWheel(event: WheelEvent): void {
     if (activeText || (event.target as Element).closest(".hepr-editor-field")) return;
     event.preventDefault(); event.stopPropagation();
+    if (pendingPick || pointer && pointer.action !== "draw") cancelPointerGesture();
     host.getCanvas().dispatchEvent(new WheelEvent("wheel", { bubbles: true, cancelable: true, clientX: event.clientX, clientY: event.clientY,
       deltaX: event.deltaX, deltaY: event.deltaY, deltaZ: event.deltaZ, deltaMode: event.deltaMode, ctrlKey: event.ctrlKey, metaKey: event.metaKey, shiftKey: event.shiftKey }));
-  }, { passive: false });
+  }
+  overlay.addEventListener("wheel", forwardWheel, { passive: false });
   async function doubleClick(event: MouseEvent): Promise<void> {
     if (!active || running) return;
     if (tool === "polygon" || tool === "polyline") { completePolygon(true); return; }
@@ -1403,7 +1587,12 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     const request = ++textRequest;
     const id = await pick(point, { x: event.clientX, y: event.clientY });
     if (!id || disposed || !active || running || tool !== "select" || request !== textRequest) return; const object = session.getObject(id);
+    if (session.isObjectLocked(id)) return;
     if (object.kind === "text") { await startText(point, object); return; }
+    if (object.kind === "shape" && object.review || object.kind === "source" && object.annotationId && latestScene.annotations?.some(annotation =>
+        annotation.id === object.annotationId && ["Text", "Highlight", "Underline", "StrikeOut"].includes(annotation.subtype))) {
+      session.select([id]); review.editSelection(); return;
+    }
     if (object.kind !== "source" || !object.annotationId) return;
     const annotation = session.sourceScene.annotations?.find(item => item.id === object.annotationId);
     if (annotation?.subtype !== "FreeText") return;
@@ -1418,9 +1607,14 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   overlay.addEventListener("dblclick", event => { void doubleClick(event).catch(report); });
   function keydown(event: KeyboardEvent): void {
     if (!active || event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
-    if (structuralRunning || running && clipboardRunning) {
+    if (recoveryDialog) {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") event.preventDefault();
+      return;
+    }
+    if (structuralRunning || running || savePreparing) {
       if (event.key === "Escape") operation?.abort();
-      if (event.key === "Escape" || (event.ctrlKey || event.metaKey) && /^[szdcxv]$/i.test(event.key)) event.preventDefault();
+      if (event.key === "Escape" || (event.ctrlKey || event.metaKey) && /^[szdcxvy]$/i.test(event.key) ||
+          inputTarget(event.target) && !["Tab", "Shift", "Control", "Meta", "Alt"].includes(event.key)) event.preventDefault();
       return;
     }
     if (event.key === "Escape") { polygon = null; cancelPointerGesture(); cancelText(); operation?.abort(); if (tool === "signature") setTool("select"); session.select([]); return; }
@@ -1436,10 +1630,10 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     }
     if ((event.key === "ContextMenu" || event.shiftKey && event.key === "F10") && canOpenContextMenu()) { event.preventDefault(); showSelectionContextMenu(); return; }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") { event.preventDefault(); changeHistory(event.shiftKey); }
-    else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "d") { event.preventDefault(); commit(() => session.cloneSelection()); }
+    else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "d") { event.preventDefault(); void runClipboard("duplicate"); }
     else if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); commit(() => session.deleteSelection()); }
     else if (event.key === "Enter" && polygon) { event.preventDefault(); completePolygon(); }
-    else if (/^Arrow/.test(event.key) && session.getSelection().length) { event.preventDefault(); const d = event.shiftKey ? 10 : 1;
+    else if (/^Arrow/.test(event.key) && session.getSelection().length && !selectionLocked()) { event.preventDefault(); const d = event.shiftKey ? 10 : 1;
       commit(() => interaction.nudge(event.key === "ArrowLeft" ? -d : event.key === "ArrowRight" ? d : 0, event.key === "ArrowDown" ? -d : event.key === "ArrowUp" ? d : 0)); }
   }
   window.addEventListener("keydown", keydown, { signal: lifetime.signal });
@@ -1447,25 +1641,100 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   window.addEventListener("keyup", transformModifiers, { signal: lifetime.signal });
   function hasUnsavedChanges(): boolean {
     return session.getState().dirty || hasPendingEditorTextChanges(activeText) || hasPendingEditorFields(fieldDrafts) ||
-      pdfProtection.hasChanges() || Boolean(passwordDialog?.hasDraftChanges()) || structuralRunning;
+      pdfProtection.hasChanges() || Boolean(passwordDialog?.hasDraftChanges()) || review.hasDraftChanges() || structuralRunning;
+  }
+  async function initializeRecovery(): Promise<void> {
+    try {
+      recoveryKey = await editorRecoveryDocumentKey({ bytes: source.bytes ?? source.pdf, scene: currentSourceScene }, lifetime.signal);
+      const protectedSource = await editorServices.isSourceProtected(lifetime.signal);
+      if (disposed) return;
+      recovery = createEditorRecovery({ session, key: recoveryKey, label: source.label, password: source.password,
+        protected: protectedSource,
+        isInteracting: () => Boolean(pointer || pendingPick || cameraPan.isPanning() || review.isSelecting() || structuralRunning || running || savePreparing),
+        getDraft: async () => { const editing = activeText; return { text: editing ? { object: await readTextDraft(), objectId: editing.objectId,
+          sourceAnnotationId: editing.sourceAnnotationId, layerId: editing.layerId } : null,
+          fields: [...fieldDrafts].filter(([control, baseline]) => editorFieldDraftSignature(control) !== baseline)
+            .map(([control]) => ({ id: control.dataset.fieldId, signature: editorFieldDraftSignature(control) })),
+          comment: review.getDraft() }; },
+        async applyDraft(value) {
+          cancelPointerGesture(false); cancelText();
+          await refreshScene(lifetime.signal, false, true); updateFonts();
+          if (!value || typeof value !== "object") return;
+          const draft = value as { text?: { object?: EditorTextObject; objectId?: string; sourceAnnotationId?: string; layerId?: string | null }; fields?: { id: string; signature: string }[]; comment?: unknown };
+          if (draft.fields?.length) {
+            setTool("form"); renderFields();
+            for (const item of draft.fields) {
+              const control = [...fieldDrafts.keys()].find(control => control.dataset.fieldId === item.id); if (!control || control.disabled) continue;
+              if (control.tagName === "SELECT" && (control as HTMLSelectElement).multiple) {
+                const values = JSON.parse(item.signature) as string[];
+                for (const option of (control as HTMLSelectElement).options) option.selected = values.includes(option.value);
+              } else if (control.tagName === "INPUT" && /^(checkbox|radio)$/.test((control as HTMLInputElement).type)) (control as HTMLInputElement).checked = Boolean(JSON.parse(item.signature)[0]);
+              else control.value = item.signature;
+              updateFieldPaint(control);
+            }
+          }
+          if (draft.text?.object) {
+            setTool("select"); const object = draft.text.object;
+            await startText({ x: 0, y: 0 }, { ...object, id: draft.text.objectId ?? "recovered-text-draft" }, draft.text.sourceAnnotationId);
+            if (activeText) { activeText.objectId = draft.text.objectId; activeText.layerId = draft.text.layerId; activeText.baseline.html = ""; }
+          }
+          if (draft.comment) review.restoreDraft(draft.comment);
+          updateState(session.getState());
+        },
+        onStatus(value) {
+          recoveryNotice = value.state === "saved" ? "Local recovery saved" : value.state === "saving" ? "Saving recovery…" : `Recovery unavailable: ${value.message}`;
+          if (!disposed && !recoveryOffered) query("[data-recovery-status]").textContent = recoveryNotice;
+        }, onError: report
+      });
+      recoveryOffered = Boolean(await recovery.probe());
+      if (!disposed && recoveryOffered) query("[data-recovery-status]").textContent = "An older recovery draft is available; choose Restore or Discard to resume recovery.";
+    } catch (error) { if (!disposed) { query("[data-recovery-status]").textContent = "Local recovery unavailable"; report(error); } }
+  }
+  async function openRecovery(): Promise<void> {
+    await recoveryReady;
+    if (disposed || !active || !recovery || recoveryDialog || running || savePreparing || structuralRunning) return;
+    const offered = recoveryOffered ? await recovery.probe() : undefined;
+    if (disposed || !active || recoveryDialog || running || savePreparing || structuralRunning) return;
+    recoveryDialog = showEditorRecoveryDialog(document, { controller: recovery, currentKey: recoveryKey, offered,
+      onRestored() { recoveryOffered = false; setStatus("Recovered edits. The original file is unchanged."); }, onError: report,
+      onBusyChange(value) {
+        recoveryRunning = value;
+        if (disposed) return;
+        toolbar.inert = overlay.inert = value || structuralRunning;
+        host.onBusyChange?.(running || structuralRunning || value || cameraPan.isPanning());
+      },
+      onClose() {
+        recoveryDialog = null;
+        if (!disposed) void recovery?.probe().then(record => {
+          if (disposed) return;
+          recoveryOffered = recovery?.hasPendingDecision() ?? false;
+          query("[data-recovery-status]").textContent = recoveryOffered ? "Recovery paused until the older draft is restored or discarded." : recoveryNotice;
+        });
+      }
+    });
   }
   function confirmDocumentChange(): boolean {
-    return !hasUnsavedChanges() || window.confirm("Discard unsaved PDF changes and open another document?");
+    if (recoveryRunning) { setStatus("Wait for recovery to finish before opening another document."); return false; }
+    const confirmed = !hasUnsavedChanges() || window.confirm("Discard unsaved PDF changes and open another document?");
+    if (confirmed && hasUnsavedChanges()) discardRecovery = true;
+    return confirmed;
   }
   function beforeUnload(event: BeforeUnloadEvent): void {
     if (hasUnsavedChanges()) { event.preventDefault(); event.returnValue = ""; }
   }
   window.addEventListener("beforeunload", beforeUnload, { signal: lifetime.signal });
   updatePointerCursor(); updateState(session.getState()); toolbar.hidden = overlay.hidden = true;
+  const recoveryReady = initializeRecovery();
   return {
     async setEditing(value, externalSignal) {
-      if (disposed || structuralRunning || active === value) return;
+      if (disposed || structuralRunning || savePreparing || running && !clipboardRunning || recoveryRunning || active === value) return;
       const signal = AbortSignal.any([lifetime.signal, ...(externalSignal ? [externalSignal] : [])]);
       signal.throwIfAborted();
       contextMenu.close();
+      if (!value) recoveryDialog?.close();
       if (!value && clipboardRunning) operation?.abort();
       if (!value) pendingFieldFocus = null;
-      if (!value) { flushEditorFieldDrafts(fieldDrafts); if (activeText) await finishText(); }
+      if (!value) { flushEditorFieldDrafts(fieldDrafts); if (activeText) await finishText(); if (!review.flushDraft()) return; await recovery?.flush(); }
       if (!value) { toolRequest++; cancelPointerGesture(); polygon = null; signatureHover = null; textRequest++; }
       // Detach drawing previews only after the document has drawn their replacement.
       if (!value) while (pendingDrawings.capture()) {
@@ -1475,6 +1744,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       }
       try {
         active = value; toolbar.hidden = overlay.hidden = !value; document.body.classList.toggle("hepr-editing", value);
+        cameraPan.setActive(value);
+        review.setActive(value);
         layerControls.setActive(value); if (!value) layerDialog?.close();
         releaseFrameListener?.(); releaseFrameListener = null;
         if (value) releaseFrameListener = host.subscribeToFrames?.(() => { if (active && !disposed) updateGeometry(true); }) ?? null;
@@ -1484,19 +1755,26 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
           if (host.onSetupProgress) await yieldAfterPaint(signal);
           signal.throwIfAborted();
           updateGeometry(); await refreshScene(signal, false, true); signal.throwIfAborted(); tick();
+          await recoveryReady; signal.throwIfAborted(); if (recoveryOffered) void openRecovery();
         } else window.cancelAnimationFrame(frame);
       } catch (error) {
         if (value && !disposed) {
           active = false; toolbar.hidden = overlay.hidden = true; document.body.classList.remove("hepr-editing");
+          cameraPan.setActive(false);
+          review.setActive(false);
           layerControls.setActive(false); releaseFrameListener?.(); releaseFrameListener = null;
           window.cancelAnimationFrame(frame); host.setEditing(false); host.onModeChange?.(false);
         }
         throw error;
       }
     },
-    isEditing: () => active, isBusy: () => running || structuralRunning, isDirty: hasUnsavedChanges, save, attachDocuments, dropImages, confirmDocumentChange,
+    isEditing: () => active, isBusy: () => running || savePreparing || structuralRunning || recoveryRunning || cameraPan.isPanning(), isDirty: hasUnsavedChanges, save, attachDocuments, dropImages, confirmDocumentChange,
     dispose() {
       if (disposed) return; disposed = true; active = false; cancelPointerGesture(false); lifetime.abort(); scenePreparation?.abort(); operation?.abort(); window.cancelAnimationFrame(frame);
+      cameraPan.dispose();
+      review.dispose(); recoveryDialog?.close();
+      if (discardRecovery && recovery) { const controller = recovery; void controller.discard().finally(() => controller.dispose()).catch(() => {}); }
+      else recovery?.dispose();
       pendingFieldFocus = null;
       pendingDrawings.clear();
       releaseFrameListener?.(); releaseFrameListener = null;

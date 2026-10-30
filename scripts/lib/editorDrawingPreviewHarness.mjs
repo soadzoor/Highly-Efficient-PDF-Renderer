@@ -1,3 +1,4 @@
+import { editorUiTestContext } from "./editorUiTestContext.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
@@ -20,7 +21,7 @@ export function createEditorDrawingPreviewHarness(initialTool = "ink") {
   const sourceScene = { pageRects: new Float32Array([1000, 2000, 1300, 2400]) };
   const rect = { left: 80, top: 40, width: 800, height: 1000, right: 880, bottom: 1040 };
   const captures = new Set(); let state = { revision: 0, selection: [], previewing: false };
-  const context = vm.createContext({ AbortController, AbortSignal, Set, active: true, disposed: false, running: false, structuralRunning: false, clipboardRunning: false,
+  const context = editorUiTestContext({ AbortController, AbortSignal, Set, active: true, disposed: false, running: false, structuralRunning: false, clipboardRunning: false,
     currentState: state, presented: { sourceScene, revision: 0, selection: new Set(), frame: null, delta: null },
     requestedPreview: null, scenePreparation: null, sceneApplication: null, renderRevision: 0,
     latestScene: sourceScene, lifetime: new AbortController(), pointer: null, pendingPick: null, picking: null,
@@ -36,6 +37,7 @@ export function createEditorDrawingPreviewHarness(initialTool = "ink") {
     displayedSelection: () => ({ frame: null }), updateRotationValue() {}, focusPendingField() {},
     svg(tag, attributes) { paths.push({ tag, ...attributes }); return { style: {} }; },
     contextMenu: { close() {} }, updateOpacityControls() {}, renderFields() {}, updateFieldPaint() {}, finishText: async () => {},
+    cameraPan: { cancel() {}, isPanning: () => false, setActive() {}, dispose() {} }, updateAppearanceControls() {},
     fieldAtClientPoint: () => null, pick: async () => null, startText: async () => {}, cancelText() {},
     inputTarget: () => false, canOpenContextMenu: () => false, showSelectionContextMenu() {}, save: async () => {}, changeHistory() {},
     synchronizeDocumentSource: async () => {}, report: error => { if (error.name !== "AbortError") errors.push(error); },

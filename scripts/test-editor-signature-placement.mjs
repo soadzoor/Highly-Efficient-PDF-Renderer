@@ -1,3 +1,4 @@
+import { editorUiTestContext } from "./lib/editorUiTestContext.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { registerHooks, stripTypeScriptTypes } from "node:module";
@@ -60,7 +61,7 @@ try {
       setEditing: noop
     };
     const overlay = { dataset: {}, style: {}, addEventListener(name, listener) { listeners.set(name, listener); }, hasPointerCapture: () => false };
-    const context = vm.createContext({
+    const context = editorUiTestContext({
       AbortSignal, lifetime: new AbortController(),
       pendingDrawings: { add: noop, visible: () => [], capture: () => undefined }, updateRotationValue: noop,
       editorSignaturePlacement, signature, signatureHover: null, objectOpacity: .6,
@@ -79,6 +80,7 @@ try {
       currentState: { selection: [] }, updateOpacityControls: noop,
       layerControls: { setActive: noop, dispose: noop }, layerDialog: null,
       contextMenu: { close: noop, dispose: noop },
+      cameraPan: { cancel: noop, isPanning: () => false, setActive: noop, dispose: noop }, updateAppearanceControls: noop,
       clearPreview: noop, focusPendingField: noop, renderFields: noop,
       refreshScene: async () => { refreshes.push(objects.length); }, report: error => assert.fail(String(error)),
       finishText: async () => {}, flushEditorFieldDrafts: noop, fieldDrafts: new Map(),

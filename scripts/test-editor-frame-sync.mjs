@@ -1,3 +1,4 @@
+import { editorUiTestContext } from "./lib/editorUiTestContext.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { stripTypeScriptTypes } from "node:module";
@@ -10,7 +11,7 @@ const [uiSource, threeSource, formSource] = await Promise.all([
   readFile(new URL("../src/three-example.ts", import.meta.url), "utf8"),
   readFile(new URL("../src/editorFormControls.ts", import.meta.url), "utf8")
 ]);
-const eligibility = vm.createContext({}); vm.runInContext(sourceFunction(formSource, "canEditEditorField"), eligibility);
+const eligibility = editorUiTestContext({}); vm.runInContext(sourceFunction(formSource, "canEditEditorField"), eligibility);
 const canEditEditorField = eligibility.canEditEditorField;
 vm.runInContext(sourceFunction(formSource, "updateEditorFieldControlAppearance"), eligibility);
 const nested = uiSource.replace(/^ {2}/gm, "");
@@ -55,7 +56,7 @@ function harness(frameHost = true) {
     listener = callback; callbacks.push(callback); events.push("subscribe");
     return () => { releases++; if (listener === callback) listener = null; events.push("unsubscribe"); };
   };
-  const context = vm.createContext({
+  const context = editorUiTestContext({
     pendingDrawings: { visible: () => [], capture() {}, clear() {} },
     host, document, fields, AbortSignal, editorFieldClientGeometry, latestScene: sourceScene, presented: null,
     overlay: { dataset: {}, style: {}, remove: noop }, toolbar: { style: {}, querySelectorAll: () => [], remove: noop }, graphic: { setAttribute: noop, replaceChildren: noop },
@@ -65,6 +66,7 @@ function harness(frameHost = true) {
     session: { sourceScene, getFieldValues: () => fieldValues, setFieldValue: (name, value) => fieldValues.set(name, value), isAnnotationVisible: () => true, dispose: noop },
     layerControls: { setActive: noop, dispose: noop }, layerDialog: null,
     contextMenu: { close: noop, dispose: noop },
+    cameraPan: { cancel: noop, isPanning: () => false, setActive: noop, dispose: noop }, updateAppearanceControls: noop,
     currentState: { selection: [] }, updateOpacityControls: noop, rotationDraft: null,
     query: () => ({ value: "", disabled: false }),
     canEditEditorField, isSceneSettling: () => false, property: () => ({ disabled: false }),
@@ -367,7 +369,7 @@ for (const boundary of ["tool", "view", "source", "dispose"]) {
 {
   const h = harness(); await h.context.api.setEditing(true); h.context.renderFields();
   const events = [], camera = { zoom: 1 };
-  const context = vm.createContext({
+  const context = editorUiTestContext({
     animationFrameId: 1, needsRender: true, captureProfiler: null, activePageLayout: "grid", pageLayoutWarmingUp: false,
     pageLayoutAnimator: { update: () => false }, pageLayoutView: null,
     controls: { update() { camera.zoom = 2; h.requestView(camera.zoom); return false; } }, updateCameraClipping: noop,
@@ -394,7 +396,7 @@ for (const boundary of ["tool", "view", "source", "dispose"]) {
   const start = threeSource.indexOf("        subscribeToFrames(listener) {"), end = threeSource.indexOf("\n        },", start);
   assert(start >= 0 && end > start);
   const method = stripTypeScriptTypes(threeSource.slice(start, end + "\n        }".length).replace("subscribeToFrames(", "function subscribeToFrames("));
-  const context = vm.createContext({ editorFrameListener: null }); vm.runInContext(method, context);
+  const context = editorUiTestContext({ editorFrameListener: null }); vm.runInContext(method, context);
   const first = () => {}, second = () => {};
   const releaseFirst = context.subscribeToFrames(first), releaseSecond = context.subscribeToFrames(second);
   releaseFirst(); assert.equal(context.editorFrameListener, second, "stale cleanup cannot detach a replacement listener");

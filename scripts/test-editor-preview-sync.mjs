@@ -1,3 +1,4 @@
+import { editorUiTestContext } from "./lib/editorUiTestContext.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
@@ -14,7 +15,8 @@ function harness() {
   let state = { revision: 0, dirty: false, selection: ["object"], previewing: false }, canonicalFrame = frame(0), rafId = 0;
   let activeApplications = 0, maximumApplications = 0, displayedScene = null, picks = 0;
   const initialSource = { name: "source" };
-  const context = vm.createContext({ AbortController, AbortSignal, Set, active: true, disposed: false, running: false, structuralRunning: false,
+  const context = editorUiTestContext({ AbortController, AbortSignal, Set, active: true, disposed: false, running: false, structuralRunning: false,
+    cameraPan: { cancel() {}, isPanning: () => false, setActive() {}, dispose() {} },
     pendingDrawings: { capture() {}, acknowledge() {} },
     currentState: state, presented: null, requestedPreview: null, scenePreparation: null, sceneApplication: null,
     renderRevision: 0, latestScene: initialSource, lifetime: new AbortController(), pointer: null, pendingPick: null, picking: null,
@@ -227,9 +229,9 @@ for (const boundary of ["cancel", "view", "dispose"]) {
 {
   const initial = { revision: 2, dirty: true, canUndo: true, canRedo: false, selection: ["object"], previewing: false };
   const scene = {}, nodes = new Map(), counts = { bounds: 0, frames: 0, queries: 0, opacity: 0, mode: 0, reconcile: 0, cursors: 0 }, statuses = [];
-  const c = vm.createContext({ currentState: initial, currentSourceScene: scene, active: true, running: false, document: { activeElement: null },
+  const c = editorUiTestContext({ currentState: initial, currentSourceScene: scene, active: true, running: false, document: { activeElement: null },
     contextMenu: { close() {} }, pendingDrawings: { reconcile() { counts.reconcile++; } },
-    updatePointerCursor() { counts.cursors++; }, updateClipboardButtons() {}, setStatus: value => statuses.push(value), hasUnsavedChanges: () => true,
+    updatePointerCursor() { counts.cursors++; }, updateClipboardButtons() {}, updateAppearanceControls() {}, setStatus: value => statuses.push(value), hasUnsavedChanges: () => true,
     query(selector) { counts.queries++; if (!nodes.has(selector)) nodes.set(selector, {}); return nodes.get(selector); },
     editorFrameSize: () => ({ width: 100, height: 50 }), updateRotationValue() {}, updateOpacityControls() { counts.opacity++; },
     session: { sourceScene: scene, getSelectionBounds() { counts.bounds++; return frame(0).bounds; }, getSelectionFrame() { counts.frames++; return frame(0); } },

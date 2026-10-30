@@ -40,6 +40,8 @@ async function openSingleEditorSession(scene: VectorScene, options: EditorSessio
       : (await import("./editorSceneObjects")).compileEditorObjectGeometry(object, signal)),
     compileFields: options.compileFields ?? (async (source, values, signal) =>
       (await getServices()).sessionOptions.compileFields!(source, values, signal)),
+    captureRecoveryFonts: options.captureRecoveryFonts ?? (async () => (await getServices()).sessionOptions.captureRecoveryFonts!()),
+    restoreRecoveryFonts: options.restoreRecoveryFonts ?? (async (fonts, signal) => (await getServices()).sessionOptions.restoreRecoveryFonts!(fonts, signal)),
     savePdf: options.savePdf ?? (async (source, owner, saveOptions) => options.sourcePdf ||
       (!saveOptions.flatten && owner.getObjects().some(object => object.kind !== "group" && (object.kind !== "source" || object.isClone)))
       ? (await getServices()).sessionOptions.savePdf!(source, owner, saveOptions)

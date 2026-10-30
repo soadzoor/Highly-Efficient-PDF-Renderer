@@ -6,7 +6,7 @@ import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 import { PAGE_PRIMITIVE_KINDS, ScenePageViews, scenePrimitiveCounts } from "./scenePageViews";
 import type { ScenePaintNode } from "./scenePaintGraph";
 import type { EditorAnnotationEdit, EditorFieldValue, EditorMatrix, EditorObject, EditorObjectInput, EditorSession, EditorSessionOptions,
-  EditorSourceEdit, EditorSourceObject, EditorState, EditorSelectionFrame, EditorLayerEdits, EditorStackingAction } from "./editorTypes";
+  EditorSourceEdit, EditorSourceObject, EditorState, EditorSelectionFrame, EditorLayerEdits, EditorStackingAction, EditorRecoverySnapshot } from "./editorTypes";
 import { editorPaintIdentity, editorAuthoredOwner, editorPaintOwnerObject, setEditorPaintIdentity, remapEditorPaintIdentity, composeEditorPaintIdentity } from "./editorPaintIdentity";
 import { prepareEditorTranslationPreview } from "./editorTranslationPreview";
 import { editorCloneOwner } from "./editorObjectOrder";
@@ -24,12 +24,14 @@ interface LayerSnapshot {
   objectOrder?: readonly string[];
 }
 import { bakeEditorAnnotationEdits, bakeEditorSourceScene, compactEditorScene, composeEditorPage, EDITOR_IDENTITY, editorMatrix, editorMatrixIsIdentity,
-  editorRefKey, editorTransformBounds, editorUnionBounds, invertEditorMatrix, multiplyEditorMatrices, retainEditorAnnotationPlacements, transformWholeEditorScene } from "./editorScene";
+  editorRefKey, editorTransformBounds, editorUnionBounds, invertEditorMatrix, multiplyEditorMatrices, retainEditorAnnotationPlacements, transformWholeEditorScene,
+  getEditorAnnotationSource, getEditorAnnotationFrameTransform, setEditorAnnotationSource } from "./editorScene";
 import { compileEditorObjectGeometry, editorArrowHeadPoints } from "./editorSceneObjects";
 import { waitForLoad } from "./loadCancellation";
 import { createLoadProgressReporter, type PDFLoadProgress } from "./loadProgress";
 import { createEditorGlyphStoreCache } from "./editorGlyphStoreCache";
 import { editorClipboardStore, releaseEditorClipboard, registerEditorCapturedSourceReader, type EditorCapturedSource, type EditorClipboardSnapshot } from "./editorClipboard";
+import { validateEditorReviewMetadata } from "./editorReview";
 
 interface Snapshot {
   objects: Map<string, EditorObject>;
@@ -39,7 +41,17 @@ interface Snapshot {
   layers: LayerSnapshot;
   selection: string[];
   selectionBasis?: EditorMatrix;
+  sourceLocks: Set<string>;
   identity: object;
+}
+interface RecoveryStateData {
+  state: Omit<Snapshot, "identity">;
+  sourceObjects: Map<string, EditorSourceObject>;
+  capturedSources: Map<string, EditorCapturedSource>;
+  cloneLayers: Map<string, EditorLayerEdits>;
+  nextId: number; nextLayerId: number; activeLayer: string | null;
+  paintOwners: Record<string, string[]>;
+  annotationFrames: { annotation: NonNullable<VectorScene["annotations"]>[number]; transform: EditorMatrix }[];
 }
 function copy<T>(value: T): T { return structuredClone(value); }
 const orderRestorers = new WeakMap<EditorSession, (tokens: readonly string[], stackingChanged?: boolean) => void>();
@@ -61,6 +73,7 @@ function finite(value: unknown, name: string, minimum?: number): asserts value i
 }
 function validateObject(object: EditorObject, pageCount: number): void {
   if (!object.id || typeof object.id !== "string") throw new TypeError("Editor objects require an ID.");
+  if (object.locked !== undefined && typeof object.locked !== "boolean") throw new TypeError("An editing lock must be true or false.");
   if (!Number.isSafeInteger(object.pageIndex) || object.pageIndex < 0 || object.pageIndex >= pageCount) throw new RangeError("Editor object references an unknown page.");
   editorMatrix(object.transform);
   if (object.opacity !== undefined) { finite(object.opacity, "Opacity", 0); if (object.opacity > 1) throw new RangeError("Opacity must not exceed one."); }
@@ -78,6 +91,7 @@ function validateObject(object: EditorObject, pageCount: number): void {
     if (!Number.isSafeInteger(object.imageWidth) || object.imageWidth < 1 || !Number.isSafeInteger(object.imageHeight) || object.imageHeight < 1 ||
       !(object.data instanceof Uint8Array) || object.data.length !== object.imageWidth * object.imageHeight * 4) throw new TypeError("An editor image requires complete RGBA pixels and positive integer dimensions.");
   } else if (object.kind === "shape") {
+    if (object.review) validateEditorReviewMetadata(object.review);
     if (!["rectangle", "ellipse", "line", "arrow", "polygon", "polyline"].includes(object.shape)) throw new TypeError("Unknown editor shape.");
     if (object.strokeWidth !== undefined) finite(object.strokeWidth, "Stroke width", 0);
     for (const point of object.points ?? []) { if (point.length !== 2) throw new TypeError("Shape points must have X and Y."); point.forEach(value => finite(value, "Shape coordinate")); }
@@ -100,7 +114,8 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
   if (!Number.isInteger(pageCount) || pageCount < 1) throw new RangeError("An editor requires a complete scene with at least one page.");
   const initialCatalog = editorLayerCatalog(sourceScene.optionalContent);
   const initialLayers: LayerSnapshot = { catalog: initialCatalog, removals: [], sourceAssignments: new Map(), annotationAssignments: new Map(), stackingChanged: false };
-  let state: Snapshot = { objects: new Map(), edits: new Map(), annotationEdits: new Map(), fields: new Map(), layers: initialLayers, selection: [], identity: {} };
+  const initialSourceLocks = new Set((sourceScene.annotations ?? []).filter(annotation => (annotation.flags & 128) !== 0).map(annotation => `annotation:${annotation.id}`));
+  let state: Snapshot = { objects: new Map(), edits: new Map(), annotationEdits: new Map(), fields: new Map(), layers: initialLayers, selection: [], sourceLocks: initialSourceLocks, identity: {} };
   let activeLayer: string | null = null, nextLayerId = 0, layerRevision = 0;
   let savedIdentity = state.identity, revision = 0, disposed = false, nextId = 0, transactionDepth = 0, transactionStart: Snapshot | null = null;
   let previewTransform: EditorMatrix | null = null, previewSequence = 0;
@@ -146,7 +161,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
   const emit = () => { const value = getState(); for (const listener of listeners) { try { listener(value); } catch { /* Observers cannot interrupt an edit. */ } } };
   const change = (operation: () => void) => {
     assertLive(); const before = state;
-    state = { ...state, objects: new Map(state.objects), edits: new Map(state.edits), annotationEdits: new Map(state.annotationEdits), fields: new Map(state.fields), selection: state.selection.slice(), selectionBasis: state.selectionBasis, identity: {} };
+    state = { ...state, objects: new Map(state.objects), edits: new Map(state.edits), annotationEdits: new Map(state.annotationEdits), fields: new Map(state.fields), sourceLocks: new Set(state.sourceLocks), selection: state.selection.slice(), selectionBasis: state.selectionBasis, identity: {} };
     try { operation(); } catch (error) { state = before; throw error; }
     if (state.layers !== before.layers) layerRevision++;
     if (previewTransform) { previewTransform = null; previewSequence++; cache = null; }
@@ -173,6 +188,21 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     sourceObjects.set(id, object); return object;
   };
   const internalObject = (id: string): EditorObject => state.objects.get(id) ?? sourceObject(id);
+  const sourceLockKey = (object: EditorObject): string => object.kind === "source" && !state.objects.has(object.id) && object.annotationId ? `annotation:${object.annotationId}` : object.id;
+  const objectLocked = (id: string, visiting = new Set<string>()): boolean => {
+    if (visiting.has(id)) return false;
+    visiting.add(id); const object = internalObject(id);
+    if (object.locked || state.sourceLocks.has(sourceLockKey(object))) return true;
+    if (object.kind === "group" && object.children.some(child => objectLocked(child, new Set(visiting)))) return true;
+    const contains = (group: EditorObject, seen = new Set<string>()): boolean => {
+      if (group.kind !== "group" || seen.has(group.id)) return false;
+      seen.add(group.id); return group.children.some(child => child === id || contains(internalObject(child), seen));
+    };
+    return [...state.objects.values()].some(group => group.kind === "group" && group.locked && contains(group));
+  };
+  const assertUnlocked = (ids: readonly string[]): void => {
+    for (const id of ids) if (objectLocked(id)) throw new Error("This selection contains locked objects. Unlock them before editing.");
+  };
   const objectDeleted = (object: EditorObject): boolean => object.kind === "source" && !state.objects.has(object.id) &&
     (!!(object.annotationId && state.annotationEdits.get(object.annotationId)?.deleted) ||
       (object.primitives.length > 0 && object.primitives.every(ref => state.edits.get(editorRefKey(ref))?.deleted)));
@@ -291,7 +321,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       if (object.kind === "source" && !snapshot.objects.has(id)) {
         if (object.annotationId && !annotations.has(object.annotationId)) {
           annotations.add(object.annotationId); const previous = result.annotationEdits.get(object.annotationId);
-          result.annotationEdits.set(object.annotationId, { id: object.annotationId, transform: multiplyEditorMatrices(matrix, previous?.transform ?? EDITOR_IDENTITY), deleted: previous?.deleted ?? false });
+          result.annotationEdits.set(object.annotationId, { ...previous, id: object.annotationId, transform: multiplyEditorMatrices(matrix, previous?.transform ?? EDITOR_IDENTITY), deleted: previous?.deleted ?? false });
         }
         for (const ref of object.primitives) { const key = editorRefKey(ref); if (refs.has(key)) continue; refs.add(key);
           const previous = result.edits.get(key); result.edits.set(key, { ref: { ...ref }, transform: multiplyEditorMatrices(matrix, previous?.transform ?? EDITOR_IDENTITY), deleted: previous?.deleted ?? false }); }
@@ -521,6 +551,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     assertLive(); const signal = suppliedSignal ? AbortSignal.any([suppliedSignal, lifetime.signal]) : lifetime.signal;
     signal.throwIfAborted();
     const snapshot = state, roots = snapshot.selection.slice(); if (!roots.length) return 0;
+    if (cut) assertUnlocked(roots);
     const store = editorClipboardStore(session), sequence = ++store.sequence;
     const objects = new Map<string, EditorObject>(), frames = new Map<string, EditorSelectionFrame>();
     const visit = (id: string) => {
@@ -577,6 +608,57 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     const object = snapshot.objects.get(id), captured = object && capturedSource(object);
     return object && captured ? transformWholeEditorScene(captured.scene, object.transform, lifetime.signal, options.onDiagnostic) : undefined;
   };
+  const captureRecoveryData = (): RecoveryStateData => {
+    const owners = editorPaintIdentity(sourceScene), counts = scenePrimitiveCounts(sourceScene);
+    const paintOwners = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind => [kind, Array.from({ length: counts[kind] }, (_, index) => owners({ kind, index }))]));
+    const { identity: _identity, ...snapshot } = state;
+    return { state: snapshot, sourceObjects: new Map(sourceObjects), nextId, nextLayerId, activeLayer: session.getActiveLayer(), paintOwners,
+      capturedSources: new Map([...state.objects].flatMap(([id, object]) => { const capture = capturedSource(object); return capture ? [[id, capture] as const] : []; })),
+      cloneLayers: new Map([...state.objects].flatMap(([id, object]) => { const layers = cloneLayers.get(geometryOrigins.get(object) ?? object); return layers ? [[id, layers] as const] : []; })),
+      annotationFrames: (sourceScene.annotations ?? []).flatMap(annotation => { const source = getEditorAnnotationSource(sourceScene, annotation.id);
+        return source ? [{ annotation: source, transform: getEditorAnnotationFrameTransform(sourceScene, annotation.id) ?? EDITOR_IDENTITY }] : []; }) };
+  };
+  const restoreRecoveryData = (payload: EditorRecoverySnapshot): RecoveryStateData => {
+    if (payload?.format !== "hepr-editor-recovery" || payload.version !== 1 || !payload.data || typeof payload.data !== "object") throw new TypeError("Unsupported editor recovery snapshot.");
+    const data = copy(payload.data) as RecoveryStateData, candidate = data.state;
+    if (!candidate || !(candidate.objects instanceof Map) || !(candidate.edits instanceof Map) || !(candidate.annotationEdits instanceof Map) ||
+        !(candidate.fields instanceof Map) || !(candidate.sourceLocks instanceof Set) || !Array.isArray(candidate.selection) ||
+        !(data.sourceObjects instanceof Map) || !(data.capturedSources instanceof Map) || !(data.cloneLayers instanceof Map) ||
+        !candidate.layers || !(candidate.layers.sourceAssignments instanceof Map) || !(candidate.layers.annotationAssignments instanceof Map)) throw new TypeError("Invalid editor recovery state.");
+    if (payload.sourceScene.pageCount !== pageCount || payload.sourceScene.pageRects.length !== sourceScene.pageRects.length ||
+        payload.sourceScene.pageRects.some((value, index) => value !== sourceScene.pageRects[index])) throw new Error("Recovery source pages do not match this session.");
+    if (Boolean(payload.sourcePdf) !== Boolean(sourcePdf) || sourcePdf && (sourcePdf.length !== payload.sourcePdf!.length || sourcePdf.some((value, index) => value !== payload.sourcePdf![index]))) throw new Error("Recovery source PDF does not match this session.");
+    const catalog = editorLayerCatalog(candidate.layers.catalog), counts = scenePrimitiveCounts(sourceScene);
+    for (const kind of PAGE_PRIMITIVE_KINDS) if (!Array.isArray(data.paintOwners[kind]) || data.paintOwners[kind].length !== counts[kind] || data.paintOwners[kind].some(value => typeof value !== "string")) throw new TypeError("Recovery source ownership is incomplete.");
+    for (const [id, object] of [...candidate.objects, ...data.sourceObjects]) {
+      if (id !== object.id) throw new TypeError("Recovery object identity is invalid."); validateObject(object, pageCount);
+      if (object.layerId != null) editorLayer(catalog, object.layerId);
+      if (object.layerCondition !== undefined) importEditorLayerCondition(catalog, catalog, object.layerCondition);
+      if (object.kind === "source") for (const ref of object.primitives) getScenePrimitive(sourceScene, ref);
+    }
+    const resolve = (id: string): EditorObject => { const object = candidate.objects.get(id) ?? data.sourceObjects.get(id);
+      if (!object) throw new RangeError("Recovery refers to an unknown object."); return object; };
+    const walk = (id: string, visited = new Set<string>()): void => {
+      const object = resolve(id); if (object.kind !== "group") return;
+      if (visited.has(id)) throw new TypeError("Cyclic recovery object group."); const next = new Set(visited); next.add(id); object.children.forEach(child => walk(child, next));
+    };
+    for (const id of candidate.objects.keys()) walk(id); candidate.selection.forEach(resolve);
+    for (const [key, edit] of candidate.edits) { getScenePrimitive(sourceScene, edit.ref); editorMatrix(edit.transform); if (key !== editorRefKey(edit.ref) || typeof edit.deleted !== "boolean") throw new TypeError("Invalid recovered source edit."); }
+    for (const [key, edit] of candidate.annotationEdits) {
+      if (key !== edit.id || !sourceScene.annotations?.some(annotation => annotation.id === edit.id)) throw new TypeError("Unknown recovered annotation."); editorMatrix(edit.transform);
+      if (typeof edit.deleted !== "boolean" || edit.contents !== undefined && typeof edit.contents !== "string" || edit.author !== undefined && typeof edit.author !== "string") throw new TypeError("Invalid recovered annotation metadata.");
+    }
+    for (const [name, value] of candidate.fields) {
+      if (typeof name !== "string" || !sourceScene.annotations?.some(annotation => annotation.field?.name === name) || !(value === null || typeof value === "string" || typeof value === "boolean" || typeof value === "number" && Number.isFinite(value) || Array.isArray(value) && value.every(item => typeof item === "string"))) throw new TypeError("Invalid recovered form value.");
+    }
+    for (const key of candidate.sourceLocks) if (typeof key !== "string") throw new TypeError("Invalid recovered source lock.");
+    if (data.activeLayer !== null) editorLayer(catalog, data.activeLayer);
+    if (!Number.isSafeInteger(data.nextId) || data.nextId < 0 || !Number.isSafeInteger(data.nextLayerId) || data.nextLayerId < 0) throw new TypeError("Invalid recovery identity counters.");
+    if (candidate.selectionBasis) editorMatrix(candidate.selectionBasis);
+    for (const { annotation, transform } of data.annotationFrames) { if (!sourceScene.annotations?.some(item => item.id === annotation.id)) throw new TypeError("Unknown recovered field frame."); editorMatrix(transform); }
+    for (const [id, captured] of data.capturedSources) { if (candidate.objects.get(id)?.kind !== "source" || !captured.scene || !captured.frame) throw new TypeError("Invalid recovered source copy."); editorMatrix(captured.frame.transform); }
+    return data;
+  };
   const session: EditorSession = {
     sourceScene, sourcePdf,
     get revision() { return revision; },
@@ -607,6 +689,20 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       if (object.kind === "source" && !state.objects.has(id) && object.primitives.length === 1) object.transform = copy(state.edits.get(editorRefKey(object.primitives[0]))?.transform ?? EDITOR_IDENTITY);
       if (object.kind === "source" && !state.objects.has(id) && object.annotationId && !object.primitives.length) object.transform = copy(state.annotationEdits.get(object.annotationId)?.transform ?? EDITOR_IDENTITY);
       return object; },
+    isObjectLocked(id) { assertLive(); return objectLocked(id); },
+    setObjectsLocked(input, locked) {
+      assertLive(); if (typeof locked !== "boolean") throw new TypeError("An editing lock must be true or false.");
+      const ids = new Set<string>(), visit = (id: string): void => { if (ids.has(id)) return; ids.add(id); const object = internalObject(id); if (object.kind === "group") object.children.forEach(visit); };
+      input.forEach(visit); if (!ids.size) return;
+      if ([...ids].every(id => { const object = internalObject(id); return (state.objects.has(id) ? Boolean(object.locked) : state.sourceLocks.has(sourceLockKey(object))) === locked; })) return;
+      change(() => { for (const id of ids) {
+        const object = internalObject(id);
+        if (state.objects.has(id)) {
+          const next = { ...object, locked }; state.objects.set(id, next); geometryOrigins.set(next, geometryOrigins.get(object) ?? object);
+          const inherited = cloneLayers.get(object); if (inherited) cloneLayers.set(next, inherited);
+        } else { const key = sourceLockKey(object); if (locked) state.sourceLocks.add(key); else state.sourceLocks.delete(key); }
+      } });
+    },
     getObjectBounds(id) { assertLive(); return objectBounds(id); },
     getSelection() { return state.selection.slice(); },
     getSelectionBounds() { let bounds: Bounds | null = null; for (const id of state.selection) bounds = editorUnionBounds(bounds, objectBounds(id)); return bounds; },
@@ -658,7 +754,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       change(() => { state.objects.set(id, object); if (object.layerId != null || object.layerCondition !== undefined) state.layers = { ...state.layers }; state.selection = [id]; state.selectionBasis = undefined; }); return id;
     },
     updateObject(id, patch) {
-      assertLive(); const original = internalObject(id);
+      assertLive(); assertUnlocked([id]); const original = internalObject(id);
       if (!state.objects.has(id) && original.kind === "source") throw new TypeError("Original content is updated through selection transforms.");
       const object = copy({ ...original, ...patch, id, kind: original.kind }) as EditorObject;
       if (Object.hasOwn(patch, "layerId") && !Object.hasOwn(patch, "layerCondition")) delete object.layerCondition;
@@ -676,17 +772,20 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     },
     transformSelection(input) {
       const matrix = editorMatrix(input); if (editorMatrixIsIdentity(matrix) || !state.selection.length) return;
+      assertUnlocked(state.selection);
       for (const id of state.selection) editorTransformBounds(objectBounds(id), matrix);
       change(() => { state = transformedSnapshot(state, matrix); });
     },
     setPreviewTransform(input) {
       assertLive(); const matrix = input === null ? null : editorMatrix(input);
+      if (matrix) assertUnlocked(state.selection);
       if (matrix) for (const id of state.selection) editorTransformBounds(objectBounds(id), matrix);
       previewTransform = matrix && !editorMatrixIsIdentity(matrix) ? matrix : null;
       previewSequence++; cache = null; emit();
     },
     deleteSelection() {
       if (!state.selection.length) return;
+      assertUnlocked(state.selection);
       change(() => {
         if (expand(state.selection).some(id => objectLayerIds(id).length)) state.layers = { ...state.layers };
         const selectedGroups = new Set<string>();
@@ -714,6 +813,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       });
     },
     cloneSelection(offset = [12, -12]) {
+      assertUnlocked(state.selection);
       finite(offset[0], "Clone X offset"); finite(offset[1], "Clone Y offset"); const clones: string[] = [];
       const basis = selectionFrame()?.transform;
       session.transaction("Duplicate", () => {
@@ -737,6 +837,34 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       }); return clones;
     },
     copySelection(clipboardOptions = {}) { return captureSelection(false, clipboardOptions.signal); },
+    async duplicateSelection(duplicateOptions = {}) {
+      assertLive(); assertUnlocked(state.selection); duplicateOptions.signal?.throwIfAborted();
+      const leaves = expand(state.selection);
+      // Generic source groups may carry different per-primitive OCMD scopes.
+      // Their existing source-clone path retains those scopes without flattening.
+      if (leaves.some(id => { const object = internalObject(id); return object.kind === "source" && !object.annotationId && object.layerId === undefined && object.layerCondition === undefined; })) {
+        return session.cloneSelection(duplicateOptions.offset);
+      }
+      const before = state, roots = state.selection.slice(), store = editorClipboardStore(session), previous = store.value, sequence = store.sequence + 1;
+      let clones: readonly string[] = [];
+      try {
+        if (!await captureSelection(false, duplicateOptions.signal)) return [];
+        duplicateOptions.signal?.throwIfAborted();
+        if (state !== before) throw new Error("The selection changed while duplicating. Try again.");
+        session.transaction("Duplicate", () => {
+          const preference = activeLayer;
+          try { activeLayer = null; clones = session.pasteSelection({ offset: duplicateOptions.offset ?? [12, -12] }); }
+          finally { activeLayer = preference; }
+          const membership = (source: string, target: string): void => {
+            const original = internalObject(source), duplicate = internalObject(target);
+            if (original.kind === "group" && duplicate.kind === "group") original.children.forEach((id, index) => membership(id, duplicate.children[index]));
+            else session.copyObjectLayerMembership(source, target);
+          };
+          roots.forEach((id, index) => membership(id, clones[index]));
+        });
+        return clones;
+      } finally { if (store.sequence === sequence) { store.value = previous; emit(); } }
+    },
     cutSelection(clipboardOptions = {}) { return captureSelection(true, clipboardOptions.signal); },
     canPaste() { assertLive(); return editorClipboardStore(session).value !== null; },
     pasteSelection(pasteOptions = {}) {
@@ -769,6 +897,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     },
     groupSelection() {
       if (state.selection.length < 2) return null;
+      assertUnlocked(state.selection);
       const children = state.selection.slice(), pageIndex = internalObject(children[0]).pageIndex;
       if (children.some(id => internalObject(id).pageIndex !== pageIndex)) throw new RangeError("Group objects on the same page.");
       const origin = pageOrigin(pageIndex), frame = selectionFrame()!;
@@ -776,6 +905,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         transform: multiplyEditorMatrices([1, 0, 0, 1, -origin[0], -origin[1]], frame.transform) });
     },
     ungroupSelection() {
+      assertUnlocked(state.selection);
       const selected: string[] = [], basis = selectionFrame()?.transform;
       change(() => { for (const id of state.selection) { const object = internalObject(id);
         if (object.kind === "group") { selected.push(...object.children); state.objects.delete(id); } else selected.push(id);
@@ -792,6 +922,17 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     getFieldValues() { return new Map([...state.fields].map(([name, value]) => [name, copy(value)])); },
     getSourceEdits() { return [...state.edits.values()].map(copy); },
     getAnnotationEdits() { return [...state.annotationEdits.values()].map(copy); },
+    updateAnnotation(id, patch) {
+      assertLive(); const annotation = sourceScene.annotations?.find(annotation => annotation.id === id);
+      if (!annotation) throw new RangeError("Unknown PDF annotation.");
+      assertUnlocked([`annotation:${id}`]);
+      if (patch.contents !== undefined && typeof patch.contents !== "string" || patch.author !== undefined && typeof patch.author !== "string") throw new TypeError("Annotation contents and author must be text.");
+      if (annotation.subtype === "Widget" && patch.author !== undefined) throw new TypeError("A Widget uses PDF /T for its field name; its author cannot be changed.");
+      const supplied = { ...(patch.contents === undefined ? {} : { contents: patch.contents }), ...(patch.author === undefined ? {} : { author: patch.author }) };
+      if (!Object.keys(supplied).length) return;
+      change(() => { const previous = state.annotationEdits.get(id); state.annotationEdits.set(id, { ...previous, id,
+        transform: previous?.transform ?? EDITOR_IDENTITY, deleted: previous?.deleted ?? false, ...supplied }); });
+    },
     getLayers() { assertLive(); return copy(state.layers.catalog.groups.filter(group => group.annotationId === undefined)); },
     getLayerOrder() { assertLive(); return copy(state.layers.catalog.order); },
     createLayer(input) {
@@ -808,8 +949,9 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       assertLive(); const catalog = setEditorLayerOrder(state.layers.catalog, order);
       if (catalog !== state.layers.catalog) catalogChange(catalog, true);
     },
-    canReorderSelection(action) { return arrangeSelection(action).changed; },
+    canReorderSelection(action) { return !state.selection.some(id => objectLocked(id)) && arrangeSelection(action).changed; },
     reorderSelection(action) {
+      assertUnlocked(state.selection);
       const result = arrangeSelection(action); if (!result.changed) return;
       change(() => { state.layers = { ...state.layers, objectOrder: result.order }; });
     },
@@ -835,7 +977,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     getObjectLayerIds(id) { assertLive(); return objectLayerIds(id); },
     getObjectLayerCondition(id) { assertLive(); return copy(objectLayerCondition(id)); },
     copyObjectLayerMembership(sourceId, targetId) {
-      assertLive(); const source = objectLayerCondition(sourceId), target = internalObject(targetId);
+      assertLive(); assertUnlocked([targetId]); const source = objectLayerCondition(sourceId), target = internalObject(targetId);
       if (!state.objects.has(targetId) || target.kind === "group" || objectDeleted(target)) throw new TypeError("Layer membership can be copied onto an authored object.");
       const imported = importEditorLayerCondition(state.layers.catalog, source.catalog, source.condition);
       const next: EditorObject = { ...target, layerId: null, layerCondition: imported.condition };
@@ -849,6 +991,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     },
     assignObjectsToLayer(input, layerId) {
       assertLive(); if (layerId !== null) editorLayer(state.layers.catalog, layerId);
+      assertUnlocked(input);
       const ids = expand(input), source = new Map<string, EditorSourceObject>();
       for (const id of ids) {
         const object = internalObject(id); if (objectDeleted(object)) throw new RangeError("A deleted object cannot be assigned to a layer.");
@@ -908,6 +1051,10 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     async rotatePages() { throw new Error("Page operations require an editor document session."); },
     async removePages() { throw new Error("Page operations require an editor document session."); },
     async insertPdf() { throw new Error("Page operations require an editor document session."); },
+    async reorderPages() { throw new Error("Page operations require an editor document session."); },
+    async duplicatePages() { throw new Error("Page operations require an editor document session."); },
+    async cropPages() { throw new Error("Page operations require an editor document session."); },
+    async extractPages() { throw new Error("Page operations require an editor document session."); },
     transaction(_label, operation) {
       assertLive(); const before = state, beforeLayers = layerRevision, outer = transactionDepth === 0; if (outer) transactionStart = before; transactionDepth++;
       try { operation(); } catch (error) { state = before; layerRevision = beforeLayers; throw error; }
@@ -919,6 +1066,28 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     undo() { assertLive(); previewTransform = null; previewSequence++; const previous = undoStack.pop(); if (!previous) { emit(); return false; } redoStack.push(state); if (previous.layers !== state.layers) layerRevision++; state = previous; revision++; cache = null; emit(); return true; },
     redo() { assertLive(); previewTransform = null; previewSequence++; const next = redoStack.pop(); if (!next) { emit(); return false; } undoStack.push(state); if (next.layers !== state.layers) layerRevision++; state = next; revision++; cache = null; emit(); return true; },
     markSaved() { assertLive(); savedIdentity = state.identity; emit(); },
+    async captureRecovery(recoveryOptions = {}) {
+      assertLive(); const signal = recoveryOptions.signal ? AbortSignal.any([recoveryOptions.signal, lifetime.signal]) : lifetime.signal; signal.throwIfAborted();
+      const data = captureRecoveryData(), fonts = options.captureRecoveryFonts ? await options.captureRecoveryFonts() : [];
+      signal.throwIfAborted();
+      return copy({ format: "hepr-editor-recovery" as const, version: 1 as const, sourceScene,
+        ...(sourcePdf ? { sourcePdf } : {}), ...(options.sourceLabel ? { sourceLabel: options.sourceLabel } : {}), fonts, data });
+    },
+    async restoreRecovery(payload, recoveryOptions = {}) {
+      assertLive(); const signal = recoveryOptions.signal ? AbortSignal.any([recoveryOptions.signal, lifetime.signal]) : lifetime.signal; signal.throwIfAborted();
+      const before = state, startedRevision = revision, data = restoreRecoveryData(payload);
+      if (payload.fonts.length && !options.restoreRecoveryFonts) throw new Error("This host does not support restoring authoring fonts.");
+      await options.restoreRecoveryFonts?.(payload.fonts, signal); signal.throwIfAborted(); assertLive();
+      if (state !== before || revision !== startedRevision) throw new Error("The document changed while preparing recovery. Try restoring again.");
+      change(() => {
+        state = { ...data.state, identity: state.identity }; sourceObjects = new Map([...sourceObjects, ...data.sourceObjects]); nextId = data.nextId; nextLayerId = data.nextLayerId; activeLayer = data.activeLayer;
+        for (const [id, captured] of data.capturedSources) capturedSources.set(state.objects.get(id)!, captured);
+        for (const [id, layers] of data.cloneLayers) { const object = state.objects.get(id); if (object) cloneLayers.set(object, layers); }
+        setEditorPaintIdentity(sourceScene, ref => data.paintOwners[ref.kind][ref.index]);
+        for (const { annotation, transform } of data.annotationFrames) setEditorAnnotationSource(sourceScene, annotation, transform);
+      });
+      previewTransform = null; previewSequence++; cache = null; committedSceneCache = null; translationPreviewCache = null; frameCache = null; sourcePartition = null;
+    },
     subscribe(listener) { assertLive(); listeners.add(listener); return () => listeners.delete(listener); },
     async getScene(compileOptions = {}) {
       assertLive(); const signal = compileOptions.signal ? AbortSignal.any([compileOptions.signal, lifetime.signal]) : lifetime.signal;
@@ -984,6 +1153,8 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       let base = bakeEditorSourceScene(layeredSource, [...snapshot.edits.values()], signal, options.onDiagnostic);
       const metadataOnly = [...snapshot.annotationEdits.values()].filter(edit => !(getSceneAnnotationRuns(sourceScene).get(edit.id)?.length));
       base = bakeEditorAnnotationEdits(base, metadataOnly);
+      base = bakeEditorAnnotationEdits(base, [...snapshot.annotationEdits.values()].filter(edit => !edit.deleted && (edit.contents !== undefined || edit.author !== undefined))
+        .map(edit => ({ ...edit, transform: EDITOR_IDENTITY, deleted: false })));
       progress.report(.15, compileMeta); signal.throwIfAborted();
       if (snapshot.fields.size) {
         if (!options.compileFields) throw new Error("Form field updates require the editor's field appearance compiler.");
@@ -1103,6 +1274,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         getState: () => copy(snapshotStatus),
         getObjects: objectOptions => withSnapshot(() => session.getObjects(objectOptions)),
         getObject: id => withSnapshot(() => session.getObject(id)),
+        isObjectLocked: id => withSnapshot(() => objectLocked(id)), setObjectsLocked: readOnly,
         getObjectBounds: id => withSnapshot(() => session.getObjectBounds(id)),
         getSelection: () => snapshot.selection.slice(),
         getSelectionBounds: () => withSnapshot(() => session.getSelectionBounds()),
@@ -1142,10 +1314,10 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         createLayer: readOnly, updateLayer: readOnly, moveLayer: readOnly, setLayerOrder: readOnly, removeLayer: readOnly,
         setActiveLayer: readOnly, assignObjectsToLayer: readOnly, assignSelectionToLayer: readOnly, selectLayerContents: readOnly, copyObjectLayerMembership: readOnly,
         addObject: readOnly, updateObject: readOnly, transformSelection: readOnly, setPreviewTransform: readOnly,
-        deleteSelection: readOnly, cloneSelection: readOnly, copySelection: readOnly, cutSelection: readOnly, canPaste: () => false, pasteSelection: readOnly, groupSelection: readOnly, ungroupSelection: readOnly,
-        setFieldValue: readOnly, transaction: readOnly, undo: readOnly, redo: readOnly, markSaved: readOnly,
-        rotatePages: readOnly, removePages: readOnly, insertPdf: readOnly,
-        subscribe: readOnly, savePdf: readOnly, saveHep: readOnly, dispose: readOnly
+        deleteSelection: readOnly, cloneSelection: readOnly, duplicateSelection: readOnly, copySelection: readOnly, cutSelection: readOnly, canPaste: () => false, pasteSelection: readOnly, groupSelection: readOnly, ungroupSelection: readOnly,
+        setFieldValue: readOnly, updateAnnotation: readOnly, transaction: readOnly, undo: readOnly, redo: readOnly, markSaved: readOnly,
+        rotatePages: readOnly, removePages: readOnly, insertPdf: readOnly, reorderPages: readOnly, duplicatePages: readOnly, cropPages: readOnly, extractPages: readOnly,
+        subscribe: readOnly, savePdf: readOnly, saveHep: readOnly, captureRecovery: readOnly, restoreRecovery: readOnly, dispose: readOnly
       };
       registerEditorCapturedSourceReader(owner, id => capturedSourceScene(id, snapshot));
       progress.report(.4, { stage: "pdf-page", sourceType: "scene", unit: "pages", processed: 0, total: pageCount, pageCount });
@@ -1157,7 +1329,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         : await (await import("./editorPdfWriter")).writeScenePdf(scene, persistenceOptions);
       saveOptions.signal?.throwIfAborted();
       progress.complete({ sourceType: "scene", unit: "pages", processed: pageCount, total: pageCount, pageCount });
-      if (!disposed && revision === targetRevision) session.markSaved(); return blob;
+      if (!disposed && revision === targetRevision && saveOptions.markSaved !== false) session.markSaved(); return blob;
     },
     async saveHep(saveOptions = {}) {
       assertLive(); saveOptions = { ...saveOptions, signal: saveOptions.signal ? AbortSignal.any([saveOptions.signal, lifetime.signal]) : lifetime.signal };
@@ -1178,9 +1350,9 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       const blob = await buildHep(exportScene, { ...saveOptions, sourceLabel: saveOptions.sourceLabel ?? options.sourceLabel,
         onProgress: payload => { if (!saveOptions.signal?.aborted) persistenceProgress.report(payload.value, payload); } });
       saveOptions.signal?.throwIfAborted(); progress.complete({ sourceType: "hep", unit: "pages", processed: pageCount, total: pageCount, pageCount });
-      if (!disposed && revision === targetRevision) session.markSaved(); return blob;
+      if (!disposed && revision === targetRevision && saveOptions.markSaved !== false) session.markSaved(); return blob;
     },
-    dispose() { if (disposed) return; disposed = true; lifetime.abort(); releaseEditorClipboard(session); listeners.clear(); undoStack.length = redoStack.length = 0; sourceObjects.clear(); cache = null; committedSceneCache = null; translationPreviewCache = null; frameCache = null; sourcePartition = null; glyphStores.clear(); state = { objects: new Map(), fields: new Map(), edits: new Map(), annotationEdits: new Map(), layers: initialLayers, selection: [], identity: {} }; }
+    dispose() { if (disposed) return; disposed = true; lifetime.abort(); releaseEditorClipboard(session); listeners.clear(); undoStack.length = redoStack.length = 0; sourceObjects.clear(); cache = null; committedSceneCache = null; translationPreviewCache = null; frameCache = null; sourcePartition = null; glyphStores.clear(); state = { objects: new Map(), fields: new Map(), edits: new Map(), annotationEdits: new Map(), layers: initialLayers, selection: [], sourceLocks: new Set(), identity: {} }; }
   };
   registerEditorCapturedSourceReader(session, id => { assertLive(); return capturedSourceScene(id); });
   orderReaders.set(session, () => { assertLive(); return [...visibility().getObjectOrder().order]; });

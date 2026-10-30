@@ -210,13 +210,66 @@ pass it as `ScenePrimitivePickOptions.resolvePaintRank` after reordering layers.
 work during transform previews. `getLayerEdits()` returns a detached persistence
 snapshot for writers. Compiled scenes and HEP use ordinary optional-content data.
 PDF saves preserve OCG identities and visibility configuration. Metadata-only
-edits retain original drawing streams; changing source membership, removing
-referenced layers or restacking can rebuild affected page/annotation appearances
-as vectors, with compatibility warnings. `savePdf({ onDiagnostic })` also reports
+edits retain original drawing streams. Source paint transforms, deletion,
+membership changes and independent graphics-state scope reordering rewrite
+owned operations at their original paint positions. A modified shared Form
+invocation receives its own resource without changing other instances. When an
+operation or a reordered range cannot be separated safely, the writer replaces
+that bounded region with its compiled vector appearance and reports
+`editor.pdf-source-operation-appearance`. Unsupported ancestor clipping or
+semantic replacement scopes can require a page-vector fallback, reported as
+`editor.pdf-source-operation-fallback` and through `onWarning`.
+`savePdf({ onDiagnostic })` also reports
 the `editor.pdf-layer-stacking` warning for separate annotation paint passes.
 Editable PDF
 annotations and widgets still obey independent readers' separate paint passes;
 use `savePdf({ flatten: true })` for exact displayed order across those passes.
+
+`await createEditorLayoutController(editor)` returns `align(alignment,
+reference?)`, `distribute(direction)` and `createAlignmentSnap(candidates?)`.
+Alignments are `left`, `center`, `right`, `top`, `middle` and `bottom`; the reference
+is `selection` (default) or `page`. Distribution accepts `horizontal` or `vertical`
+and equalizes gaps while keeping the outer objects fixed. Each operation arranges
+selection roots independently per page, preserves rotations and grouping, and
+creates one undoable transaction. Locked selections reject layout changes.
+The return value is the number of moved roots.
+
+For custom direct manipulation, prepare `createAlignmentSnap()` once at gesture
+start. Its `snap(translation, tolerance, disabled?)` returns `{ matrix, guides }`;
+tolerance uses scene units. Targets include page edges/centers and visible objects
+on that page. Supplying `candidates` replaces object targets with those bounds.
+The prepared object keeps target lookup out of pointer-movement document scans.
+Recreate it after selection or scene changes. Stock controls use a six-pixel
+threshold, render guides with the acknowledged document pose and bypass snapping
+while Alt/Option is held.
+
+`await createEditorReviewTools(editor)` returns `textQuads(scene, spans)`,
+`addTextMarkup(scene, spans, type, style?)` and `addComment(page, x, y, contents,
+author?, style?)`. Spans use `{ pageIndex, start, length }` offsets in the current
+scene's text index. Text markup types are `highlight`, `underline` and `strikeout`;
+style accepts `color`, `opacity`, `contents` and `author`. Glyph positions determine
+oriented line quadrilaterals, including rotated text. Text that lacks searchable
+character geometry cannot supply text-markup spans. Comments use page-local
+coordinates and nonempty text, with optional color and opacity. Returned IDs are
+ordinary editor objects, with `review` metadata on their shape model.
+
+```ts
+const layout = await createEditorLayoutController(editor);
+layout.align("left");
+layout.distribute("horizontal");
+const review = await createEditorReviewTools(editor);
+review.addTextMarkup(await editor.getScene(), [{ pageIndex: 0, start: 0, length: 12 }],
+  "highlight", { color: "#ffdd00", opacity: 0.35, contents: "Check this passage" });
+review.addComment(0, 24, 80, "Confirm this value", "Reviewer");
+```
+
+Editable PDFs store standard Highlight, Underline, StrikeOut and Text annotations,
+with explicit appearances, quadrilaterals and comment metadata. Source annotation
+notes can be changed through `updateAnnotation(id, { contents?, author? })`.
+Widget author changes are rejected because PDF `/T` names the form field there.
+HEP bakes their appearance into ordinary geometry and existing annotation metadata;
+it carries no editor history or font programs. Removing or restyling a note follows
+the same selection, locking and undo rules as other objects.
 
 `getPages()` returns current page indexes, displayed dimensions and
 rotation. Page indexes are zero-based. `rotatePages(indexes, degrees, options?)`
@@ -225,7 +278,18 @@ keeps at least one page. `insertPdf(bytes, { at?, pages?, password?, signal?,
 onProgress?, onDiagnostic? })` inserts selected pages from another PDF before
 `at`, or appends when `at` is omitted. Omit `pages` to import the whole PDF.
 The inserted page indexes follow their supplied order. The foreign password is
-independent of the primary document's password.
+independent of the primary document's password. `reorderPages(order, options?)`
+accepts a complete permutation of current indexes. `duplicatePages(indexes,
+{ at?, signal?, onProgress?, onDiagnostic? })` inserts independent copies in the
+supplied order before `at` (default: append), retaining the original layer
+identities and separating copied form-field owners from their originals.
+`cropPages(indexes, box, options?)` changes the visible page box. A
+`PdfPageCropBox` is `{ x, y, width, height }` in displayed points from the current
+lower-left corner, accounting for rotation and PDF `UserUnit`; the box must fit
+every selected page. Pass `null` to reset to the media box. Cropping retains hidden
+content and is not redaction. `extractPages(indexes, options?)` returns a PDF Blob
+in the supplied order, including current edits and source protection, without
+changing the active document, selection, history or saved marker.
 Source-backed sessions require all source pages in their original order for page
 management; partial or reordered source scenes reject the operation before
 changing the document. Open the complete PDF, or use the direct native API for
@@ -236,10 +300,16 @@ await editor.rotatePages([0, 1], 90, { signal });
 await editor.removePages([2], { signal });
 await editor.insertPdf(otherPdfBytes, { at: 1, password: otherPassword, signal });
 // Repeat insertion to merge additional PDFs.
+await editor.reorderPages([1, 0, 2], { signal });
+await editor.duplicatePages([0, 2], { at: 1, signal });
+await editor.cropPages([0], { x: 12, y: 12, width: 300, height: 400 }, { signal });
+await editor.cropPages([0], null, { signal });
+const extractedPdf = await editor.extractPages([2, 0], { signal });
 ```
 
 Page changes share undo/redo with object and field edits. They retain the current
-authoring state in memory and commit only after the new document is ready;
+authoring state in memory, including independent copied author objects/groups,
+and commit only after the new document is ready;
 cancelled, failed or stale operations leave the active document unchanged.
 Explicit drawing order is retained in the canonical scene during page changes,
 including source content interleaved with authored annotations; editable PDF
@@ -359,9 +429,16 @@ source fonts, original text-authoring structure or form semantics.
 
 Newly authored objects remain editable PDF annotations even with HEP-only input.
 When `sourcePdf` is supplied, `savePdf` preserves the source document and writes
-editable annotations/forms with explicit appearances. Generic source-content
-transforms may rebuild the affected page's drawing content; `onWarning` reports
-the resulting authoring-structure limitation. `{ flatten: true }` requests a
+editable annotations/forms with explicit appearances. Source-operation provenance
+is prepared lazily from the original PDF when saving changed source paint; it is
+transient and adds no View-mode frame work or HEP persistence data. Native text
+operations retain their encoded character strings and original font resources,
+including per-glyph transforms and deletion with the original subsequent text
+advances. Source wording is not rewritten. Inseparable source operations use
+diagnosed vector appearances; a page fallback is reserved for cases that cannot
+be isolated safely. Original annotation discussion metadata and lock-only edits
+update their dictionaries without regenerating their appearances.
+`{ flatten: true }` requests a
 rendering-data PDF. Existing supported password encryption is preserved by
 default, including flattened copies. No cryptographic signing or PDF script
 execution occurs.
@@ -410,8 +487,11 @@ HEP exports contain the decrypted rendering data.
 
 `manipulatePdfPages(bytes, operation, options?)` provides native page operations
 without an editor or page rendering. Operations are `{ kind: "rotate", pages,
-degrees }`, `{ kind: "remove", pages }`, or `{ kind: "insert", at, bytes,
-pages?, password? }`. Options accept the primary `password`, `signal`,
+degrees }`, `{ kind: "remove", pages }`, `{ kind: "insert", at, bytes,
+pages?, password? }`, `{ kind: "reorder", pages }` (complete permutation),
+`{ kind: "duplicate", pages, at }`, `{ kind: "extract", pages }`, and
+`{ kind: "crop", pages, box }` (`PdfPageCropBox | null`, as above). All return a
+new PDF Blob and leave caller bytes untouched. Options accept the primary `password`, `signal`,
 `onProgress`, and `onDiagnostic`. The root, bundler and Node entries export it.
 It preserves primary encryption, native page resources and editable fields and
 annotations. Imported field names receive a namespace when they collide with
@@ -443,6 +523,51 @@ The optional `smoothing` on ink/signature objects uses local page units; zero
 retains the original polylines. SVG previews, compiled curves and explicit PDF
 appearances share the fitted geometry; PDF `InkList` samples follow those curves.
 HEP stores ordinary line/quadratic geometry without the capture or smoothing model.
+
+## Local editor recovery
+
+`await createEditorRecovery(options)` lazily loads a browser-only recovery
+controller; renderer imports and HEP encoding do not load or persist recovery
+state. `await editorRecoveryDocumentKey({ bytes?, scene? }, signal?)` computes a
+SHA-256 source key. Prefer original PDF/HEP bytes so identity is independent of
+viewer layout and filenames; a complete scene can be used when bytes are absent.
+
+Supply `session`, `key`, `label`, optional `password` and `protected`, plus
+`getDraft()`/`applyDraft(value)` for serializable unfinished text/form models.
+Never store DOM nodes, executable HTML or output-password settings as draft data.
+`await services.isSourceProtected(signal?)` probes source encryption when needed,
+including PDFs that open with an empty password and PDFs without form fields.
+Set `protected: true` for protected sources; missing passwords fail safely instead
+of writing a plaintext recovery snapshot.
+
+The controller subscribes only to committed revisions and debounces writes.
+Call `draftChanged()` for uncommitted typing, and provide `isInteracting()` to
+defer automatic work during gestures. `probe()` offers a matching old checkpoint;
+`restore()` and `discard()` resolve it. Until that decision, older matching data
+is preserved, including when the UI is closed with Later. `flush()` requests a
+current checkpoint, `hasPendingDecision()` reports whether the old-draft choice
+still blocks checkpoints, `list()` returns small management metadata, and
+`discard(key?)` deletes the current or another local draft. `dispose()` cancels
+queued work, detaches its session subscription and closes owned storage.
+An injected `EditorRecoveryStore` can replace IndexedDB for custom hosts/tests.
+
+`session.captureRecovery({ signal? })` returns a detached, versioned
+`EditorRecoverySnapshot`. `session.restoreRecovery(snapshot, { signal? })`
+validates and restores it atomically as an undoable operation. The snapshot keeps
+actual font programs, editable author models, current source/page resources,
+field values, annotation metadata/frames, layers and editing locks. It excludes
+passwords, undo/redo history, clipboard contents and transient previews. The
+opaque `data` field is a private recovery schema, not a PDF/HEP extension.
+Protected checkpoints use PBKDF2-SHA256 and AES-256-GCM with fresh nonces; password
+and derived keys remain in memory. Normal PDF opening/password verification is
+performed again before stored source state replaces the current document.
+
+`savePdf({ markSaved: false })` and `saveHep({ markSaved: false })` serialize a
+snapshot without clearing dirty state. The default remains true for API
+compatibility. Custom hosts should distinguish serialized/exported output from
+a confirmed file write before calling `markSaved()`; a browser anchor download
+does not acknowledge filesystem persistence. Recovery status `saved` means the
+local checkpoint transaction completed, not that the source file was saved.
 
 ## `renderPdfThumbnail(source, options?)`
 

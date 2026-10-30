@@ -133,6 +133,29 @@ try {
         editorTextAndShapeRemainEditable: true, independentReaderPixelsUnchangedAtExpectedRotation: true }, stageInfo, captures, exactPreservation, diagnostics };
     await writeFile(resolve(output, "report.json"), JSON.stringify(report, null, 2));
     console.log(JSON.stringify({ output, checks: report.checks, exactPreservation, captures: captures.filter(value => value.name === "merged") }, null, 2));
+    const organizer = [];
+    for (const [name, operation] of [
+      ["reordered", { kind: "reorder", pages: [3, 0, 2, 1] }],
+      ["duplicated", { kind: "duplicate", pages: [1], at: 2 }],
+      ["cropped", { kind: "crop", pages: [0], box: { x: 8, y: 8, width: 260, height: 200 } }],
+      ["reset", { kind: "crop", pages: [0], box: null }],
+      ["extracted", { kind: "extract", pages: [0, 2, 4] }]
+    ]) {
+      bytes = new Uint8Array(await (await manipulatePdfPages(bytes, operation)).arrayBuffer());
+      await writeFile(resolve(output, `organizer-${name}.pdf`), bytes);
+      const task = pdfjs.getDocument({ data: bytes.slice(), disableFontFace: true, useSystemFonts: false, isEvalSupported: false, CanvasFactory });
+      const pdf = await task.promise, pages = [];
+      try {
+        for (let index = 0; index < pdf.numPages; index++) {
+          const reference = await renderReference(pdf, index), actual = await renderHepr(bytes, index), difference = comparePixels(reference, actual);
+          assert(difference.meanMaxChannelDifference < 3 && difference.fractionDifferentByMoreThan20 < .04, `${name}, page ${index + 1}: renderer agreement`);
+          await writeFile(resolve(output, `organizer-${name}-page-${index + 1}-side-by-side.png`), sideBySide(reference, actual, `${name}: pdf.js ${pdfjs.version}`, "HEPR Canvas2D").toBuffer("image/png"));
+          pages.push({ page: index + 1, ...difference });
+        }
+      } finally { await task.destroy(); }
+      organizer.push({ name, bytes: bytes.length, pages });
+    }
+    await writeFile(resolve(output, "organizer-report.json"), JSON.stringify({ pdfjsVersion: pdfjs.version, description: "Offline native page reorder, duplicate, crop/reset and extraction comparisons.", organizer }, null, 2));
   } finally { for (const value of documents.values()) await value.task.destroy(); }
 
   async function renderReference(document, index, rotation) {

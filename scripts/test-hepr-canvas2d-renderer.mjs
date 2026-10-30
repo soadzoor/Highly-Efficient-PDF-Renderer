@@ -323,6 +323,36 @@ try {
     await compatibilitySession.close();
   }
 
+  const rgbIndex = page.stores.colors.spaceKinds.indexOf(dataApi.HEPR_COLOR_SPACE_KIND.DeviceRgb);
+  assert(rgbIndex >= 0);
+  const explicitRgb = structuredClone(page);
+  for (const [index, group] of explicitRgb.displayProgram.groups.entries()) if (index !== explicitRgb.displayProgram.rootGroupIndex) group.blendingColorSpaceIndex = rgbIndex;
+  const explicitResult = await renderHeprPageToCanvas2d(explicitRgb, { surfaceFactory, scale: 2, background: [1, 1, 1, 1] });
+  assert.deepEqual(explicitResult.surface.context.getImageData(0, 0, 24, 20).data, result.surface.context.getImageData(0, 0, 24, 20).data,
+    "explicit device RGB invoked groups use the same sRGB pixels as implicit groups, including alpha and Multiply");
+  const boundaryRgb = structuredClone(page), boundaryRoot = boundaryRgb.displayProgram.groups[boundaryRgb.displayProgram.rootGroupIndex];
+  const boundary = { ...boundaryRoot, isolated: false, blendingColorSpaceIndex: rgbIndex, commands: boundaryRoot.commands };
+  boundaryRoot.commands = [{ kind: "invoke-group", groupIndex: boundaryRgb.displayProgram.groups.length, transformIndex: 0, clipIndex: -1,
+    optionalContentIndex: -1, markedContentIndex: -1, sourceOffset: -1, sourceLength: -1 }];
+  boundaryRgb.displayProgram.groups.push(boundary);
+  const boundaryResult = await renderHeprPageToCanvas2d(boundaryRgb, { surfaceFactory, scale: 2, background: [1, 1, 1, 1] });
+  assert.deepEqual(boundaryResult.surface.context.getImageData(0, 0, 24, 20).data, result.surface.context.getImageData(0, 0, 24, 20).data,
+    "an opaque nonisolated device RGB wrapper remains a direct no-op boundary with multiple paints");
+  for (const kind of [dataApi.HEPR_COLOR_SPACE_KIND.CalRgb, dataApi.HEPR_COLOR_SPACE_KIND.IccBased, dataApi.HEPR_COLOR_SPACE_KIND.DeviceCmyk]) {
+    const unsupported = structuredClone(page), colors = unsupported.stores.colors, index = colors.spaceKinds.length;
+    const append = (key, values) => { const result = new colors[key].constructor(colors[key].length + values.length); result.set(colors[key]); result.set(values, colors[key].length); colors[key] = result; };
+    const parameters = kind === dataApi.HEPR_COLOR_SPACE_KIND.IccBased ? [0, 1, 0, 1, 0, 1] : [];
+    append("spaceKinds", [kind]); append("componentCounts", [kind === dataApi.HEPR_COLOR_SPACE_KIND.DeviceCmyk ? 4 : 3]);
+    append("alternateSpaceIndices", [-1]); append("functionIndices", [-1]); append("parameterOffsets", [colors.parameters.length + parameters.length]); append("parameters", parameters);
+    for (const key of ["nameOffsets", "profileOffsets", "lookupOffsets", "iccTransformOffsets"]) append(key, [colors[key].at(-1)]);
+    append("iccModes", [0]);
+    for (const [groupIndex, group] of unsupported.displayProgram.groups.entries()) if (groupIndex !== unsupported.displayProgram.rootGroupIndex) group.blendingColorSpaceIndex = index;
+    await assert.rejects(renderHeprPageToCanvas2d(unsupported, { surfaceFactory }), isCanvasError(HEPR_CANVAS_2D_ERROR_CODES.UnsupportedComposite),
+      "explicit non-device-RGB group spaces still require managed PDF blending");
+  }
+  const explicitRoot = structuredClone(page); explicitRoot.displayProgram.groups[explicitRoot.displayProgram.rootGroupIndex].blendingColorSpaceIndex = rgbIndex;
+  await assert.rejects(renderHeprPageToCanvas2d(explicitRoot, { surfaceFactory }), isCanvasError(HEPR_CANVAS_2D_ERROR_CODES.UnsupportedComposite), "the root-group contract is unchanged");
+
   const knockoutPage = structuredClone(page);
   const invoked = knockoutPage.displayProgram.groups.find((group, index) =>
     index !== knockoutPage.displayProgram.rootGroupIndex && group.alpha < 1

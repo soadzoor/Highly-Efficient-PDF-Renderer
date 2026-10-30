@@ -31,6 +31,7 @@ import { applyEditorSceneLayers, assignEditorGeometryLayer, reorderEditorSceneLa
 import { isScenePaintRunVisible, scenePaintOrderedRuns } from "./scenePaintQuery";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 import { getEditorCapturedSourceScene } from "./editorClipboard";
+import type { NativeMissingFontResolver } from "./pdf/nativeFont";
 
 export const EDITOR_PDF_LAYER_STACKING_DIAGNOSTIC_CODE = "editor.pdf-layer-stacking";
 
@@ -699,7 +700,7 @@ function documentText(bytes: Uint8Array): string {
 
 export async function saveEditorNativePdf(scene: VectorScene, session: EditorSession, options: EditorPdfSaveOptions,
   services: { fonts: EditorFontRegistry; password?: string; compileObject: (object: EditorObject, signal?: AbortSignal) => Promise<VectorScene>;
-    sourceSceneIsPageContent?: boolean }): Promise<Blob> {
+    sourceSceneIsPageContent?: boolean; missingFontResolver?: NativeMissingFontResolver }): Promise<Blob> {
   options = { ...options, protection: validatePdfOutputProtection(options.protection) };
   const progress = createLoadProgressReporter(options.onProgress);
   const childOptions = (start: number, end: number, fixed: Partial<Omit<PDFLoadProgress, "value">> = {}): EditorPdfSaveOptions => {
@@ -822,6 +823,25 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
       const start = .25 + .25 * rebuiltPages / changedPages.size, end = .25 + .25 * (rebuiltPages + 1) / changedPages.size;
       progress.report(start, { stage: "pdf-page", sourceType: "pdf", unit: "pages", processed: rebuiltPages, total: changedPages.size,
         pageIndex, pageCount: session.sourceScene.pageCount });
+      if (!services.sourceSceneIsPageContent) {
+        try {
+          const { rewriteEditorPdfSourcePage } = await import("./editorPdfSourceOperations");
+          const rewritten = await rewriteEditorPdfSourcePage(writer, session, pageIndex, layers,
+            { ...options, password: services.password, missingFontResolver: services.missingFontResolver });
+          const sourceIndex = session.sourceScene.pdfPages?.find(page => page.pageIndex === pageIndex)?.sourcePageIndex ?? pageIndex;
+          const dictionary = pageDictionary(sourceIndex);
+          dictionary.set("Contents", writer.add(pdfStreamValue(rewritten.content))); dictionary.set("Resources", rewritten.resources);
+          progress.report(end, { stage: "pdf-page", sourceType: "pdf", unit: "pages", processed: ++rebuiltPages, total: changedPages.size,
+            pageIndex, pageCount: session.sourceScene.pageCount });
+          continue;
+        } catch (error) {
+          options.signal?.throwIfAborted();
+          const reason = error instanceof Error ? error.message : String(error);
+          options.onDiagnostic?.({ code: "editor.pdf-source-operation-fallback", severity: "warning", pageIndex,
+            message: `Page ${pageIndex + 1}: source operations require a vector appearance fallback: ${reason}`,
+            details: { fallback: "page-vectors", reason } });
+        }
+      }
       const view = bakedSourceViews.extract(pageIndex).scene;
       const keep = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind => [kind, new Set(Array.from({ length: kind === "stroke" ? view.segmentCount : kind === "fill" ? view.fillPathCount : kind === "text" ? view.textInstanceCount : kind === "raster" ? view.rasterLayers.length : kind === "gradient-fill" ? view.gradientFillPathCount : view.gradientStrokeRunCount }, (_, i) => i))])) as Record<PrimitiveKind, Set<number>>;
       if (!services.sourceSceneIsPageContent) for (const runs of getSceneAnnotationRuns(view).values()) for (const run of runs) for (let i = 0; i < run.count; i++) keep[run.kind].delete(run.first + i);
@@ -868,7 +888,9 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
         const affected = edits.filter(edit => refs.some(ref => ref.kind === edit.ref.kind && ref.index === edit.ref.index));
         const annotationEdit = annotationEdits.get(annotation.id);
         const membershipChanged = changedAnnotationMemberships.has(annotation.id);
-        if (!affected.length && !annotationEdit && !membershipChanged) continue;
+        const locked = session.isObjectLocked(`annotation:${annotation.id}`), originalFlags = Number(annotation.dictionary.get("F") ?? 0),
+          lockChanged = locked !== ((originalFlags & 128) !== 0);
+        if (!affected.length && !annotationEdit && !membershipChanged && !lockChanged) continue;
         if (annotationEdit?.deleted || (refs.length && refs.every(ref => affected.some(edit => edit.ref.kind === ref.kind && edit.ref.index === ref.index && edit.deleted)))) {
           if (annotation.subtype === "Widget" && annotation.ref) await removeEditorPdfWidget(writer, annotation.ref, options.signal);
           const dictionary = pageDictionary(sourceIndex);
@@ -878,6 +900,18 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
         }
         const pendingAnnotation = annotation.ref ? writer.get(annotation.ref) : undefined;
         const originalDictionary = new Map(isPdfDictionary(pendingAnnotation) ? pendingAnnotation : annotation.dictionary);
+        if (lockChanged) originalDictionary.set("F", locked ? originalFlags | 128 : originalFlags & ~128);
+        if (annotationEdit?.contents !== undefined) originalDictionary.set("Contents", pdfTextValue(annotationEdit.contents));
+        if (annotationEdit?.author !== undefined) originalDictionary.set("T", pdfTextValue(annotationEdit.author));
+        const geometryChanged = affected.length > 0 || (annotationEdit && !annotationEdit.transform.every((value, index) => value === [1, 0, 0, 1, 0, 0][index]));
+        if (!geometryChanged && !membershipChanged) {
+          if (annotation.ref) writer.set(annotation.ref, originalDictionary);
+          else {
+            const owner = pageDictionary(sourceIndex), raw = await document.resolveValue(owner.get("Annots"), options.signal);
+            if (Array.isArray(raw)) owner.set("Annots", raw.map(item => item === annotation.dictionary ? writer.add(originalDictionary) : item));
+          }
+          continue;
+        }
         const resolvePending = async (value: PdfValue | undefined): Promise<PdfValue | undefined> => isPdfRef(value)
           ? writer.get(value) ?? await document.resolveValue(value, options.signal) : value;
         const rawAppearances = await resolvePending(originalDictionary.get("AP"));
@@ -970,8 +1004,7 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
           maxX: canonicalBounds.maxX - origin[0], maxY: canonicalBounds.maxY - origin[1] } : local;
         imported.form.set("BBox", [appearanceBounds.minX, appearanceBounds.minY, appearanceBounds.maxX, appearanceBounds.maxY]);
         const rect = editorTransformBounds(local, matrix);
-        const existing = annotation.ref ? writer.get(annotation.ref) : undefined;
-        const dictionary = new Map(isPdfDictionary(existing) ? existing : annotation.dictionary);
+        const dictionary = new Map(originalDictionary);
         dictionary.set("Rect", [rect.minX, rect.minY, rect.maxX, rect.maxY]);
         let appearance = writer.add(pdfStreamValue(imported.content, imported.form));
         if (frameScene && canonical?.pdfGeometry.rect) appearance = wrapEditorFieldAppearance(writer, annotation, {
@@ -1078,11 +1111,21 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
       const appearance = writer.add(pdfStreamValue(imported.content, imported.form));
       const annotation: PdfDictionary = new Map<string, PdfValue>([["Type", pdfNameValue("Annot")], ["Subtype", pdfNameValue(object.kind === "text" ? "FreeText" : object.kind === "ink" || object.kind === "signature" ? "Ink" : object.kind === "image" ? "Stamp" : object.shape === "rectangle" ? "Square" : object.shape === "ellipse" ? "Circle" : object.shape === "polygon" ? "Polygon" : object.shape === "line" || object.shape === "arrow" ? "Line" : "PolyLine")],
         ["NM", pdfTextValue(object.id)], ["Rect", [rect.minX, rect.minY, rect.maxX, rect.maxY]], ["F", 4], ["AP", new Map([["N", appearance]])]]);
+      if (object.kind === "shape" && object.review) {
+        const review = object.review;
+        annotation.set("Subtype", pdfNameValue(review.type === "highlight" ? "Highlight" : review.type === "underline" ? "Underline" : review.type === "strikeout" ? "StrikeOut" : "Text"));
+        annotation.set("Contents", pdfTextValue(review.contents ?? ""));
+        if (review.author) annotation.set("T", pdfTextValue(review.author));
+        if (review.quads) annotation.set("QuadPoints", review.quads.flatMap(quad => quad.flatMap(([x, y]) => editorPoint(localToPdf, x, y))));
+        if (review.type === "comment") annotation.set("Name", pdfNameValue("Comment"));
+      }
       const membership = session.getObjectLayerCondition(object.id);
       const layer = layers.conditionReference(membership.catalog, membership.condition);
       if (typeof layer !== "boolean") annotation.set("OC", layer);
       else if (!layer) annotation.set("F", 6);
-      if (object.kind !== "image") annotation.set("C", normalizePrimitiveColor(object.color ?? 0x000000));
+      if (session.isObjectLocked(object.id)) annotation.set("F", (annotation.get("F") as number) | 128);
+      if (object.kind !== "image") annotation.set("C", normalizePrimitiveColor(object.kind === "shape" &&
+        (object.review?.type === "highlight" || object.review?.type === "comment") ? object.fill ?? object.color ?? 0x000000 : object.color ?? 0x000000));
       if (object.kind === "shape" || object.kind === "ink" || object.kind === "signature") {
         annotation.set("BS", new Map<string, PdfValue>([["W", object.strokeWidth ?? 1], ["S", pdfNameValue("S")]]));
         if (object.fill !== undefined && object.fill !== null) annotation.set("IC", normalizePrimitiveColor(object.fill));

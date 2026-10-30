@@ -35,6 +35,8 @@ export interface EditorAppServicesOptions {
 export interface EditorAppServices {
   sessionOptions: EditorSessionOptions;
   fonts: ReturnType<typeof createEditorFontRegistry>;
+  /** Cached source protection metadata; also covers empty-password PDFs. */
+  isSourceProtected(signal?: AbortSignal): Promise<boolean>;
   readTextAnnotation(annotationId: string, scene: VectorScene, signal?: AbortSignal,
     source?: { pdf?: Uint8Array; password?: string }): Promise<EditorTextObject | null>;
   dispose(): void;
@@ -62,6 +64,7 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
     : nativeVectorMissingFontResolver();
   let disposed = false;
   const servicesLifetime = new AbortController();
+  let sourceProtected: boolean | undefined = options.sourcePdf ? undefined : false, protectionProbe: Promise<boolean> | undefined;
   type FieldAppearancePages = Map<number, Map<string, VectorScene>>;
   let fieldAppearanceCache: { key: string; sourcePdf: Uint8Array; password?: string; controller: AbortController;
     waiters: number; promise: Promise<FieldAppearancePages> } | undefined;
@@ -175,6 +178,12 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
   const sessionOptions: EditorSessionOptions = {
     sourcePdf: options.sourcePdf, password: options.password, loadFontAsset: options.loadFontAsset,
     compileObject, compileFields, onDiagnostic: options.onDiagnostic,
+    captureRecoveryFonts: async () => fonts.list().map(font => ({ ...font, bytes: font.bytes.slice() })),
+    restoreRecoveryFonts: async (assets, signal) => {
+      for (const asset of assets) { signal?.throwIfAborted(); const registered = await fonts.register(asset.bytes, asset);
+        if (registered.id !== asset.id) throw new Error("A recovered font does not match its recorded bytes."); }
+      signal?.throwIfAborted();
+    },
     createSourceOptions: async (sourcePdf, password) => {
       if (disposed) throw new Error("Editor services are disposed.");
       const services = await createEditorAppServices({ ...options, sourcePdf, password }, fonts);
@@ -190,6 +199,7 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
       if (!options.sourcePdf || !scene.annotations?.some(annotation => annotation.field)) { options.onPrepareProgress?.(1); return scene; }
       const yieldProgress = options.onPrepareProgress ? createLoadYielder(signal) : undefined;
       const document = await NativePdfDocument.open({ kind: "bytes", bytes: options.sourcePdf }, { password: options.password, signal });
+      sourceProtected = Boolean(document.getWriterState().protection);
       try {
         const forms = new NativePdfFormAppearanceRegistry(document);
         const optional = await createNativeOptionalContentRegistry(document, { signal });
@@ -230,9 +240,24 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
         return result;
       } finally { await document.close(); }
     },
-    savePdf: (scene, session, saveOptions) => saveEditorNativePdf(scene, session, saveOptions, { fonts, password: options.password, compileObject })
+    savePdf: async (scene, session, saveOptions) => saveEditorNativePdf(scene, session, saveOptions,
+      { fonts, password: options.password, missingFontResolver: await getMissingFontResolver(), compileObject })
   };
   return { sessionOptions, fonts,
+    async isSourceProtected(signal) {
+      if (disposed) throw new Error("Editor services are disposed.");
+      signal?.throwIfAborted();
+      if (sourceProtected !== undefined) return sourceProtected;
+      if (!protectionProbe) {
+        protectionProbe = (async () => {
+          const document = await NativePdfDocument.open({ kind: "bytes", bytes: options.sourcePdf! }, { password: options.password, signal: servicesLifetime.signal });
+          try { return sourceProtected = Boolean(document.getWriterState().protection); }
+          finally { await document.close(); }
+        })();
+        void protectionProbe.catch(() => { protectionProbe = undefined; });
+      }
+      return waitForLoad(protectionProbe, signal);
+    },
     async readTextAnnotation(annotationId: string, scene: VectorScene, signal?: AbortSignal,
       source?: { pdf?: Uint8Array; password?: string }) {
       const sourcePdf = source ? source.pdf : options.sourcePdf, password = source ? source.password : options.password;

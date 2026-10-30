@@ -26,6 +26,7 @@ try {
   const { NativeSfntFont } = await import("../src/pdf/nativeFont.ts");
   const { loadSceneFromHep } = await import("../src/hepReader.ts");
   const { writeScenePdf } = await import("../src/editorPdfWriter.ts");
+  const { addEditorTextMarkup, addEditorComment } = await import("../src/editorReview.ts");
   const { getScenePrimitive } = await import("../src/scenePrimitives.ts");
   const loadFontAsset = async url => new Uint8Array(await readFile(url));
   const initialServices = await createEditorAppServices({ loadFontAsset });
@@ -100,6 +101,12 @@ try {
   const serifFont = NativeSfntFont.parse(serif.bytes);
   const serifWidths = Array.from({ length: 95 }, (_, i) => serifFont.getHorizontalMetric(serifFont.mapCodePoint(i + 32)).advanceWidth * 1000 / serifFont.unitsPerEm);
   const book = await compareSynthetic("book", bookFixture(serif.bytes, serifWidths), async (editor, services) => {
+    const text = editor.sourceScene.textIndex.pages[0].text;
+    for (const [type, word] of [["highlight", "Workshop"], ["underline", "Synthetic"], ["strikeout", "vector"]]) {
+      const start = text.indexOf(word); assert(start >= 0);
+      addEditorTextMarkup(editor, editor.sourceScene, [{ pageIndex: 0, start, length: word.length }], type, { contents: `${type} review`, author: "Reviewer" });
+    }
+    addEditorComment(editor, 0, 386, 480, "Review annotation with an explicit appearance", "Reviewer");
     const italic = await services.fonts.loadBundled("Liberation Serif", { fontStyle: "italic" });
     editor.addObject({ kind: "shape", pageIndex: 0, shape: "rectangle", x: 43, y: 389, width: 285, height: 15, fill: "#ffdf66", strokeWidth: 0, opacity: .25 });
     editor.addObject({ kind: "ink", pageIndex: 0, paths: [[[34, 406], [31, 395], [34, 382], [32, 370]]], color: "#2b58a1", strokeWidth: 1.3 });
@@ -107,7 +114,7 @@ try {
       text: "Reviewer note: preserve searchable text and typography. Ω",
       runs: [{ text: "Reviewer note: ", fontFamily: "Liberation Sans", fontWeight: "bold", color: "#24557c" },
         { text: "preserve searchable text and typography. Ω", fontId: italic.id, fontStyle: "italic", underline: true, color: "#24557c" }] });
-  }, { description: "Synthetic book page with serif paragraphs, line spacing, vector markups and a mixed-font Unicode review note.", requiredText: "Workshop" });
+  }, { description: "Synthetic book page with serif paragraphs, standard highlight/underline/strikeout/comment annotations and a mixed-font Unicode review note.", requiredText: "Workshop" });
   const image = await compareSynthetic("image", imageFixture(regular.bytes, widths), async editor => {
     const size = 128, data = new Uint8Array(size * size * 4);
     for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {

@@ -91,7 +91,7 @@ try {
       assert(sourceRef);editor.selectPrimitives([sourceRef]);editor.transformSelection([1,0,0,1,5,3]);
       editor.addObject({kind:"text",pageIndex:0,x:5,y:5,width:70,height:25,fontSize:8,text:"A Ω",runs:[{text:"A "},{text:"Ω",fontWeight:"bold",underline:true,color:"red"}]});
       const preview=await editor.getScene(),warnings=[],saved=await editor.savePdf({onWarning:warning=>warnings.push(warning)}),reopened=await compile(new Uint8Array(await saved.arrayBuffer()));
-      assert(warnings.some(warning=>/rebuilt as vectors/.test(warning)));assert(reopened.annotations.some(annotation=>annotation.subtype==="FreeText"));
+      assert(!warnings.some(warning=>/rebuilt as vectors/.test(warning)),"an independently transformable source path preserves page operations");assert(reopened.annotations.some(annotation=>annotation.subtype==="FreeText"));
       assert(reopened.textIndex.pages[0].text.includes("Ω"));assert.equal(reopened.rasterLayers.length,0);
       validateVectorDrawRuns(preview);validateScenePaintGraph(preview);validateVectorDrawRuns(reopened);validateScenePaintGraph(reopened);
       // A copied original source object is a visible new object in native PDF saves.

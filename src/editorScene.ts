@@ -68,18 +68,90 @@ export function editorTransformBounds(bounds: Bounds, m: ArrayLike<number>): Bou
 }
 export function editorRefKey(ref: PrimitiveRef): string { return `${ref.kind}:${ref.index}`; }
 export function editorMatrixIsIdentity(m: ArrayLike<number>): boolean { return EDITOR_IDENTITY.every((value, i) => value === m[i]); }
+
+interface EditorClipOwnership {
+  paths: Map<number, Set<string>>;
+  children: Map<number, number[]>;
+  rectangles: Map<string, { paths: number[]; refs: Set<string> }>;
+  pathRectangles: Map<number, string>;
+  fixedRectangles: Set<string>;
+}
+const clipOwnership = new WeakMap<VectorScene, EditorClipOwnership>();
+const clipRectangleKey = (rect: Bounds): string => `${rect.minX},${rect.minY},${rect.maxX},${rect.maxY}`;
+/** Editor-only, shared across gestures; HEP contains no ownership sidecar. */
+function getEditorClipOwnership(source: VectorScene, runs: readonly VectorDrawRun[]): EditorClipOwnership {
+  const cached = clipOwnership.get(source); if (cached) return cached;
+  const result: EditorClipOwnership = { paths: new Map(), children: new Map(), rectangles: new Map(), pathRectangles: new Map(), fixedRectangles: new Set() };
+  for (let page = 0; page < source.pageCount; page++) {
+    const i = page * 4; result.fixedRectangles.add(clipRectangleKey({ minX: source.pageRects[i], minY: source.pageRects[i + 1], maxX: source.pageRects[i + 2], maxY: source.pageRects[i + 3] }));
+  }
+  const rectangle = (key: string) => { let value = result.rectangles.get(key); if (!value) result.rectangles.set(key, value = { paths: [], refs: new Set() }); return value; };
+  for (let index = 0; index < (source.clipPaths?.length ?? 0); index++) {
+    const clip = source.clipPaths![index], children = result.children.get(clip.parent) ?? []; children.push(index); result.children.set(clip.parent, children);
+    if (clip.edges.length !== 16) continue;
+    const xs = [], ys = []; let aligned = true;
+    for (let i = 0; i < clip.edges.length; i += 4) { const [x, y, endX, endY] = clip.edges.subarray(i, i + 4); xs.push(x, endX); ys.push(y, endY); aligned &&= x === endX || y === endY; }
+    const minX = Math.min(...xs), minY = Math.min(...ys), maxX = Math.max(...xs), maxY = Math.max(...ys);
+    if (!aligned || xs.some(x => x !== minX && x !== maxX) || ys.some(y => y !== minY && y !== maxY)) continue;
+    const key = clipRectangleKey({ minX, minY, maxX, maxY }); result.pathRectangles.set(index, key); rectangle(key).paths.push(index);
+  }
+  const seen = new Set<string>();
+  for (const run of runs) for (let index = run.first; index < run.first + run.count; index++) {
+    const ref = { kind: run.kind, index }, key = editorRefKey(ref); if (seen.has(key)) continue; seen.add(key);
+    const clip = getPrimitiveClipChain(source, ref);
+    if (clip.clipIndex >= 0) { let users = result.paths.get(clip.clipIndex); if (!users) result.paths.set(clip.clipIndex, users = new Set()); users.add(key); }
+    if (clip.rect) rectangle(clipRectangleKey(clip.rect)).refs.add(key);
+    if (ref.kind === "gradient-stroke") for (let segment = 0; segment < source.gradientStrokeRunMetaA[index * 4 + 1]; segment++) {
+      const rect = getPrimitiveSegmentClipBounds(source, ref, segment); if (rect) rectangle(clipRectangleKey(rect)).refs.add(key);
+    }
+  }
+  clipOwnership.set(source, result); return result;
+}
+function createEditorClipTransformPolicy(source: VectorScene, accepts: (ref: string) => boolean): { path(index: number): boolean; rectangle(rect: Bounds): boolean } {
+  const ownership = getEditorClipOwnership(source, source.drawRuns ?? defaultVectorDrawRuns(source));
+  const paths = new Map<number, boolean>(), rectangles = new Map<string, boolean>();
+  const ownsRefs = (refs?: ReadonlySet<string>): boolean => { for (const key of refs ?? []) if (!accepts(key)) return false; return true; };
+  const subtree = (index: number): boolean => {
+    const cached = paths.get(index); if (cached !== undefined) return cached;
+    paths.set(index, false); // Invalid cycles preserve their original clip.
+    const result = ownsRefs(ownership.paths.get(index)) && (ownership.children.get(index) ?? []).every(subtree);
+    paths.set(index, result); return result;
+  };
+  const rectangle = (key: string): boolean => {
+    if (ownership.fixedRectangles.has(key)) return false;
+    const cached = rectangles.get(key); if (cached !== undefined) return cached;
+    const entry = ownership.rectangles.get(key), result = !entry || ownsRefs(entry.refs) && entry.paths.every(subtree);
+    rectangles.set(key, result); return result;
+  };
+  return { path(index) { const rect = ownership.pathRectangles.get(index); return rect ? rectangle(rect) : subtree(index); },
+    rectangle(rect) { return rectangle(clipRectangleKey(rect)); } };
+}
+/** Shared by the general compiler and once-per-gesture translation preparation. */
+export function editorSelectionClipOwnership(source: VectorScene, refs: readonly PrimitiveRef[]): (index: number) => boolean {
+  const selected = new Set(refs.map(editorRefKey)), policy = createEditorClipTransformPolicy(source, key => selected.has(key));
+  return index => policy.path(index);
+}
+/** Save-time counterpart: deleted descendants do not constrain a surviving clip. */
+export function editorSourceClipTransformOwnership(source: VectorScene, edits: readonly EditorSourceEdit[], matrix: EditorMatrix) {
+  const pending = new Map(edits.map(edit => [editorRefKey(edit.ref), edit]));
+  return createEditorClipTransformPolicy(source, key => {
+    const edit = pending.get(key); return edit?.deleted === true || !!edit && matrix.every((value, index) => value === edit.transform[index]);
+  });
+}
 export function editorUnionBounds(a: Bounds | null, b: Bounds): Bounds {
   return a ? { minX: Math.min(a.minX, b.minX), minY: Math.min(a.minY, b.minY), maxX: Math.max(a.maxX, b.maxX), maxY: Math.max(a.maxY, b.maxY) } : { ...b };
 }
 
 /** Blank widgets and metadata-only annotations have no primitive ranges to edit. */
 export function bakeEditorAnnotationEdits(scene: VectorScene, edits: readonly EditorAnnotationEdit[]): VectorScene {
-  const pending = new Map(edits.filter(edit => edit.deleted || !editorMatrixIsIdentity(edit.transform)).map(edit => [edit.id, edit]));
+  const pending = new Map(edits.filter(edit => edit.deleted || !editorMatrixIsIdentity(edit.transform) || edit.contents !== undefined || edit.author !== undefined).map(edit => [edit.id, edit]));
   if (!pending.size || !scene.annotations) return scene;
   const transforms = new Map(annotationTransforms.get(scene));
   const sources = new Map(annotationSources.get(scene));
   const annotations = scene.annotations.flatMap(annotation => {
     const edit = pending.get(annotation.id); if (!edit) return [annotation]; if (edit.deleted) { transforms.delete(annotation.id); sources.delete(annotation.id); return []; }
+    const metadata = { ...(edit.contents === undefined ? {} : { contents: edit.contents }), ...(edit.author === undefined ? {} : { author: edit.author }) };
+    if (editorMatrixIsIdentity(edit.transform)) return [{ ...annotation, ...metadata }];
     const matrix = editorMatrix(edit.transform), bounds = annotation.bounds;
     const geometry = transformAnnotationGeometry({ rect: [bounds.minX, bounds.minY, bounds.maxX, bounds.maxY], quadPoints: annotation.quadPoints,
       line: annotation.line, vertices: annotation.vertices, inkList: annotation.inkList }, matrix as PdfMatrix);
@@ -89,7 +161,7 @@ export function bakeEditorAnnotationEdits(scene: VectorScene, edits: readonly Ed
     const original = annotation.pdfGeometry, box = editorTransformBounds({ minX: original.rect[0], minY: original.rect[1], maxX: original.rect[2], maxY: original.rect[3] }, pdfMatrix);
     if (!sources.has(annotation.id)) sources.set(annotation.id, { annotation, transform: EDITOR_IDENTITY });
     transforms.set(annotation.id, multiplyEditorMatrices(matrix, transforms.get(annotation.id) ?? EDITOR_IDENTITY));
-    return [{ ...annotation, ...geometry, pdfGeometry: { rect: [box.minX, box.minY, box.maxX, box.maxY] as const,
+    return [{ ...annotation, ...metadata, ...geometry, pdfGeometry: { rect: [box.minX, box.minY, box.maxX, box.maxY] as const,
       ...(original.quadPoints ? { quadPoints: transformAnnotationPoints(original.quadPoints, pdfMatrix as PdfMatrix) } : {}),
       ...(original.line ? { line: transformAnnotationPoints(original.line, pdfMatrix as PdfMatrix) } : {}),
       ...(original.vertices ? { vertices: transformAnnotationPoints(original.vertices, pdfMatrix as PdfMatrix) } : {}),
@@ -101,7 +173,7 @@ export function bakeEditorAnnotationEdits(scene: VectorScene, edits: readonly Ed
 
 /** Copy only arrays written by the edit; the caller's canonical scene stays immutable. */
 export function bakeEditorSourceScene(source: VectorScene, edits: readonly EditorSourceEdit[], signal?: AbortSignal,
-  onDiagnostic?: (diagnostic: PdfDiagnostic) => void): VectorScene {
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void, wholeScene = false): VectorScene {
   edits = edits.filter(edit => edit.deleted || !editorMatrixIsIdentity(edit.transform));
   if (!edits.length) return source;
   const scene: VectorScene = { ...source, rasterLayers: source.rasterLayers.slice(), clipPaths: source.clipPaths?.slice(),
@@ -124,16 +196,27 @@ export function bakeEditorSourceScene(source: VectorScene, edits: readonly Edito
   const removed = new Set(edits.filter(edit => edit.deleted).map(edit => editorRefKey(edit.ref)));
   const replacements = new Map<string, PrimitiveRef[]>(), changedClips = new Map<string, number>(), changedGradients = new Map<string, number>();
   const originalRuns = source.drawRuns ?? defaultVectorDrawRuns(source);
+  const clipPolicies = new Map<string, ReturnType<typeof createEditorClipTransformPolicy>>();
+  const clipPolicy = (matrix: EditorMatrix) => {
+    const key = matrix.join(","); let policy = clipPolicies.get(key);
+    if (!policy) { policy = createEditorClipTransformPolicy(source, key => {
+      const edit = pending.get(key); return edit?.deleted === true || !!edit && matrix.every((value, index) => value === edit.transform[index]);
+    }); clipPolicies.set(key, policy); }
+    return policy;
+  };
   let outlinedApproximation = false;
   const transformedClip = (index: number, matrix: EditorMatrix): number => {
     if (index < 0) return -1;
     const key = `${index}/${matrix.join(",")}`;
     if (changedClips.has(key)) return changedClips.get(key)!;
-    const clip = source.clipPaths![index], parent = transformedClip(clip.parent, matrix), edges = clip.edges.slice();
-    for (let i = 0; i < edges.length; i += 2) edges.set(editorPoint(matrix, edges[i], edges[i + 1]), i);
+    const clip = source.clipPaths![index], parent = transformedClip(clip.parent, matrix), owned = wholeScene || clipPolicy(matrix).path(index);
+    if (!owned && parent === clip.parent) { changedClips.set(key, index); return index; }
+    const edges = clip.edges.slice();
+    if (owned) for (let i = 0; i < edges.length; i += 2) edges.set(editorPoint(matrix, edges[i], edges[i + 1]), i);
     const result = (scene.clipPaths ??= []).push({ parent, fillRule: clip.fillRule, edges }) - 1; changedClips.set(key, result); return result;
   };
   const rectClip = (rect: Bounds, matrix: EditorMatrix, parent: number): number => {
+    if (!wholeScene && !clipPolicy(matrix).rectangle(rect)) matrix = EDITOR_IDENTITY;
     const corners = [[rect.minX, rect.minY], [rect.maxX, rect.minY], [rect.maxX, rect.maxY], [rect.minX, rect.maxY]]
       .map(([x, y]) => editorPoint(matrix, x, y));
     const edges = new Float32Array(16);
@@ -303,7 +386,7 @@ export function bakeEditorSourceScene(source: VectorScene, edits: readonly Edito
     if (node.kind === "draw") return (runMap.get(node.runIndex) ?? []).map(runIndex => ({ ...node, runIndex }));
     if (node.kind === "retained") return removed.has(`raster:${node.rasterIndex}`) ? [] : [{ ...node }];
     const children = updateNodes(node.children); if (!children.length) return [];
-    return [{ ...node, bounds: undefined, children, ...(node.softMask ? { softMask: { ...node.softMask, children: updateNodes(node.softMask.children) } } : {}) }];
+    return [{ ...node, bounds: wholeScene ? node.bounds : undefined, children, ...(node.softMask ? { softMask: { ...node.softMask, children: updateNodes(node.softMask.children) } } : {}) }];
   });
   scene.drawRuns = runs;
   if (scene.paintGraph) scene.paintGraph = { roots: updateNodes(scene.paintGraph.roots) };
@@ -556,7 +639,18 @@ export function transformWholeEditorScene(scene: VectorScene, matrix: EditorMatr
   if (editorMatrixIsIdentity(matrix)) return scene;
   const counts = scenePrimitiveCounts(scene), edits: EditorSourceEdit[] = [];
   for (const kind of PAGE_PRIMITIVE_KINDS) for (let index = 0; index < counts[kind]; index++) edits.push({ ref: { kind, index }, transform: matrix, deleted: false });
-  return bakeEditorSourceScene(scene, edits, signal, onDiagnostic);
+  const transformed = bakeEditorSourceScene(scene, edits, signal, onDiagnostic, true);
+  if (!transformed.paintGraph) return transformed;
+  // Whole-page placement also moves transparency surfaces and mask bounds.
+  // Keeping their former bounds can crop away correctly transformed paint.
+  const nodes = (values: readonly ScenePaintNode[]): ScenePaintNode[] => values.map(node => {
+    signal?.throwIfAborted();
+    return node.kind !== "group" ? node : { ...node, children: nodes(node.children),
+      ...(node.bounds ? { bounds: editorTransformBounds(node.bounds, matrix) } : {}),
+      ...(node.softMask ? { softMask: { ...node.softMask, children: nodes(node.softMask.children) } } : {}) };
+  });
+  const result = { ...transformed, paintGraph: { roots: nodes(transformed.paintGraph.roots) } };
+  retainEditorAnnotationPlacements(transformed, result); return result;
 }
 
 export function splitEditorPages(scene: VectorScene): VectorScene[] {

@@ -8,6 +8,14 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Added
 
+- Add per-page alignment, equal-gap distribution and cached movement snapping
+  guides, with Alt/Option bypass and one-step Undo. Add glyph-bound highlights,
+  underlines, strikeouts and comments with standard PDF annotations and explicit
+  appearances, plus separate object/group editing locks and reusable host APIs.
+- Add local IndexedDB recovery for committed authoring state and pending text,
+  form and comment drafts. Offer Restore/Discard/Later without overwriting older
+  drafts; encrypt protected-source drafts without storing passwords. Keep
+  recovery separate from PDF/HEP persistence, history and the clipboard.
 - Add independent fill opacity for editor shapes, ink and signatures, with
   linked sliders and numeric inputs for color/fill opacity in 0.1 steps from
   0 to 1. Preserve separate paint alpha in PDF/HEP output and retain the fill
@@ -62,8 +70,10 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 - Expose reusable editor sessions, shared interaction controls, font/form
   services and a vector-first scene-to-PDF writer with cancellation and progress
   reporting. PDF saves preserve source forms, annotations and supported
-  encryption; transformed page content may be rebuilt as vectors with a
-  diagnostic about changed authoring structure.
+  encryption. Prepare source-operation provenance only on demand for saving;
+  rewrite affected paths, text glyphs, images and individual shared Form
+  invocations while retaining unrelated operations and resources. Diagnose
+  bounded vector fallback for operations that cannot be rewritten independently.
 - Bake edits into ordinary HEP rendering data without embedding the original
   PDF, source font files or editor history. HEP-only documents can be transformed
   and rebuilt as PDFs with searchable outline text and layers; original
@@ -73,8 +83,10 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   protection rewrites the final object graph without retaining old revisions.
   Editable and flattened PDF copies support the same settings; HEP remains
   unencrypted and passwords are kept in memory only.
-- Add undoable page management: rotate pages in 90-degree increments, remove
-  pages, and insert or merge PDFs with independent input passwords. Expose
+- Add undoable page management: rotate pages in 90-degree increments, remove,
+  reorder, duplicate, extract and crop pages, and insert or merge PDFs with
+  independent input passwords. Support mouse/touch/pen page reordering and
+  keyboard alternatives; cropping retains hidden content. Expose
   matching editor methods and native `manipulatePdfPages` APIs; preserve page
   resources, editable fields/annotations and destination protection, and
   namespace colliding imported fields. Retain authored object models through
@@ -82,6 +94,13 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Changed
 
+- Pan the camera with the held middle mouse button in any editing tool across
+  native/Three.js Reader and Grid layouts. Restore the complete object context
+  menu, including Duplicate, Copy, Cut and Paste alongside drawing order.
+- Show mixed/contextual appearance properties and apply supported group changes
+  to descendants. Keep drawing defaults independent of the selected objects.
+  Report browser downloads separately from confirmed file writes, retaining
+  local edits and recovery when a browser save or print dialog may be cancelled.
 - Dock Settings to the right of the document in the native, Three.js and room
   detection demos, reserving canvas space instead of covering it. Closing
   Settings restores document width; editing tools stay within the canvas column.
@@ -110,6 +129,16 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
+- Keep shared ancestor clips fixed when transforming only some of their content,
+  while moving clips owned by the transformed objects. Use the same ownership
+  rules for cached drag previews and compiled output.
+- Restore hidden and partially cropped artwork when resetting page crops after
+  restacking, without doubling translucent paint. Move page-owned clips and
+  transparency/mask bounds together during whole-page placement.
+- Render explicit device-RGB transparency groups in Canvas2D, including saved
+  highlight appearances, while retaining checks for other managed blend spaces.
+- Keep export preparation and serialization isolated from editing commands;
+  retain drafts on cancellation and reject stale picks after camera changes.
 - Open saved PDFs whose layer identifiers collide with internal form/annotation
   visibility controls. Allocate distinct controls without changing PDF layers,
   and keep field visibility independent in document rendering and thumbnails.

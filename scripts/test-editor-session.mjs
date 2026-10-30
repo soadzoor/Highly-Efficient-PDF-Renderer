@@ -102,9 +102,10 @@ try {
   clipped.clipPaths = [{ parent: -1, fillRule: 0, edges: Float32Array.of(0,0,80,0, 80,0,80,80, 80,80,0,80, 0,80,0,0) }];
   clipped.drawRuns = [{ kind: "stroke", first: 0, count: 2, clipIndex: 0 }];
   const rotated = bakeEditorSourceScene(clipped, [{ ref: { kind: "stroke", index: 0 }, transform: [0, 1, -1, 0, 100, 0], deleted: false }]);
-  assert.equal(rotated.drawRuns.length, 2); assert.notEqual(rotated.drawRuns[0].clipIndex, rotated.drawRuns[1].clipIndex);
-  assert.deepEqual([...rotated.clipPaths[rotated.drawRuns[1].clipIndex].edges], [...clipped.clipPaths[0].edges]);
-  assert.deepEqual([...rotated.clipPaths[rotated.drawRuns[0].clipIndex].edges.subarray(0, 4)], [100,0,100,80]);
+  assert.equal(rotated.drawRuns.length, 1, "a shared ancestor clip remains fixed when only one child transforms");
+  assert.deepEqual([...rotated.clipPaths[rotated.drawRuns[0].clipIndex].edges], [...clipped.clipPaths[0].edges]);
+  const allRotated = bakeEditorSourceScene(clipped, [0,1].map(index => ({ ref: { kind: "stroke", index }, transform: [0, 1, -1, 0, 100, 0], deleted: false })));
+  assert.deepEqual([...allRotated.clipPaths[allRotated.drawRuns[0].clipIndex].edges.subarray(0, 4)], [100,0,100,80], "the owned subtree clip follows a complete shared transform");
 
   // Shared glyph geometry remains shared while only the selected instance moves.
   const textScene = structuredClone(scene);

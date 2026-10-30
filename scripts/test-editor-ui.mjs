@@ -1,5 +1,6 @@
+import { editorUiTestContext } from "./lib/editorUiTestContext.mjs";
 import assert from "node:assert/strict";
-import { registerHooks } from "node:module";
+import { registerHooks, stripTypeScriptTypes } from "node:module";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 import { sourceFunction } from "./lib/sourceFunction.mjs";
@@ -25,6 +26,9 @@ class Element extends EventTarget {
   querySelectorAll(selector) { return this.children.flatMap(child => [...(child.tagName === selector.toUpperCase() ? [child] : []), ...child.querySelectorAll(selector)]); }
   click() { if (!this.disabled) this.dispatchEvent(new Event("click")); }
 }
+const uiContext = values => editorUiTestContext({
+  cameraPan: { cancel() {}, isPanning: () => false, setActive() {}, dispose() {} }, updateAppearanceControls() {}, ...values
+});
 const text = value => ({ nodeType: 3, textContent: value });
 const document = { createElement: tag => new Element(tag) };
 const annotation = (type, extra = {}) => ({ id: "widget:1", subtype: "Widget", visibleInDefaultView: true,
@@ -283,7 +287,7 @@ try {
   const { editorIconButton } = await import("../src/editorToolbarIcons.ts");
   const toolbarTemplate = uiSource.match(/toolbar\.innerHTML = (`[\s\S]*?`);/)?.[1];
   assert(toolbarTemplate, "the editor exposes its actual toolbar markup");
-  const toolbarMarkup = vm.runInNewContext(toolbarTemplate, { editorIconButton });
+  const toolbarMarkup = vm.runInNewContext(stripTypeScriptTypes(`(${toolbarTemplate})`), { editorIconButton });
   for (const action of ["pages", "pdf-password", "save-pdf", "flatten", "save-hep", "print", "apply-text", "cancel-text", "cancel-operation"]) {
     const button = toolbarMarkup.match(new RegExp(`<button\\b(?=[^>]*data-action="${action}")[^>]*>[\\s\\S]*?<\\/button>`))?.[0];
     assert(button, `${action}: the action selector remains available`);
@@ -295,7 +299,7 @@ try {
     assert.equal(/\shidden(?:\s|>)/.test(opening), ["apply-text", "cancel-text", "cancel-operation"].includes(action), `${action}: contextual actions preserve their initial visibility`);
   }
   const sourceLifecycle = [], changedScene = { id: "new-source" }, changedPdf = Uint8Array.of(9);
-  const sourceHost = vm.createContext({ currentSourceScene: { id: "old-source" }, latestScene: null, pendingFieldFocus: { id: "old-field" }, picker: { dispose: () => sourceLifecycle.push("dispose picker") },
+  const sourceHost = uiContext({ currentSourceScene: { id: "old-source" }, latestScene: null, pendingFieldFocus: { id: "old-field" }, picker: { dispose: () => sourceLifecycle.push("dispose picker") },
     picking: { abort: () => sourceLifecycle.push("cancel pick") }, session: { sourceScene: changedScene, sourcePdf: changedPdf },
     host: { documentChanged: async (scene, value) => { assert.equal(scene, changedScene); assert.equal(value.pdf, changedPdf); sourceLifecycle.push("document changed"); } },
     source: { password: "primary password", label: "primary.pdf" }, tool: "form", renderFields: () => sourceLifecycle.push("fields"), pagesDialog: { refresh: () => sourceLifecycle.push("pages") } });
@@ -305,7 +309,7 @@ try {
   assert.equal(sourceHost.latestScene, changedScene); assert.equal(sourceHost.picker, null, "structural source swaps invalidate the old primitive picker exactly once");
   assert.equal(sourceHost.pendingFieldFocus, null, "structural source swaps cancel pending focus on old widgets");
   const structuralEvents = [], structuralWarnings = [], structuralStatuses = []; let finishPageChange;
-  const structuralHost = vm.createContext({ running: false, structuralRunning: false, fieldDrafts: new Map(), hasPendingEditorFields: () => false,
+  const structuralHost = uiContext({ running: false, structuralRunning: false, fieldDrafts: new Map(), hasPendingEditorFields: () => false,
     flushEditorFieldDrafts: () => structuralEvents.push("fields"), activeText: {}, finishText: async () => structuralEvents.push("text"),
     toolbar: { inert: false }, overlay: { inert: false, dataset: {}, style: {} }, host: {}, isSceneSettling: () => false, pointer: {}, polygon: {}, textRequest: 0, picking: { abort: () => structuralEvents.push("cancel pick") }, pendingPick: { canceled: false },
     clearPreview: () => structuralEvents.push("cancel gesture"), operation: null, lifetime: new AbortController(), AbortController, AbortSignal, LoadProgressReporter,
@@ -363,7 +367,7 @@ try {
   const focusedField = new Element("input"); focusedField.value = "initial"; focusedField.selectionStart = 2; focusedField.selectionEnd = 4;
   const focusedDocument = { activeElement: focusedField }; let finishCompile;
   const compilePending = new Promise(resolve => { finishCompile = resolve; });
-  const refreshHost = vm.createContext({ renderRevision: 0, operation: null, AbortController, disposed: false, tool: "form", latestScene: { id: "before" },
+  const refreshHost = uiContext({ renderRevision: 0, operation: null, AbortController, disposed: false, tool: "form", latestScene: { id: "before" },
     pendingDrawings: { capture() {}, acknowledge() {} },
     scenePreparation: null, sceneApplication: null, lifetime: new AbortController(), AbortSignal, active: false, requestedPreview: null, presented: null, updatePointerCursor() {},
     synchronizeDocumentSource: async () => {}, updateFieldPaint() {},
@@ -376,14 +380,14 @@ try {
   let assignments = 0, focusedValue = focusedField.value;
   Object.defineProperty(focusedField, "value", { get: () => focusedValue, set: value => { assignments++; focusedValue = value; focusedField.selectionStart = 0; }, configurable: true });
   setEditorFieldControlValue(focusedField, annotation("Tx"), focusedValue); assert.equal(assignments, 0); assert.equal(focusedField.selectionStart, 2, "syncing an unchanged widget preserves its focused caret");
-  const historyEvents = [], historyHost = vm.createContext({ tool: "form", session: { undo: () => historyEvents.push("undo"), redo: () => historyEvents.push("redo") },
+  const historyEvents = [], historyHost = uiContext({ tool: "form", session: { undo: () => historyEvents.push("undo"), redo: () => historyEvents.push("redo") },
     commit: apply => apply(), renderFields: () => historyEvents.push("render") });
   vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), "changeHistory"), historyHost); historyHost.changeHistory(false); historyHost.changeHistory(true);
   assert.deepEqual(historyEvents, ["undo", "render", "redo", "render"], "explicit history actions refresh field values synchronously");
   const guardState = { dirty: false }, draftElement = { innerHTML: "Original", style: { textAlign: "left" } };
   let discardPrompts = 0, unloadPrompts = 0;
   const guardProtection = createEditorPdfProtectionState();
-  const guards = vm.createContext({ session: { getState: () => guardState }, hasPendingEditorTextChanges, hasPendingEditorFields, fieldDrafts, pdfProtection: guardProtection, passwordDialog: null, structuralRunning: false,
+  const guards = uiContext({ session: { getState: () => guardState }, hasPendingEditorTextChanges, hasPendingEditorFields, fieldDrafts, pdfProtection: guardProtection, passwordDialog: null, structuralRunning: false,
     activeText: { element: draftElement, opacity: 1, baseline: { html: "Original", align: "left", opacity: 1 } },
     window: { confirm() { discardPrompts++; return false; } } });
   for (const name of ["hasUnsavedChanges", "confirmDocumentChange", "beforeUnload"]) vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), name), guards);
@@ -409,7 +413,7 @@ try {
   guards.passwordDialog = { hasDraftChanges: () => true }; assert.equal(guards.hasUnsavedChanges(), true, "unapplied password dialog drafts guard tab closing");
   guards.passwordDialog = null;
   guards.structuralRunning = true; assert.equal(guards.hasUnsavedChanges(), true, "a pending structural operation guards document replacement"); guards.structuralRunning = false;
-  const savedFromFocus = [], keyHost = vm.createContext({ active: true, structuralRunning: false, running: false, clipboardRunning: false, layerDialog: null,
+  const savedFromFocus = [], keyHost = uiContext({ active: true, structuralRunning: false, running: false, clipboardRunning: false, layerDialog: null,
     inputTarget: () => true, save: kind => savedFromFocus.push(kind) });
   vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), "keydown"), keyHost);
   let preventedSave = 0;
@@ -428,7 +432,7 @@ try {
   let cancelledStructure = 0; keyHost.structuralRunning = true; keyHost.operation = { abort() { cancelledStructure++; } };
   keyHost.keydown({ key: "s", ctrlKey: true, preventDefault() {} }); keyHost.keydown({ key: "Escape", preventDefault() {} });
   assert.equal(cancelledStructure, 1); assert.deepEqual(savedFromFocus, ["pdf", "pdf"], "structural work blocks keyboard exports and allows cancellation");
-  const created = [], creationHost = vm.createContext({ objectOpacity: .375, fillOpacity: .6, tool: "rectangle", pendingPick: null, pointer: null,
+  const created = [], creationHost = uiContext({ objectOpacity: .375, fillOpacity: .6, tool: "rectangle", pendingPick: null, pointer: null,
     pendingDrawings: { add() {} },
     appendEditorInkSamples, editorInkCaptureTolerance, host: { clientToScenePoint: (x, y) => ({ x, y }), sceneToClientPoint: (x, y) => ({ x, y }) },
     Math, editorSignaturePlacement, clearPreview() {}, updatePointerCursor() {}, overlay: { releasePointerCapture() {} }, property: name => ({ value: name === "color" ? "#123456" : "2", checked: false }),
@@ -468,7 +472,7 @@ try {
   captureInk(creationHost.pointer);
   creationHost.pointerUp({ pointerId: 4, clientX: 9, clientY: 11, getCoalescedEvents: () => [] });
   assert.deepEqual(Array.from(created.at(-1).paths[0].at(-1)), [9, 11], "pencil release appends the actual final pen location");
-  const textCreationHost = vm.createContext({ disposed: false, textRequest: 0,
+  const textCreationHost = uiContext({ disposed: false, textRequest: 0,
     activeText: { element: { innerText: "Opacity", scrollHeight: 20 }, layerId: "draft-layer", pageIndex: 0, x: 5, y: 5, width: 100, height: 30, transform: [1, 0, 0, 1, 0, 0], opacity: .375 },
     selectedFont: async () => ({ id: "font", family: "Test" }), editorServices: { fonts: { list: () => [] } }, window: {},
     readRichTextRuns: () => [{ text: "Opacity", fontSize: 12 }], styleEnabled: () => false,
@@ -476,14 +480,14 @@ try {
     cancelText() {}, commit: apply => apply(), commitEditorText,
     session: { transaction(_label, apply) { apply(); }, addObject(object) { created.push(object); return "text-created"; }, select() {} }
   });
-  vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), "finishText"), textCreationHost);
+  for (const name of ["readTextDraft", "finishText"]) vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), name), textCreationHost);
   await textCreationHost.finishText(); assert.equal(created.at(-1).kind, "text"); assert.equal(created.at(-1).opacity, .375);
   assert.equal(created.at(-1).layerId, "draft-layer", "a new textbox keeps the active layer captured when typing began");
   const statuses = [], downloads = [], cancellationButton = { hidden: true };
   draftField.value = "Bob";
   const savedProtection = createEditorPdfProtectionState(); savedProtection.set({ mode: "remove" });
   const pdfSaveOptions = [];
-  const saveHost = vm.createContext({ activeText: null, running: false, structuralRunning: false, operation: null, AbortController, fieldDrafts, flushEditorFieldDrafts, hasPendingEditorFields, LoadProgressReporter,
+  const saveHost = uiContext({ activeText: null, running: false, structuralRunning: false, operation: null, AbortController, fieldDrafts, flushEditorFieldDrafts, hasPendingEditorFields, LoadProgressReporter,
     pdfProtection: savedProtection, passwordDialog: null, hasUnsavedChanges: () => savedProtection.hasChanges(),
     query: () => cancellationButton, setStatus: value => statuses.push(value), source: { label: "sample.pdf" },
     sourceFunction, finishText: async () => {}, host: {}, pointer: null, pendingPick: null, picking: null, overlay: { dataset: {}, style: {} }, isSceneSettling: () => false, clearPreview() {},
@@ -495,25 +499,25 @@ try {
   for (const name of ["updatePointerCursor", "cancelPointerGesture", "save"]) vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), name), saveHost);
   await saveHost.save("pdf");
   assert.deepEqual(downloads, ["sample-edited.pdf"]);
-  assert.equal(statuses.at(-1), "Preserved export warning", "successful download retains fidelity diagnostics");
+  assert.match(statuses.at(-1), /Preserved export warning/, "successful download retains fidelity diagnostics");
   assert.equal(cancellationButton.hidden, true, "export cancellation control returns to its idle state");
-  assert.deepEqual(pdfSaveOptions[0].protection, { mode: "remove" }); assert.equal(savedProtection.hasChanges(), false);
+  assert.deepEqual(pdfSaveOptions[0].protection, { mode: "remove" }); assert.equal(savedProtection.hasChanges(), true, "a browser download keeps local protection changes pending");
   savedProtection.set({ mode: "password", password: "test opening password" }); await saveHost.save("hep");
   assert.equal(savedProtection.hasChanges(), true, "HEP output does not clear pending PDF-only protection settings");
   await saveHost.save("flatten"); assert.equal(pdfSaveOptions.at(-1).flatten, true);
-  assert.equal(pdfSaveOptions.at(-1).protection.mode, "password"); assert.equal(savedProtection.hasChanges(), false);
+  assert.equal(pdfSaveOptions.at(-1).protection.mode, "password"); assert.equal(savedProtection.hasChanges(), true, "a browser download keeps local protection changes pending");
   let finishPasswordSave;
   saveHost.session.savePdf = async options => { pdfSaveOptions.push(options); return new Promise(resolve => { finishPasswordSave = () => resolve(new Blob(["PDF"])); }); };
   savedProtection.set({ mode: "remove" }); const pendingPasswordSave = saveHost.save("pdf");
   savedProtection.set({ mode: "password", password: "newer password" }); finishPasswordSave(); await pendingPasswordSave;
-  assert.equal(savedProtection.hasChanges(), true); assert.equal(statuses.at(-1), "Unsaved changes", "a successful older export keeps newer protection changes visible");
+  assert.equal(savedProtection.hasChanges(), true); assert.match(statuses.at(-1), /local edits.*kept/, "a successful older export keeps newer protection changes pending");
   const failedSaves = []; saveHost.report = error => failedSaves.push(error.message);
   saveHost.session.savePdf = async () => { throw new Error("Synthetic export failure"); }; await saveHost.save("pdf");
   assert.equal(savedProtection.hasChanges(), true); assert.deepEqual(failedSaves, ["Synthetic export failure"]);
   saveHost.passwordDialog = { apply: () => false }; const downloadsBeforeInvalidPassword = downloads.length;
   await saveHost.save("pdf"); assert.equal(downloads.length, downloadsBeforeInvalidPassword, "invalid dialog passwords prevent export");
   saveHost.passwordDialog = null;
-  const viewStatuses = [], viewStatus = { textContent: "" }, statusHost = vm.createContext({ active: false, status: viewStatus,
+  const viewStatuses = [], viewStatus = { textContent: "" }, statusHost = uiContext({ active: false, status: viewStatus,
     host: { onStatus: text => viewStatuses.push(text) } });
   vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), "setStatus"), statusHost);
   statusHost.setStatus("Preparing print…"); statusHost.setStatus("Print failed");
@@ -522,7 +526,7 @@ try {
   assert.equal(viewStatus.textContent, "Editing text"); assert.equal(viewStatuses.length, 2);
   let resolveFont, fontLoads = 0, installedFonts = 0;
   const fontLoad = new Promise(resolve => { resolveFont = resolve; });
-  const fontHost = vm.createContext({ fontFaces: new Map(), fontFaceLoads: new Map(), disposed: false, DOMException,
+  const fontHost = uiContext({ fontFaces: new Map(), fontFaceLoads: new Map(), disposed: false, DOMException,
     FontFace: class { load() { fontLoads++; return fontLoad; } }, document: { fonts: { add() { installedFonts++; } } } });
   vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), "activateFont"), fontHost);
   const typingFont = { id: "shared-field-font", bytes: Uint8Array.of(1, 2), fontWeight: 400, fontStyle: "normal" };
@@ -531,7 +535,7 @@ try {
   resolveFont(); await Promise.all(fieldFontLoads); assert.equal(installedFonts, 1);
   await fontHost.activateFont(typingFont); assert.equal(fontLoads, 1);
   const paintedControl = { tagName: "INPUT", type: "text", dataset: { fieldId: "new-appearance" }, value: "focused draft", selectionStart: 4 };
-  const paintHost = vm.createContext({ fieldPaintCache: null, updateEditorFieldControlAppearance,
+  const paintHost = uiContext({ fieldPaintCache: null, updateEditorFieldControlAppearance,
     latestScene: { annotations: [{ id: "new-appearance", hasAppearance: false, field: { value: "focused draft" } }] },
     fieldDrafts: new Map([[paintedControl, "draft"]]), getSceneAnnotationRuns: () => new Map() });
   vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), "updateFieldPaint"), paintHost);

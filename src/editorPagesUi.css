@@ -1,0 +1,13 @@
+.hepr-editor-pages-list .hepr-editor-page-row{position:relative;display:flex;align-items:center;gap:6px;min-height:32px;padding:3px;border:1px solid transparent;border-radius:3px}
+.hepr-editor-page-row:focus-visible{outline:2px solid #1765d7;outline-offset:-2px}
+.hepr-editor-page-row>span{min-width:0;overflow-wrap:anywhere}
+.hepr-editor-page-row[data-dragging=true]{opacity:.45}
+.hepr-editor-page-row[data-drop-position]::after{content:"";position:absolute;inset-inline:0;height:2px;background:#1765d7;pointer-events:none}
+.hepr-editor-page-row[data-drop-position=before]::after{top:-2px}.hepr-editor-page-row[data-drop-position=after]::after{bottom:-2px}
+.hepr-editor-pages-dialog .hepr-editor-page-grip{flex:none;margin:0;padding:3px;border:0;background:transparent;line-height:0;cursor:grab;touch-action:none}
+.hepr-editor-page-grip:active{cursor:grabbing}.hepr-editor-page-grip svg{width:18px;height:20px;pointer-events:none}
+.hepr-editor-page-crop{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;min-width:0;margin:12px 0;padding:10px;border:1px solid #b6c3d4;border-radius:5px}
+.hepr-editor-page-crop p{grid-column:1/-1;margin:0;font-size:12px;line-height:1.4}
+.hepr-editor-page-crop label{display:flex;align-items:center;flex-wrap:wrap;gap:4px;min-width:0}
+.hepr-editor-page-crop input{box-sizing:border-box;max-width:100%;min-width:0}
+@media(pointer:coarse){.hepr-editor-pages-list .hepr-editor-page-row{min-height:44px}.hepr-editor-pages-dialog .hepr-editor-page-grip{align-self:stretch;min-width:36px}}

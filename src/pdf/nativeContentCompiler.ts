@@ -131,6 +131,8 @@ export interface DensePdfTextOperatorSink {
 
 /** Static marked/optional-content state at one source operator. */
 export interface DensePdfTextOperatorContext {
+  /** Source tag used only by temporary editor-provenance compilations. @internal */
+  readonly editorSourceMcid?: number;
   /** Present only when gs selects a font dictionary and text-space size. */
   readonly font?: Readonly<DensePdfFontSelection>;
   /** Thumbnail-only, immutable-by-replacement graphics CTM before this operator. */
@@ -1308,6 +1310,8 @@ export interface DensePdfResourceScanOptions {
   readonly onInlineImage?: () => void;
   /** Internal text-only interpreter; operands use the native text sink representation. */
   readonly onOperator?: (operator: string, operands: readonly unknown[], markedContentProperty?: import("./nativeCos").PdfValue) => void;
+  /** Editor-only byte addresses; spans include operands/comments since the preceding operator. */
+  readonly onOperatorSource?: (operator: string, operands: readonly unknown[], start: number, end: number, operatorStart: number) => void;
 }
 
 /**
@@ -1336,7 +1340,7 @@ export function scanDensePdfPreparedResourceReferences(
   options: DensePdfResourceScanOptions = {}
 ): DensePdfResourceReferences {
   options.signal?.throwIfAborted();
-  const scanner = new DensePdfResourceReferenceScanner(options.onOperator);
+  const scanner = new DensePdfResourceReferenceScanner(options.onOperator, options.onOperatorSource);
   let tokenCount = 0;
   const lexer = new IncrementalPdfLexer((token) => {
     if ((tokenCount++ & 0xfff) === 0) options.signal?.throwIfAborted();
@@ -2278,6 +2282,7 @@ class DenseContentCompiler {
           outputEnabled: this.contentVisible,
           optionalContentIndex: this.activeOptionalContentIndex,
           markedContentIndex: this.activeMarkedContentIndex,
+          ...(this.options.capturePaintSourceIdentities === true ? { editorSourceMcid: this.markedContent[this.activeMarkedContentIndex]?.mcid ?? -1 } : {}),
           ...(this.options.thumbnail === true ? { graphicsTransform: this.state.matrix } : {})
         });
         if ((this.markedContentStack.length & 0x1fff) === 0) await checkpoint();
@@ -2615,6 +2620,7 @@ class DenseContentCompiler {
           outputEnabled: this.contentVisible,
           optionalContentIndex: this.activeOptionalContentIndex,
           markedContentIndex: this.activeMarkedContentIndex,
+          ...(this.options.capturePaintSourceIdentities === true ? { editorSourceMcid: this.markedContent[this.activeMarkedContentIndex]?.mcid ?? -1 } : {}),
           ...(this.options.thumbnail === true ? { graphicsTransform: this.state.matrix } : {})
         }
       );
@@ -5468,9 +5474,12 @@ class DenseContentCompiler {
 
 class DensePdfResourceReferenceScanner {
   private readonly onOperator?: DensePdfResourceScanOptions["onOperator"];
+  private readonly onOperatorSource?: DensePdfResourceScanOptions["onOperatorSource"];
+  private sourceStart = 0;
 
-  constructor(onOperator?: DensePdfResourceScanOptions["onOperator"]) {
+  constructor(onOperator?: DensePdfResourceScanOptions["onOperator"], onOperatorSource?: DensePdfResourceScanOptions["onOperatorSource"]) {
     this.onOperator = onOperator;
+    this.onOperatorSource = onOperatorSource;
   }
   readonly xObjects = new Set<string>();
 
@@ -5592,6 +5601,11 @@ class DensePdfResourceReferenceScanner {
     }
     this.onOperator?.(token.value, this.operands.map(toTextSinkOperand),
       token.value === "BDC" ? contentOperandToCos(this.operands[1]) : undefined);
+    if (this.onOperatorSource) {
+      const end = token.sourceOffset + token.sourceLength;
+      this.onOperatorSource(token.value, this.operands.map(toTextSinkOperand), this.sourceStart, end, token.sourceOffset);
+      this.sourceStart = end;
+    }
     this.operands.length = 0;
   }
 

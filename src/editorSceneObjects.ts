@@ -6,6 +6,7 @@ import type { EditorObject, EditorShapeObject } from "./editorTypes";
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import { editorInkBounds, fitEditorInkPaths, type EditorInkSegment } from "./editorInkGeometry";
 import { editorShapeGeometry, type EditorShapeGeometry } from "./editorShapeGeometry";
+import { editorReviewShapes } from "./editorReview";
 export { editorArrowHeadPoints } from "./editorShapeGeometry";
 
 type Point = readonly [number, number];
@@ -73,6 +74,14 @@ function inkFill(path: readonly EditorInkSegment[], color: EditorShapeObject["fi
 export async function compileEditorObjectGeometry(object: EditorObject, signal?: AbortSignal): Promise<VectorScene> {
   signal?.throwIfAborted();
   const opacity = object.opacity ?? 1;
+  if (object.kind === "shape" && object.review) {
+    const parts = await Promise.all(editorReviewShapes(object).map(shape => object.review!.type === "highlight"
+      ? polygon(shape.points!, shape.fill, shape.fillOpacity ?? .3) : compileEditorObjectGeometry(shape, signal)));
+    const first = parts.shift()!, result = page(composeEditorPage(first, parts), [first, ...parts].map(part => part.bounds).reduce((a, b) => editorUnionBounds(a, b)));
+    if (object.review.type === "highlight") result.paintGraph = { roots: [{ kind: "group", isolated: true, knockout: false, alpha: 1,
+      alphaIsShape: false, blendMode: "Multiply", bounds: result.bounds, children: (result.drawRuns ?? []).map((_, runIndex) => ({ kind: "draw" as const, runIndex })) }] };
+    return result;
+  }
   if (object.kind === "text") throw new Error("Adding text requires the editor's portable font compiler.");
   if (object.kind === "source" || object.kind === "group") throw new Error("Source and group objects are compiled by the editor session.");
   if (object.kind === "image") {

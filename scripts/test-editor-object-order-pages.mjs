@@ -18,7 +18,7 @@ try {
     { number: 1, body: "<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [6 0 R] /D << /Order [6 0 R] /ON [6 0 R] >> >> >>" },
     { number: 2, body: "<< /Type /Pages /Count 2 /Kids [3 0 R 7 0 R] >>" },
     { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Properties << /L 6 0 R >> >> /Contents 4 0 R >>" },
-    { number: 4, body: tinyPdfStream("", "/OC /L BDC 1 0 0 rg 10 10 45 45 re f EMC 0 0 1 rg 20 20 50 50 re f") },
+    { number: 4, body: tinyPdfStream("", "/OC /L BDC 1 0 0 rg 10 10 45 45 re f EMC 0 0 1 rg 20 20 50 50 re f 1 0 1 rg 1 1 6 6 re f") },
     { number: 6, body: "<< /Type /OCG /Name (Layer 1) >>" },
     { number: 7, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 8 0 R >>" },
     { number: 8, body: tinyPdfStream("", "") }
@@ -63,6 +63,25 @@ try {
       assert.deepEqual(await pixel(await editor.getScene(), 1, 30, 30), [255, 0, 0, 255], "insertion preserves private owner mapping and ordering on shifted pages");
       await editor.removePages([0]);
       assert.deepEqual(await pixel(await editor.getScene(), 0, 30, 30), [255, 0, 0, 255], "removal retains ordering and correct page transforms");
+      await editor.duplicatePages([0], { at: 0 });
+      assert.equal(editor.getObject(id).pageIndex, 1);
+      const copied = editor.getObjects().find(object => object.kind === "shape" && object.pageIndex === 0);
+      assert(copied && copied.id !== id, "ordered page copies keep an independent author model");
+      assert.deepEqual(await pixel(await editor.getScene(), 0, 30, 30), [255, 0, 0, 255]);
+      assert.deepEqual(await pixel(await editor.getScene(), 1, 30, 30), [255, 0, 0, 255], "copies preserve source/annotation interleaving on both pages");
+      editor.select([copied.id]); editor.reorderSelection("bring-to-front");
+      assert.deepEqual(await pixel(await editor.getScene(), 0, 30, 30), [0, 255, 0, 255]);
+      assert.deepEqual(await pixel(await editor.getScene(), 1, 30, 30), [255, 0, 0, 255], "copy stacking is independent from the original");
+      assert(editor.undo()); assert(editor.undo());
+      await editor.reorderPages([1, 0]);
+      assert.equal(editor.getObject(id).pageIndex, 1); assert.deepEqual(await pixel(await editor.getScene(), 1, 30, 30), [255, 0, 0, 255]); assert(editor.undo());
+      await editor.cropPages([0], { x: 20, y: 50, width: 40, height: 40 });
+      assert.deepEqual(await pixel(await editor.getScene(), 0, 30, 30), [255, 0, 0, 255]);
+      const clipped = editor.sourceScene, page = clipped.pageRects.subarray(0, 4);
+      assert(clipped.clipPaths.some(clip => clip.parent < 0 && clip.edges.every((value, index) => Math.abs(value - page[index % 2]) < .001 || Math.abs(value - page[index % 2 + 2]) < .001)), "retained canonical geometry has the new page clipping boundary");
+      await editor.cropPages([0], null);
+      assert.deepEqual(await pixel(await editor.getScene(), 0, 15, 15), [255, 0, 0, 255], "resetting a crop reveals retained geometry outside the former visible box");
+      assert.deepEqual(await pixel(await editor.getScene(), 0, 30, 30), [255, 0, 0, 255]);
       const hep = await loadSceneFromHep(await (await editor.saveHep()).arrayBuffer());
       assert.deepEqual(await pixel(hep, 0, 30, 30), [255, 0, 0, 255], "page changes bake order into normal HEP paint data");
       assert(!("objectOrder" in hep)); assert(!JSON.stringify(hep).includes("source:page:"), "operation-local owner labels are never persisted in HEP");
@@ -83,6 +102,16 @@ try {
     clones.selectPrimitives([{ kind: "fill", index: 0 }]); const [id] = clones.cloneSelection([40, 0]);
     clones.select([id]); clones.reorderSelection("send-to-back");
     assert.deepEqual(await pixel(await clones.getScene(), 0, 80, 30), [255, 0, 0, 255]);
+    await clones.duplicatePages([0], { at: 0 });
+    for (const page of [0, 1]) {
+      assert.deepEqual(await pixel(await clones.getScene(), page, 80, 30), [255, 0, 0, 255]);
+      const annotation = clones.sourceScene.annotations.find(annotation => annotation.name === id && annotation.pageIndex === page);
+      assert(annotation && getSceneAnnotationRuns(clones.sourceScene).get(annotation.id)?.length, "copied source units retain actual independent annotation ownership");
+    }
+    const copied = clones.sourceScene.annotations.find(annotation => annotation.name === id && annotation.pageIndex === 0);
+    clones.selectAnnotations([copied.id]); clones.reorderSelection("bring-to-front");
+    assert.deepEqual(await pixel(await clones.getScene(), 1, 80, 30), [255, 0, 0, 255], "source-copy stacking changes remain page-local");
+    assert(clones.undo()); assert(clones.undo());
     await clones.rotatePages([0], 90);
     const scene = await clones.getScene();
     assert.deepEqual(await pixel(scene, 0, 80, 30), [255, 0, 0, 255], "materialized source copies retain their canonical paint geometry");
@@ -92,5 +121,41 @@ try {
     clones.reorderSelection("bring-to-front");
     assert.deepEqual(await pixel(await clones.getScene(), 0, 60, 30), [255, 0, 0, 255]);
   } finally { clones.dispose(); }
+  // Resetting a PDF's initial CropBox must reveal its native hidden artwork,
+  // even when current stacking requires canonical source/annotation interleaving.
+  const { manipulatePdfPages } = await import("../src/editorPdfPages.ts");
+  const croppingSourceBytes = writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [6 0 R] /D << /Order [6 0 R] /ON [6 0 R] >> >> >>" },
+    { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+    { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Properties << /L 6 0 R >> /ExtGState << /Half 7 0 R >> >> /Contents 4 0 R >>" },
+    { number: 4, body: tinyPdfStream("", "/OC /L BDC 1 0 0 rg 10 10 45 45 re f EMC 0 0 1 rg 20 20 50 50 re f 1 0 1 rg 1 1 6 6 re f q /Half gs 0 1 1 rg 70 5 25 30 re f Q") },
+    { number: 6, body: "<< /Type /OCG /Name (Layer 1) >>" }, { number: 7, body: "<< /Type /ExtGState /ca 0.5 >>" }
+  ] });
+  const initiallyCroppedBytes = new Uint8Array(await (await manipulatePdfPages(croppingSourceBytes, { kind: "crop", pages: [0], box: { x: 20, y: 20, width: 60, height: 60 } })).arrayBuffer());
+  const initiallyCropped = await openEditorSession(await compile(initiallyCroppedBytes), { sourcePdf: initiallyCroppedBytes });
+  try {
+    const mark = initiallyCropped.addObject({ kind: "shape", shape: "rectangle", pageIndex: 0, x: 5, y: 5, width: 40, height: 40, fill: "#00ff00", strokeWidth: 0, layerId: "ref:6:0" });
+    initiallyCropped.select([mark]); initiallyCropped.reorderSelection("send-to-back");
+    const { rebaseEditorOrderedSource } = await import("../src/editorPageOrderRebase.ts");
+    const fullNative = new Uint8Array(await (await manipulatePdfPages(initiallyCroppedBytes, { kind: "crop", pages: [0], box: null })).arrayBuffer());
+    const rebased = rebaseEditorOrderedSource(initiallyCropped, await initiallyCropped.getScene({ preview: false, sourceCopiesOnly: true }), await compile(fullNative),
+      { kind: "crop", pages: [0], box: null }, "crop-test:", new AbortController().signal).scene;
+    assert.deepEqual(await pixel(rebased, 0, 5, 5), [255, 0, 255, 255]); assert.deepEqual(await pixel(rebased, 0, 15, 15), [255, 0, 0, 255]);
+    for (const [x, y] of [[75, 25], [85, 15]]) {
+      const rgba = await pixel(rebased, 0, x, y); assert(Math.abs(rgba[0] - 127) <= 1 && rgba[1] === 255 && rgba[2] === 255 && rgba[3] === 255, `canonical/exterior page composition must paint translucent source once at ${x},${y}: ${rgba}`);
+    }
+    await initiallyCropped.cropPages([0], null);
+    assert.deepEqual(await pixel(await compile(initiallyCropped.sourcePdf), 0, 5, 5), [255, 0, 255, 255], "native bytes retain paint wholly outside the original crop");
+    assert.deepEqual(await pixel(await compile(initiallyCropped.sourcePdf), 0, 15, 15), [255, 0, 0, 255], "native bytes reveal partially cropped paths after resetting the crop");
+    assert.deepEqual(await pixel(await initiallyCropped.getScene(), 0, 5, 5), [255, 0, 255, 255], "resetting an initial crop restores paint wholly outside its initial visible box");
+    assert.deepEqual(await pixel(await initiallyCropped.getScene(), 0, 15, 15), [255, 0, 0, 255], "resetting an initial crop restores partially cropped native paint after restacking");
+    for (const [x, y] of [[75, 25], [85, 15]]) {
+      const pixelValue = await pixel(await initiallyCropped.getScene(), 0, x, y);
+      assert(Math.abs(pixelValue[0] - 127) <= 1 && pixelValue[1] === 255 && pixelValue[2] === 255 && pixelValue[3] === 255,
+        `crop reset paints translucent source content once inside and outside the former box: ${pixelValue}`);
+    }
+    assert.equal((initiallyCropped.sourceScene.annotations ?? []).filter(annotation => annotation.name === mark).length, 1, "reveal composition does not duplicate authored annotation identities");
+    assert.deepEqual(await pixel(await initiallyCropped.getScene(), 0, 30, 30), [255, 0, 0, 255], "reset keeps existing interleaving in the former crop region");
+  } finally { initiallyCropped.dispose(); }
   console.log("Object order survives PDF/HEP source rotation, insertion/removal, undo/redo, author reseeding and source-copy materialization.");
 } finally { hooks.deregister(); }

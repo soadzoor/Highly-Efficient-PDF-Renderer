@@ -28,7 +28,7 @@ class Element extends Target {
   setAttribute(name, value) { this.attributes.set(name, value); }
   contains(node) { return node === this || this.childNodes.some(child => child.contains(node)); }
   closest(selector) {
-    return (selector === "[data-stack-action]" && this.dataset.stackAction || selector === "[data-clipboard-action]" && this.dataset.clipboardAction)
+    return (selector === "[data-stack-action]" && this.dataset.stackAction || selector === "[data-clipboard-action]" && this.dataset.clipboardAction || selector === "[data-custom-action]" && this.dataset.customAction)
       ? this : this.parent?.closest(selector) ?? null;
   }
   focus(options) { if (this.disabled) return; this.ownerDocument.activeElement = this; this.focusCount++; this.focusOptions = options; }
@@ -177,4 +177,48 @@ clipboardFailure = new Error("Clipboard failed"); clipboardWidget.show({ x: 30, 
 await new Promise(resolve => setImmediate(resolve)); assert.equal(errors.at(-1), "Clipboard failed"); clipboardFailure = null;
 clipboardWidget.show({ x: 30, y: 40 }); clipboardWidget.dispose();
 assert(!menu()); assert.equal(window.listenerCount, 0); assert.equal(document.activeElement, anchor);
+const objectCalls = [], objectEnabled = new Set(["duplicate", "copy", "cut", "paste"]);
+const objectWidget = createEditorContextMenu(document, {
+  canRun: action => enabled.has(action), run: action => calls.push(action),
+  objects: { canRun: action => objectEnabled.has(action), run: action => objectCalls.push(action) }
+});
+objectWidget.show({ x: 30, y: 40 }); panel = menu();
+assert.deepEqual(panel.childNodes.filter(node => node.attributes.get("role") === "menuitem").map(button => button.textContent),
+  ["Duplicate", "Copy", "Cut", "Paste", "Bring to front", "Bring forward", "Send backward", "Send to back"], "stock object actions are present independently of stacking eligibility");
+assert.equal(panel.childNodes[4].attributes.get("role"), "separator");
+assert.equal(document.activeElement.dataset.clipboardAction, "duplicate");
+const duplicate = panel.childNodes[0]; assert.equal(duplicate.attributes.get("aria-keyshortcuts"), "Control+D Meta+D");
+event(panel, "click", duplicate); assert.deepEqual(objectCalls, ["duplicate"]); assert(!menu());
+for (const action of ["copy", "cut", "paste"]) {
+  objectWidget.show({ x: 30, y: 40 }); const button = menu().childNodes.find(node => node.dataset.clipboardAction === action);
+  assert(button && !button.disabled); event(menu(), "click", button); assert.equal(objectCalls.at(-1), action);
+}
+objectWidget.dispose(); assert.equal(window.listenerCount, 0);
+const customEnabled = new Set(["lock", "edit-comment"]), customCalls = [];
+let customEligibilityError = false, customRunError = null;
+const customWidget = createEditorContextMenu(document, {
+  canRun: () => false, run: () => assert.fail("no enabled stacking commands"),
+  objects: { canRun: () => false, run: () => assert.fail("no enabled object commands") },
+  extra: ["lock", "unlock", "edit-comment"].map(action => ({ action, label: action,
+    canRun() { if (customEligibilityError) throw new Error("Custom eligibility failed"); return customEnabled.has(action); },
+    run() { assert(!menu(), "custom commands close before mutation"); customCalls.push(action); if (customRunError) return Promise.reject(customRunError); }
+  })), onError: error => errors.push(error.message)
+});
+const customButton = action => menu().childNodes.find(button => button.dataset.customAction === action);
+anchor.focus(); customWidget.show({ x: 20, y: 20 });
+assert.deepEqual(menu().childNodes.filter(node => node.attributes.get("role") === "menuitem").map(button => button.textContent),
+  ["Duplicate", "Copy", "Cut", "Paste", "lock", "unlock", "edit-comment", "Bring to front", "Bring forward", "Send backward", "Send to back"]);
+assert(customButton("unlock").disabled); assert.equal(document.activeElement.dataset.customAction, "lock");
+key("ArrowDown", true); assert.equal(document.activeElement.dataset.customAction, "edit-comment", "keyboard navigation includes custom commands and skips disabled ones");
+key("ArrowDown"); assert.equal(document.activeElement.dataset.customAction, "lock"); key("End"); assert.equal(document.activeElement.dataset.customAction, "edit-comment");
+const child = document.createElement("span"); customButton("edit-comment").append(child); event(menu(), "click", child);
+assert.deepEqual(customCalls, ["edit-comment"]); assert.equal(document.activeElement, anchor); assert.equal(window.listenerCount, 0);
+customWidget.show({ x: 20, y: 20 }); event(menu(), "click", customButton("unlock")); assert(menu()); assert.equal(customCalls.length, 1);
+customEnabled.delete("lock"); event(menu(), "click", customButton("lock")); assert(!menu()); assert.equal(customCalls.length, 1, "custom eligibility is revalidated at execution");
+customEnabled.add("unlock"); customWidget.show({ x: 20, y: 20 }); assert.equal(document.activeElement.dataset.customAction, "unlock");
+event(menu(), "click", customButton("unlock")); assert.equal(customCalls.at(-1), "unlock");
+customRunError = new Error("Custom action failed"); customWidget.show({ x: 20, y: 20 }); event(menu(), "click", customButton("edit-comment"));
+await new Promise(resolve => setImmediate(resolve)); assert.equal(errors.at(-1), "Custom action failed"); customRunError = null;
+customEligibilityError = true; customWidget.show({ x: 20, y: 20 }); assert(!menu()); assert.equal(errors.at(-1), "Custom eligibility failed"); customEligibilityError = false;
+customWidget.show({ x: 20, y: 20 }); customWidget.dispose(); assert(!menu()); assert.equal(window.listenerCount, 0);
 console.log("Editor context menu: clipboard and stacking commands, eligibility, keyboard/focus, viewport, dismissal and idle cleanup passed.");

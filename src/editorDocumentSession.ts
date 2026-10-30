@@ -4,7 +4,7 @@ import type { PdfPageOperation } from "./editorPdfPages";
 import type { NativeVectorPdfSession } from "./pdfSession";
 import { createLoadProgressReporter, type PDFLoadProgress } from "./loadProgress";
 import { invertEditorMatrix, multiplyEditorMatrices } from "./editorScene";
-import { editorOperationPageMap, rebaseEditorOrderedSource } from "./editorPageOrderRebase";
+import { editorOperationPageTargets, rebaseEditorOrderedSource, type EditorRebasedObjectIds } from "./editorPageOrderRebase";
 import { editorClipboardStore, shareEditorClipboard, getEditorCapturedSourceScene, registerEditorCapturedSourceReader } from "./editorClipboard";
 
 export interface EditorDocumentVersion { session: EditorSession; options: EditorSessionOptions }
@@ -97,6 +97,7 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
       // Inner save markers are private. Only the document facade owns the
       // user's saved identity, so this materialization never clears dirty.
       const materialized = new Uint8Array(await (await source.session.savePdf({ signal, flatten: false, protection: { mode: "preserve" }, onProgress: child(0, .35),
+        onDiagnostic,
         onWarning: message => onDiagnostic?.({ code: "editor.page-materialized", severity: "warning", message }) })).arrayBuffer());
       check();
       const { manipulatePdfPages } = await import("./editorPdfPages"); check();
@@ -149,6 +150,8 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
     get revision() { return revision; }, getState,
     getObjects: options => { assertLive(); return current.version.session.getObjects(options); },
     getObject: id => { assertLive(); return current.version.session.getObject(id); },
+    isObjectLocked: id => { assertLive(); return current.version.session.isObjectLocked(id); },
+    setObjectsLocked: (ids, locked) => { assertLive(); current.version.session.setObjectsLocked(ids, locked); },
     getObjectBounds: id => { assertLive(); return current.version.session.getObjectBounds(id); },
     getSelection: () => { assertLive(); return current.version.session.getSelection(); },
     getSelectionBounds: () => { assertLive(); return current.version.session.getSelectionBounds(); },
@@ -163,6 +166,7 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
     setPreviewTransform: matrix => { assertLive(); current.version.session.setPreviewTransform(matrix); },
     deleteSelection: () => { assertLive(); current.version.session.deleteSelection(); },
     cloneSelection: offset => { assertLive(); return current.version.session.cloneSelection(offset); },
+    duplicateSelection: options => { assertLive(); return current.version.session.duplicateSelection(options); },
     copySelection: options => { assertLive(); return current.version.session.copySelection(options); },
     cutSelection: options => { assertLive(); return current.version.session.cutSelection(options); },
     canPaste: () => { assertLive(); return current.version.session.canPaste(); },
@@ -173,6 +177,7 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
     getFieldValues: () => { assertLive(); return current.version.session.getFieldValues(); },
     getSourceEdits: () => { assertLive(); return current.version.session.getSourceEdits(); },
     getAnnotationEdits: () => { assertLive(); return current.version.session.getAnnotationEdits(); },
+    updateAnnotation: (id, patch) => { assertLive(); current.version.session.updateAnnotation(id, patch); },
     getLayers: () => { assertLive(); return current.version.session.getLayers(); },
     getLayerOrder: () => { assertLive(); return current.version.session.getLayerOrder(); },
     createLayer: options => { assertLive(); return current.version.session.createLayer(options); },
@@ -221,6 +226,42 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
       if (!Number.isSafeInteger(at) || at < 0 || at > session.sourceScene.pageCount) throw new RangeError("Page insertion position is out of range.");
       await perform({ kind: "insert", at, bytes: bytes.slice(), pages: options.pages ? [...options.pages] : undefined, password: options.password }, { ...options });
     },
+    async reorderPages(order, options = {}) {
+      assertLive(); options.signal?.throwIfAborted(); const pages = pageIndices(order), count = session.sourceScene.pageCount;
+      if (pages.length !== count) throw new RangeError("Page order must contain every current page once.");
+      if (pages.some((page, index) => page !== index)) await perform({ kind: "reorder", pages }, { ...options });
+    },
+    async duplicatePages(indices, options = {}) {
+      assertLive(); options.signal?.throwIfAborted(); const pages = pageIndices(indices), at = options.at ?? session.sourceScene.pageCount;
+      if (!Number.isSafeInteger(at) || at < 0 || at > session.sourceScene.pageCount) throw new RangeError("Page duplication position is out of range.");
+      if (pages.length) await perform({ kind: "duplicate", pages, at }, { ...options });
+    },
+    async cropPages(indices, box, options = {}) {
+      assertLive(); options.signal?.throwIfAborted(); const pages = pageIndices(indices);
+      if (pages.length) await perform({ kind: "crop", pages, box: box ? { ...box } : null }, { ...options });
+    },
+    async extractPages(indices, options = {}) {
+      assertLive(); if (busy) throw new Error("Another document operation is already running.");
+      const pages = pageIndices(indices); if (!pages.length) throw new RangeError("Select at least one page to extract.");
+      const point = current, startedRevision = revision, signal = options.signal ? AbortSignal.any([options.signal, lifetime.signal]) : lifetime.signal;
+      const progress = createLoadProgressReporter(options.onProgress);
+      const child = (start: number, end: number) => {
+        const reporter = progress.child(start, end);
+        return (value: PDFLoadProgress) => { if (!signal.aborted) reporter.report(value.value, { ...value, stage: value.stage === "complete" ? "compile" : value.stage }); };
+      };
+      signal.throwIfAborted();
+      progress.report(0, { stage: "compile", sourceType: point.version.session.sourcePdf ? "pdf" : "scene" });
+      const bytes = new Uint8Array(await (await point.version.session.savePdf({ signal, markSaved: false, onProgress: child(0, .65),
+        onDiagnostic: options.onDiagnostic, protection: { mode: "preserve" } })).arrayBuffer());
+      signal.throwIfAborted(); if (current !== point || revision !== startedRevision) throw new Error("The document changed while extracting pages. Try again.");
+      const mapping = point.version.session.sourceScene.pdfPages, mapped = pages.map(page => mapping?.find(item => item.pageIndex === page)?.sourcePageIndex ?? page);
+      const { manipulatePdfPages } = await import("./editorPdfPages");
+      const result = await manipulatePdfPages(bytes, { kind: "extract", pages: mapped }, { ...options, signal,
+        onProgress: child(.65, 1), password: point.version.options.password });
+      signal.throwIfAborted(); if (current !== point || revision !== startedRevision) throw new Error("The document changed while extracting pages. Try again.");
+      progress.complete({ sourceType: "pdf" });
+      return result;
+    },
     transaction: (label, operation) => { assertLive(); current.version.session.transaction(label, operation); },
     undo() {
       assertLive(); const action = undo.pop();
@@ -242,12 +283,38 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
     async savePdf(options = {}) {
       assertLive(); const point = current, startedRevision = revision;
       const result = await point.version.session.savePdf(options);
-      if (!disposed && current === point && revision === startedRevision) session.markSaved(); return result;
+      if (!disposed && current === point && revision === startedRevision && options.markSaved !== false) session.markSaved(); return result;
     },
     async saveHep(options = {}) {
       assertLive(); const point = current, startedRevision = revision;
       const result = await point.version.session.saveHep(options);
-      if (!disposed && current === point && revision === startedRevision) session.markSaved(); return result;
+      if (!disposed && current === point && revision === startedRevision && options.markSaved !== false) session.markSaved(); return result;
+    },
+    captureRecovery(options) { assertLive(); return current.version.session.captureRecovery(options); },
+    async restoreRecovery(snapshot, options = {}) {
+      assertLive(); if (busy) throw new Error("Another document operation is already running.");
+      if (snapshot?.format !== "hepr-editor-recovery" || snapshot.version !== 1) throw new TypeError("Unsupported editor recovery snapshot.");
+      const signal = options.signal ? AbortSignal.any([options.signal, lifetime.signal]) : lifetime.signal, before = current, startedRevision = revision;
+      signal.throwIfAborted(); busy = true; let opened: EditorDocumentVersion | undefined, release: (() => void) | undefined;
+      const check = () => { signal.throwIfAborted(); assertLive(); if (current !== before || revision !== startedRevision) throw new Error("The document changed while preparing recovery. Try again."); };
+      try {
+        if (snapshot.sourcePdf) {
+          // Normal opening/unlocking still happens before any stored decrypted
+          // scene or author models can replace the current document.
+          const { NativePdfDocument } = await import("./pdf/nativeDocument"); check();
+          const document = await NativePdfDocument.open({ kind: "bytes", bytes: snapshot.sourcePdf }, { password: before.version.options.password, signal });
+          await document.close(); check();
+        }
+        const sourceOptions = snapshot.sourcePdf && before.version.options.createSourceOptions
+          ? await before.version.options.createSourceOptions(snapshot.sourcePdf, before.version.options.password)
+          : { ...before.version.options, sourcePdf: snapshot.sourcePdf, prepareScene: undefined };
+        let released = false; release = () => { if (!released) { released = true; sourceOptions.disposeSource?.(); } };
+        check(); opened = await openSingle(structuredClone(snapshot.sourceScene), { ...sourceOptions, sourceLabel: snapshot.sourceLabel ?? sourceOptions.sourceLabel,
+          sourcePdf: snapshot.sourcePdf, signal, disposeSource: release }); check();
+        await opened.session.restoreRecovery(snapshot, { signal }); check();
+        const after = { version: retain(opened), identity: {} }; opened = undefined; release = undefined;
+        current = after; undo.push({ kind: "pages", before, after }); redo.length = 0; revision++; prune(); emit();
+      } finally { opened?.session.dispose(); release?.(); busy = false; }
     },
     dispose() {
       if (disposed) return; disposed = true; lifetime.abort(); listeners.clear(); undo.length = redo.length = 0;
@@ -262,21 +329,20 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
 
 /** Keep in-memory author tools while replacing their baked PDF appearances. */
 function reseedAuthoredObjects(previous: EditorSession, next: EditorSession, operation: PdfPageOperation,
-  restoreOrder?: (ids: ReadonlyMap<string, string>) => void): void {
+  restoreOrder?: (ids: EditorRebasedObjectIds) => void): void {
   const objects = previous.getObjects(), sourceScene = previous.sourceScene, targetScene = next.sourceScene;
-  const pageMap = editorOperationPageMap(sourceScene.pageCount, targetScene.pageCount, operation);
-  const pageIndex = (index: number) => pageMap[index];
+  const targets = editorOperationPageTargets(sourceScene.pageCount, targetScene.pageCount, operation);
   const oldMatrices = new Map(sourceScene.pdfPages?.map(page => [page.pageIndex, page.pdfToScene]));
   const newMatrices = new Map(targetScene.pdfPages?.map(page => [page.pageIndex, page.pdfToScene]));
   const localMatrix = (scene: VectorScene, index: number): EditorMatrix => {
     const matrix = (scene === sourceScene ? oldMatrices : newMatrices).get(index);
     return matrix ? multiplyEditorMatrices([1, 0, 0, 1, -scene.pageRects[index * 4], -scene.pageRects[index * 4 + 1]], matrix) : [1, 0, 0, 1, 0, 0];
   };
-  const deltas = new Map<number, EditorMatrix>();
+  const deltas = new Map<string, EditorMatrix>();
   const delta = (index: number, target: number): EditorMatrix => {
-    let matrix = deltas.get(index);
+    const key = `${index}:${target}`; let matrix = deltas.get(key);
     if (!matrix) { matrix = multiplyEditorMatrices(localMatrix(targetScene, target), invertEditorMatrix(previous.sourcePdf
-      ? localMatrix(sourceScene, index) : [1, 0, 0, 1, 0, 0])); deltas.set(index, matrix); }
+      ? localMatrix(sourceScene, index) : [1, 0, 0, 1, 0, 0])); deltas.set(key, matrix); }
     return matrix;
   };
   const annotations = new Map<string, NonNullable<VectorScene["annotations"]>[number][]>();
@@ -284,39 +350,45 @@ function reseedAuthoredObjects(previous: EditorSession, next: EditorSession, ope
     const key = `${annotation.pageIndex}:${annotation.name}`, entries = annotations.get(key) ?? [];
     entries.push(annotation); annotations.set(key, entries);
   }
-  const authored = objects.filter(object => object.kind !== "source" && object.kind !== "group" && pageIndex(object.pageIndex) !== null);
+  const authored = objects.filter(object => object.kind !== "source" && object.kind !== "group" && targets[object.pageIndex].length);
   const replaced = new Set<string>();
-  for (const object of authored) {
-    const matches = annotations.get(`${pageIndex(object.pageIndex)}:${object.id}`);
+  for (const object of authored) for (const target of targets[object.pageIndex]) {
+    const matches = annotations.get(`${target}:${object.id}`);
     if (!matches?.length) throw new Error(`The saved PDF did not retain the editable annotation for ${object.id}. Page changes were not applied.`);
     for (const annotation of matches) replaced.add(annotation.id);
   }
   const reserved = new Set((targetScene.annotations ?? []).filter(annotation => !replaced.has(annotation.id))
     .flatMap(annotation => annotation.name ? [annotation.id, annotation.name] : [annotation.id]));
-  const ids = new Map<string, string>();
+  const originalIds = new Set(objects.map(object => object.id)); let serial = 0;
+  const freshId = (): string => { let id: string; do { id = `editor-page:${++serial}`; } while (reserved.has(id) || originalIds.has(id)); return id; };
+  const pageCopies = new Map<number, Map<string, string>>(), ids = Object.assign(new Map<string, string>(), { pageCopies });
+  const targetIds = (page: number): Map<string, string> => { let map = pageCopies.get(page); if (!map) pageCopies.set(page, map = new Map()); return map; };
   const groups = new Map(objects.filter((object): object is EditorGroupObject => object.kind === "group").map(group => [group.id, group]));
   next.transaction("Retain author models", () => {
-    if (replaced.size) { next.selectAnnotations([...replaced]); next.deleteSelection(); }
-    for (const object of authored) {
-      const target = pageIndex(object.pageIndex)!;
-      const id = next.addObject({ ...object, id: reserved.has(object.id) ? undefined : object.id,
+    if (replaced.size) { next.selectAnnotations([...replaced]); next.setObjectsLocked(next.getSelection(), false); next.deleteSelection(); }
+    // Restore every original before its copies, so existing object IDs survive
+    // even when the copied pages were inserted before their original pages.
+    for (const copy of [false, true]) for (const object of authored) for (const target of targets[object.pageIndex]) {
+      if ((target !== targets[object.pageIndex][0]) !== copy) continue;
+      const id = next.addObject({ ...object, id: copy || reserved.has(object.id) ? freshId() : object.id,
         ...(object.layerCondition === undefined ? {} : { layerId: null, layerCondition: undefined }),
         pageIndex: target, transform: multiplyEditorMatrices(delta(object.pageIndex, target), object.transform) });
       if (object.layerCondition !== undefined) next.copyObjectLayerMembership(`annotation:${annotations.get(`${target}:${object.id}`)![0].id}`, id);
-      ids.set(object.id, id); reserved.add(id);
+      targetIds(target).set(object.id, id); if (!copy) ids.set(object.id, id); reserved.add(id);
     }
     const visiting = new Set<string>();
-    const restoreGroup = (id: string): boolean => {
-      if (ids.has(id)) return true;
-      const group = groups.get(id), target = group ? pageIndex(group.pageIndex) : null;
-      if (!group || target === null || visiting.has(id)) return false;
-      visiting.add(id); const children = group.children.every(child => ids.has(child) || restoreGroup(child)); visiting.delete(id);
+    const restoreGroup = (id: string, target: number): boolean => {
+      const mapped = targetIds(target); if (mapped.has(id)) return true;
+      const group = groups.get(id), key = `${target}:${id}`;
+      if (!group || !targets[group.pageIndex].includes(target) || visiting.has(key)) return false;
+      visiting.add(key); const children = group.children.every(child => mapped.has(child) || restoreGroup(child, target)); visiting.delete(key);
       if (!children) return false;
-      const restored = next.addObject({ ...group, id: reserved.has(id) ? undefined : id, pageIndex: target,
-        children: group.children.map(child => ids.get(child)!), transform: multiplyEditorMatrices(delta(group.pageIndex, target), group.transform) });
-      ids.set(id, restored); reserved.add(restored); return true;
+      const restored = next.addObject({ ...group, id: target !== targets[group.pageIndex][0] || reserved.has(id) ? freshId() : id, pageIndex: target,
+        children: group.children.map(child => mapped.get(child)!), transform: multiplyEditorMatrices(delta(group.pageIndex, target), group.transform) });
+      mapped.set(id, restored); if (target === targets[group.pageIndex][0]) ids.set(id, restored); reserved.add(restored); return true;
     };
-    for (const id of groups.keys()) restoreGroup(id);
+    for (const copy of [false, true]) for (const group of groups.values()) for (const target of targets[group.pageIndex])
+      if ((target !== targets[group.pageIndex][0]) === copy) restoreGroup(group.id, target);
     restoreOrder?.(ids);
     const active = previous.getActiveLayer(); if (active && next.getLayers().some(layer => layer.id === active)) next.setActiveLayer(active);
     next.select(previous.getSelection().flatMap(id => ids.has(id) ? [ids.get(id)!] : []));

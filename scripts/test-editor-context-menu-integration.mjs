@@ -1,13 +1,16 @@
+import { editorUiTestContext } from "./lib/editorUiTestContext.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 import { sourceFunction } from "./lib/sourceFunction.mjs";
 
 const source = await readFile(new URL("../src/editorUi.ts", import.meta.url), "utf8");
+assert.match(source, /objects:\s*\{\s*canRun:\s*canUseClipboard,\s*run:\s*runClipboard/, "stock editors always configure Duplicate/Copy/Cut/Paste alongside drawing order");
 function harness() {
   let selection = ["a", "b"], pickResult = "c", projection = 1;
   const shown = [], selected = [], calls = { picks: 0, closes: 0 };
-  const context = vm.createContext({ active: true, disposed: false, running: false, structuralRunning: false,
+  const context = editorUiTestContext({ active: true, disposed: false, running: false, structuralRunning: false,
+    cameraPan: { isPanning: () => false },
     inputTarget: () => false, canUseClipboard: () => false,
     activeText: null, pointer: null, pendingPick: null, tool: "select", textRequest: 0, isSceneSettling: () => false,
     session: { revision: 0, sourceScene: {}, getSelection: () => selection,

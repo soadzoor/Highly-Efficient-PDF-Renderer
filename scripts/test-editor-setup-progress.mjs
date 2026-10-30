@@ -1,3 +1,4 @@
+import { editorUiTestContext } from "./lib/editorUiTestContext.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
@@ -12,7 +13,7 @@ function startup({ progress = true, abortStage, failure } = {}) {
   const events = [], controller = new AbortController(), scene = {}, sourcePdf = Uint8Array.of(1, 2);
   let disposedServices = 0, disposedSession = 0, prepareCalls = 0, receivedProgress, fieldProgress;
   const session = { dispose() { disposedSession++; } };
-  const context = vm.createContext({ AbortController,
+  const context = editorUiTestContext({ AbortController,
     yieldAfterPaint: async signal => { events.push(["paint", events.at(-1)?.[1]]); if (events.at(-1)[1] === abortStage) controller.abort(); signal.throwIfAborted(); },
     createEditorAppServices: async options => {
       assert.equal(options.sourcePdf, sourcePdf);
@@ -66,9 +67,10 @@ assert(methodStart >= 0 && methodEnd > methodStart);
 const activate = source.slice(methodStart, methodEnd).replace("async setEditing", "async function setEditing") + "\n}";
 function activation(mode = "success") {
   const events = [], controller = new AbortController(); let subscriptions = 0, releases = 0, ticks = 0;
-  const classes = new Set(), context = vm.createContext({ AbortController, AbortSignal,
+  const classes = new Set(), context = editorUiTestContext({ AbortController, AbortSignal,
     disposed: false, structuralRunning: false, clipboardRunning: false, active: false, lifetime: new AbortController(), frame: 1,
     contextMenu: { close() {} }, toolbar: { hidden: true }, overlay: { hidden: true }, layerDialog: null, releaseFrameListener: null,
+    cameraPan: { cancel() {}, isPanning: () => false, setActive() {}, dispose() {} },
     layerControls: { setActive: value => events.push(["layers", value]) },
     document: { body: { classList: { toggle(name, value) { if (value) classes.add(name); else classes.delete(name); }, remove: name => classes.delete(name) } } },
     window: { cancelAnimationFrame: () => events.push(["cancelFrame"]) }, updateGeometry() {}, tick: () => { ticks++; },
@@ -101,7 +103,7 @@ const disposed = activation("disposed"); await assert.rejects(disposed.run(), { 
 assert.equal(disposed.context.active, false); assert.equal(disposed.counts().ticks, 0, "disposed entry cannot restart its animation loop");
 
 for (const failure of ["compile", "apply"]) {
-  const reports = [], context = vm.createContext({ AbortController, AbortSignal, renderRevision: 0, scenePreparation: null,
+  const reports = [], context = editorUiTestContext({ AbortController, AbortSignal, renderRevision: 0, scenePreparation: null,
     pendingDrawings: { capture() {}, acknowledge() {} },
     sceneApplication: null, lifetime: new AbortController(), disposed: false, active: true, tool: "select", requestedPreview: null,
     synchronizeDocumentSource: async () => {}, updatePointerCursor() {}, updateGeometry() {}, report: error => reports.push(error),

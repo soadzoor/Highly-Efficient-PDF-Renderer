@@ -4,7 +4,7 @@ import { getScenePrimitiveBounds } from "./scenePrimitives";
 import { PAGE_PRIMITIVE_KINDS, scenePrimitiveCounts } from "./scenePageViews";
 import type { ScenePaintNode } from "./scenePaintGraph";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
-import { bakeEditorAnnotationEdits, editorUnionBounds, retainEditorAnnotationPlacements } from "./editorScene";
+import { bakeEditorAnnotationEdits, editorUnionBounds, retainEditorAnnotationPlacements, editorSelectionClipOwnership } from "./editorScene";
 import { setEditorSceneTranslationHint } from "./editorScenePreview";
 
 const key = (ref: PrimitiveRef): string => `${ref.kind}:${ref.index}`;
@@ -60,11 +60,14 @@ export function prepareEditorTranslationPreview(scene: VectorScene, refs: readon
     for (let i = first; i < first + count; i++) if (fillSegments.has(i)) return null;
   }
   const clips = scene.clipPaths?.slice() ?? [], clipCopies = new Map<number, number>(), changedClips: number[] = [];
+  const ownsClip = editorSelectionClipOwnership(scene, refs);
   const detachClip = (index: number): number => {
     if (index < 0) return index;
     const existing = clipCopies.get(index); if (existing !== undefined) return existing;
-    const original = scene.clipPaths![index], parent = detachClip(original.parent), next = clips.length;
-    clips.push({ ...original, parent }); clipCopies.set(index, next); changedClips.push(next); return next;
+    const original = scene.clipPaths![index], parent = detachClip(original.parent), owned = ownsClip(index);
+    if (!owned && parent === original.parent) { clipCopies.set(index, index); return index; }
+    const next = clips.length;
+    clips.push({ ...original, parent }); clipCopies.set(index, next); if (owned) changedClips.push(next); return next;
   };
   const drawRuns: VectorDrawRun[] = [], runMap = new Map<number, number[]>();
   originalRuns.forEach((run, runIndex) => {

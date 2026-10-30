@@ -1,9 +1,10 @@
 import { normalizePrimitiveColor } from "./colorInput";
 import { editorShapeGeometry, type EditorShapePoint } from "./editorShapeGeometry";
 import type { EditorShapeObject } from "./editorTypes";
+import { editorReviewShapes } from "./editorReview";
 
 export type EditorShapePreviewInput = Pick<EditorShapeObject,
-  "shape" | "x" | "y" | "width" | "height" | "points" | "color" | "strokeWidth" | "fill" | "opacity" | "fillOpacity">;
+  "shape" | "x" | "y" | "width" | "height" | "points" | "color" | "strokeWidth" | "fill" | "opacity" | "fillOpacity" | "review">;
 export interface EditorShapePreviewGeometry {
   /** SVG attributes in canonical fill, arrowhead, stroke paint order. */
   paths: readonly Readonly<Record<string, string | number>>[];
@@ -52,6 +53,14 @@ function styledPreview(input: EditorShapePreviewInput, geometry: ShapePreviewPat
 
 /** Hairlines use CSS pixels; pass 1 / devicePixelRatio for a device-pixel pen. */
 export function editorShapePreviewGeometry(input: EditorShapePreviewInput, hairlineWidth = 1): EditorShapePreviewGeometry {
+  if (input.review) {
+    const shapes = editorReviewShapes({ ...input, kind: "shape", id: "preview", pageIndex: 0, transform: [1, 0, 0, 1, 0, 0] });
+    const paths = shapes.flatMap(shape => {
+      const styled = styledPreview(shape, previewPaths(shape), hairlineWidth);
+      return input.review!.type === "highlight" ? styled.paths.filter(path => path.stroke === "none").map(path => ({ ...path, style: "mix-blend-mode:multiply" })) : styled.paths;
+    });
+    return { paths };
+  }
   return styledPreview(input, previewPaths(input), hairlineWidth);
 }
 
@@ -61,6 +70,7 @@ export function createEditorShapePreviewCache(): { get(input: EditorShapePreview
     points?: readonly EditorShapePoint[]; count: number; lastX?: number; lastY?: number } | undefined;
   let geometry: ShapePreviewPaths;
   return { get(input, hairlineWidth = 1) {
+    if (input.review) return editorShapePreviewGeometry(input, hairlineWidth);
     const points = input.points, last = points?.[points.length - 1], arrowWidth = input.shape === "arrow" ? input.strokeWidth ?? 1 : undefined;
     if (!previous || previous.shape !== input.shape || previous.x !== input.x || previous.y !== input.y || previous.width !== input.width ||
         previous.height !== input.height || previous.arrowWidth !== arrowWidth || previous.points !== points ||

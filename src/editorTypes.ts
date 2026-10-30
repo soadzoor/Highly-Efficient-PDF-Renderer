@@ -4,6 +4,7 @@ import type { HepEncodingOptions } from "./hepBuilder";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import type { LoadProgressCallback } from "./loadProgress";
 import type { PdfOutputProtection } from "./pdf/pdfProtection";
+import type { PdfPageCropBox } from "./editorPdfPages";
 import type { OptionalContentGroup, OptionalContentOrderNode, SceneOptionalContent } from "./optionalContentData";
 export type { PdfOutputProtection } from "./pdf/pdfProtection";
 
@@ -26,6 +27,8 @@ export interface EditorObjectBase {
   /** Local page coordinates, before transform. Page origin is the displayed lower left. */
   transform: EditorMatrix;
   opacity?: number;
+  /** Editing lock; independent from PDF layer visibility locks. */
+  locked?: boolean;
   /** User PDF layer; null is unlayered. Omitted source clones retain source membership. */
   layerId?: string | null;
   /** Exact compound layer membership, indexed in getLayerEdits().catalog.conditions. */
@@ -80,6 +83,14 @@ export interface EditorTextRun {
   strikethrough?: boolean;
   color?: EditorColor;
 }
+/** PDF text-markup order: top-left, top-right, bottom-left, bottom-right. */
+export type EditorReviewQuad = readonly [readonly [number, number], readonly [number, number], readonly [number, number], readonly [number, number]];
+export interface EditorReviewMetadata {
+  type: "highlight" | "underline" | "strikeout" | "comment";
+  contents?: string;
+  author?: string;
+  quads?: readonly EditorReviewQuad[];
+}
 export interface EditorShapeObject extends EditorObjectBase {
   kind: "shape";
   shape: "rectangle" | "ellipse" | "line" | "arrow" | "polygon" | "polyline";
@@ -90,6 +101,8 @@ export interface EditorShapeObject extends EditorObjectBase {
   /** Independent fill alpha; omission retains the legacy object-opacity fallback. */
   fillOpacity?: number;
   strokeWidth?: number;
+  /** Standard review-annotation semantics; geometry remains ordinary scene paths. */
+  review?: EditorReviewMetadata;
 }
 interface EditorInkData extends EditorObjectBase {
   paths: readonly (readonly (readonly [number, number])[])[];
@@ -122,7 +135,7 @@ export interface EditorSourceObject extends EditorObjectBase {
 export interface EditorGroupObject extends EditorObjectBase { kind: "group"; children: readonly string[] }
 export type EditorObject = EditorTextObject | EditorShapeObject | EditorInkObject | EditorImageObject | EditorSourceObject | EditorGroupObject;
 export interface EditorSourceEdit { ref: PrimitiveRef; transform: EditorMatrix; deleted: boolean }
-export interface EditorAnnotationEdit { id: string; transform: EditorMatrix; deleted: boolean }
+export interface EditorAnnotationEdit { id: string; transform: EditorMatrix; deleted: boolean; contents?: string; author?: string }
 export type EditorObjectInput = EditorObject extends infer T ? T extends EditorObject
   ? Omit<T, "id" | "transform"> & { id?: string; transform?: EditorMatrix } : never : never;
 
@@ -135,7 +148,28 @@ export interface EditorPdfSaveOptions {
   protection?: PdfOutputProtection;
   onWarning?: (message: string) => void;
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
+  /** Serialization alone need not mark the live document saved. @default true */
+  markSaved?: boolean;
 }
+export interface EditorHepSaveOptions extends HepEncodingOptions {
+  /** Serialization alone need not mark the live document saved. @default true */
+  markSaved?: boolean;
+}
+export interface EditorRecoveryFont {
+  id: string; family: string; fontWeight: number; fontStyle: "normal" | "italic"; bytes: Uint8Array;
+}
+/** Private, versioned browser draft. Never embedded in PDF or HEP files. */
+export interface EditorRecoverySnapshot {
+  format: "hepr-editor-recovery";
+  version: 1;
+  sourceScene: VectorScene;
+  sourcePdf?: Uint8Array;
+  sourceLabel?: string;
+  fonts: readonly EditorRecoveryFont[];
+  /** Runtime state is opaque and validated atomically by restoreRecovery. */
+  data: unknown;
+}
+export interface EditorRecoveryOptions { signal?: AbortSignal }
 export interface EditorPageInfo {
   /** Zero-based position in the current document. */
   index: number;
@@ -157,6 +191,7 @@ export interface EditorPdfInsertOptions extends EditorPageOperationOptions {
   /** Opening password for the inserted PDF. */
   password?: string;
 }
+export interface EditorPageDuplicateOptions extends EditorPageOperationOptions { at?: number }
 export interface EditorSessionOptions {
   sourcePdf?: Uint8Array;
   signal?: AbortSignal;
@@ -175,6 +210,9 @@ export interface EditorSessionOptions {
   /** Release source-specific services owned by this session; shared fonts remain host-owned. */
   disposeSource?: () => void;
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
+  /** Portable authoring fonts for recovery; font programs remain outside HEP. */
+  captureRecoveryFonts?: () => Promise<readonly EditorRecoveryFont[]>;
+  restoreRecoveryFonts?: (fonts: readonly EditorRecoveryFont[], signal?: AbortSignal) => Promise<void>;
 }
 export interface EditorState {
   revision: number;
@@ -186,6 +224,7 @@ export interface EditorState {
 }
 export type EditorStackingAction = "send-to-back" | "bring-to-front" | "bring-forward" | "send-backward";
 export interface EditorClipboardOptions { signal?: AbortSignal }
+export interface EditorDuplicateOptions extends EditorClipboardOptions { offset?: readonly [number, number] }
 export interface EditorPasteOptions {
   /** Composed scene offset; defaults to successive 12/-12 steps for copy, zero for cut. */
   offset?: readonly [number, number];
@@ -199,6 +238,9 @@ export interface EditorSession {
   /** Source primitives are materialized only when explicitly requested or selected. */
   getObjects(options?: { pageIndex?: number; includeSource?: boolean }): readonly EditorObject[];
   getObject(id: string): EditorObject;
+  isObjectLocked(id: string): boolean;
+  /** Undoable editing locks; unlocking remains available on locked selections. */
+  setObjectsLocked(ids: readonly string[], locked: boolean): void;
   getObjectBounds(id: string): Bounds;
   getSelection(): readonly string[];
   getSelectionBounds(): Bounds | null;
@@ -216,6 +258,8 @@ export interface EditorSession {
   setPreviewTransform(matrix: EditorMatrix | null): void;
   deleteSelection(): void;
   cloneSelection(offset?: readonly [number, number]): readonly string[];
+  /** Duplicate current source appearances without replacing the clipboard. */
+  duplicateSelection(options?: EditorDuplicateOptions): Promise<readonly string[]>;
   /** Capture independent author models and current source appearances without changing history. */
   copySelection(options?: EditorClipboardOptions): Promise<number>;
   /** Capture successfully before deleting the selected objects as one undoable edit. */
@@ -229,6 +273,8 @@ export interface EditorSession {
   getFieldValues(): ReadonlyMap<string, EditorFieldValue>;
   getSourceEdits(): readonly EditorSourceEdit[];
   getAnnotationEdits(): readonly EditorAnnotationEdit[];
+  /** Edit inert annotation discussion metadata without replacing its appearance. */
+  updateAnnotation(id: string, patch: { contents?: string; author?: string }): void;
   getLayers(): readonly OptionalContentGroup[];
   getLayerOrder(): readonly OptionalContentOrderNode[];
   createLayer(options: EditorLayerCreateOptions): string;
@@ -262,6 +308,10 @@ export interface EditorSession {
   rotatePages(indices: readonly number[], degrees: number, options?: EditorPageOperationOptions): Promise<void>;
   removePages(indices: readonly number[], options?: EditorPageOperationOptions): Promise<void>;
   insertPdf(bytes: Uint8Array, options?: EditorPdfInsertOptions): Promise<void>;
+  reorderPages(order: readonly number[], options?: EditorPageOperationOptions): Promise<void>;
+  duplicatePages(indices: readonly number[], options?: EditorPageDuplicateOptions): Promise<void>;
+  cropPages(indices: readonly number[], box: PdfPageCropBox | null, options?: EditorPageOperationOptions): Promise<void>;
+  extractPages(indices: readonly number[], options?: EditorPageOperationOptions): Promise<Blob>;
   transaction(label: string, operation: () => void): void;
   undo(): boolean;
   redo(): boolean;
@@ -269,6 +319,8 @@ export interface EditorSession {
   subscribe(listener: (state: EditorState) => void): () => void;
   getScene(options?: { signal?: AbortSignal; onProgress?: LoadProgressCallback; preview?: boolean; includeObjects?: boolean }): Promise<VectorScene>;
   savePdf(options?: EditorPdfSaveOptions): Promise<Blob>;
-  saveHep(options?: HepEncodingOptions): Promise<Blob>;
+  saveHep(options?: EditorHepSaveOptions): Promise<Blob>;
+  captureRecovery(options?: EditorRecoveryOptions): Promise<EditorRecoverySnapshot>;
+  restoreRecovery(snapshot: EditorRecoverySnapshot, options?: EditorRecoveryOptions): Promise<void>;
   dispose(): void;
 }

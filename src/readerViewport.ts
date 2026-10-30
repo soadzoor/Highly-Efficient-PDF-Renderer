@@ -272,6 +272,11 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     if (!Number.isFinite(view.zoom) || view.zoom <= 0 || !Number.isFinite(view.centerX) || !Number.isFinite(view.centerY)) return;
     savedView = view; prepareZoom(view.zoom); positionView(view); present();
   }
+  function panByPixels(dx: number, dy: number): void {
+    if (!active || !Number.isFinite(dx) || !Number.isFinite(dy)) return;
+    stopInertia(); navigationTarget = null; fit = null; initialView = false;
+    scrollBy(-dx, -dy); present();
+  }
   function zoomAt(nextZoom: number, x = metrics.width / 2, y = metrics.height / 2): void {
     setView(readerZoomAt(getView(), nextZoom, x, y));
   }
@@ -630,6 +635,6 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     thumbnailCanvases.clear(); thumbnailWanted.clear(); thumbnailFailed.clear(); rows.length = rowTops.length = 0;
     announcement.textContent = "";
   }
-  return { setDocument, setLayout, getView, setView, goToPage, resize, canvasChanged,
+  return { setDocument, setLayout, getView, setView, panByPixels, goToPage, resize, canvasChanged,
     invalidateThumbnails, snapshot, restore, dispose, isActive, cancelActiveGesture, settingsChanged };
 }

@@ -1,3 +1,4 @@
+import { editorUiTestContext } from "./lib/editorUiTestContext.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
@@ -19,6 +20,8 @@ const [source, css, nativeCss, threeHtml] = await Promise.all([
 ]);
 const nested = source.replace(/^ {2}/gm, "");
 const install = (context, ...names) => {
+  context.cameraPan ??= { cancel() {}, isPanning: () => false, setActive() {}, dispose() {} };
+  context.updateAppearanceControls ??= () => {};
   if (names.some(name => ["pointerDown", "pointerMove", "pointerUp"].includes(name))) names.push("createShapeDraft", "updateShapeGesture");
   for (const name of names) vm.runInContext(sourceFunction(nested, name), context);
 };
@@ -26,7 +29,7 @@ const bounds = { minX: 10, minY: 20, maxX: 50, maxY: 60 };
 let geometryFrame = { bounds, transform: IDENTITY };
 const shapes = [], overlay = { dataset: {}, style: {} };
 const rotationInput = { value: "", disabled: false, dataset: { transform: "rotation" } }, rotationDocument = { activeElement: null };
-const geometry = vm.createContext({
+const geometry = editorUiTestContext({
   pendingDrawings: { visible: () => [] },
   ...frameHelpers,
   currentState: { revision: 0, selection: ["object"] }, presented: null, isSceneSettling: () => false,
@@ -73,7 +76,7 @@ const gestureOverlay = { dataset: {}, style: {}, setPointerCapture(id) { capture
   releasePointerCapture(id) { captures.delete(id); released.push(id); } };
 for (const name of ["select", "pan", "form", "rectangle"]) toolButtons.push({ dataset: { tool: name }, attributes: {}, setAttribute(name, value) { this.attributes[name] = value; } });
 let finishPick, abortedPicks = 0;
-const gestures = vm.createContext({
+const gestures = editorUiTestContext({
   ...frameHelpers,
   isSceneSettling: () => false,
   active: true, running: false, structuralRunning: false, activeText: null, disposed: false, tool: "select", toolRequest: 0, textRequest: 0,
@@ -129,8 +132,35 @@ for (const [handle, action] of [["rotate", "rotate"], ["ne", "resize"], ["sw", "
 }
 const moving = gestures.pointerDown(event(12)); finishPick("source:fill:2"); await moving;
 assert.equal(gestures.pointer.action, "move"); assert.equal(gestureOverlay.dataset.gesture, "move");
+gestures.alignmentSnap = {}; gestures.requestedGuides = [{ axis: "x", value: 1, start: 0, end: 100 }];
 gestures.pointerUp(event(12)); assert.equal(gestureOverlay.dataset.gesture, "");
 assert.deepEqual(selected, ["source:fill:2"]);
+assert.equal(gestures.alignmentSnap, null); assert.equal(gestures.requestedGuides.length, 0, "pointer release relinquishes cached targets and guides");
+for (const change of ["camera", "source", "revision"]) {
+  let cameraOffset = 0;
+  gestures.host.sceneToClientPoint = (x, y) => ({ x: x + cameraOffset, y });
+  gestures.session.sourceScene = {}; gestures.session.revision = 1;
+  const stale = gestures.pointerDown(event(22)); assert(gestures.pendingPick);
+  if (change === "camera") cameraOffset = 15;
+  else if (change === "source") gestures.session.sourceScene = {};
+  else gestures.session.revision++;
+  finishPick("stale-object"); await stale;
+  assert.equal(gestures.pointer, null); assert.equal(gestures.pendingPick, null); assert.equal(captures.size, 0);
+  assert.deepEqual(selected, ["source:fill:2"], `${change} changes invalidate a pending pick before it selects or moves anything`);
+}
+{
+  const forwarded = [];
+  gestures.host.getCanvas = () => ({ dispatchEvent: event => forwarded.push(event) });
+  gestures.WheelEvent = class { constructor(type, init) { this.type = type; Object.assign(this, init); } };
+  install(gestures, "forwardWheel");
+  const wheel = field => ({ target: { closest: () => field ? {} : null }, preventDefault() {}, stopPropagation() {} });
+  gestures.pointer = { id: 27, action: "move" }; captures.add(27);
+  gestures.alignmentSnap = {}; gestures.requestedGuides = [{}]; gestures.forwardWheel(wheel(false));
+  assert.equal(gestures.pointer, null); assert.equal(captures.size, 0); assert.equal(gestures.alignmentSnap, null); assert.equal(gestures.requestedGuides.length, 0);
+  assert.equal(forwarded.length, 1, "wheel navigation cancels stale object origins and releases guides before forwarding the camera event");
+  gestures.activeText = {}; gestures.forwardWheel(wheel(false)); gestures.activeText = null; gestures.forwardWheel(wheel(true));
+  assert.equal(forwarded.length, 1, "textboxes and form fields retain their own wheel behavior");
+}
 gestures.running = true; const preventBeforeBusy = prevented; await gestures.pointerDown(event(13));
 assert.equal(prevented, preventBeforeBusy); assert.equal(gestures.pointer, null, "busy operations cannot start document gestures");
 
@@ -214,7 +244,7 @@ assert.equal(gestureOverlay.dataset.gesture, "");
 
 const decodeRequests = [], activatedTools = [], imageStatuses = [], decodedCanvases = [], bitmapCloses = [];
 const rgba = Uint8ClampedArray.of(20, 40, 60, 255, 80, 100, 120, 128), previousImage = { preserved: true };
-const images = vm.createContext({ disposed: false, active: true, toolRequest: 1, pendingImage: previousImage,
+const images = editorUiTestContext({ disposed: false, active: true, toolRequest: 1, pendingImage: previousImage,
   waitForLoad, createImageBitmap: file => new Promise((resolve, reject) => decodeRequests.push({ file, resolve, reject })),
   document: { createElement(tag) {
     assert.equal(tag, "canvas");
@@ -335,7 +365,7 @@ const transformPoint = (matrix, point) => ({ x: matrix[0] * point.x + matrix[2] 
 const composeMatrices = (a, b) => [a[0] * b[0] + a[2] * b[1], a[1] * b[0] + a[3] * b[1],
   a[0] * b[2] + a[2] * b[3], a[1] * b[2] + a[3] * b[3], a[0] * b[4] + a[2] * b[5] + a[4], a[1] * b[4] + a[3] * b[5] + a[5]];
 const resizeBounds = { minX: 10, minY: 20, maxX: 110, maxY: 70 };
-const matrixHost = vm.createContext({ ...frameHelpers }); install(matrixHost, "dragMatrix");
+const matrixHost = editorUiTestContext({ ...frameHelpers }); install(matrixHost, "dragMatrix");
 for (const [handle, start, fixed] of [
   ["nw", { x: 10, y: 70 }, { x: 110, y: 20 }], ["ne", { x: 110, y: 70 }, { x: 10, y: 20 }],
   ["sw", { x: 10, y: 20 }, { x: 110, y: 70 }], ["se", { x: 110, y: 20 }, { x: 10, y: 70 }]
@@ -374,7 +404,7 @@ let resizeSelection = ["first", "second"];
 let resizeFrame = { bounds: resizeBounds, transform: IDENTITY };
 const textModel = { id: "textbox", kind: "text", pageIndex: 0, x: 10, y: 20, width: 100, height: 50,
   fontSize: 12, text: "Wrapping text", transform: [1, 0, 0, 1, 0, 0] };
-const resizing = vm.createContext({ active: true, running: false, structuralRunning: false, activeText: null, disposed: false,
+const resizing = editorUiTestContext({ active: true, running: false, structuralRunning: false, activeText: null, disposed: false,
   ...frameHelpers,
   requestedPreview: null, isSceneSettling: () => false,
   tool: "select", textRequest: 0, pointer: null, pendingPick: null, polygon: null,
@@ -590,7 +620,7 @@ nearMatrix(resizeCommits.at(-1), [2.6, 0, 0, 2.6, -16, -32], "final handle relea
 
 let numericFrame = initialOrientedFrame;
 const numericMatrices = [], numericNudges = [];
-const numeric = vm.createContext({ ...frameHelpers, activeText: null, pointer: null, currentState: { selection: ["numeric"] }, rotationDraft: null,
+const numeric = editorUiTestContext({ ...frameHelpers, activeText: null, pointer: null, currentState: { selection: ["numeric"] }, rotationDraft: null,
   document: rotationDocument, query: () => rotationInput, session: { sourceScene: {}, getSelectionFrame: () => numericFrame,
   getSelectionBounds() { const corners = editorFrameCorners(numericFrame); return { minX: Math.min(...corners.map(point => point.x)), minY: Math.min(...corners.map(point => point.y)), maxX: Math.max(...corners.map(point => point.x)), maxY: Math.max(...corners.map(point => point.y)) }; } },
   commit: change => change(), interaction: { applyTransform(matrix) { numericMatrices.push(Array.from(matrix)); numericFrame = { ...numericFrame, transform: composeMatrices(matrix, numericFrame.transform) }; },
@@ -671,7 +701,7 @@ assert.doesNotMatch(source, /input\.dataset\.transform === "rotation"\) input\.v
 const surfaceSelection = ["first", "second"], surfaceModifiers = [], surfacePlanes = [], surfaceTransforms = [], surfaceText = [];
 let surfacePicks = 0;
 const surfaceFrame = { bounds: resizeBounds, transform: IDENTITY, pageIndex: 5 };
-const surface = vm.createContext({ ...frameHelpers, active: true, running: false, disposed: false, activeText: null,
+const surface = editorUiTestContext({ ...frameHelpers, active: true, running: false, disposed: false, activeText: null,
   isSceneSettling: () => false,
   tool: "select", textRequest: 0, pointer: null, pendingPick: null, picking: null, polygon: null, fieldAtClientPoint: () => null,
   host: { clientToScenePoint(x, y, pageIndex) { surfacePlanes.push(pageIndex); return pageIndex === 5 ? { x, y } : null; } },
@@ -689,9 +719,9 @@ await surface.pointerDown(surfaceEvent(50, 50));
 assert.equal(surface.pointer.action, "move"); assert.equal(surface.pointer.frame, surfaceFrame);
 assert.equal(surfacePicks, 0); assert.deepEqual(surfaceModifiers, [], "plain selection-surface presses keep the current multiselection without picking again");
 assert.deepEqual(surfaceSelection, ["first", "second"]);
-surface.pointerMove(surfaceEvent(80, 70)); surface.pointerUp(surfaceEvent(80, 70));
-nearMatrix(surfaceTransforms[0], [1, 0, 0, 1, 30, 20], "selection-surface drag moves the entire selection");
-assert.deepEqual(surfacePlanes, [5, 5], "selection-surface press and drag use the selected frame's page plane");
+surface.pointerMove(surfaceEvent(80, 70)); surface.pointerUp(surfaceEvent(85, 75));
+nearMatrix(surfaceTransforms[0], [1, 0, 0, 1, 35, 25], "selection-surface drag uses the final release point for the entire selection");
+assert.deepEqual(surfacePlanes, [5, 5, 5], "selection-surface press, drag and release use the selected frame's page plane");
 surface.host.clientToScenePoint = (x, y) => ({ x, y });
 for (const modifiers of [{ ctrlKey: true }, { metaKey: true }, { shiftKey: true }]) await surface.pointerDown(surfaceEvent(50, 50, modifiers));
 assert.equal(surfacePicks, 3); assert.equal(surface.pointer, null);

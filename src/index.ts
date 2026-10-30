@@ -51,8 +51,13 @@ export type { PdfThumbnailOptions, PdfThumbnailResult, PdfThumbnailTiming } from
 export { openDocumentSession } from "./documentSession";
 export { openEditorSession } from "./editorSession";
 export { createEditorAppServices, createEditorUi, createEditorInteractionController, writeScenePdf, changePdfProtection, manipulatePdfPages } from "./editorApi";
+export { createEditorLayoutController, createEditorReviewTools } from "./editorApi";
+export type { EditorAlignment, EditorDistribution, EditorAlignmentGuide } from "./editorLayout";
+export { createEditorRecovery, editorRecoveryDocumentKey } from "./editorApi";
+export type { EditorRecoveryController, EditorRecoveryStatus } from "./editorRecovery";
+export type { EditorRecoveryStore, EditorRecoveryMetadata, EditorRecoveryRecord } from "./editorRecoveryStore";
 export type { PdfProtectionChangeOptions } from "./editorPdfProtection";
-export type { PdfPageOperation, PdfPageOperationOptions } from "./editorPdfPages";
+export type { PdfPageOperation, PdfPageOperationOptions, PdfPageCropBox } from "./editorPdfPages";
 export type { EditorInteractionController, EditorSelectionModifiers } from "./editorInteraction";
 export { createEditorSignatureLibrary, normalizeEditorSignature, validateEditorSignature } from "./editorSignatures";
 export type * from "./editorTypes";
@@ -346,7 +351,8 @@ export type {
   TextSelectionController,
   TextSelectionOptions,
   TextSelectionPoint,
-  TextSelectionRange
+  TextSelectionRange,
+  TextSelectionSpan
 } from "./textSelection";
 
 export { computeCharQuad, computeCharRangeBounds } from "./sceneTextGeometry";

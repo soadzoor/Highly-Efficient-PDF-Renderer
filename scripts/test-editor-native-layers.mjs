@@ -121,7 +121,7 @@ try {
     assignment.updateLayer("ref:5:0", { defaultVisible: false });
     assignment.addObject({ id: "new-layered-ink", kind: "ink", pageIndex: 0, paths: [[[70, 70], [90, 85]]], color: "blue", strokeWidth: 3, layerId: added });
     const warnings = []; assigned = await save(assignment, { onWarning: warning => warnings.push(warning) });
-    assert(warnings.some(warning => /rebuilt as vectors/.test(warning)));
+    assert(!warnings.some(warning => /rebuilt as vectors/.test(warning)), "source membership edits preserve the page and isolate only the affected invocation");
     const first = await sample(assigned), second = await sample(assigned, 1);
     assert.deepEqual(first(15, 15), [255, 0, 0, 255]); assert.deepEqual(second(15, 15), [255, 255, 255, 255], "one assigned shared Form invocation does not change the other page");
     const document = await NativePdfDocument.open({ kind: "bytes", bytes: assigned });
