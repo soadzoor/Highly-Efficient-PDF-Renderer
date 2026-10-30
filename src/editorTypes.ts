@@ -6,6 +6,7 @@ import type { LoadProgressCallback } from "./loadProgress";
 import type { PdfOutputProtection } from "./pdf/pdfProtection";
 import type { PdfPageCropBox } from "./editorPdfPages";
 import type { OptionalContentGroup, OptionalContentOrderNode, SceneOptionalContent } from "./optionalContentData";
+import type { AnnotationDestination } from "./annotationData";
 export type { PdfOutputProtection } from "./pdf/pdfProtection";
 
 /** Affine [a,b,c,d,e,f], with X right and Y up. */
@@ -20,6 +21,9 @@ export interface EditorSelectionFrame {
 }
 export type EditorColor = string | number | readonly [number, number, number];
 export type EditorFieldValue = string | number | boolean | null | readonly string[];
+/** Links are inert descriptions. Only ordinary web/contact URIs and local destinations are authored. */
+export type EditorLink = { type: "url"; url: string } | { type: "object"; objectId: string }
+  | { type: "destination"; destination: AnnotationDestination };
 
 export interface EditorObjectBase {
   id: string;
@@ -29,6 +33,8 @@ export interface EditorObjectBase {
   opacity?: number;
   /** Editing lock; independent from PDF layer visibility locks. */
   locked?: boolean;
+  /** Clickable reference independent of this object's visual appearance. */
+  link?: EditorLink;
   /** User PDF layer; null is unlayered. Omitted source clones retain source membership. */
   layerId?: string | null;
   /** Exact compound layer membership, indexed in getLayerEdits().catalog.conditions. */
@@ -241,6 +247,9 @@ export interface EditorSession {
   isObjectLocked(id: string): boolean;
   /** Undoable editing locks; unlocking remains available on locked selections. */
   setObjectsLocked(ids: readonly string[], locked: boolean): void;
+  getObjectLink(id: string): EditorLink | null;
+  /** Set or remove a link without changing the object's appearance. Undoable. */
+  setObjectLink(id: string, link: EditorLink | null): void;
   getObjectBounds(id: string): Bounds;
   getSelection(): readonly string[];
   getSelectionBounds(): Bounds | null;

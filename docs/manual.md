@@ -297,6 +297,42 @@ because the browser may cancel its save dialog. Printing also retains the
 unsaved state. The reusable save APIs can mark a document saved after a host
 confirms its own file write.
 
+### Links and same-document references
+
+Select a highlight or another object and use **Link** (Ctrl/Cmd+K outside text or
+form typing) to add or edit its target.
+Choose a URL or pick another object in the document, including an object on a
+different page. URL targets accept HTTP, HTTPS, `mailto` and `tel`. Selecting an
+object target uses its current position and size when the document is exported.
+Use **Remove link** to remove the hotspot while keeping its text or artwork.
+Link edits follow the usual locks, Undo and Redo behavior.
+Copying both the linked object and its target links the independent copies to
+each other. Copying just the linked object retains its original target. Removing
+a target leaves a broken reference that is omitted with an export warning;
+Undo restores it.
+Editing a reopened textbox preserves its outgoing link and updates incoming
+object references to follow the edited textbox.
+
+The dialog lists known objects and offers **Pick in document** for selecting a
+destination directly. Press Escape while picking to return to the same draft;
+Apply commits it. Ctrl/Cmd+Enter also applies a link. An imported page destination
+can be retained as-is or replaced with a URL/object target.
+
+Links attached to highlighted text keep the highlighting and comment intact;
+only the individual text quads are clickable. In View mode, click or tap a link
+to open its URL or navigate to its internal destination. While editing, ordinary
+selection remains available for changing the linked artwork.
+
+Saved PDFs use standard link annotations and local destinations. Reopened links
+to identifiable authored annotations keep their object binding; a reference to
+anonymous source geometry remains a functional page destination after reopen.
+HEP keeps link actions and destination mappings in its existing metadata.
+Script and executable PDF actions remain informational and are never executed.
+Verify links in both View layouts/backends, save and reopen a PDF, and inspect
+the same files in an independent reader. Repeat after moving the target and
+after page reordering; a multi-line highlight's inter-line gaps should not
+activate its link.
+
 ### Local recovery
 
 Edit mode checkpoints committed changes and unfinished text/form drafts in this

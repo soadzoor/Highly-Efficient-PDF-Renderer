@@ -6,6 +6,7 @@ import { createLoadProgressReporter, type PDFLoadProgress } from "./loadProgress
 import { invertEditorMatrix, multiplyEditorMatrices } from "./editorScene";
 import { editorOperationPageTargets, rebaseEditorOrderedSource, type EditorRebasedObjectIds } from "./editorPageOrderRebase";
 import { editorClipboardStore, shareEditorClipboard, getEditorCapturedSourceScene, registerEditorCapturedSourceReader } from "./editorClipboard";
+import { editorSourceLinks, registerEditorLinkRebinder, rebindEditorLinkTarget } from "./editorLinks";
 
 export interface EditorDocumentVersion { session: EditorSession; options: EditorSessionOptions }
 interface Version extends EditorDocumentVersion { observedRevision: number; unsubscribe: () => void }
@@ -152,6 +153,8 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
     getObject: id => { assertLive(); return current.version.session.getObject(id); },
     isObjectLocked: id => { assertLive(); return current.version.session.isObjectLocked(id); },
     setObjectsLocked: (ids, locked) => { assertLive(); current.version.session.setObjectsLocked(ids, locked); },
+    getObjectLink: id => { assertLive(); return current.version.session.getObjectLink(id); },
+    setObjectLink: (id, link) => { assertLive(); current.version.session.setObjectLink(id, link); },
     getObjectBounds: id => { assertLive(); return current.version.session.getObjectBounds(id); },
     getSelection: () => { assertLive(); return current.version.session.getSelection(); },
     getSelectionBounds: () => { assertLive(); return current.version.session.getSelectionBounds(); },
@@ -324,6 +327,7 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
   };
   shareEditorClipboard(initial.session, session);
   registerEditorCapturedSourceReader(session, id => getEditorCapturedSourceScene(current.version.session, id));
+  registerEditorLinkRebinder(session, (previous, replacement) => { assertLive(); rebindEditorLinkTarget(current.version.session, previous, replacement); });
   return session;
 }
 
@@ -389,6 +393,27 @@ function reseedAuthoredObjects(previous: EditorSession, next: EditorSession, ope
     };
     for (const copy of [false, true]) for (const group of groups.values()) for (const target of targets[group.pageIndex])
       if ((target !== targets[group.pageIndex][0]) === copy) restoreGroup(group.id, target);
+    for (const [page, mapped] of pageCopies) for (const [original, restored] of mapped) {
+      const link = previous.getObjectLink(original); if (!link) continue;
+      let target: string | undefined;
+      if (link.type === "object") {
+        const ownerPage = previous.getObject(original).pageIndex;
+        const cohort = targets[ownerPage].indexOf(page);
+        try {
+          const destinationPage = previous.getObject(link.objectId).pageIndex, copiedPage = targets[destinationPage]?.[cohort];
+          target = mapped.get(link.objectId) ?? (copiedPage === undefined ? undefined : pageCopies.get(copiedPage)?.get(link.objectId)) ?? ids.get(link.objectId);
+        } catch { /* A removed target remains a broken reference, without preventing page edits. */ }
+      }
+      const annotation = annotations.get(`${page}:${original}`)?.[0];
+      const fallback = annotation && editorSourceLinks(targetScene).get(`annotation:${annotation.id}`)?.link;
+      const value = link.type !== "object" ? link : target ? { type: "object" as const, objectId: target } : fallback ?? link;
+      if (value.type === "object") { try { next.getObject(value.objectId); } catch { continue; } }
+      if (JSON.stringify(next.getObjectLink(restored)) === JSON.stringify(value)) continue;
+      const locked = next.isObjectLocked(restored);
+      if (locked) next.setObjectsLocked([restored], false);
+      next.setObjectLink(restored, value);
+      if (locked) next.setObjectsLocked([restored], true);
+    }
     restoreOrder?.(ids);
     const active = previous.getActiveLayer(); if (active && next.getLayers().some(layer => layer.id === active)) next.setActiveLayer(active);
     next.select(previous.getSelection().flatMap(id => ids.has(id) ? [ids.get(id)!] : []));

@@ -3,6 +3,7 @@ import "./editorContextMenu.css";
 import "./editorPagesUi.css";
 import "./editorReviewUi.css";
 import "./editorRecoveryUi.css";
+import "./editorLinkUi.css";
 import "./toolbarIcons.css";
 import { openEditorSession } from "./editorSession";
 import type { EditorColor, EditorMatrix, EditorObject, EditorObjectInput, EditorSelectionFrame, EditorSession, EditorState, EditorTextObject } from "./editorTypes";
@@ -45,6 +46,8 @@ import { alignEditorSelection, distributeEditorSelection, createEditorAlignmentS
 import { createEditorReviewController, isEditorReviewTool, type EditorReviewTool } from "./editorReviewUi";
 import { createEditorRecovery, editorRecoveryDocumentKey, type EditorRecoveryController } from "./editorRecovery";
 import { showEditorRecoveryDialog } from "./editorRecoveryUi";
+import { createEditorLinkController } from "./editorLinkUi";
+import { editorLinkSelectionOwner } from "./editorLinks";
 
 export interface EditorUiHost {
   getCanvas(): HTMLCanvasElement;
@@ -188,6 +191,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     ${editorIconButton("tool", "strikeout-text", "Strike out selected text")}
     ${editorIconButton("tool", "comment", "Add a comment")}
     ${editorIconButton("action", "edit-comment", "Edit the selected review comment")}
+    ${editorIconButton("action", "link", "Add or edit a link to a URL or another object (Ctrl/Cmd+K)")}
+    ${editorIconButton("action", "remove-link", "Remove links from selected objects")}
     ${editorIconButton("tool", "rectangle", "Draw a rectangle")}
     ${editorIconButton("tool", "ellipse", "Draw an ellipse")}
     ${editorIconButton("tool", "line", "Draw a line")}
@@ -330,22 +335,44 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     }, extra: [
       { action: "lock", label: "Lock", canRun: () => canOpenContextMenu() && session.getSelection().some(id => !session.isObjectLocked(id)), run: () => commit(() => session.setObjectsLocked(session.getSelection(), true)) },
       { action: "unlock", label: "Unlock", canRun: () => canOpenContextMenu() && selectionLocked(), run: () => commit(() => session.setObjectsLocked(session.getSelection(), false)) },
-      { action: "edit-comment", label: "Edit comment", canRun: () => canOpenContextMenu() && canEditComment(), run: () => review.editSelection() }
+      { action: "edit-comment", label: "Edit comment", canRun: () => canOpenContextMenu() && canEditComment(), run: () => review.editSelection() },
+      { action: "link", label: "Add or edit link", canRun: () => canOpenContextMenu() && links.canEditSelection(), run: () => openLinkEditor() },
+      { action: "remove-link", label: "Remove link", canRun: () => canOpenContextMenu() && links.canRemoveSelection(), run: () => { links.removeSelection(); } }
     ], onError: report
   });
   const cameraPan = createEditorCameraPan({ overlay, getCanvas: host.getCanvas,
     canPan: () => active && !disposed && !running && !savePreparing && !structuralRunning && Boolean(host.panCameraByPixels),
     begin() { contextMenu.close(); cancelPointerGesture(); signatureHover = null; updatePolygonPreview(); host.beginCameraPan?.(); },
     pan: (dx, dy) => host.panCameraByPixels?.(dx, dy), end: () => host.endCameraPan?.(),
-    onStateChange: () => host.onBusyChange?.(running || savePreparing || structuralRunning || cameraPan.isPanning())
+    onStateChange: () => host.onBusyChange?.(running || savePreparing || structuralRunning || cameraPan.isPanning() || links.isBusy())
   });
   const review = createEditorReviewController({ overlay, session, getScene: () => latestScene,
-    canEdit: () => active && !disposed && !running && !structuralRunning && !activeText && !pointer && !pendingPick && !cameraPan.isPanning() && !isSceneSettling(),
+    canEdit: () => active && !disposed && !running && !structuralRunning && !activeText && !pointer && !pendingPick && !cameraPan.isPanning() && !links.isOpen() && !isSceneSettling(),
     toScene: (x, y) => host.clientToScenePoint(x, y), toClient: (x, y) => host.sceneToClientPoint(x, y),
     style: () => ({ color: property("color").value, opacity: objectOpacity }),
     change(change) { change(); void refreshScene(); }, added: ids => { for (const id of ids) pendingDrawings.add(id); }, onError: report,
     onDraftChange: () => recovery?.draftChanged()
   });
+  const links = createEditorLinkController({ document, session,
+    canEdit: () => active && !disposed && !running && !structuralRunning && !recoveryRunning && !activeText && !pointer && !pendingPick && !cameraPan.isPanning() && !isSceneSettling(),
+    change(change) { change(); void refreshScene(); }, onError: report, onStatus: setStatus,
+    onDraftChange() { recovery?.draftChanged(); updateLinkButtons(); }, onPickingChange: linkPickingChanged
+  });
+  function linkPickingChanged(picking: boolean): void {
+    if (picking) { contextMenu.close(); cancelPointerGesture(); polygon = null; signatureHover = null; setTool("select", true); }
+    else if (pendingPick) cancelPointerGesture();
+    overlay.dataset.linkPicking = String(picking); updateLinkButtons();
+    host.onBusyChange?.(running || savePreparing || structuralRunning || recoveryRunning || cameraPan.isPanning() || picking);
+  }
+  function updateLinkButtons(): void {
+    query<HTMLButtonElement>('[data-action="link"]').disabled = links.isOpen() || !links.canEditSelection();
+    query<HTMLButtonElement>('[data-action="remove-link"]').disabled = links.isOpen() || !links.canRemoveSelection();
+  }
+  function openLinkEditor(): void {
+    if (links.isOpen()) return;
+    if (tool !== "select") setTool("select");
+    if (links.editSelection()) updateLinkButtons();
+  }
   function selectionLocked(): boolean { return session.getSelection().some(id => session.isObjectLocked(id)); }
   function canEditComment(): boolean {
     const selection = session.getSelection(); if (selection.length !== 1 || selectionLocked()) return false;
@@ -557,6 +584,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     query<HTMLButtonElement>('[data-action="lock"]').disabled = !state.selection.some(id => !session.isObjectLocked(id));
     query<HTMLButtonElement>('[data-action="unlock"]').disabled = !selectionLocked();
     query<HTMLButtonElement>('[data-action="edit-comment"]').disabled = !canEditComment();
+    updateLinkButtons();
     for (const button of toolbar.querySelectorAll<HTMLButtonElement>('[data-action^="align-"], [data-action^="distribute-"]')) button.disabled = !state.selection.length || selectionLocked();
     updateClipboardButtons();
     if (tool === "form") for (const control of fieldDrafts.keys()) control.disabled = session.isObjectLocked(`annotation:${control.dataset.fieldId}`);
@@ -617,7 +645,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       } finally {
         if (sceneApplication === application) sceneApplication = null;
         finish?.();
-        if (!disposed) { updatePointerCursor(); if (active) updateGeometry(); }
+        if (!disposed) { updatePointerCursor(); if (!preview) updateLinkButtons(); if (active) updateGeometry(); }
       }
     } catch (error) { if (propagateError) throw error; report(error); }
     finally { if (scenePreparation === abort) scenePreparation = null; }
@@ -637,7 +665,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   function canUseClipboard(action: EditorObjectMenuAction): boolean {
     return active && !disposed && !running && !savePreparing && !structuralRunning && !activeText && !pointer && !pendingPick && !polygon && !isSceneSettling() &&
-      !cameraPan.isPanning() &&
+      !cameraPan.isPanning() && !links.isOpen() &&
       (action === "paste" ? session.canPaste() : session.getSelection().length > 0 && (action === "copy" || !selectionLocked()));
   }
   async function runClipboard(action: EditorObjectMenuAction, inPlace = false): Promise<void> {
@@ -721,8 +749,9 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (id !== undefined && overlay.hasPointerCapture?.(id)) overlay.releasePointerCapture(id);
     clearPreview(restore); updatePointerCursor();
   }
-  function setTool(next: Tool): void {
+  function setTool(next: Tool, preserveLinkPick = false): void {
     if (structuralRunning || running || savePreparing) return;
+    if (next !== tool && !preserveLinkPick && links.isPicking()) links.cancelPick();
     contextMenu.close();
     pendingFieldFocus = null;
     if (activeText) {
@@ -746,6 +775,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     updateOpacityControls(currentState);
     updateAppearanceControls();
     if (next === "form") renderFields();
+    updateLinkButtons();
     updateGeometry();
   }
   function renderFields(): void {
@@ -836,12 +866,19 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       }
     }
     const appearanceRuns = getSceneAnnotationRuns(session.sourceScene);
-    const annotationId = pickEditorMetadataAnnotation((latestScene.annotations ?? []).filter(annotation => session.isAnnotationVisible(annotation.id)), point,
-      annotation => session.getObjectBounds(`annotation:${annotation.id}`),
+    const metadataOwners = new Map<string, string>();
+    const metadata = (latestScene.annotations ?? []).filter(annotation => {
+      const owner = annotation.subtype === "Link" ? editorLinkSelectionOwner(session, annotation) : `annotation:${annotation.id}`;
+      if (!owner || (annotation.subtype === "Link" ? !session.isObjectVisible(owner) : !session.isAnnotationVisible(annotation.id))) return false;
+      metadataOwners.set(annotation.id, owner); return true;
+    });
+    const annotationId = pickEditorMetadataAnnotation(metadata, point,
+      annotation => session.getObjectBounds(metadataOwners.get(annotation.id)!),
       annotation => appearanceRuns.get(annotation.id)?.some(run => run.count > 0) ?? false);
     if (annotationId) {
-      if (!reordered) return `annotation:${annotationId}`;
-      candidate(`annotation:${annotationId}`);
+      const owner = metadataOwners.get(annotationId)!;
+      if (!reordered) return owner;
+      candidate(owner);
     }
     picker ??= new ScenePrimitivePicker(session.sourceScene);
     picking?.abort(); const controller = picking = new AbortController();
@@ -931,6 +968,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     polygon.preview = { ...polygon.object, points, x: minX, y: minY, width: maxX - minX, height: maxY - minY };
   }
   async function pointerDown(event: PointerEvent): Promise<void> {
+    if (links.isPicking()) { await pickLinkTarget(event); return; }
     if (!active || running || savePreparing || activeText || pointer || pendingPick ||
         isSceneSettling() && (!["ink", "rectangle", "ellipse", "line", "arrow", "polygon", "polyline", "signature"].includes(tool) || !presented || presented.sourceScene !== session.sourceScene) ||
         tool === "pan" || tool === "form" || isEditorReviewTool(tool) || event.button !== 0 || (event.target as Element).closest(".hepr-editor-field")) return;
@@ -1011,6 +1049,29 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     updateShapeGesture(pointer, point);
     updatePointerCursor();
     overlay.setPointerCapture?.(event.pointerId);
+  }
+  async function pickLinkTarget(event: PointerEvent): Promise<void> {
+    if (!active || disposed || running || savePreparing || structuralRunning || activeText || pointer || pendingPick || event.button !== 0 || cameraPan.isPanning() || isSceneSettling()) return;
+    const point = host.clientToScenePoint(event.clientX, event.clientY); if (!point) return;
+    event.preventDefault(); event.stopPropagation();
+    const client = { x: event.clientX, y: event.clientY }, requestId = ++textRequest;
+    const request = { id: event.pointerId, point, client, lastClient: client, released: false, canceled: false };
+    const sourceScene = session.sourceScene, revision = session.revision, selected = JSON.stringify(session.getSelection());
+    const projection = host.sceneToClientPoint(point.x, point.y);
+    pendingPick = request; overlay.setPointerCapture?.(event.pointerId); updatePointerCursor();
+    try {
+      const id = await pick(point, client), currentProjection = host.sceneToClientPoint(point.x, point.y);
+      if (!links.isPicking() || disposed || !active || running || savePreparing || structuralRunning || request.canceled || pendingPick !== request || requestId !== textRequest ||
+          sourceScene !== session.sourceScene || revision !== session.revision || selected !== JSON.stringify(session.getSelection()) || !projection || !currentProjection ||
+          Math.abs(projection.x - currentProjection.x) + Math.abs(projection.y - currentProjection.y) > .1) return;
+      pendingPick = null;
+      if (id) links.pickTarget(id);
+      else setStatus("No object was found. Click the destination object, or press Escape to return to link settings.");
+    } finally {
+      if (pendingPick === request) pendingPick = null;
+      if (overlay.hasPointerCapture?.(event.pointerId)) overlay.releasePointerCapture(event.pointerId);
+      updatePointerCursor(); updateLinkButtons();
+    }
   }
   function pointerMove(event: PointerEvent): void {
     if (active && tool === "signature") signatureHover = event.pointerType === "touch" ? null : { x: event.clientX, y: event.clientY };
@@ -1234,6 +1295,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     lifetime.signal.throwIfAborted(); externalSignal?.throwIfAborted();
     if (!active) throw new Error("Switch to Edit mode before dropping images.");
     if (running || savePreparing || structuralRunning) throw new Error("Wait for the current operation to finish.");
+    if (links.isOpen()) throw new Error("Apply or cancel the pending link before dropping images.");
     if (!files.length) return;
     if (files.some(file => droppedFileKind(file) !== "image")) throw new TypeError("Drop PNG, JPEG or WebP images.");
     const canvas = host.getCanvas(), rect = canvas.getBoundingClientRect();
@@ -1300,6 +1362,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   async function save(kind: "pdf" | "flatten" | "hep" | "print"): Promise<void> {
     if (disposed || running || savePreparing || structuralRunning || recoveryRunning || recoveryDialog) return;
+    if (links.isOpen()) { setStatus("Apply or cancel the pending link before saving or printing."); return; }
     if ((kind === "pdf" || kind === "flatten") && passwordDialog && !passwordDialog.apply()) return;
     flushEditorFieldDrafts(fieldDrafts);
     if (hasPendingEditorFields(fieldDrafts)) { setStatus("Check the pending form value before saving or printing."); return; }
@@ -1312,6 +1375,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       signal.throwIfAborted();
       if (activeText) { setStatus("Check the active textbox before saving or printing."); return; }
       if (!review.flushDraft()) return;
+      if (!links.flushDraft()) return;
       const protection = kind === "pdf" || kind === "flatten" ? pdfProtection.get() : undefined;
       const wasPreviewing = session.getState().previewing;
       cancelPointerGesture(false); running = true; savePreparing = false; updatePointerCursor(); updateClipboardButtons();
@@ -1362,10 +1426,12 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   async function runPageOperation(change: (options: { signal: AbortSignal; onProgress: LoadProgressCallback; onDiagnostic: (diagnostic: PdfDiagnostic) => void }) => Promise<void>, externalSignal?: AbortSignal): Promise<void> {
     lifetime.signal.throwIfAborted(); externalSignal?.throwIfAborted();
     if (running || savePreparing || structuralRunning) throw new Error("Wait for the current operation to finish.");
+    if (links.isOpen()) throw new Error("Apply or cancel the pending link before changing pages.");
     flushEditorFieldDrafts(fieldDrafts);
     if (hasPendingEditorFields(fieldDrafts)) throw new Error("Check the pending form value before changing pages.");
     if (activeText) await finishText();
     if (!review.flushDraft()) throw new Error("Apply or cancel the pending comment before changing pages.");
+    if (!links.flushDraft()) throw new Error("Apply or cancel the pending link before changing pages.");
     lifetime.signal.throwIfAborted(); externalSignal?.throwIfAborted();
     if (running || savePreparing || structuralRunning) throw new Error("Wait for the current operation to finish.");
     structuralRunning = running = true; toolbar.inert = overlay.inert = true;
@@ -1416,6 +1482,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   toolbar.addEventListener("click", event => {
     const button = (event.target as Element).closest<HTMLButtonElement>("button"); if (!button) return;
     if (running || savePreparing || structuralRunning) { if (button.dataset.action === "cancel-operation") operation?.abort(); return; }
+    if (links.isOpen() && !button.dataset.tool) { setStatus("Apply or cancel the pending link before using another editing command."); return; }
     if (button.dataset.tool) { setTool(button.dataset.tool as Tool); return; }
     if (button.dataset.style) { applyTextStyle(button.dataset.style); return; }
     if (button.dataset.action?.startsWith("align-")) {
@@ -1435,6 +1502,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       case "lock": commit(() => session.setObjectsLocked(session.getSelection(), true)); break;
       case "unlock": commit(() => session.setObjectsLocked(session.getSelection(), false)); break;
       case "edit-comment": try { review.editSelection(); } catch (error) { report(error); } break;
+      case "link": openLinkEditor(); break;
+      case "remove-link": links.removeSelection(); break;
       case "guides": button.setAttribute("aria-pressed", String(button.getAttribute("aria-pressed") !== "true")); break;
       case "recovery": void openRecovery(); break;
       case "apply-text": void finishText().catch(report); break; case "cancel-text": cancelText(); break;
@@ -1520,7 +1589,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   });
   overlay.addEventListener("pointerdown", event => { void pointerDown(event).catch(report); });
   function canOpenContextMenu(): boolean {
-    return active && !disposed && !running && !structuralRunning && !activeText && !pointer && !pendingPick && tool === "select" && !isSceneSettling() && !cameraPan.isPanning();
+    return active && !disposed && !running && !structuralRunning && !activeText && !pointer && !pendingPick && tool === "select" && !isSceneSettling() && !cameraPan.isPanning() && !links.isOpen();
   }
   function showSelectionContextMenu(): void {
     if (!canOpenContextMenu()) return;
@@ -1571,7 +1640,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   overlay.addEventListener("wheel", forwardWheel, { passive: false });
   async function doubleClick(event: MouseEvent): Promise<void> {
-    if (!active || running) return;
+    if (!active || running || links.isOpen()) return;
     if (tool === "polygon" || tool === "polyline") { completePolygon(true); return; }
     if (isSceneSettling()) return;
     if (tool !== "select" || activeText) return;
@@ -1611,6 +1680,11 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") event.preventDefault();
       return;
     }
+    if (links.isOpen()) {
+      if ((event.ctrlKey || event.metaKey) && /^[szdcxvy]$/i.test(event.key) && !inputTarget(event.target)) event.preventDefault();
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") event.preventDefault();
+      return;
+    }
     if (structuralRunning || running || savePreparing) {
       if (event.key === "Escape") operation?.abort();
       if (event.key === "Escape" || (event.ctrlKey || event.metaKey) && /^[szdcxvy]$/i.test(event.key) ||
@@ -1622,6 +1696,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     const dialog = (event.target as Element | null)?.closest?.("dialog");
     if (dialog && dialog !== layerDialog) return;
     if (inputTarget(event.target)) return;
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "k") { event.preventDefault(); openLinkEditor(); return; }
     if ((event.ctrlKey || event.metaKey) && !event.altKey && /^[cxv]$/i.test(event.key)) {
       const action = event.key.toLowerCase() === "c" ? "copy" : event.key.toLowerCase() === "x" ? "cut" : "paste";
       if (action !== "paste" && document.getSelection()?.isCollapsed === false) return;
@@ -1641,7 +1716,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   window.addEventListener("keyup", transformModifiers, { signal: lifetime.signal });
   function hasUnsavedChanges(): boolean {
     return session.getState().dirty || hasPendingEditorTextChanges(activeText) || hasPendingEditorFields(fieldDrafts) ||
-      pdfProtection.hasChanges() || Boolean(passwordDialog?.hasDraftChanges()) || review.hasDraftChanges() || structuralRunning;
+      pdfProtection.hasChanges() || Boolean(passwordDialog?.hasDraftChanges()) || review.hasDraftChanges() || links.hasDraftChanges() || structuralRunning;
   }
   async function initializeRecovery(): Promise<void> {
     try {
@@ -1650,17 +1725,17 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if (disposed) return;
       recovery = createEditorRecovery({ session, key: recoveryKey, label: source.label, password: source.password,
         protected: protectedSource,
-        isInteracting: () => Boolean(pointer || pendingPick || cameraPan.isPanning() || review.isSelecting() || structuralRunning || running || savePreparing),
+        isInteracting: () => Boolean(pointer || pendingPick || cameraPan.isPanning() || review.isSelecting() || links.isPicking() || structuralRunning || running || savePreparing),
         getDraft: async () => { const editing = activeText; return { text: editing ? { object: await readTextDraft(), objectId: editing.objectId,
           sourceAnnotationId: editing.sourceAnnotationId, layerId: editing.layerId } : null,
           fields: [...fieldDrafts].filter(([control, baseline]) => editorFieldDraftSignature(control) !== baseline)
             .map(([control]) => ({ id: control.dataset.fieldId, signature: editorFieldDraftSignature(control) })),
-          comment: review.getDraft() }; },
+          comment: review.getDraft(), link: links.getDraft() }; },
         async applyDraft(value) {
           cancelPointerGesture(false); cancelText();
           await refreshScene(lifetime.signal, false, true); updateFonts();
           if (!value || typeof value !== "object") return;
-          const draft = value as { text?: { object?: EditorTextObject; objectId?: string; sourceAnnotationId?: string; layerId?: string | null }; fields?: { id: string; signature: string }[]; comment?: unknown };
+          const draft = value as { text?: { object?: EditorTextObject; objectId?: string; sourceAnnotationId?: string; layerId?: string | null }; fields?: { id: string; signature: string }[]; comment?: unknown; link?: unknown };
           if (draft.fields?.length) {
             setTool("form"); renderFields();
             for (const item of draft.fields) {
@@ -1679,6 +1754,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
             if (activeText) { activeText.objectId = draft.text.objectId; activeText.layerId = draft.text.layerId; activeText.baseline.html = ""; }
           }
           if (draft.comment) review.restoreDraft(draft.comment);
+          if (draft.link) { setTool("select"); links.restoreDraft(draft.link); }
           updateState(session.getState());
         },
         onStatus(value) {
@@ -1734,7 +1810,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if (!value) recoveryDialog?.close();
       if (!value && clipboardRunning) operation?.abort();
       if (!value) pendingFieldFocus = null;
-      if (!value) { flushEditorFieldDrafts(fieldDrafts); if (activeText) await finishText(); if (!review.flushDraft()) return; await recovery?.flush(); }
+      if (!value) { flushEditorFieldDrafts(fieldDrafts); if (activeText) await finishText(); if (!review.flushDraft() || !links.flushDraft()) return; await recovery?.flush(); }
       if (!value) { toolRequest++; cancelPointerGesture(); polygon = null; signatureHover = null; textRequest++; }
       // Detach drawing previews only after the document has drawn their replacement.
       if (!value) while (pendingDrawings.capture()) {
@@ -1746,6 +1822,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         active = value; toolbar.hidden = overlay.hidden = !value; document.body.classList.toggle("hepr-editing", value);
         cameraPan.setActive(value);
         review.setActive(value);
+        links.setActive(value); updateLinkButtons();
         layerControls.setActive(value); if (!value) layerDialog?.close();
         releaseFrameListener?.(); releaseFrameListener = null;
         if (value) releaseFrameListener = host.subscribeToFrames?.(() => { if (active && !disposed) updateGeometry(true); }) ?? null;
@@ -1762,17 +1839,18 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
           active = false; toolbar.hidden = overlay.hidden = true; document.body.classList.remove("hepr-editing");
           cameraPan.setActive(false);
           review.setActive(false);
+          links.setActive(false);
           layerControls.setActive(false); releaseFrameListener?.(); releaseFrameListener = null;
           window.cancelAnimationFrame(frame); host.setEditing(false); host.onModeChange?.(false);
         }
         throw error;
       }
     },
-    isEditing: () => active, isBusy: () => running || savePreparing || structuralRunning || recoveryRunning || cameraPan.isPanning(), isDirty: hasUnsavedChanges, save, attachDocuments, dropImages, confirmDocumentChange,
+    isEditing: () => active, isBusy: () => running || savePreparing || structuralRunning || recoveryRunning || cameraPan.isPanning() || links.isBusy(), isDirty: hasUnsavedChanges, save, attachDocuments, dropImages, confirmDocumentChange,
     dispose() {
       if (disposed) return; disposed = true; active = false; cancelPointerGesture(false); lifetime.abort(); scenePreparation?.abort(); operation?.abort(); window.cancelAnimationFrame(frame);
       cameraPan.dispose();
-      review.dispose(); recoveryDialog?.close();
+      review.dispose(); links.dispose(); recoveryDialog?.close();
       if (discardRecovery && recovery) { const controller = recovery; void controller.discard().finally(() => controller.dispose()).catch(() => {}); }
       else recovery?.dispose();
       pendingFieldFocus = null;

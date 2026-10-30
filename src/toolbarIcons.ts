@@ -8,6 +8,8 @@ const icons = {
   "strikeout-text": '<path d="M18 5c-5-5-15 0-10 5m-5 2h18M6 18c5 5 14 1 10-4"/>',
   comment: '<path d="M3 3h18v14H9l-6 5V3Zm4 5h10M7 12h7"/>',
   "edit-comment": '<path d="M10 3H3v18l6-5h12v-5M12 11l1-5 5-5 4 4-5 5Z"/>',
+  link: '<path d="m10 14 4-4m-7 6-2 2a4 4 0 0 1-6-6l5-5a4 4 0 0 1 6 0m4 1 2-2a4 4 0 0 1 6 6l-5 5a4 4 0 0 1-6 0" transform="translate(2 -1)"/>',
+  "remove-link": '<path d="m8 16-2 2a4 4 0 0 1-6-6l4-4m12 0 2-2a4 4 0 0 1 6 6l-4 4M3 3l18 18M10 14l4-4"/>',
   "apply-review": '<path d="m3 12 6 6 12-12M3 23h18"/>',
   "align-left": '<path d="M3 2v20M7 5h14v5H7Zm0 9h10v5H7Z"/>',
   "align-center": '<path d="M12 2v20M3 5h18v5H3Zm4 9h10v5H7Z"/>',

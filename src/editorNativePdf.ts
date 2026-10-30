@@ -32,6 +32,7 @@ import { isScenePaintRunVisible, scenePaintOrderedRuns } from "./scenePaintQuery
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 import { getEditorCapturedSourceScene } from "./editorClipboard";
 import type { NativeMissingFontResolver } from "./pdf/nativeFont";
+import { writeEditorNativePdfLinks } from "./editorPdfLinks";
 
 export const EDITOR_PDF_LAYER_STACKING_DIAGNOSTIC_CODE = "editor.pdf-layer-stacking";
 
@@ -884,7 +885,10 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
           pageIndex, pageCount: session.sourceScene.pageCount, sourcePageIndex: sourceIndex, sourcePageCount: document.pages.length };
         progress.report(start, { ...progressMetadata, stage: "compile", processed: index });
         try {
+        // Navigation is metadata, not an appearance. Preserve its original /AP
+        // and actions independently from ordinary annotation paint changes.
         const refs = sourceAnnotationRuns.get(annotation.id)?.flatMap(run => Array.from({ length: run.count }, (_, i) => ({ kind: run.kind, index: run.first + i }))) ?? [];
+        if (annotation.subtype === "Link" && !refs.length && !annotation.hasAppearanceDictionary) continue;
         const affected = edits.filter(edit => refs.some(ref => ref.kind === edit.ref.kind && ref.index === edit.ref.index));
         const annotationEdit = annotationEdits.get(annotation.id);
         const membershipChanged = changedAnnotationMemberships.has(annotation.id);
@@ -900,6 +904,7 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
         }
         const pendingAnnotation = annotation.ref ? writer.get(annotation.ref) : undefined;
         const originalDictionary = new Map(isPdfDictionary(pendingAnnotation) ? pendingAnnotation : annotation.dictionary);
+        if (annotation.subtype === "Link" && !annotation.ref && !originalDictionary.has("NM")) originalDictionary.set("NM", pdfTextValue(annotation.id));
         if (lockChanged) originalDictionary.set("F", locked ? originalFlags | 128 : originalFlags & ~128);
         if (annotationEdit?.contents !== undefined) originalDictionary.set("Contents", pdfTextValue(annotationEdit.contents));
         if (annotationEdit?.author !== undefined) originalDictionary.set("T", pdfTextValue(annotationEdit.author));
@@ -1189,6 +1194,8 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
         options.onWarning?.(`[${EDITOR_PDF_LAYER_STACKING_DIAGNOSTIC_CODE}] ${message}`);
       }
     }
+    await writeEditorNativePdfLinks(writer, scene, session, { ...options, pageDictionary,
+      condition: index => layers.conditionReference(scene.optionalContent!, index) });
     for (const [index, dictionary] of pageDictionaries) { const ref = document.getPage(index).ref; if (!ref) throw new Error("Recovered direct page requires a full scene export."); writer.set(ref, dictionary); }
     await layers.finishRemovals();
     progress.report(.94, { stage: "compile", sourceType: "pdf", unit: "sections", processed: processedObjects, total: objectCount });

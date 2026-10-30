@@ -153,7 +153,8 @@ export function bakeEditorAnnotationEdits(scene: VectorScene, edits: readonly Ed
     const metadata = { ...(edit.contents === undefined ? {} : { contents: edit.contents }), ...(edit.author === undefined ? {} : { author: edit.author }) };
     if (editorMatrixIsIdentity(edit.transform)) return [{ ...annotation, ...metadata }];
     const matrix = editorMatrix(edit.transform), bounds = annotation.bounds;
-    const geometry = transformAnnotationGeometry({ rect: [bounds.minX, bounds.minY, bounds.maxX, bounds.maxY], quadPoints: annotation.quadPoints,
+    const linkQuad = annotation.subtype === "Link" && !annotation.quadPoints ? [bounds.minX, bounds.maxY, bounds.maxX, bounds.maxY, bounds.minX, bounds.minY, bounds.maxX, bounds.minY] : undefined;
+    const geometry = transformAnnotationGeometry({ rect: [bounds.minX, bounds.minY, bounds.maxX, bounds.maxY], quadPoints: annotation.quadPoints ?? linkQuad,
       line: annotation.line, vertices: annotation.vertices, inkList: annotation.inkList }, matrix as PdfMatrix);
     const page = scene.pdfPages?.find(page => page.pageIndex === annotation.pageIndex);
     const mapping = page?.pdfToScene ?? [1, 0, 0, 1, scene.pageRects[annotation.pageIndex * 4], scene.pageRects[annotation.pageIndex * 4 + 1]];
@@ -162,7 +163,8 @@ export function bakeEditorAnnotationEdits(scene: VectorScene, edits: readonly Ed
     if (!sources.has(annotation.id)) sources.set(annotation.id, { annotation, transform: EDITOR_IDENTITY });
     transforms.set(annotation.id, multiplyEditorMatrices(matrix, transforms.get(annotation.id) ?? EDITOR_IDENTITY));
     return [{ ...annotation, ...metadata, ...geometry, pdfGeometry: { rect: [box.minX, box.minY, box.maxX, box.maxY] as const,
-      ...(original.quadPoints ? { quadPoints: transformAnnotationPoints(original.quadPoints, pdfMatrix as PdfMatrix) } : {}),
+      ...(original.quadPoints ? { quadPoints: transformAnnotationPoints(original.quadPoints, pdfMatrix as PdfMatrix) }
+        : linkQuad && geometry.quadPoints ? { quadPoints: transformAnnotationPoints(geometry.quadPoints, invertEditorMatrix(mapping) as PdfMatrix) } : {}),
       ...(original.line ? { line: transformAnnotationPoints(original.line, pdfMatrix as PdfMatrix) } : {}),
       ...(original.vertices ? { vertices: transformAnnotationPoints(original.vertices, pdfMatrix as PdfMatrix) } : {}),
       ...(original.inkList ? { inkList: original.inkList.map(path => transformAnnotationPoints(path, pdfMatrix as PdfMatrix)) } : {}) } }];
@@ -426,14 +428,16 @@ export function bakeEditorSourceScene(source: VectorScene, edits: readonly Edito
       })) return [annotation];
       if (!sources.has(annotation.id)) sources.set(annotation.id, { annotation, transform: EDITOR_IDENTITY });
       transforms.set(annotation.id, multiplyEditorMatrices(matrix, transforms.get(annotation.id) ?? EDITOR_IDENTITY));
-      const bounds = annotation.bounds, transformed = transformAnnotationGeometry({ rect: [bounds.minX, bounds.minY, bounds.maxX, bounds.maxY],
-        quadPoints: annotation.quadPoints, line: annotation.line, vertices: annotation.vertices, inkList: annotation.inkList }, matrix as PdfMatrix);
+      const bounds = annotation.bounds, linkQuad = annotation.subtype === "Link" && !annotation.quadPoints ? [bounds.minX, bounds.maxY, bounds.maxX, bounds.maxY, bounds.minX, bounds.minY, bounds.maxX, bounds.minY] : undefined;
+      const transformed = transformAnnotationGeometry({ rect: [bounds.minX, bounds.minY, bounds.maxX, bounds.maxY],
+        quadPoints: annotation.quadPoints ?? linkQuad, line: annotation.line, vertices: annotation.vertices, inkList: annotation.inkList }, matrix as PdfMatrix);
       const page = source.pdfPages?.find(page => page.pageIndex === annotation.pageIndex);
       const mapping = page?.pdfToScene ?? [1, 0, 0, 1, source.pageRects[annotation.pageIndex * 4], source.pageRects[annotation.pageIndex * 4 + 1]];
       const pdfMatrix = multiplyEditorMatrices(invertEditorMatrix(mapping), multiplyEditorMatrices(matrix, mapping));
       const original = annotation.pdfGeometry, pdfRect = editorTransformBounds({ minX: original.rect[0], minY: original.rect[1], maxX: original.rect[2], maxY: original.rect[3] }, pdfMatrix);
       return [{ ...annotation, ...transformed, pdfGeometry: { rect: [pdfRect.minX, pdfRect.minY, pdfRect.maxX, pdfRect.maxY] as const,
-        ...(original.quadPoints ? { quadPoints: transformAnnotationPoints(original.quadPoints, pdfMatrix as PdfMatrix) } : {}),
+        ...(original.quadPoints ? { quadPoints: transformAnnotationPoints(original.quadPoints, pdfMatrix as PdfMatrix) }
+          : linkQuad && transformed.quadPoints ? { quadPoints: transformAnnotationPoints(transformed.quadPoints, invertEditorMatrix(mapping) as PdfMatrix) } : {}),
         ...(original.line ? { line: transformAnnotationPoints(original.line, pdfMatrix as PdfMatrix) } : {}),
         ...(original.vertices ? { vertices: transformAnnotationPoints(original.vertices, pdfMatrix as PdfMatrix) } : {}),
         ...(original.inkList ? { inkList: original.inkList.map(path => transformAnnotationPoints(path, pdfMatrix as PdfMatrix)) } : {}) } }];

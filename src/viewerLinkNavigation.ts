@@ -13,19 +13,23 @@ export interface LinkNavigationAdapter {
   beforeNavigate?(): void;
 }
 
-/** Only ordinary web URLs are activated; all other PDF actions stay informational. */
-export function resolveAnnotationUrl(annotation: SceneAnnotation, sourceUrl?: string): string | null {
-  const action = annotation.action;
-  if (action?.type !== "URI" || !action.uri) return null;
+/** Ordinary web/contact URIs only; PDF scripts, files and executable actions stay inert. */
+export function resolvePdfLinkUrl(uri: string, sourceUrl?: string, uriBase?: string): string | null {
+  if (!uri) return null;
   try {
     let url: URL;
-    try { url = new URL(action.uri); }
+    try { url = new URL(uri); }
     catch {
-      const base = action.uriBase ? new URL(action.uriBase, sourceUrl).href : sourceUrl;
-      url = new URL(action.uri, base);
+      const base = uriBase ? new URL(uriBase, sourceUrl).href : sourceUrl;
+      url = new URL(uri, base);
     }
-    return url.protocol === "https:" || url.protocol === "http:" ? url.href : null;
+    return ["https:", "http:", "mailto:", "tel:"].includes(url.protocol) ? url.href : null;
   } catch { return null; }
+}
+
+export function resolveAnnotationUrl(annotation: SceneAnnotation, sourceUrl?: string): string | null {
+  const action = annotation.action;
+  return action?.type === "URI" && action.uri ? resolvePdfLinkUrl(action.uri, sourceUrl, action.uriBase) : null;
 }
 
 function localDestination(annotation: SceneAnnotation): AnnotationDestination | undefined {
@@ -113,7 +117,8 @@ export function createViewerLinkNavigation(adapter: LinkNavigationAdapter) {
   return {
     getActivationLabel(annotation: SceneAnnotation): string | null {
       if (disposed) return null;
-      if (resolveAnnotationUrl(annotation, sourceUrl())) return "Open link in new tab";
+      const url = resolveAnnotationUrl(annotation, sourceUrl());
+      if (url) return url.startsWith("mailto:") ? "Compose email" : url.startsWith("tel:") ? "Call number" : "Open link in new tab";
       const scene = adapter.getScene(), view = adapter.getView();
       return scene && view && resolveAnnotationView(scene, annotation, view, adapter.getCanvas().getBoundingClientRect())
         ? "Go to destination" : null;

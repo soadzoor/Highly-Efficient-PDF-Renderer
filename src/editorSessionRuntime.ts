@@ -6,7 +6,7 @@ import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 import { PAGE_PRIMITIVE_KINDS, ScenePageViews, scenePrimitiveCounts } from "./scenePageViews";
 import type { ScenePaintNode } from "./scenePaintGraph";
 import type { EditorAnnotationEdit, EditorFieldValue, EditorMatrix, EditorObject, EditorObjectInput, EditorSession, EditorSessionOptions,
-  EditorSourceEdit, EditorSourceObject, EditorState, EditorSelectionFrame, EditorLayerEdits, EditorStackingAction, EditorRecoverySnapshot } from "./editorTypes";
+  EditorSourceEdit, EditorSourceObject, EditorState, EditorSelectionFrame, EditorLayerEdits, EditorStackingAction, EditorRecoverySnapshot, EditorLink } from "./editorTypes";
 import { editorPaintIdentity, editorAuthoredOwner, editorPaintOwnerObject, setEditorPaintIdentity, remapEditorPaintIdentity, composeEditorPaintIdentity } from "./editorPaintIdentity";
 import { prepareEditorTranslationPreview } from "./editorTranslationPreview";
 import { editorCloneOwner } from "./editorObjectOrder";
@@ -32,6 +32,7 @@ import { createLoadProgressReporter, type PDFLoadProgress } from "./loadProgress
 import { createEditorGlyphStoreCache } from "./editorGlyphStoreCache";
 import { editorClipboardStore, releaseEditorClipboard, registerEditorCapturedSourceReader, type EditorCapturedSource, type EditorClipboardSnapshot } from "./editorClipboard";
 import { validateEditorReviewMetadata } from "./editorReview";
+import { compileEditorLinks, editorSourceLinks, editorSourceLinkAnnotation, validateEditorLink, getEditorLinkDiagnostics, registerEditorLinkRebinder } from "./editorLinks";
 
 interface Snapshot {
   objects: Map<string, EditorObject>;
@@ -42,6 +43,7 @@ interface Snapshot {
   selection: string[];
   selectionBasis?: EditorMatrix;
   sourceLocks: Set<string>;
+  links: Map<string, EditorLink | null>;
   identity: object;
 }
 interface RecoveryStateData {
@@ -72,6 +74,7 @@ function finite(value: unknown, name: string, minimum?: number): asserts value i
   if (typeof value !== "number" || !Number.isFinite(value) || (minimum !== undefined && value < minimum)) throw new RangeError(`${name} must be a finite number${minimum === undefined ? "" : ` at least ${minimum}`}.`);
 }
 function validateObject(object: EditorObject, pageCount: number): void {
+  if (object.link !== undefined) validateEditorLink(object.link);
   if (!object.id || typeof object.id !== "string") throw new TypeError("Editor objects require an ID.");
   if (object.locked !== undefined && typeof object.locked !== "boolean") throw new TypeError("An editing lock must be true or false.");
   if (!Number.isSafeInteger(object.pageIndex) || object.pageIndex < 0 || object.pageIndex >= pageCount) throw new RangeError("Editor object references an unknown page.");
@@ -115,7 +118,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
   const initialCatalog = editorLayerCatalog(sourceScene.optionalContent);
   const initialLayers: LayerSnapshot = { catalog: initialCatalog, removals: [], sourceAssignments: new Map(), annotationAssignments: new Map(), stackingChanged: false };
   const initialSourceLocks = new Set((sourceScene.annotations ?? []).filter(annotation => (annotation.flags & 128) !== 0).map(annotation => `annotation:${annotation.id}`));
-  let state: Snapshot = { objects: new Map(), edits: new Map(), annotationEdits: new Map(), fields: new Map(), layers: initialLayers, selection: [], sourceLocks: initialSourceLocks, identity: {} };
+  let state: Snapshot = { objects: new Map(), edits: new Map(), annotationEdits: new Map(), fields: new Map(), layers: initialLayers, selection: [], sourceLocks: initialSourceLocks, links: new Map(), identity: {} };
   let activeLayer: string | null = null, nextLayerId = 0, layerRevision = 0;
   let savedIdentity = state.identity, revision = 0, disposed = false, nextId = 0, transactionDepth = 0, transactionStart: Snapshot | null = null;
   let previewTransform: EditorMatrix | null = null, previewSequence = 0;
@@ -161,7 +164,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
   const emit = () => { const value = getState(); for (const listener of listeners) { try { listener(value); } catch { /* Observers cannot interrupt an edit. */ } } };
   const change = (operation: () => void) => {
     assertLive(); const before = state;
-    state = { ...state, objects: new Map(state.objects), edits: new Map(state.edits), annotationEdits: new Map(state.annotationEdits), fields: new Map(state.fields), sourceLocks: new Set(state.sourceLocks), selection: state.selection.slice(), selectionBasis: state.selectionBasis, identity: {} };
+    state = { ...state, objects: new Map(state.objects), edits: new Map(state.edits), annotationEdits: new Map(state.annotationEdits), fields: new Map(state.fields), sourceLocks: new Set(state.sourceLocks), links: new Map(state.links), selection: state.selection.slice(), selectionBasis: state.selectionBasis, identity: {} };
     try { operation(); } catch (error) { state = before; throw error; }
     if (state.layers !== before.layers) layerRevision++;
     if (previewTransform) { previewTransform = null; previewSequence++; cache = null; }
@@ -188,6 +191,10 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     sourceObjects.set(id, object); return object;
   };
   const internalObject = (id: string): EditorObject => state.objects.get(id) ?? sourceObject(id);
+  const readLink = (id: string): EditorLink | null => {
+    const object = internalObject(id);
+    return state.objects.has(id) ? object.link ?? null : state.links.has(id) ? state.links.get(id)! : editorSourceLinks(sourceScene).get(id)?.link ?? null;
+  };
   const sourceLockKey = (object: EditorObject): string => object.kind === "source" && !state.objects.has(object.id) && object.annotationId ? `annotation:${object.annotationId}` : object.id;
   const objectLocked = (id: string, visiting = new Set<string>()): boolean => {
     if (visiting.has(id)) return false;
@@ -518,6 +525,19 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     }
     return waitForLoad(result, signal);
   };
+  const linkedOwners = new WeakMap<object, readonly string[]>();
+  const applyLinks = (scene: VectorScene, snapshot: Snapshot, includeObjects = true): VectorScene => {
+    let owners = linkedOwners.get(snapshot.identity);
+    if (!owners) { owners = [...new Set([...editorSourceLinks(sourceScene).values()].filter(value => value.ownerId !== `annotation:${value.annotationId}` || value.link.type === "object").map(value => value.ownerId).concat([...snapshot.links.keys()],
+      [...snapshot.objects.values()].filter(object => object.link).map(object => object.id)))]; linkedOwners.set(snapshot.identity, owners); }
+    if (!includeObjects) owners = owners.filter(id => !snapshot.objects.has(id));
+    if (!owners.length) return scene;
+    const previous = state; state = snapshot;
+    try { return compileEditorLinks(scene, sourceScene, owners, { getObject: internalObject, getFrame: id => objectFrame(id, snapshot), getLink: readLink,
+      isDeleted: id => { try { return objectDeleted(internalObject(id)); } catch { return true; } },
+      condition: id => objectLayerCondition(id).condition, onDiagnostic: options.onDiagnostic }); }
+    finally { state = previous; }
+  };
   const selection = (ids: readonly string[], selectionOptions: { additive?: boolean; toggle?: boolean } = {}) => {
     assertLive(); const valid = [...new Set(ids.map(id => {
       const match = /^source:(stroke|fill|text|raster|gradient-fill|gradient-stroke):(\d+)$/.exec(id);
@@ -556,7 +576,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     const objects = new Map<string, EditorObject>(), frames = new Map<string, EditorSelectionFrame>();
     const visit = (id: string) => {
       if (objects.has(id)) return;
-      const object = internalObject(id); objects.set(id, copy(object));
+      const object = internalObject(id), link = readLink(id); objects.set(id, copy({ ...object, ...(link ? { link } : {}) }));
       if (object.kind === "group") object.children.forEach(visit);
       else if (object.kind === "source") frames.set(id, copy(objectFrame(id, snapshot)));
     };
@@ -621,8 +641,9 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
   const restoreRecoveryData = (payload: EditorRecoverySnapshot): RecoveryStateData => {
     if (payload?.format !== "hepr-editor-recovery" || payload.version !== 1 || !payload.data || typeof payload.data !== "object") throw new TypeError("Unsupported editor recovery snapshot.");
     const data = copy(payload.data) as RecoveryStateData, candidate = data.state;
+    if (candidate && candidate.links === undefined) candidate.links = new Map();
     if (!candidate || !(candidate.objects instanceof Map) || !(candidate.edits instanceof Map) || !(candidate.annotationEdits instanceof Map) ||
-        !(candidate.fields instanceof Map) || !(candidate.sourceLocks instanceof Set) || !Array.isArray(candidate.selection) ||
+        !(candidate.fields instanceof Map) || !(candidate.sourceLocks instanceof Set) || !(candidate.links instanceof Map) || !Array.isArray(candidate.selection) ||
         !(data.sourceObjects instanceof Map) || !(data.capturedSources instanceof Map) || !(data.cloneLayers instanceof Map) ||
         !candidate.layers || !(candidate.layers.sourceAssignments instanceof Map) || !(candidate.layers.annotationAssignments instanceof Map)) throw new TypeError("Invalid editor recovery state.");
     if (payload.sourceScene.pageCount !== pageCount || payload.sourceScene.pageRects.length !== sourceScene.pageRects.length ||
@@ -652,6 +673,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       if (typeof name !== "string" || !sourceScene.annotations?.some(annotation => annotation.field?.name === name) || !(value === null || typeof value === "string" || typeof value === "boolean" || typeof value === "number" && Number.isFinite(value) || Array.isArray(value) && value.every(item => typeof item === "string"))) throw new TypeError("Invalid recovered form value.");
     }
     for (const key of candidate.sourceLocks) if (typeof key !== "string") throw new TypeError("Invalid recovered source lock.");
+    for (const [id, link] of candidate.links) { if (typeof id !== "string") throw new TypeError("Invalid recovered link owner."); if (link !== null) validateEditorLink(link); }
     if (data.activeLayer !== null) editorLayer(catalog, data.activeLayer);
     if (!Number.isSafeInteger(data.nextId) || data.nextId < 0 || !Number.isSafeInteger(data.nextLayerId) || data.nextLayerId < 0) throw new TypeError("Invalid recovery identity counters.");
     if (candidate.selectionBasis) editorMatrix(candidate.selectionBasis);
@@ -690,6 +712,26 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       if (object.kind === "source" && !state.objects.has(id) && object.annotationId && !object.primitives.length) object.transform = copy(state.annotationEdits.get(object.annotationId)?.transform ?? EDITOR_IDENTITY);
       return object; },
     isObjectLocked(id) { assertLive(); return objectLocked(id); },
+    getObjectLink(id) { assertLive(); return copy(readLink(id)); },
+    setObjectLink(id, value) {
+      assertLive(); assertUnlocked([id]); const object = internalObject(id);
+      if (objectDeleted(object)) throw new RangeError("A removed object cannot own a link.");
+      const link = value === null ? null : copy(value);
+      if (link) {
+        validateEditorLink(link);
+        if (link.type === "object" && objectDeleted(internalObject(link.objectId))) throw new RangeError("The destination object was removed.");
+      }
+      const inheritedOpaqueRemoval = link === null && !state.objects.has(id) && !state.links.has(id) && editorSourceLinkAnnotation(sourceScene, id) !== undefined;
+      if (JSON.stringify(readLink(id)) === JSON.stringify(link) && !inheritedOpaqueRemoval) return;
+      change(() => {
+        if (state.objects.has(id)) {
+          const next = { ...object, link: link ?? undefined }; state.objects.set(id, next);
+          geometryOrigins.set(next, geometryOrigins.get(object) ?? object);
+          const inherited = cloneLayers.get(geometryOrigins.get(object) ?? object); if (inherited) cloneLayers.set(next, inherited);
+          const captured = capturedSource(object); if (captured) capturedSources.set(next, captured);
+        } else state.links.set(id, link);
+      });
+    },
     setObjectsLocked(input, locked) {
       assertLive(); if (typeof locked !== "boolean") throw new TypeError("An editing lock must be true or false.");
       const ids = new Set<string>(), visit = (id: string): void => { if (ids.has(id)) return; ids.add(id); const object = internalObject(id); if (object.kind === "group") object.children.forEach(visit); };
@@ -814,12 +856,14 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     },
     cloneSelection(offset = [12, -12]) {
       assertUnlocked(state.selection);
-      finite(offset[0], "Clone X offset"); finite(offset[1], "Clone Y offset"); const clones: string[] = [];
+      finite(offset[0], "Clone X offset"); finite(offset[1], "Clone Y offset"); const clones: string[] = [], copiedIds = new Map<string, string>();
       const basis = selectionFrame()?.transform;
       session.transaction("Duplicate", () => {
         const selected = expand(state.selection);
         for (const id of selected) {
           const original = internalObject(id), clone = copy(original); clone.id = nextObjectId();
+          copiedIds.set(id, clone.id);
+          const link = readLink(id); if (link) clone.link = copy(link);
           if (clone.kind === "source" && !state.objects.has(id)) {
             // Different member transforms are already visible in the baked subset; preserve a common transform when available.
             const matrices = clone.primitives.length ? clone.primitives.map(ref => state.edits.get(editorRefKey(ref))?.transform ?? EDITOR_IDENTITY)
@@ -832,6 +876,8 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
           if (clone.kind === "source") cloneLayers.set(clone, cloneLayers.get(geometryOrigins.get(original) ?? original) ?? layerEdits());
           change(() => { state.objects.set(clone.id, clone); if (objectLayerIds(id).length) state.layers = { ...state.layers }; }); clones.push(clone.id);
         }
+        for (const id of clones) { const object = state.objects.get(id)!;
+          if (object.link?.type === "object" && copiedIds.has(object.link.objectId)) state.objects.set(id, { ...object, link: { type: "object", objectId: copiedIds.get(object.link.objectId)! } }); }
         state.selection = clones; state.selectionBasis = clones.length > 1 ? basis : undefined;
         session.transformSelection([1, 0, 0, 1, offset[0], offset[1]]);
       }); return clones;
@@ -877,6 +923,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       const ids = new Map([...captured.objects.keys()].map(id => [id, nextObjectId()])), additions: EditorObject[] = [];
       for (const [id, original] of captured.objects) {
         const object = copy(original); object.id = ids.get(id)!;
+        if (object.link?.type === "object" && ids.has(object.link.objectId)) object.link = { type: "object", objectId: ids.get(object.link.objectId)! };
         if (object.kind === "group") { object.children = object.children.map(child => ids.get(child)!); delete object.layerId; delete object.layerCondition; }
         else { object.layerId = destination; delete object.layerCondition; }
         validateObject(object, pageCount);
@@ -1143,7 +1190,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         }
         const prepared = await waitForLoad(translationPreviewCache.promise, signal);
         if (prepared) {
-          const scene = prepared.translate(capturedPreview[4], capturedPreview[5], signal);
+          const scene = applyLinks(prepared.translate(capturedPreview[4], capturedPreview[5], signal), transformedSnapshot(committedSnapshot, capturedPreview));
           if (revision === startedRevision && previewSequence === startedPreview && !disposed) cache = { revision, previewSequence: startedPreview, scene };
           progress.complete(completeMeta); return scene;
         }
@@ -1167,6 +1214,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         if (objectOrder) base = applyEditorObjectOrdering(base, objectOrder);
         base = await refreshEditorSceneLayerDefaults(base, { signal, onDiagnostic: options.onDiagnostic });
         base = reuseGlyphStores(base);
+        base = applyLinks(base, snapshot, includeObjects && !sourceCopiesOnly);
         if (useFullCache && (!preview || !capturedPreview) && !disposed && state.identity === committedSnapshot.identity) committedSceneCache = { identity: committedSnapshot.identity, scene: base };
         if (useFullCache && revision === startedRevision && (!preview || previewSequence === startedPreview) && !disposed) cache = { revision, previewSequence: startedPreview, scene: base };
         progress.complete(completeMeta); return base;
@@ -1238,6 +1286,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       if (objectOrder) result = applyEditorObjectOrdering(result, objectOrder);
       result = await refreshEditorSceneLayerDefaults(result, { signal, onDiagnostic: options.onDiagnostic });
       result = reuseGlyphStores(result);
+      result = applyLinks(result, snapshot, includeObjects && !sourceCopiesOnly);
       if (useFullCache && (!preview || !capturedPreview) && !disposed && state.identity === committedSnapshot.identity) committedSceneCache = { identity: committedSnapshot.identity, scene: result };
       if (useFullCache && revision === startedRevision && (!preview || previewSequence === startedPreview) && !disposed) cache = { revision, previewSequence: startedPreview, scene: result };
       progress.complete(completeMeta); return result;
@@ -1253,6 +1302,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       const snapshotStatus = { ...getState(), previewing: false };
       const scene = await session.getScene({ ...saveOptions, preview: false,
         onProgress: payload => compileProgress.report(payload.value, { ...payload, stage: payload.stage === "complete" ? "compile" : payload.stage }) });
+      for (const diagnostic of getEditorLinkDiagnostics(scene)) { saveOptions.onDiagnostic?.(diagnostic); saveOptions.onWarning?.(diagnostic.message); }
       saveOptions.signal?.throwIfAborted();
       // Native persistence queries metadata after asynchronous parsing and
       // resource imports. Give it the same revision as the compiled scene,
@@ -1275,6 +1325,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         getObjects: objectOptions => withSnapshot(() => session.getObjects(objectOptions)),
         getObject: id => withSnapshot(() => session.getObject(id)),
         isObjectLocked: id => withSnapshot(() => objectLocked(id)), setObjectsLocked: readOnly,
+        getObjectLink: id => withSnapshot(() => copy(readLink(id))), setObjectLink: readOnly,
         getObjectBounds: id => withSnapshot(() => session.getObjectBounds(id)),
         getSelection: () => snapshot.selection.slice(),
         getSelectionBounds: () => withSnapshot(() => session.getSelectionBounds()),
@@ -1337,6 +1388,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       const progress = createLoadProgressReporter(saveOptions.onProgress), compileProgress = progress.child(0, .3), persistenceProgress = progress.child(.3, 1);
       const targetRevision = revision, scene = await session.getScene({ ...saveOptions, preview: false,
         onProgress: payload => compileProgress.report(payload.value, { ...payload, stage: payload.stage === "complete" ? "compile" : payload.stage }) }), { buildHep } = await import("./hepBuilder");
+      for (const diagnostic of getEditorLinkDiagnostics(scene)) saveOptions.onWarning?.(diagnostic.message);
       saveOptions.signal?.throwIfAborted();
       // Extra form controls are editor state, not an expansion of HEP's
       // established compact field metadata schema.
@@ -1352,9 +1404,25 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       saveOptions.signal?.throwIfAborted(); progress.complete({ sourceType: "hep", unit: "pages", processed: pageCount, total: pageCount, pageCount });
       if (!disposed && revision === targetRevision && saveOptions.markSaved !== false) session.markSaved(); return blob;
     },
-    dispose() { if (disposed) return; disposed = true; lifetime.abort(); releaseEditorClipboard(session); listeners.clear(); undoStack.length = redoStack.length = 0; sourceObjects.clear(); cache = null; committedSceneCache = null; translationPreviewCache = null; frameCache = null; sourcePartition = null; glyphStores.clear(); state = { objects: new Map(), fields: new Map(), edits: new Map(), annotationEdits: new Map(), layers: initialLayers, selection: [], sourceLocks: new Set(), identity: {} }; }
+    dispose() { if (disposed) return; disposed = true; lifetime.abort(); releaseEditorClipboard(session); listeners.clear(); undoStack.length = redoStack.length = 0; sourceObjects.clear(); cache = null; committedSceneCache = null; translationPreviewCache = null; frameCache = null; sourcePartition = null; glyphStores.clear(); state = { objects: new Map(), fields: new Map(), edits: new Map(), annotationEdits: new Map(), layers: initialLayers, selection: [], sourceLocks: new Set(), links: new Map(), identity: {} }; }
   };
   registerEditorCapturedSourceReader(session, id => { assertLive(); return capturedSourceScene(id); });
+  registerEditorLinkRebinder(session, (previous, replacement) => {
+    assertLive(); if (previous === replacement) return;
+    if (objectDeleted(internalObject(replacement))) throw new RangeError("The replacement link target was removed.");
+    const owners = [...new Set([...state.objects.keys(), ...state.links.keys(), ...editorSourceLinks(sourceScene).keys()])].filter(id => {
+      try { const link = readLink(id); return !objectDeleted(internalObject(id)) && link?.type === "object" && link.objectId === previous; } catch { return false; }
+    });
+    if (!owners.length) return;
+    change(() => { for (const id of owners) {
+      const link: EditorLink = { type: "object", objectId: replacement }, object = internalObject(id);
+      if (state.objects.has(id)) {
+        const next = { ...object, link }; state.objects.set(id, next); geometryOrigins.set(next, geometryOrigins.get(object) ?? object);
+        const inherited = cloneLayers.get(geometryOrigins.get(object) ?? object); if (inherited) cloneLayers.set(next, inherited);
+        const captured = capturedSource(object); if (captured) capturedSources.set(next, captured);
+      } else state.links.set(id, link);
+    } });
+  });
   orderReaders.set(session, () => { assertLive(); return [...visibility().getObjectOrder().order]; });
   orderedSourceReaders.set(session, options => session.getScene({ ...options, preview: false, sourceCopiesOnly: true } as NonNullable<Parameters<EditorSession["getScene"]>[0]>));
   orderRestorers.set(session, (tokens, stackingChanged = state.layers.stackingChanged) => {

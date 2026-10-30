@@ -7,11 +7,15 @@ export function editorUiTestContext(values = {}) {
   if (values.host && !values.host.sceneToClientPoint) values.host.sceneToClientPoint = () => null;
   if (values.session && !values.session.isObjectLocked) values.session.isObjectLocked = () => false;
   return vm.createContext({
-    disposed: false, running: false, structuralRunning: false, savePreparing: false, AbortSignal,
+    disposed: false, running: false, structuralRunning: false, savePreparing: false, AbortSignal, AbortController,
     async waitForLoad(promise, signal) { signal?.throwIfAborted(); const value = await promise; signal?.throwIfAborted(); return value; },
     overlay: {}, lifetime: new AbortController(), updateClipboardButtons() {},
     review: { flushDraft: () => true, updateOverlay() {}, preview: () => null, setTool() {}, setActive() {}, cancelGesture() {},
       dispose() {}, isSelecting: () => false, hasDraftChanges: () => false },
+    links: { flushDraft: () => true, isOpen: () => false, hasOpenDialog: () => false, isBusy: () => false, isPicking: () => false,
+      canEditSelection: () => false, canRemoveSelection: () => false, editSelection: () => false, removeSelection: () => false,
+      getDraft: () => null, restoreDraft() {}, hasDraftChanges: () => false, cancelPick() {}, setActive() {}, dispose() {}, pickTarget() {} },
+    updateLinkButtons() {},
     isEditorReviewTool: tool => ["highlight", "underline-text", "strikeout-text", "comment"].includes(tool),
     reviewDefaults: new Map(), selectionLocked: () => false, canEditComment: () => false,
     tool: "select", appearanceControls: { refresh() {} }, latestScene: {}, toolbar: { querySelectorAll: () => [] },

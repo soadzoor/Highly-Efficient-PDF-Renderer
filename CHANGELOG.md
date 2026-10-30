@@ -8,6 +8,13 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Added
 
+- Add URL and same-document object links to selected content, including precise
+  multi-line highlighted text. Provide toolbar/context actions, Ctrl/Cmd+K and
+  destination picking, with undo, locks, copy/page-duplication rebinding and local
+  draft recovery. Save invisible standard PDF Link annotations and named
+  destinations without altering artwork; retain links in flattened PDFs and HEP.
+  References follow identifiable targets while editing; anonymous source targets
+  reopen as ordinary PDF destinations when their identity cannot be retained.
 - Add per-page alignment, equal-gap distribution and cached movement snapping
   guides, with Alt/Option bypass and one-step Undo. Add glyph-bound highlights,
   underlines, strikeouts and comments with standard PDF annotations and explicit

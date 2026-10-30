@@ -271,6 +271,45 @@ HEP bakes their appearance into ordinary geometry and existing annotation metada
 it carries no editor history or font programs. Removing or restyling a note follows
 the same selection, locking and undo rules as other objects.
 
+`getObjectLink(id)` returns an `EditorLink` or `null`;
+`setObjectLink(id, linkOrNull)` adds, replaces or removes that object's link.
+The object may be an added textbox, image, shape, review highlight, handwriting,
+group, or selectable source content. Link changes support transactions and
+Undo/Redo, and respect editing locks. Use one transaction to assign a link to
+several selected objects.
+
+Internal targets follow current transforms. Copying both ends retargets the
+copied owner to the copied target; copying only the owner retains its original
+target. Duplicating both pages also pairs their copied objects, including
+references across those pages. Removing a target omits the broken hotspot with
+a diagnostic/export warning; Undo can restore the original reference. An old
+primitive index is never substituted with unrelated source content.
+
+```ts
+editor.setObjectLink(highlightId, { type: "url", url: "https://example.com/reference" });
+editor.setObjectLink(anotherHighlightId, { type: "object", objectId: diagramId });
+const previousLink = editor.getObjectLink(highlightId);
+editor.setObjectLink(highlightId, null); // The highlight itself is retained.
+```
+
+`EditorLink` is `{ type: "url", url: string }`, `{ type: "object", objectId:
+string }`, or `{ type: "destination", destination: AnnotationDestination }`.
+New URLs must use HTTP, HTTPS, `mailto` or `tel`; script, data and file schemes
+are not activated. Object destinations belong to the same session and resolve
+to the target's current transformed bounds, including targets on another page.
+The destination variant retains an existing standard PDF destination when no
+reliable authoring-object identity is available.
+
+Compiled scenes and PDF exports represent the hotspot as an invisible standard
+Link annotation, leaving a highlight's visual annotation and its note intact.
+Highlighted text uses its individual quadrilaterals, so gaps between lines are
+not clickable. URLs use URI actions; internal references use standard local
+GoTo destinations. Identifiable authored-annotation targets retain their object
+binding when a saved PDF is reopened. Anonymous source primitives become
+standard page destinations across save/reopen, rather than binding an old
+primitive index to unrelated content. HEP retains links in existing annotation
+and page-mapping metadata, without a new editor-persistence section.
+
 `getPages()` returns current page indexes, displayed dimensions and
 rotation. Page indexes are zero-based. `rotatePages(indexes, degrees, options?)`
 accepts clockwise multiples of 90 degrees; `removePages(indexes, options?)`
@@ -1399,7 +1438,8 @@ room-detection enable **Annotation bubbles** by default, with no permanent
 hotspot markers. `pickSceneAnnotation` is also exported for custom UIs; it tests
 individual markup quads, ink proximity and other annotation bounds.
 
-All three examples opt into opening HTTP(S) links in a new tab and navigating
+All three examples opt into opening HTTP(S) links in a new tab, activating
+`mailto` and `tel` links through the browser's contact handlers, and navigating
 local `/GoTo` or `/Dest` links with a distance-aware camera animation: nearby
 jumps have a subtle zoom arc, while longer jumps pull back as they move and
 zoom in on arrival. Travel takes 450–1200 ms with a smooth departure and

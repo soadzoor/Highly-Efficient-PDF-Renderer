@@ -1,5 +1,6 @@
 import type { EditorObjectInput, EditorSession, EditorTextRun } from "./editorTypes";
 import type { EditorFont } from "./editorFonts";
+import { rebindEditorLinkTarget } from "./editorLinks";
 
 export interface EditorTextDraftBaseline { html: string; align: string; opacity: number }
 export function hasPendingEditorTextChanges(draft: {
@@ -27,11 +28,13 @@ export function commitEditorText(session: EditorSession, object: Extract<EditorO
   if (!object && !target.objectId && !target.sourceAnnotationId) return null;
   let id: string | null = null;
   session.transaction("Edit text", () => {
+    const link = object && target.sourceAnnotationId ? session.getObjectLink?.(`annotation:${target.sourceAnnotationId}`) : undefined;
     if (target.sourceAnnotationId) { session.selectAnnotations([target.sourceAnnotationId]); session.deleteSelection(); }
     else if (target.objectId && !object) { session.select([target.objectId]); session.deleteSelection(); }
     if (object) {
-      id = target.objectId && !target.sourceAnnotationId ? target.objectId : session.addObject(object);
+      id = target.objectId && !target.sourceAnnotationId ? target.objectId : session.addObject({ ...object, ...(link ? { link } : {}) });
       if (target.sourceAnnotationId) session.copyObjectLayerMembership(`annotation:${target.sourceAnnotationId}`, id);
+      if (target.sourceAnnotationId) rebindEditorLinkTarget(session, `annotation:${target.sourceAnnotationId}`, id);
       if (target.objectId && !target.sourceAnnotationId) session.updateObject(id, object);
     }
     session.select(id ? [id] : []);

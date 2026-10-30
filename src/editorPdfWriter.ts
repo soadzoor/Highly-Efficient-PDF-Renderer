@@ -10,6 +10,7 @@ import { GRADIENT_LUT_WIDTH } from "./orderedGradientPaint";
 import { PdfByteWriter, pdfNumber, pdfRef, pdfUtf16Hex } from "./editorPdfBytes";
 import { createLoadProgressReporter, type LoadProgressCallback } from "./loadProgress";
 import { validatePdfOutputProtection, type PdfOutputProtection } from "./pdf/pdfProtection";
+import { writeScenePdfLinks } from "./editorPdfLinks";
 
 export interface ScenePdfWriteOptions {
   readonly signal?: AbortSignal;
@@ -58,7 +59,9 @@ export async function writeScenePdf(scene: VectorScene, options: ScenePdfWriteOp
   validateVectorDrawRuns(scene); validateScenePaintGraph(scene);
   const writer = new PdfByteWriter(options), catalog = writer.reserve(), pages = writer.reserve();
   const layers = new EditorPdfLayers(writer, scene.optionalContent, options.flatten);
-  const views = new ScenePageViews(scene), pageReferences: number[] = [];
+  const views = new ScenePageViews(scene), pageReferences = Array.from({ length: views.pageCount }, () => writer.reserve());
+  const links = writeScenePdfLinks(writer, scene, pageReferences, { ...options,
+    condition: index => layers.annotationCondition(scene.optionalContent, index) });
   for (let index = 0; index < views.pageCount; index++) {
     options.signal?.throwIfAborted();
     progress.report(.95 * index / views.pageCount, { stage: "pdf-page", sourceType: "scene", unit: "pages",
@@ -72,13 +75,14 @@ export async function writeScenePdf(scene: VectorScene, options: ScenePdfWriteOp
     const content = await exportPage.content(resources);
     const bounds = exportPage.bounds;
     const stream = await writer.stream(`q\n1 0 0 1 ${numbers([-bounds.minX, -bounds.minY])} cm\n${rectangle(bounds)}W n\n${content}Q\n`);
-    pageReferences.push(writer.add(`<< /Type /Page /Parent ${pdfRef(pages)} /MediaBox [0 0 ${numbers([bounds.maxX - bounds.minX, bounds.maxY - bounds.minY])}] ` +
-      `/Resources ${resources.dictionary()} /Group << /S /Transparency /CS /DeviceRGB /I false /K false >> /Contents ${pdfRef(stream)} >>`));
+    const annotations = links.annotations.get(index);
+    writer.set(pageReferences[index], `<< /Type /Page /Parent ${pdfRef(pages)} /MediaBox [0 0 ${numbers([bounds.maxX - bounds.minX, bounds.maxY - bounds.minY])}] ` +
+      `/Resources ${resources.dictionary()} /Group << /S /Transparency /CS /DeviceRGB /I false /K false >> /Contents ${pdfRef(stream)} ${annotations?.length ? `/Annots [${annotations.map(pdfRef).join(" ")}]` : ""} >>`);
     progress.report(.95 * (index + 1) / views.pageCount, { stage: "pdf-page", sourceType: "scene", unit: "pages",
       processed: index + 1, total: views.pageCount, pageIndex: index, pageCount: views.pageCount });
   }
   writer.set(pages, `<< /Type /Pages /Count ${pageReferences.length} /Kids [${pageReferences.map(pdfRef).join(" ")}] >>`);
-  writer.set(catalog, `<< /Type /Catalog /Pages ${pdfRef(pages)} ${layers.catalog()} >>`);
+  writer.set(catalog, `<< /Type /Catalog /Pages ${pdfRef(pages)} ${layers.catalog()} ${links.names} >>`);
   let bytes = writer.build(catalog);
   if (encrypt) {
     progress.report(1, { stage: "compile", sourceType: "scene" });

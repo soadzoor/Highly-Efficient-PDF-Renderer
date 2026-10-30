@@ -44,6 +44,15 @@ export class EditorPdfLayers {
     return `/OC ${useProperty(expression.reference)} BDC\n${content}EMC\n`;
   }
 
+  /** Annotation memberships share the page writer's OCG/OCMD resources. */
+  annotationCondition(data: SceneOptionalContent | undefined, condition: number): number | boolean {
+    if (!data) throw new RangeError("A PDF annotation layer condition has no layer table.");
+    const expression = this.expression(data, condition);
+    if (this.flatten || typeof expression.value === "boolean") return expression.visible;
+    expression.reference ??= this.writer.add(`<< /Type /OCMD /OCGs [${expression.groups.map(pdfRef).join(" ")}] /VE ${expression.value} >>`);
+    return expression.reference;
+  }
+
   private expression(data: SceneOptionalContent, index: number): Expression {
     let cache = this.expressions.get(data); if (!cache) { cache = new Map(); this.expressions.set(data, cache); }
     const cached = cache.get(index); if (cached) return cached;
