@@ -5,6 +5,7 @@ import { stripTypeScriptTypes } from "node:module";
 import vm from "node:vm";
 import { sourceFunction } from "./lib/sourceFunction.mjs";
 import { editorFieldClientGeometry } from "../src/editorCoordinates.ts";
+import { createEditorFieldActivation } from "../src/editorFieldActivation.ts";
 
 const [uiSource, threeSource, formSource] = await Promise.all([
   readFile(new URL("../src/editorUi.ts", import.meta.url), "utf8"),
@@ -90,7 +91,7 @@ function harness(frameHost = true) {
     styleEditorFieldControl(control, annotation, family) { control.fontStyleAnnotation = annotation; control.fontFamily = family; },
     report: error => assert.fail(String(error))
   });
-  for (const name of ["sceneBoundsToClient", "focusPendingField", "updateTextVisibility", "updateGeometry", "updateFieldPaint", "renderFields", "setTool", "fieldAtClientPoint", "doubleClick"]) vm.runInContext(sourceFunction(nested, name), context);
+  for (const name of ["sceneBoundsToClient", "focusPendingField", "canActivateField", "activateField", "updateTextVisibility", "updateGeometry", "updateFieldPaint", "renderFields", "setTool", "fieldAtClientPoint", "doubleClick"]) vm.runInContext(sourceFunction(nested, name), context);
   vm.runInContext(`${tickSource}\n${apiSource}`, context);
   return {
     context, host, document, fields, controls, callbacks, events, raf,
@@ -115,8 +116,128 @@ function assertPlacement(h, zoom, x = 0, y = 0) {
   assert.equal(field.hidden, false); assert.equal(legacy.hidden, false);
 }
 
-const doubleClickEvent = (x, y) => ({ clientX: x, clientY: y, target: { getAttribute: () => null } });
+const doubleClickEvent = (x, y) => ({ button: 0, detail: 0, clientX: x, clientY: y, target: { getAttribute: () => null } });
 const focused = h => h.events.filter(event => event?.focus);
+
+// Exercise the complete Select press/move/release lifecycle. Native dblclick
+// delivery is deliberately absent: capture and redrawn SVG targets can change it.
+async function pointerHarness() {
+  const h = harness(), c = h.context, captures = new Set(), listeners = new Map(), windowListeners = new Map(), previews = [], transforms = [];
+  await c.api.setEditing(true); c.setTool("select");
+  c.currentState = { revision: 0, selection: [], previewing: false };
+  c.session.revision = 0; c.session.getState = () => c.currentState;
+  c.session.getSelection = () => c.currentState.selection;
+  c.session.getSelectionBounds = () => c.currentState.selection.length ? c.latestScene.annotations[0].bounds : null;
+  c.session.getSelectionFrame = () => c.currentState.selection.length
+    ? { bounds: c.latestScene.annotations[0].bounds, transform: [1, 0, 0, 1, 0, 0], pageIndex: 0 } : null;
+  c.session.getObject = id => ({ id, kind: "source" });
+  c.host.clientToScenePoint = (x, y) => ({ x: x - 100, y: 150 - y });
+  c.fieldActivation = createEditorFieldActivation();
+  c.pendingPick = c.picking = c.pointer = c.sceneApplication = null;
+  c.previewGeneration = 0; c.previewQueued = c.previewPending = false; c.requestedPreview = null;
+  c.pick = async () => "annotation:pdf-axes";
+  c.interaction = {
+    selectHit(id) { c.currentState.selection = [id]; },
+    selectArea() { assert.fail("field clicks do not select an area"); },
+    previewTransform(matrix) { c.currentState.previewing = true; previews.push(matrix); },
+    cancelTransform() { c.currentState.previewing = false; },
+    applyTransform(matrix) { transforms.push(matrix); }, dispose: noop
+  };
+  c.queuePreview = () => h.events.push("preview");
+  c.dragMatrix = (p, point) => [1, 0, 0, 1, point.x - p.start.x, point.y - p.start.y];
+  Object.assign(c.overlay, {
+    setPointerCapture: id => captures.add(id), hasPointerCapture: id => captures.has(id),
+    releasePointerCapture: id => captures.delete(id), addEventListener: (name, callback) => listeners.set(name, callback)
+  });
+  for (const name of ["isSceneSettling", "updatePointerCursor", "clearPreview", "cancelPointerGesture", "updateShapeGesture", "pointerDown", "pointerMove", "pointerUp", "forwardWheel"])
+    vm.runInContext(sourceFunction(nested, name), c);
+  for (const type of ["pointerdown", "pointermove", "pointercancel", "lostpointercapture", "dblclick"])
+    vm.runInContext(uiSource.match(new RegExp(`^  overlay\\.addEventListener\\("${type}",[^\\n]+$`, "m"))[0].trim(), c);
+  c.window.addEventListener = (name, listener, options) => { assert.equal(options.signal, c.lifetime.signal); windowListeners.set(name, listener); };
+  vm.runInContext(uiSource.match(/^  window\.addEventListener\("blur",[^\n]+$/m)[0].trim(), c);
+  const event = (timeStamp, options = {}) => ({ button: 0, pointerId: 1, pointerType: "mouse", isPrimary: true,
+    clientX: 149, clientY: 129, timeStamp,
+    target: { closest: () => null, getAttribute: name => name === "data-selection-move" ? "true" : null },
+    preventDefault: noop, stopPropagation: noop, ...options });
+  return { ...h, captures, previews, transforms, event, emit: (name, event) => listeners.get(name)(event), blur: () => windowListeners.get("blur")() };
+}
+const settlePointers = () => new Promise(resolve => setImmediate(resolve));
+
+for (const jitter of [0, .5, 1.5]) {
+  const h = await pointerHarness(), c = h.context, initialRefreshes = h.events.filter(e => e === "refresh").length;
+  h.emit("pointerdown", h.event(0)); await settlePointers();
+  h.emit("pointermove", h.event(10, { button: -1, clientX: 149 - jitter }));
+  h.emit("pointerup", h.event(20));
+  assert.equal(h.previews.length, 0, "zero/subpixel click jitter cannot start scene preview work");
+  assert.equal(h.events.filter(e => e === "refresh").length, initialRefreshes);
+  c.updateGeometry(); // Next click has a different SVG target, as after a rendered frame.
+  h.emit("pointerdown", h.event(120)); await settlePointers();
+  assert.equal(c.tool, "select", "the second press remains available for dragging");
+  h.emit("pointerup", h.event(140));
+  assert.equal(c.tool, "form", "actual pointer releases enter Fill without a native dblclick");
+  assert.equal(c.pendingFieldFocus.id, "pdf-axes"); assert.equal(h.captures.size, 0);
+  assert.equal(focused(h).length, 0); h.draw();
+  assert.equal(h.document.activeElement, h.controls[0]); assert.equal(focused(h).length, 1);
+  c.api.dispose();
+}
+
+// Both releases can arrive before the first cold primitive pick finishes.
+{
+  const h = await pointerHarness(), c = h.context; let finishPick, aborted = 0;
+  c.pick = () => new Promise(resolve => { finishPick = resolve; }); c.picking = { abort() { aborted++; } };
+  h.emit("pointerdown", h.event(0)); const request = c.pendingPick;
+  h.emit("pointerup", h.event(20));
+  h.emit("pointerdown", h.event(120)); h.emit("pointerup", h.event(140));
+  assert.equal(c.tool, "form"); assert.equal(request.canceled, true); assert.equal(aborted, 1);
+  assert.equal(c.pendingPick, null); assert.equal(h.captures.size, 0);
+  finishPick("older-source-object"); await settlePointers();
+  assert.equal(c.tool, "form"); assert.equal(c.pointer, null); assert.equal(c.currentState.selection.length, 0);
+  h.draw(); assert.equal(h.document.activeElement, h.controls[0]); c.api.dispose();
+}
+
+// Preview restoration may still be pending for an earlier canceled gesture.
+{
+  const h = await pointerHarness(), c = h.context;
+  c.sceneApplication = new Promise(() => {});
+  c.presented = { sourceScene: c.session.sourceScene, revision: 0, delta: [1, 0, 0, 1, 0, 0] };
+  assert(c.isSceneSettling());
+  for (const time of [0, 120]) { h.emit("pointerdown", h.event(time)); h.emit("pointerup", h.event(time + 20)); }
+  assert.equal(c.tool, "form", "restoring the same document revision cannot block field activation");
+  h.draw(); assert.equal(h.document.activeElement, h.controls[0]); c.api.dispose();
+}
+
+// Movement invalidates the entire press, even if it returns to its origin.
+// A browser's larger native double-click tolerance cannot bypass that decision.
+{
+  const h = await pointerHarness(), c = h.context;
+  h.emit("pointerdown", h.event(0)); await settlePointers(); h.emit("pointerup", h.event(20));
+  h.emit("pointerdown", h.event(120)); await settlePointers();
+  h.emit("pointermove", h.event(130, { button: -1, clientX: 145 }));
+  h.emit("pointermove", h.event(140, { button: -1 })); h.emit("pointerup", h.event(150));
+  assert.equal(h.previews.length, 2, "a real drag and its return keep live transform feedback");
+  h.emit("dblclick", { ...h.event(150), detail: 2 }); await settlePointers();
+  assert.equal(c.tool, "select"); assert.equal(c.pendingFieldFocus, null); c.api.dispose();
+}
+
+for (const boundary of ["wheel", "blur", "cancel", "locked", "source", "revision", "tool", "modifier", "handle", "links"]) {
+  const h = await pointerHarness(), c = h.context;
+  h.emit("pointerdown", h.event(0)); await settlePointers(); h.emit("pointerup", h.event(20));
+  if (boundary === "wheel") {
+    c.WheelEvent = class { constructor(type, init) { this.type = type; Object.assign(this, init); } };
+    c.host.getCanvas().dispatchEvent = noop; c.forwardWheel(h.event(40));
+  } else if (boundary === "blur") h.blur();
+  else if (boundary === "cancel") h.emit("pointercancel", h.event(40));
+  else if (boundary === "locked") c.session.isObjectLocked = () => true;
+  else if (boundary === "source") c.session.sourceScene = { ...c.session.sourceScene };
+  else if (boundary === "revision") c.session.revision++;
+  else if (boundary === "tool") { c.setTool("rectangle"); c.setTool("select"); }
+  else if (boundary === "links") c.links.isOpen = () => true;
+  const extra = boundary === "modifier" ? { shiftKey: true } : boundary === "handle"
+    ? { target: { closest: () => null, getAttribute: name => name === "data-handle" ? "ne" : null } } : {};
+  h.emit("pointerdown", h.event(120, extra)); await settlePointers(); h.emit("pointerup", h.event(140, extra));
+  assert.equal(c.tool, "select", `${boundary} cannot reuse the old click to activate a field`);
+  assert.equal(c.pendingFieldFocus, null); c.api.dispose();
+}
 
 // A docked Settings panel and Reader thumbnails both consume horizontal space.
 // The body-mounted editing toolbar follows only the canvas that remains.

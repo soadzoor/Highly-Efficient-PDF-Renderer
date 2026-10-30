@@ -24,6 +24,7 @@ import { commitEditorText, hasPendingEditorTextChanges, normalizeEditorTextColor
 import type { EditorFont } from "./editorFonts";
 import { editorIconButton } from "./editorToolbarIcons";
 import { canEditEditorField, createEditorFieldControl, createEditorFieldOptions, editorFieldDraftSignature, flushEditorFieldDrafts, hasPendingEditorFields, setEditorFieldControlValue, styleEditorFieldControl, updateEditorFieldControlAppearance, type EditorFieldControl } from "./editorFormControls";
+import { createEditorFieldActivation } from "./editorFieldActivation";
 import { editorBoundsClickHit, editorFieldClientGeometry, pickEditorMetadataAnnotation, transformEditorAnnotationText } from "./editorCoordinates";
 import { applyEditorFillOpacity, applyEditorOpacity, applyEditorPropertyPatch, editorFillSelection, editorPropertySelection, editorStyledSelection, validateEditorOpacity } from "./editorProperties";
 import { createEditorPropertyControls } from "./editorPropertyControls";
@@ -94,7 +95,7 @@ type EditorInkInput = Extract<EditorObjectInput, { kind: "ink" }>;
 type EditorShapeInput = Extract<EditorObjectInput, { kind: "shape" }>;
 type EditorDrawingInput = Extract<EditorObjectInput, { kind: "shape" | "ink" | "signature" }>;
 type EditorDrawingCache = ReturnType<typeof createEditorInkPreviewCache> | ReturnType<typeof createEditorShapePreviewCache>;
-type PointerGesture = { id: number; start: PrimitivePoint; startClient: PrimitivePoint; last: PrimitivePoint; points: [number, number][]; bounds: Bounds | null; frame?: EditorSelectionFrame; action: "draw" | "marquee" | "move" | "resize" | "rotate"; additive: boolean; handle?: string; freeResize?: boolean; scaleText?: boolean; freeRotation?: boolean; ink?: EditorInkInput; shape?: EditorShapeInput };
+type PointerGesture = { id: number; start: PrimitivePoint; startClient: PrimitivePoint; last: PrimitivePoint; points: [number, number][]; bounds: Bounds | null; frame?: EditorSelectionFrame; action: "draw" | "marquee" | "move" | "resize" | "rotate"; additive: boolean; dragging?: boolean; handle?: string; freeResize?: boolean; scaleText?: boolean; freeRotation?: boolean; ink?: EditorInkInput; shape?: EditorShapeInput };
 interface PresentedScene {
   sourceScene: VectorScene;
   revision: number;
@@ -140,6 +141,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   finally { signal?.removeEventListener("abort", abortInitialization); }
   const editorServices = services;
   const interaction = createEditorInteractionController(session);
+  const fieldActivation = createEditorFieldActivation();
   const pdfProtection = createEditorPdfProtectionState();
   let passwordDialog: EditorPdfPasswordDialog | null = null;
   let pagesDialog: EditorPagesDialog | null = null, structuralRunning = false;
@@ -739,6 +741,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (pointer?.action !== "resize") overlay.style.cursor = "";
   }
   function cancelPointerGesture(restore = true): void {
+    fieldActivation.reset();
     cameraPan.cancel();
     review.cancelGesture();
     alignmentSnap = null; requestedGuides = [];
@@ -848,6 +851,16 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (!control) { pendingFieldFocus = null; return; }
     if (fields.hidden || control.hidden) return;
     pendingFieldFocus = null; control.focus({ preventScroll: true });
+  }
+  function canActivateField(): boolean {
+    return active && !disposed && !running && !savePreparing && !structuralRunning && !recoveryRunning &&
+      tool === "select" && !activeText && !links.isOpen() && !cameraPan.isPanning() &&
+      (!presented || presented.sourceScene === session.sourceScene && presented.revision === session.revision);
+  }
+  function activateField(id: string): void {
+    setTool("form");
+    pendingFieldFocus = { id, sourceScene: session.sourceScene };
+    updateGeometry(); host.requestFrame?.();
   }
   async function pick(point: PrimitivePoint, client: PrimitivePoint): Promise<string | null> {
     const objects = session.getObjects(), edits = session.getSourceEdits();
@@ -968,6 +981,9 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     polygon.preview = { ...polygon.object, points, x: minX, y: minY, width: maxX - minX, height: maxY - minY };
   }
   async function pointerDown(event: PointerEvent): Promise<void> {
+    const fieldId = canActivateField() && !pointer && !(event.target as Element).getAttribute("data-handle")
+      ? fieldAtClientPoint({ x: event.clientX, y: event.clientY }) : null;
+    fieldActivation.pointerDown(event, fieldId ? { id: fieldId, sourceScene: session.sourceScene, revision: session.revision } : null);
     if (links.isPicking()) { await pickLinkTarget(event); return; }
     if (!active || running || savePreparing || activeText || pointer || pendingPick ||
         isSceneSettling() && (!["ink", "rectangle", "ellipse", "line", "arrow", "polygon", "polyline", "signature"].includes(tool) || !presented || presented.sourceScene !== session.sourceScene) ||
@@ -1074,6 +1090,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     }
   }
   function pointerMove(event: PointerEvent): void {
+    fieldActivation.pointerMove(event);
     if (active && tool === "signature") signatureHover = event.pointerType === "touch" ? null : { x: event.clientX, y: event.clientY };
     if (active && polygon && (tool === "polygon" || tool === "polyline")) {
       const point = host.clientToScenePoint(event.clientX, event.clientY, polygon.pageIndex);
@@ -1090,6 +1107,9 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       });
     } else if (pointer.action === "draw" && pointer.shape) updateShapeGesture(pointer, point);
     else if (pointer.bounds && ["move", "resize", "rotate"].includes(pointer.action)) {
+      // Click jitter must not start an asynchronous scene preview/restoration.
+      if (!pointer.dragging && Math.hypot(event.clientX - pointer.startClient.x, event.clientY - pointer.startClient.y) <= 2) return;
+      pointer.dragging = true;
       const matrix = dragMatrix(pointer, point);
       if (matrix[0] * matrix[3] - matrix[1] * matrix[2] !== 0) { interaction.previewTransform(matrix); requestedPreview = matrix; queuePreview(); }
       else clearPreview(true);
@@ -1097,7 +1117,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     event.preventDefault();
   }
   function transformModifiers(event: KeyboardEvent): void {
-    if (!active || running || event.isComposing || !pointer?.bounds ||
+    if (!active || running || event.isComposing || !pointer?.bounds || !pointer.dragging ||
         !(pointer.action === "resize" && (event.key === "Shift" || event.key === "Alt") || (pointer.action === "rotate" || pointer.action === "move") && event.key === "Alt")) return;
     pointer.freeResize = event.shiftKey; pointer.scaleText = event.altKey; pointer.freeRotation = event.altKey;
     const matrix = dragMatrix(pointer, pointer.last);
@@ -1105,6 +1125,11 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     else clearPreview(true);
   }
   function pointerUp(event: PointerEvent): void {
+    const field = fieldActivation.pointerUp(event);
+    if (field && canActivateField() && field.sourceScene === session.sourceScene && field.revision === session.revision &&
+        fieldAtClientPoint({ x: event.clientX, y: event.clientY }) === field.id) {
+      event.preventDefault(); event.stopPropagation(); activateField(field.id); return;
+    }
     if (pendingPick?.id === event.pointerId) { pendingPick.released = true; pendingPick.lastClient = { x: event.clientX, y: event.clientY }; overlay.releasePointerCapture?.(event.pointerId); }
     const p = pointer; if (!p || event.pointerId !== p.id) return; pointer = null; updatePointerCursor();
     try {
@@ -1633,23 +1658,28 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   overlay.addEventListener("lostpointercapture", event => { if (pointer?.id === event.pointerId || pendingPick?.id === event.pointerId && !pendingPick.released) cancelPointerGesture(); });
   function forwardWheel(event: WheelEvent): void {
     if (activeText || (event.target as Element).closest(".hepr-editor-field")) return;
+    fieldActivation.reset();
     event.preventDefault(); event.stopPropagation();
     if (pendingPick || pointer && pointer.action !== "draw") cancelPointerGesture();
     host.getCanvas().dispatchEvent(new WheelEvent("wheel", { bubbles: true, cancelable: true, clientX: event.clientX, clientY: event.clientY,
       deltaX: event.deltaX, deltaY: event.deltaY, deltaZ: event.deltaZ, deltaMode: event.deltaMode, ctrlKey: event.ctrlKey, metaKey: event.metaKey, shiftKey: event.shiftKey }));
   }
   overlay.addEventListener("wheel", forwardWheel, { passive: false });
+  window.addEventListener("blur", () => fieldActivation.reset(), { signal: lifetime.signal });
   async function doubleClick(event: MouseEvent): Promise<void> {
     if (!active || running || links.isOpen()) return;
     if (tool === "polygon" || tool === "polyline") { completePolygon(true); return; }
-    if (isSceneSettling()) return;
     if (tool !== "select" || activeText) return;
-    const fieldId = fieldAtClientPoint({ x: event.clientX, y: event.clientY });
+    // Field hit testing needs no primitive pick or completed preview restoration.
+    const fieldId = canActivateField() && event.button === 0 && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey &&
+      !(event.target as Element).getAttribute("data-handle") ? fieldAtClientPoint({ x: event.clientX, y: event.clientY }) : null;
     if (fieldId) {
-      cancelPointerGesture(); setTool("form");
-      pendingFieldFocus = { id: fieldId, sourceScene: session.sourceScene };
-      updateGeometry(); host.requestFrame?.(); return;
+      // Real click pairs are handled on pointer release, including drag rejection.
+      // Retain native-only activation from accessibility/programmatic events.
+      if (event.detail === 0) activateField(fieldId);
+      return;
     }
+    if (isSceneSettling()) return;
     const pageIndex = (event.target as Element).getAttribute("data-selection-move") === "true" ? session.getSelectionFrame()?.pageIndex : undefined;
     const point = host.clientToScenePoint(event.clientX, event.clientY, pageIndex); if (!point) return;
     cancelPointerGesture();

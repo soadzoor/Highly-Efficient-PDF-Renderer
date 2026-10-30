@@ -253,6 +253,7 @@ const editorWheelSource = sourceFunction(editorUiSource.replace(/^ {2}/gm, ""), 
 function editorWheelBridge(env) {
   const dispatches = []; let handler, cancellations = 0;
   const context = vm.createContext({ activeText: null, pointer: null, pendingPick: null,
+    fieldActivation: { reset() {} },
     cancelPointerGesture() { cancellations++; context.pointer = context.pendingPick = null; },
     overlay: { addEventListener(type, listener) { assert.equal(type, "wheel"); handler = listener; } },
     host: { getCanvas() {

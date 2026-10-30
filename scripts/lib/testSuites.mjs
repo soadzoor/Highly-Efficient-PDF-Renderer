@@ -65,6 +65,7 @@ export const fastTests = [
   "editor-presentation",
   "editor-preview-sync",
   "editor-frame-sync",
+  "editor-field-activation",
   "pdf-print",
   "viewer-print",
   "viewer-file-drop",

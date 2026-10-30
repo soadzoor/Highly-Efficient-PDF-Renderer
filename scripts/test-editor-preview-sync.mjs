@@ -211,7 +211,7 @@ for (const boundary of ["cancel", "view", "dispose"]) {
 // pointer remains stationary; they use the same coalescing and ACK boundary.
 {
   const h = harness(), c = h.context;
-  c.pointer = { id: 1, action: "rotate", bounds: frame(0).bounds, last: { x: 10, y: 20 } };
+  c.pointer = { id: 1, action: "rotate", dragging: true, bounds: frame(0).bounds, last: { x: 10, y: 20 } };
   c.dragMatrix = gesture => translation(gesture.freeRotation ? 13 : 45);
   c.interaction.previewTransform = matrix => h.preview(matrix[4]);
   vm.runInContext(sourceFunction(source, "transformModifiers"), c);

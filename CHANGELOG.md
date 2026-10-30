@@ -57,7 +57,9 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 - Insert PNG, JPEG and WebP files dropped onto document pages in Edit, retaining
   full image resolution and transparency with cancellation and stale-drop guards.
 - Double-click an editable form field with Select to activate Fill and focus the
-  clicked widget, including empty and transformed fields.
+  clicked widget, including empty and transformed fields. Recognize click pairs
+  across redrawn selection handles and pending object picks; ignore click jitter
+  before starting transform previews so it cannot delay or block field activation.
 - Show reusable signatures as selectable vector previews beside their names.
   Fit compact quadratic curves for signatures and pencil drawings, straightening
   sampling jitter while retaining endpoints, corners, pen lifts and loops.

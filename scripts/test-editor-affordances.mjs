@@ -417,6 +417,48 @@ const resizing = editorUiTestContext({ active: true, running: false, structuralR
 });
 install(resizing, "dragMatrix", "resizeTextBox", "transformModifiers", "updatePointerCursor", "pointerDown", "pointerMove", "pointerUp");
 const resizeEvent = (x, y, modifiers = {}) => ({ ...event(30, "ne"), clientX: x, clientY: y, shiftKey: false, altKey: false, ...modifiers });
+
+// A stationary Select click must not enqueue the asynchronous transform preview
+// that used to block the following form-field activation. Once dragging starts,
+// returning through the click-slop region must still update the live geometry.
+for (const action of ["move", "resize", "rotate"]) {
+  const livePreviews = [], queued = [], restored = [];
+  const slop = editorUiTestContext({ active: true, activeText: null, pointer: null, pendingPick: null, polygon: null, textRequest: 0,
+    isSceneSettling: () => false,
+    host: { clientToScenePoint: (x, y) => ({ x, y }) },
+    overlay: { dataset: {}, style: {}, setPointerCapture() {}, releasePointerCapture() {} },
+    session: { getSelectionBounds: () => resizeBounds, getSelectionFrame: () => resizeFrame },
+    interaction: { previewTransform: matrix => livePreviews.push(Array.from(matrix)) },
+    dragMatrix: (gesture, point) => [1, 0, 0, 1, point.x - gesture.start.x, point.y - gesture.start.y],
+    queuePreview: () => queued.push(true), clearPreview: restore => restored.push(restore),
+    commit: () => assert.fail("releasing back at the press point cannot commit a transform")
+  });
+  install(slop, "updatePointerCursor", "pointerDown", "pointerMove", "pointerUp", "transformModifiers");
+  const slopEvent = (x, y, modifiers = {}) => ({ ...resizeEvent(x, y, modifiers),
+    target: { closest: () => null, getAttribute: name => name === "data-handle" ? action === "resize" ? "ne" : action === "rotate" ? "rotate" : null
+      : name === "data-selection-move" && action === "move" ? "true" : null } });
+  await slop.pointerDown(slopEvent(110, 70)); assert.equal(slop.pointer.action, action);
+  for (const [x, y] of [[110, 70], [110.25, 70.5], [111, 71], [112, 70]]) {
+    slop.pointerMove(slopEvent(x, y));
+    slop.transformModifiers({ key: "Shift", shiftKey: true, altKey: false });
+    slop.transformModifiers({ key: "Alt", shiftKey: true, altKey: true });
+    assert.equal(livePreviews.length, 0, `${action}: click jitter and stationary modifier changes cannot preview`);
+    assert.equal(queued.length, 0, `${action}: no scene work starts inside two CSS pixels`);
+    assert.equal(Boolean(slop.pointer.dragging), false);
+  }
+  slop.pointerMove(slopEvent(112.001, 70));
+  assert.equal(slop.pointer.dragging, true); assert.equal(livePreviews.length, 1); assert.equal(queued.length, 1);
+  nearMatrix(livePreviews.at(-1), [1, 0, 0, 1, 2.001, 0], `${action}: crossing the drag threshold previews immediately`);
+  slop.transformModifiers({ key: "Alt", shiftKey: false, altKey: true });
+  assert.equal(livePreviews.length, 2, `${action}: modifier changes update an established drag`);
+  slop.pointerMove(slopEvent(110.5, 70.25));
+  nearMatrix(livePreviews.at(-1), [1, 0, 0, 1, .5, .25], `${action}: a drag returning inside click slop stays live`);
+  slop.pointerMove(slopEvent(110, 70));
+  nearMatrix(livePreviews.at(-1), IDENTITY, `${action}: returning to the press point restores the live position`);
+  assert.equal(livePreviews.length, queued.length);
+  slop.pointerUp(slopEvent(110, 70)); assert.equal(slop.pointer, null); assert.deepEqual(restored, [true]);
+}
+
 await resizing.pointerDown(resizeEvent(110, 70, { shiftKey: true, altKey: true }));
 assert.equal(resizing.pointer.freeResize, true); assert.equal(resizing.pointer.scaleText, true, "corner press captures Shift and Alt");
 resizing.pointerMove(resizeEvent(210, 45));

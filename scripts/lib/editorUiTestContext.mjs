@@ -23,6 +23,7 @@ export function editorUiTestContext(values = {}) {
     recovery: null, recoveryReady: Promise.resolve(), recoveryOffered: false,
     recoveryDialog: null, recoveryRunning: false, discardRecovery: false, exportedRevision: null,
     cameraPan: { cancel() {}, isPanning: () => false, setActive() {}, dispose() {} },
+    fieldActivation: { pointerDown() {}, pointerMove() {}, pointerUp: () => null, reset() {} }, canActivateField: () => false,
     updateAppearanceControls() {}, ...values
   });
 }
