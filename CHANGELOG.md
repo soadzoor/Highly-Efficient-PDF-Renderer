@@ -138,6 +138,10 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
+- Compile links attached to original page primitives and groups with their exact
+  layer visibility, keeping same-document destinations usable in Read mode and
+  preventing failed Edit re-entry. Wait for the current committed frame before
+  leaving Edit, including link changes that do not add visible drawing geometry.
 - Keep shared ancestor clips fixed when transforming only some of their content,
   while moving clips owned by the transformed objects. Use the same ownership
   rules for cached drag previews and compiled output.

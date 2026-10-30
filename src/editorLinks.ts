@@ -1,4 +1,6 @@
 import type { AnnotationDestination, SceneAnnotation, ScenePdfPage } from "./annotationData";
+import type { SceneOptionalContent } from "./optionalContentData";
+import { importEditorLayerCondition } from "./editorLayers";
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import type { EditorLink, EditorObject, EditorSelectionFrame, EditorSession } from "./editorTypes";
 import { editorPoint, editorTransformBounds, invertEditorMatrix, retainEditorAnnotationPlacements } from "./editorScene";
@@ -109,7 +111,7 @@ export function compileEditorLinks(scene: VectorScene, source: VectorScene, owne
   getFrame(id: string): EditorSelectionFrame;
   getLink(id: string): EditorLink | null;
   isDeleted(id: string): boolean;
-  condition(id: string): number | undefined;
+  condition(id: string): { catalog: SceneOptionalContent; condition?: number };
   onDiagnostic?(diagnostic: PdfDiagnostic): void;
 }): VectorScene {
   if (!owners.length) return scene;
@@ -122,7 +124,7 @@ export function compileEditorLinks(scene: VectorScene, source: VectorScene, owne
   };
   const names = new Set(owners.flatMap(id => { try { return [`${EDITOR_LINK_PREFIX}${encodeURIComponent(id)}`, `${EDITOR_LINK_PREFIX}${encodeURIComponent(stableId(context.getObject(id)))}`]; } catch { return []; } }));
   const annotations = (scene.annotations ?? []).filter(annotation => !replaced.has(annotation.id) && !names.has(annotation.name ?? annotation.id));
-  let pdfPages: ScenePdfPage[] | undefined;
+  let pdfPages: ScenePdfPage[] | undefined, optionalContent = scene.optionalContent;
   const page = (pageIndex: number): ScenePdfPage => {
     pdfPages ??= scene.pdfPages?.map(value => ({ ...value })) ?? [];
     let result = pdfPages.find(value => value.pageIndex === pageIndex);
@@ -163,7 +165,12 @@ export function compileEditorLinks(scene: VectorScene, source: VectorScene, owne
       }
     } else if (link.type === "destination") destination = structuredClone(link.destination);
     const name = `${EDITOR_LINK_PREFIX}${encodeURIComponent(stableId(object))}`;
-    const condition = context.condition(id);
+    const membership = context.condition(id);
+    let condition: number | undefined;
+    if (membership.condition !== undefined) {
+      const imported = importEditorLayerCondition(optionalContent ?? membership.catalog, membership.catalog, membership.condition);
+      optionalContent = imported.catalog; condition = imported.condition;
+    }
     const pdfPoints = points.flatMap((_, index) => index % 2 ? [] : editorPoint(inverse, points[index], points[index + 1]));
     annotations.push({ id: original?.annotationId ?? inherited?.id ?? name, name, subtype: "Link", pageIndex: object.pageIndex, sourcePageIndex: ownerPage.sourcePageIndex,
       annotationIndex: (source.annotations?.length ?? 0) + annotations.length, bounds, quadPoints: points,
@@ -171,7 +178,7 @@ export function compileEditorLinks(scene: VectorScene, source: VectorScene, owne
       hasAppearance: false, border: { width: 0 }, ...(condition === undefined ? {} : { optionalContent: condition }),
       ...(link.type === "url" ? { action: { type: "URI", uri: link.url } } : { destination }) });
   }
-  const result: VectorScene = { ...scene, annotations, ...(pdfPages ? { pdfPages } : {}) };
+  const result: VectorScene = { ...scene, annotations, ...(pdfPages ? { pdfPages } : {}), ...(optionalContent ? { optionalContent } : {}) };
   retainEditorAnnotationPlacements(scene, result);
   diagnostics.set(result, notices);
   const hint = getEditorSceneTranslationHint(scene); if (hint) setEditorSceneTranslationHint(result, hint);

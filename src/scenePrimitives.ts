@@ -232,6 +232,13 @@ export function getPrimitiveOptionalContentCondition(scene: VectorScene, ref: Pr
   return primitiveRun(scene, ref)?.optionalContent;
 }
 
+/** Exact layer predicates for visible page paint, including ancestor scopes.
+ * Null excludes mask-only and statically hidden paint; an empty list is unconditional. */
+export function getPrimitiveVisibilityConditions(scene: VectorScene, ref: PrimitiveRef): readonly number[] | null {
+  const run = primitiveRun(scene, ref);
+  return isScenePaintRunVisible(scene, run, () => true) ? scenePaintRunConditions(scene, run, false) : null;
+}
+
 /** Includes static paint-graph eligibility and ancestor visibility conditions. */
 export function isScenePrimitiveVisible(scene: VectorScene, ref: PrimitiveRef, visible: (condition?: number) => boolean): boolean {
   return isScenePaintRunVisible(scene, primitiveRun(scene, ref), visible);

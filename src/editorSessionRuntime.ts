@@ -13,7 +13,8 @@ import { editorCloneOwner } from "./editorObjectOrder";
 import { editorLayerCatalog, editorLayer, createEditorLayer, updateEditorLayer, moveEditorLayer, setEditorLayerOrder, removeEditorLayer, importEditorLayerCondition } from "./editorLayers";
 import { getOptionalContentGroupIds, createDefaultOptionalContentSnapshot } from "./optionalContent";
 import { applyEditorSceneLayers, assignEditorGeometryLayer, refreshEditorSceneLayerDefaults, isEditorLayerCompositingUnit,
-  createEditorLayerVisibility, createEditorObjectOrderSchedule, reorderEditorSceneLayers, applyEditorObjectOrdering, detachEditorGeometryAnnotationLayers, captureEditorAnnotationLayerCondition } from "./editorLayerScene";
+  createEditorLayerVisibility, createEditorObjectOrderSchedule, reorderEditorSceneLayers, applyEditorObjectOrdering, detachEditorGeometryAnnotationLayers, captureEditorAnnotationLayerCondition,
+  captureEditorPrimitiveLayerCondition, combineEditorLayerConditions } from "./editorLayerScene";
 
 interface LayerSnapshot {
   catalog: EditorLayerEdits["catalog"];
@@ -481,6 +482,16 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     if (!object.annotationId) throw new TypeError("Exact membership copying requires an annotation or an authored object.");
     return captureEditorAnnotationLayerCondition(sourceScene, objectLayerEdits(id), object.annotationId);
   };
+  const linkLayerCondition = (id: string): ReturnType<typeof objectLayerCondition> => {
+    const object = internalObject(id);
+    if (object.kind === "group") return combineEditorLayerConditions(state.layers.catalog,
+      object.children.filter(child => !objectDeleted(internalObject(child))).map(linkLayerCondition));
+    if (object.kind === "source" && !object.annotationId && object.layerId === undefined && object.layerCondition === undefined) {
+      const refs = state.objects.has(id) ? object.primitives : object.primitives.filter(ref => !state.edits.get(editorRefKey(ref))?.deleted);
+      return captureEditorPrimitiveLayerCondition(sourceScene, objectLayerEdits(id), refs);
+    }
+    return objectLayerCondition(id);
+  };
   const validateObjectLayer = (object: EditorObject): void => {
     if (object.layerCondition !== undefined) {
       if (object.kind === "group") throw new TypeError("Assign layer membership to a temporary group's contents.");
@@ -535,7 +546,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     const previous = state; state = snapshot;
     try { return compileEditorLinks(scene, sourceScene, owners, { getObject: internalObject, getFrame: id => objectFrame(id, snapshot), getLink: readLink,
       isDeleted: id => { try { return objectDeleted(internalObject(id)); } catch { return true; } },
-      condition: id => objectLayerCondition(id).condition, onDiagnostic: options.onDiagnostic }); }
+      condition: linkLayerCondition, onDiagnostic: options.onDiagnostic }); }
     finally { state = previous; }
   };
   const selection = (ids: readonly string[], selectionOptions: { additive?: boolean; toggle?: boolean } = {}) => {

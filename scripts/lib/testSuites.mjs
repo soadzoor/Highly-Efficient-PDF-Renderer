@@ -27,6 +27,8 @@ export const fastTests = [
   "editor-link-text",
   "editor-link-ui",
   "editor-link-integration",
+  "editor-link-source-owners",
+  "editor-link-mode-switch",
   "editor-link-pdf",
   "editor-glyph-store-cache",
   "editor-translation-preview",

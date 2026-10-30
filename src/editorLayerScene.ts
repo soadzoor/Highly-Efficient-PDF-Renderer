@@ -4,7 +4,8 @@ import { editorOrderGeometry, editorOrderToken, editorCloneOwner, arrangeEditorO
 import type { SceneOptionalContent, OptionalContentCondition } from "./optionalContentData";
 import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import type { PrimitiveRef } from "./scenePrimitives";
-import { getSceneAnnotationRuns, getScenePrimitiveBounds, isScenePrimitiveVisible } from "./scenePrimitives";
+import { getSceneAnnotationRuns, getScenePrimitiveBounds, getPrimitiveVisibilityConditions, isScenePrimitiveVisible } from "./scenePrimitives";
+import { importEditorLayerCondition } from "./editorLayers";
 import { createDefaultOptionalContentSnapshot, validateSceneOptionalContentReferences } from "./optionalContent";
 import type { ScenePaintGroup, ScenePaintNode } from "./scenePaintGraph";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
@@ -275,6 +276,38 @@ export function captureEditorAnnotationLayerCondition(source: VectorScene, edits
   const builder = new Conditions(scene.optionalContent ?? edits.catalog);
   let condition = annotation.optionalContent;
   for (const group of builder.catalog.groups) if (group.annotationId !== undefined) condition = builder.replace(condition, group.id, null);
+  return { catalog: builder.data(), ...(condition === undefined ? {} : { condition }) };
+}
+
+/** A source object's hotspot is eligible when any of its painted members is visible. */
+export function captureEditorPrimitiveLayerCondition(source: VectorScene, edits: EditorLayerEdits, refs: readonly PrimitiveRef[]): {
+  catalog: SceneOptionalContent;
+  condition?: number;
+} {
+  const scene = compileEditorSceneLayers(source, edits), builder = new Conditions(scene.optionalContent ?? edits.catalog);
+  const members: (number | undefined)[] = [];
+  for (const ref of refs) {
+    const conditions = getPrimitiveVisibilityConditions(scene, ref);
+    if (conditions) members.push(builder.combine("and", conditions));
+  }
+  let condition = builder.combine("or", members);
+  for (const group of builder.catalog.groups) if (group.annotationId !== undefined) condition = builder.replace(condition, group.id, null);
+  return { catalog: builder.data(), ...(condition === undefined ? {} : { condition }) };
+}
+
+/** Merge independent membership tables without changing existing condition addresses. */
+export function combineEditorLayerConditions(catalog: SceneOptionalContent, members: readonly { catalog: SceneOptionalContent; condition?: number }[]): {
+  catalog: SceneOptionalContent;
+  condition?: number;
+} {
+  const operands: number[] = [];
+  for (const member of members) {
+    if (member.condition === undefined) return { catalog };
+    const imported = importEditorLayerCondition(catalog, member.catalog, member.condition);
+    catalog = imported.catalog; if (imported.condition === undefined) return { catalog };
+    operands.push(imported.condition);
+  }
+  const builder = new Conditions(catalog), condition = builder.combine("or", operands);
   return { catalog: builder.data(), ...(condition === undefined ? {} : { condition }) };
 }
 

@@ -1842,8 +1842,9 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if (!value) pendingFieldFocus = null;
       if (!value) { flushEditorFieldDrafts(fieldDrafts); if (activeText) await finishText(); if (!review.flushDraft() || !links.flushDraft()) return; await recovery?.flush(); }
       if (!value) { toolRequest++; cancelPointerGesture(); polygon = null; signatureHover = null; textRequest++; }
-      // Detach drawing previews only after the document has drawn their replacement.
-      if (!value) while (pendingDrawings.capture()) {
+      // Read mode needs the current committed frame, including metadata-only links.
+      if (!value) while (pendingDrawings.capture() || presented !== null && (presented.sourceScene !== session.sourceScene ||
+          presented.revision !== session.revision || presented.delta !== null)) {
         await refreshScene(signal, false, true); signal.throwIfAborted();
         if (disposed) return;
         cancelPointerGesture();
