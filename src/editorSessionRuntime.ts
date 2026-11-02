@@ -14,7 +14,7 @@ import { editorFieldAnnotation, validateEditorFieldObject, validateEditorFieldVa
 import { normalizePrimitiveColor } from "./colorInput";
 import { applyEditorSourceColors, editorSourcePaintColors } from "./editorSourceColors";
 import { applyEditorSourceFieldColors } from "./editorSourceFieldColors";
-import { editorPaintIdentity, editorAuthoredOwner, editorPaintOwnerObject, setEditorPaintIdentity, remapEditorPaintIdentity, composeEditorPaintIdentity, setEditorPaintRole } from "./editorPaintIdentity";
+import { editorPaintIdentity, editorAuthoredOwner, editorPaintOwnerObject, setEditorPaintIdentity, remapEditorPaintIdentity, composeEditorPaintIdentity, setEditorPaintRole, editorOriginalPaintPrimitive, resetEditorOriginalPaintPrimitives } from "./editorPaintIdentity";
 import { prepareEditorTranslationPreview } from "./editorTranslationPreview";
 import { registerEditorPageChangesReader } from "./editorPageChanges";
 import { editorCloneOwner } from "./editorObjectOrder";
@@ -34,7 +34,7 @@ interface LayerSnapshot {
 }
 import { bakeEditorAnnotationEdits, bakeEditorSourceScene, compactEditorScene, composeEditorPage, EDITOR_IDENTITY, editorMatrix, editorMatrixIsIdentity,
   editorRefKey, editorTransformBounds, editorUnionBounds, invertEditorMatrix, multiplyEditorMatrices, retainEditorAnnotationPlacements, transformWholeEditorScene,
-  getEditorAnnotationSource, getEditorAnnotationFrameTransform, setEditorAnnotationSource } from "./editorScene";
+  getEditorAnnotationSource, getEditorAnnotationFrameTransform, setEditorAnnotationSource, editorSourceTextBoldWidth } from "./editorScene";
 import { compileEditorObjectGeometry, editorArrowHeadPoints } from "./editorSceneObjects";
 import { waitForLoad } from "./loadCancellation";
 import { createLoadProgressReporter, type PDFLoadProgress } from "./loadProgress";
@@ -84,10 +84,22 @@ export function getEditorOrderedSourceScene(session: EditorSession, options: { s
 function finite(value: unknown, name: string, minimum?: number): asserts value is number {
   if (typeof value !== "number" || !Number.isFinite(value) || (minimum !== undefined && value < minimum)) throw new RangeError(`${name} must be a finite number${minimum === undefined ? "" : ` at least ${minimum}`}.`);
 }
+function validateSourceTextStyle(edit: EditorSourceEdit): void {
+  if (edit.textStyle === undefined) return;
+  const style = edit.textStyle;
+  if (edit.ref.kind !== "text" || !style || typeof style !== "object" || Array.isArray(style) ||
+      Object.keys(style).some(key => !["bold", "italic", "boldWidth"].includes(key)) ||
+      style.bold !== undefined && typeof style.bold !== "boolean" || style.italic !== undefined && typeof style.italic !== "boolean" ||
+      style.boldWidth !== undefined && (typeof style.boldWidth !== "number" || !Number.isFinite(style.boldWidth) || style.boldWidth <= 0))
+    throw new TypeError("Invalid recovered source text emphasis.");
+}
 function validateObject(object: EditorObject, pageCount: number): void {
   if (object.kind === "source") {
     if (object.color !== undefined) normalizePrimitiveColor(object.color);
     if (object.fill !== undefined) normalizePrimitiveColor(object.fill);
+    if (object.fontWeight !== undefined && object.fontWeight !== "normal" && object.fontWeight !== "bold" &&
+        !(typeof object.fontWeight === "number" && Number.isFinite(object.fontWeight))) throw new TypeError("Invalid source font weight.");
+    if (object.fontStyle !== undefined && !["normal", "italic", "oblique"].includes(object.fontStyle)) throw new TypeError("Invalid source font style.");
   }
   if (object.link !== undefined) validateEditorLink(object.link);
   if (!object.id || typeof object.id !== "string") throw new TypeError("Editor objects require an ID.");
@@ -135,6 +147,7 @@ function validateObject(object: EditorObject, pageCount: number): void {
 export function createEditorSession(sourceScene: VectorScene, options: EditorSessionOptions = {}): EditorSession {
   const pageCount = sourceScene.pageRects.length / 4;
   if (!Number.isInteger(pageCount) || pageCount < 1) throw new RangeError("An editor requires a complete scene with at least one page.");
+  resetEditorOriginalPaintPrimitives(sourceScene);
   const initialCatalog = editorLayerCatalog(sourceScene.optionalContent);
   const initialLayers: LayerSnapshot = { catalog: initialCatalog, removals: [], sourceAssignments: new Map(), annotationAssignments: new Map(), stackingChanged: false };
   const initialSourceLocks = new Set((sourceScene.annotations ?? []).filter(annotation => (annotation.flags & 128) !== 0).map(annotation => `annotation:${annotation.id}`));
@@ -256,6 +269,25 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     const value = paints.fill.length && fill !== undefined ? fill : color;
     return paints.color.length && value !== undefined ? [{ ref, transform: EDITOR_IDENTITY, deleted: false, color: value }] : [];
   });
+  const sourceCopyAppearance = (object: EditorSourceObject, scene: VectorScene): readonly EditorSourceEdit[] => {
+    const edits = new Map(sourceCopyColors(object).map(edit => [editorRefKey(edit.ref), edit]));
+    for (const ref of sceneRefs(scene)) if (ref.kind === "text" && (object.fontWeight !== undefined || object.fontStyle !== undefined)) {
+      const previous = edits.get(editorRefKey(ref)), textStyle = { ...previous?.textStyle,
+        ...(object.fontWeight === undefined ? {} : { bold: object.fontWeight === "bold" || Number(object.fontWeight) >= 600,
+          boldWidth: editorSourceTextBoldWidth(scene, ref.index) }),
+        ...(object.fontStyle === undefined ? {} : { italic: object.fontStyle === "italic" || object.fontStyle === "oblique" }) };
+      edits.set(editorRefKey(ref), { ...previous, ref, transform: EDITOR_IDENTITY, deleted: false, textStyle });
+    }
+    return [...edits.values()];
+  };
+  const readSourceTextStyle = (object: EditorSourceObject): void => {
+    if (state.objects.has(object.id)) return;
+    const styles = object.primitives.filter(ref => ref.kind === "text" && !state.edits.get(editorRefKey(ref))?.deleted)
+      .map(ref => state.edits.get(editorRefKey(ref))?.textStyle);
+    if (!styles.length) return;
+    if (styles.every(style => Boolean(style?.bold) === Boolean(styles[0]?.bold))) object.fontWeight = styles[0]?.bold ? "bold" : "normal";
+    if (styles.every(style => Boolean(style?.italic) === Boolean(styles[0]?.italic))) object.fontStyle = styles[0]?.italic ? "italic" : "normal";
+  };
   const objectPaintColors = (id: string): EditorPaintColors => {
     const object = internalObject(id);
     if (object.kind === "group") {
@@ -723,7 +755,8 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
   const capturedSourceScene = (id: string, snapshot = state): VectorScene | undefined => {
     const object = snapshot.objects.get(id), captured = object && capturedSource(object);
     if (!object || object.kind !== "source" || !captured) return undefined;
-    const colored = applyEditorSourceColors(captured.scene, colorEdits(captured.scene, sceneRefs(captured.scene), object.color, object.fill));
+    const styled = bakeEditorSourceScene(captured.scene, sourceCopyAppearance(object, captured.scene), lifetime.signal, options.onDiagnostic);
+    const colored = applyEditorSourceColors(styled, colorEdits(styled, sceneRefs(styled), object.color, object.fill));
     retainEditorAnnotationPlacements(captured.scene, colored);
     return transformWholeEditorScene(colored, object.transform, lifetime.signal, options.onDiagnostic);
   };
@@ -777,10 +810,10 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       if (visited.has(id)) throw new TypeError("Cyclic recovery object group."); const next = new Set(visited); next.add(id); object.children.forEach(child => walk(child, next));
     };
     for (const id of candidate.objects.keys()) walk(id); candidate.selection.forEach(resolve);
-    for (const [key, edit] of candidate.edits) { getScenePrimitive(sourceScene, edit.ref); editorMatrix(edit.transform); if (edit.color !== undefined) normalizePrimitiveColor(edit.color); if (key !== editorRefKey(edit.ref) || typeof edit.deleted !== "boolean") throw new TypeError("Invalid recovered source edit."); }
+    for (const [key, edit] of candidate.edits) { getScenePrimitive(sourceScene, edit.ref); editorMatrix(edit.transform); validateSourceTextStyle(edit); if (edit.color !== undefined) normalizePrimitiveColor(edit.color); if (key !== editorRefKey(edit.ref) || typeof edit.deleted !== "boolean") throw new TypeError("Invalid recovered source edit."); }
     for (const [id, colors] of data.cloneColors) {
       if (candidate.objects.get(id)?.kind !== "source" || !Array.isArray(colors)) throw new TypeError("Invalid recovered source colors.");
-      for (const edit of colors) { getScenePrimitive(sourceScene, edit.ref); editorMatrix(edit.transform); if (edit.deleted !== false || edit.color === undefined) throw new TypeError("Invalid recovered source color."); normalizePrimitiveColor(edit.color); }
+      for (const edit of colors) { getScenePrimitive(sourceScene, edit.ref); editorMatrix(edit.transform); validateSourceTextStyle(edit); if (edit.deleted !== false || edit.color === undefined && edit.textStyle === undefined) throw new TypeError("Invalid recovered source appearance."); if (edit.color !== undefined) normalizePrimitiveColor(edit.color); }
     }
     for (const [key, edit] of candidate.annotationEdits) {
       if (key !== edit.id || !sourceScene.annotations?.some(annotation => annotation.id === edit.id)) throw new TypeError("Unknown recovered annotation."); editorMatrix(edit.transform);
@@ -840,12 +873,14 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       }
       return [...list.values()].filter(object => !objectDeleted(object) && (listOptions.pageIndex === undefined || object.pageIndex === listOptions.pageIndex)).map(object => {
         const result = copy(object);
+        if (result.kind === "source") readSourceTextStyle(result);
         if (result.kind === "source" && !state.objects.has(result.id) && result.primitives.length === 1) result.transform = copy(state.edits.get(editorRefKey(result.primitives[0]))?.transform ?? EDITOR_IDENTITY);
         if (result.kind === "source" && !state.objects.has(result.id) && result.annotationId && !result.primitives.length) result.transform = copy(state.annotationEdits.get(result.annotationId)?.transform ?? EDITOR_IDENTITY);
         return result;
       });
     },
     getObject(id) { assertLive(); const object = copy(internalObject(id));
+      if (object.kind === "source") readSourceTextStyle(object);
       if (object.kind === "source" && !state.objects.has(id) && object.primitives.length === 1) object.transform = copy(state.edits.get(editorRefKey(object.primitives[0]))?.transform ?? EDITOR_IDENTITY);
       if (object.kind === "source" && !state.objects.has(id) && object.annotationId && !object.primitives.length) object.transform = copy(state.annotationEdits.get(object.annotationId)?.transform ?? EDITOR_IDENTITY);
       return object; },
@@ -955,16 +990,26 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     updateObject(id, patch) {
       assertLive(); assertUnlocked([id]); const original = internalObject(id);
       if (!state.objects.has(id) && original.kind === "source") {
-        if (Object.keys(patch).some(key => key !== "color" && key !== "fill")) throw new TypeError("Original content accepts color/fill changes; use selection transforms for geometry.");
-        const paint = patch as { color?: EditorColor; fill?: EditorColor };
+        if (Object.keys(patch).some(key => !["color", "fill", "fontWeight", "fontStyle"].includes(key))) throw new TypeError("Original content accepts color/fill and text emphasis changes; use selection transforms for geometry.");
+        const paint = patch as Pick<EditorSourceObject, "color" | "fill" | "fontWeight" | "fontStyle">;
+        validateObject({ ...original, ...paint }, pageCount);
         const color = paint.color === undefined ? undefined : normalizePrimitiveColor(paint.color), fill = paint.fill === undefined ? undefined : normalizePrimitiveColor(paint.fill);
-        const updates = colorEdits(sourceScene, original.primitives, color, fill).flatMap(edit => {
+        const updates = new Map(colorEdits(sourceScene, original.primitives, color, fill).flatMap(edit => {
           const previous = state.edits.get(editorRefKey(edit.ref)); if (previous?.deleted) return [];
           const current = editorSourcePaintColors(sourceScene, [edit.ref], previous ? [previous] : []).color;
           if (current.length && current.every(value => normalizePrimitiveColor(value).every((channel, index) => Math.abs(channel - (edit.color as readonly number[])[index]) <= 1e-7))) return [];
-          return [{ ...previous, ...edit, transform: previous?.transform ?? EDITOR_IDENTITY }];
-        });
-        if (updates.length) change(() => { for (const edit of updates) state.edits.set(editorRefKey(edit.ref), edit); });
+          return [[editorRefKey(edit.ref), { ...previous, ...edit, transform: previous?.transform ?? EDITOR_IDENTITY }] as const];
+        }));
+        for (const ref of original.primitives) if (ref.kind === "text" && (paint.fontWeight !== undefined || paint.fontStyle !== undefined)) {
+          const key = editorRefKey(ref), previous = updates.get(key) ?? state.edits.get(key); if (previous?.deleted) continue;
+          const textStyle = { ...previous?.textStyle,
+            ...(paint.fontWeight === undefined ? {} : { bold: paint.fontWeight === "bold" || Number(paint.fontWeight) >= 600,
+              boldWidth: editorSourceTextBoldWidth(sourceScene, ref.index) }),
+            ...(paint.fontStyle === undefined ? {} : { italic: paint.fontStyle === "italic" || paint.fontStyle === "oblique" }) };
+          if (Boolean(previous?.textStyle?.bold) === Boolean(textStyle.bold) && Boolean(previous?.textStyle?.italic) === Boolean(textStyle.italic)) continue;
+          updates.set(key, { ...previous, ref, transform: previous?.transform ?? EDITOR_IDENTITY, deleted: false, textStyle });
+        }
+        if (updates.size) change(() => { for (const [key, edit] of updates) state.edits.set(key, edit); });
         return;
       }
       const object = copy({ ...original, ...patch, id, kind: original.kind }) as EditorObject;
@@ -1075,7 +1120,8 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
             if (matrices.some(matrix => matrix.some((value, i) => value !== matrices[0][i]))) throw new Error("Group source objects with different transforms after cloning individual members.");
             clone.transform = matrices[0];
             const colors = clone.primitives.flatMap(ref => { const edit = state.edits.get(editorRefKey(ref));
-              return edit?.color === undefined || edit.deleted ? [] : [{ ref: { ...ref }, transform: EDITOR_IDENTITY, deleted: false, color: copy(edit.color) }]; });
+              return !edit || edit.deleted || edit.color === undefined && edit.textStyle === undefined ? []
+                : [{ ref: { ...ref }, transform: EDITOR_IDENTITY, deleted: false, ...(edit.color === undefined ? {} : { color: copy(edit.color) }), ...(edit.textStyle ? { textStyle: copy(edit.textStyle) } : {}) }]; });
             if (colors.length) cloneColors.set(clone, colors);
           }
           else { const colors = sourceCopyColors(original); if (colors.length) cloneColors.set(clone, colors); }
@@ -1488,7 +1534,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         signal?.throwIfAborted(); let geometry: VectorScene;
         if (object.kind === "source") {
           const captured = capturedSource(object);
-          if (captured) geometry = captured.scene;
+          if (captured) geometry = bakeEditorSourceScene(captured.scene, sourceCopyAppearance(object, captured.scene), signal, options.onDiagnostic);
           else {
             const keep = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind => [kind, new Set<number>()])) as Record<PrimitiveRef["kind"], Set<number>>;
             for (const ref of object.primitives) keep[ref.kind].add(ref.index);
@@ -1499,8 +1545,17 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
                 .then(scene => cloneEdits.objectOrderChanged ? applyEditorObjectOrdering(scene, createEditorObjectOrderSchedule(sourceScene, cloneEdits, [])) : scene);
               appliedCloneLayers.set(cloneEdits, clonePromise); void clonePromise.catch(() => appliedCloneLayers.delete(cloneEdits));
             }
-            const cloneSource = await waitForLoad(clonePromise, signal), colored = applyEditorSourceColors(cloneSource, sourceCopyColors(object));
-            retainEditorAnnotationPlacements(cloneSource, colored); geometry = compactEditorScene(colored, keep);
+            const cloneSource = await waitForLoad(clonePromise, signal), colored = bakeEditorSourceScene(cloneSource, sourceCopyAppearance(object, cloneSource), signal, options.onDiagnostic);
+            retainEditorAnnotationPlacements(cloneSource, colored);
+            if (colored.textInstanceCount !== cloneSource.textInstanceCount) {
+              const original = editorOriginalPaintPrimitive(cloneSource), styled = editorOriginalPaintPrimitive(colored);
+              const wanted = new Set(object.primitives.map(ref => editorRefKey(original(ref)))), counts = scenePrimitiveCounts(colored);
+              for (const kind of PAGE_PRIMITIVE_KINDS) {
+                keep[kind].clear();
+                for (let index = 0; index < counts[kind]; index++) if (wanted.has(editorRefKey(styled({ kind, index })))) keep[kind].add(index);
+              }
+            }
+            geometry = compactEditorScene(colored, keep);
           }
           if (object.color !== undefined || object.fill !== undefined) {
             const colored = applyEditorSourceColors(geometry, colorEdits(geometry, sceneRefs(geometry), object.color, object.fill));

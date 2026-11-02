@@ -302,13 +302,25 @@ page centers, and known editable objects. Hold Alt/Option to bypass snapping.
 Unvisited source primitives are not exhaustively indexed for guides during a
 drag; selecting source artwork makes it available as a target.
 
-Choose **Highlight**, **Underline**, or **Strike out** and drag over searchable
-text to create an annotation following its glyph positions, including rotated
-text. **Comment** places a note; enter its text and optional author, then Apply.
+Choose **Select text**, drag over searchable text, then click **B**, **I**, **U**
+or **S** to toggle bold, italic, underline or strikethrough. The selection stays
+active so styles can be combined or removed with another click. Mixed selections
+receive the style on the first click. Textbox selections retain other run styles;
+double-click a textbox to format text while typing. Existing PDF glyphs use
+synthetic bold/italic that preserve their original outlines and positions;
+toggling these off restores the original font appearance. Saved source emphasis
+is baked into its appearance, without editable font-style metadata.
+The normal **Select** tool also supports underline and strikethrough on selected
+PDF text objects and groups, with the same toggle, mixed-state and Undo behavior.
+
+Choose **Highlight** and drag over searchable text to create a highlight
+annotation following its glyph positions, including rotated text. Underline and
+strikethrough buttons also recognize saved review annotations and can remove
+only the selected portion. **Comment** places a note; enter its text and optional author, then Apply.
 Double-click a review annotation or use **Edit comment** to edit its note.
 Comments support Ctrl/Cmd+Enter to apply and Escape to cancel. PDF saves retain
 standard annotation types, text quadrilaterals and explicit appearances. HEP
-retains their visual geometry without authoring semantics.
+retains their visual geometry and review annotation metadata.
 
 **Lock** prevents moving, resizing, rotation, deletion and appearance changes to
 selected objects or groups. Locked objects remain selectable and copyable;
@@ -320,7 +332,7 @@ HEP does not add editing-lock metadata.
 Property controls show mixed values and disable changes that the selection does
 not support. Group appearance changes apply to supported descendants. Changing
 a drawing tool's defaults does not restyle the previous selection. Existing page
-text remains transform-only; the textbox tool creates editable new text.
+text supports synthetic emphasis; the textbox tool creates editable new text.
 
 Downloads report **Download started** and keep local edits and recovery available
 because the browser may cancel its save dialog. Printing also retains the

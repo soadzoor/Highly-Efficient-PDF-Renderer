@@ -19,6 +19,7 @@ export function editorSelectionLeaves(session: EditorSession, ids = session.getS
 export function editorSupportsAppearance(object: EditorObject, property: EditorAppearanceProperty, session?: EditorSession): boolean {
   if (object.kind === "group") return false;
   if (object.kind === "source") {
+    if (property === "fontWeight" || property === "fontStyle") return !object.isClone && object.primitives.length > 0 && object.primitives.every(ref => ref.kind === "text");
     if (property !== "color" && property !== "fill") return false;
     return session ? session.getObjectPaintColors(object.id)[property].length > 0 : property === "color" ? object.primitives.some(ref => ref.kind !== "raster")
       : object.primitives.some(ref => ref.kind === "fill" || ref.kind === "gradient-fill");
@@ -54,8 +55,10 @@ export function editorPropertyState(session: EditorSession, property: EditorAppe
     if (property === "underline" || property === "strikethrough") return value ?? false;
     return value;
   };
-  const values = supported.flatMap(object => object.kind === "source"
+  const values = supported.flatMap(object => object.kind === "source" && (property === "color" || property === "fill")
     ? session.getObjectPaintColors(object.id)[property as "color" | "fill"].map(editorPropertyColor)
+    : object.kind === "source" && (property === "fontWeight" || property === "fontStyle")
+      ? object.primitives.filter(ref => ref.kind === "text").map(ref => fallback(session.getObject(`source:text:${ref.index}`)))
     : object.kind === "text" && object.runs?.length && property !== "align"
       ? object.runs.map(run => fallback({ ...object, ...Object.fromEntries(Object.entries(run).filter(([, value]) => value !== undefined)) } as EditorTextObject)) : [fallback(object)]);
   return { ids: supported.map(object => object.id), total: leaves.length, values,

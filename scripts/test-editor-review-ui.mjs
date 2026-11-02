@@ -35,12 +35,27 @@ try {
   scene.textInstanceB = Float32Array.from(Array.from({ length: 4 }, (_, i) => [10 + i * 10, 5, i, 0]).flat());
   scene.textGlyphMetaA = Float32Array.from(Array.from({ length: 4 }, () => [0, 0, 0, 0]).flat());
   scene.textGlyphMetaB = Float32Array.from(Array.from({ length: 4 }, () => [8, 10, 0, 0]).flat());
-  const session = createEditorSession(scene), errors = []; let drafts = 0, failed = false;
-  const ui = createEditorReviewController({ overlay, session, getScene: () => scene, canEdit: () => true,
+  const session = createEditorSession(scene), errors = []; let drafts = 0, failed = false, latestScene = scene, selectionChanges = 0;
+  const ui = createEditorReviewController({ overlay, session, getScene: () => latestScene, canEdit: () => true,
     toScene: (x, y) => ({ x, y }), toClient: (x, y) => ({ x, y }), style: () => ({ color: "#ffdf00", opacity: .3 }),
-    change(fn) { if (failed) throw new Error("Injected failure"); fn(); }, added() {}, onError: error => errors.push(error), onDraftChange: () => drafts++ });
+    change(fn) { if (failed) throw new Error("Injected failure"); fn(); }, added() {}, onError: error => errors.push(error), onDraftChange: () => drafts++, onSelectionChange: () => selectionChanges++ });
   try {
-    ui.setActive(true); ui.setTool("highlight"); assert(host.listenerCount > 0);
+    ui.setActive(true); ui.setTool("select-text"); assert(host.listenerCount > 0);
+    const beforeSelect = session.revision;
+    host.pointer("pointerdown", 11, 10); host.pointer("pointermove", 48, 10); host.pointer("pointerup", 48, 10);
+    assert.equal(session.revision, beforeSelect, "selecting text never applies a style or creates history");
+    assert.equal(ui.getTextSelection().text, "ABCD"); assert(ui.preview()); assert(selectionChanges > 0);
+    latestScene = { ...scene }; ui.updateOverlay();
+    assert.equal(ui.getTextSelection().scene, scene, "formatting redraws retain the selected glyph provenance");
+    assert.equal(ui.applySelection(), false, "text selection is never a persistent formatting tool");
+    host.advanceTime(500); host.pointer("pointerdown", 11, 10); host.pointer("pointermove", 48, 10); host.pointer("pointerup", 48, 10);
+    assert.equal(ui.getTextSelection().scene, latestScene, "a fresh selection uses the new document scene");
+    const layer = session.createLayer({ name: "Other layer" });
+    ui.updateOverlay(); assert.equal(ui.getTextSelection(), null, "layer changes invalidate frozen selection context");
+    host.advanceTime(500); host.pointer("pointerdown", 11, 10); host.pointer("pointermove", 48, 10); host.pointer("pointerup", 48, 10);
+    assert(ui.getTextSelection()); session.updateLayer(layer, { defaultVisible: false }); ui.updateOverlay();
+    assert.equal(ui.getTextSelection(), null, "hidden-layer geometry cannot remain a formatting target");
+    ui.setTool("highlight");
     host.pointer("pointerdown", 11, 10); host.pointer("pointermove", 48, 10); host.pointer("pointerup", 48, 10);
     const mark = session.getObjects().find(object => object.kind === "shape" && object.review?.type === "highlight"); assert(mark, "real selection gesture commits markup");
     assert.equal(mark.review.contents, "ABCD"); assert.equal(ui.preview(), null);

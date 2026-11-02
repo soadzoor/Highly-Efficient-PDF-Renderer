@@ -8,6 +8,15 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Added
 
+- Add a Select text workflow with selection-based bold, italic, underline and
+  strikethrough toggles, mixed-state controls and undoable partial text changes.
+  Also apply and remove underline/strikethrough on original PDF text selected
+  with the normal Select tool, retaining object selection and mixed text edits.
+  Replace persistent underline/strikeout tools; retain the selection while
+  combining or removing styles. Remove only selected portions of saved review
+  marks and retain review metadata in HEP. Existing PDF fonts use reversible
+  synthetic emphasis in the session; saved source emphasis retains its visible
+  appearance rather than editable font-style metadata.
 - Create PDFs from scratch in both viewers and through `createPdf()`, with
   preset/custom paper sizes, orientation, page count, blank-page insertion and
   undoable resizing that preserves actual content size and top-left placement.

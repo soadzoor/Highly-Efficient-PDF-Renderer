@@ -148,6 +148,12 @@ colors while retaining its alpha and spatial coverage. Raster pixels and mask-on
 paint are excluded. Source color patches do not create or remove fill geometry;
 other source geometry changes continue through selection transforms. Color changes
 participate in transactions, Undo/Redo, copying, recovery and PDF/HEP output.
+Source text also accepts `{ fontWeight: "bold" | "normal", fontStyle: "italic" |
+"normal" }` patches. These add a synthetic outline pen/shear without replacing
+the original font or moving adjacent glyphs; normal restores the original source
+appearance, including any intrinsic bold/italic in that font. Local recovery
+retains the toggles; PDF/HEP retain their rendered appearance without editable
+source style metadata. Authored textboxes retain their ordinary font/run styles.
 Compilation and saving accept `signal` cancellation and `onProgress` callbacks
 with normalized `value` and `stage`; failed saves do not clear dirty state.
 `setPreviewTransform(matrix | null)` previews a gesture without adding history or

@@ -1,6 +1,6 @@
 import type { Bounds, VectorClipPath, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { composeOverlappingVectorScenes } from "./pdfVectorExtractor";
-import { editorPaintIdentity, setEditorPaintIdentity, retainEditorPaintIdentity, remapEditorPaintIdentity, composeEditorPaintIdentity, editorPaintRole, setEditorPaintRole } from "./editorPaintIdentity";
+import { editorPaintIdentity, setEditorPaintIdentity, retainEditorPaintIdentity, remapEditorPaintIdentity, composeEditorPaintIdentity, editorPaintRole, setEditorPaintRole, editorOriginalPaintPrimitive } from "./editorPaintIdentity";
 import type { PrimitiveKind, PrimitiveRef } from "./scenePrimitives";
 import { getScenePrimitive, getPrimitiveClipChain, getPrimitiveSegmentClipBounds, getSceneAnnotationRuns, validatePrimitiveRef } from "./scenePrimitives";
 import { transformAnnotationGeometry, transformAnnotationPoints } from "./annotationData";
@@ -14,6 +14,7 @@ import { rasterRepeatMatrix } from "./rasterRepeat";
 import type { EditorAnnotationEdit, EditorMatrix, EditorSourceEdit } from "./editorTypes";
 import type { SceneAnnotation } from "./annotationData";
 import { applyEditorSourceColors } from "./editorSourceColors";
+import type { NativeGlyphPathCommand } from "./pdf/nativeFont";
 
 export const EDITOR_IDENTITY: EditorMatrix = [1, 0, 0, 1, 0, 0];
 const annotationTransforms = new WeakMap<VectorScene, ReadonlyMap<string, EditorMatrix>>();
@@ -210,18 +211,130 @@ export function bakeEditorAnnotationEdits(scene: VectorScene, edits: readonly Ed
   annotationTransforms.set(result, transforms); annotationSources.set(result, sources); return result;
 }
 
-/** Copy only arrays written by the edit; the caller's canonical scene stays immutable. */
+/** Source scenes retain outlines, rather than font metrics. Size emphasis from their ink box. */
+export function editorSourceTextBoldWidth(scene: VectorScene, index: number): number {
+  const glyph = Math.round(scene.textInstanceB[index * 4 + 2]) * 4;
+  return Math.max(scene.textGlyphMetaB[glyph + 1] - scene.textGlyphMetaA[glyph + 3], Number.EPSILON) * .035;
+}
+
+/** Keep glyph instances searchable and preserve their paint identities while changing their outlines. */
+function applyEditorSourceTextStyles(source: VectorScene, edits: readonly EditorSourceEdit[], signal?: AbortSignal,
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void, originalSource = source): VectorScene {
+  const originalPrimitive = editorOriginalPaintPrimitive(originalSource), primitive = editorOriginalPaintPrimitive(source);
+  const byIdentity = new Map(edits.filter(edit => !edit.deleted && edit.ref.kind === "text" && (edit.textStyle?.bold || edit.textStyle?.italic))
+    .map(edit => [editorRefKey(originalPrimitive(edit.ref)), edit.textStyle!]));
+  if (!byIdentity.size) return source;
+  const styled = Array.from({ length: source.textInstanceCount }, (_, index) => ({ index, style: byIdentity.get(editorRefKey(primitive({ kind: "text", index }))) }))
+    .filter((value): value is { index: number; style: NonNullable<EditorSourceEdit["textStyle"]> } => Boolean(value.style));
+  if (!styled.length) return source;
+  const scene: VectorScene = { ...source, textInstanceA: source.textInstanceA.slice(), textInstanceB: source.textInstanceB.slice(), pagePrimitiveRanges: undefined };
+  const additionsA: number[] = [], additionsB: number[] = [], metaA: number[] = [], metaB: number[] = [];
+  const instanceA: number[] = [], instanceB: number[] = [], instanceC: number[] = [], boldInstances = new Map<number, number>();
+  const glyphs = new Map<string, number>(); let approximated = false;
+  for (const edit of styled) {
+    signal?.throwIfAborted();
+    const i = edit.index * 4, style = edit.style;
+    if (style.italic) {
+      const a = source.textInstanceA;
+      scene.textInstanceA.set([a[i], a[i + 1], a[i + 2] + a[i] * .212556, a[i + 3] + a[i + 1] * .212556], i);
+    }
+    if (!style.bold) continue;
+    const original = Math.round(source.textInstanceB[i + 2]), width = style.boldWidth ?? editorSourceTextBoldWidth(source, edit.index);
+    if (!Number.isFinite(width) || width <= 0) throw new TypeError("Synthetic source bold requires a positive finite pen width.");
+    const key = `${original}:${width}`; let glyph = glyphs.get(key);
+    if (glyph === undefined) {
+      const first = Math.round(source.textGlyphMetaA[original * 4]), count = Math.round(source.textGlyphMetaA[original * 4 + 1]);
+      const commands: NativeGlyphPathCommand[] = [];
+      let lastX = NaN, lastY = NaN, startX = NaN, startY = NaN;
+      for (let index = first; index < first + count; index++) {
+        const j = index * 4, a = source.textGlyphSegmentsA, b = source.textGlyphSegmentsB;
+        if (a[j] !== lastX || a[j + 1] !== lastY) { commands.push({ kind: "move", x: a[j], y: a[j + 1] }); startX = a[j]; startY = a[j + 1]; }
+        commands.push(b[j + 2] >= .5 ? { kind: "quadratic", controlX: a[j + 2], controlY: a[j + 3], x: b[j], y: b[j + 1] }
+          : { kind: "line", x: b[j], y: b[j + 1] });
+        lastX = b[j]; lastY = b[j + 1];
+        if (lastX === startX && lastY === startY) { commands.push({ kind: "close" }); lastX = lastY = NaN; }
+      }
+      const outline = buildNativeGlyphStroke(commands, EDITOR_IDENTITY, { transform: EDITOR_IDENTITY, width,
+        lineCap: 0, lineJoin: 0, miterLimit: 10, dashArray: [], dashPhase: 0 }, signal,
+        Math.max(width / 64, Number.EPSILON));
+      if (!outline) continue;
+      approximated ||= outline.approximated;
+      glyph = source.textGlyphCount + metaA.length / 4; glyphs.set(key, glyph);
+      const offset = source.textGlyphSegmentCount + additionsA.length / 4;
+      for (const value of outline.segmentsA) additionsA.push(value);
+      for (const value of outline.segmentsB) additionsB.push(value);
+      metaA.push(offset, outline.segmentsA.length / 4, outline.bounds.minX, outline.bounds.minY);
+      metaB.push(outline.bounds.maxX, outline.bounds.maxY, 0, 0);
+    }
+    const next = source.textInstanceCount + instanceA.length / 4; boldInstances.set(edit.index, next);
+    instanceA.push(...scene.textInstanceA.subarray(i, i + 4));
+    instanceB.push(source.textInstanceB[i], source.textInstanceB[i + 1], glyph, source.textInstanceB[i + 3]);
+    instanceC.push(...source.textInstanceC.subarray(i, i + 4));
+  }
+  const append = (original: Float32Array, added: number[]): Float32Array => {
+    if (!added.length) return original;
+    const values = new Float32Array(original.length + added.length); values.set(original); values.set(added, original.length); return values;
+  };
+  scene.textGlyphMetaA = append(source.textGlyphMetaA, metaA); scene.textGlyphMetaB = append(source.textGlyphMetaB, metaB);
+  scene.textGlyphSegmentsA = append(source.textGlyphSegmentsA, additionsA); scene.textGlyphSegmentsB = append(source.textGlyphSegmentsB, additionsB);
+  scene.textGlyphCount += metaA.length / 4; scene.textGlyphSegmentCount += additionsA.length / 4;
+  scene.textInstanceA = append(scene.textInstanceA, instanceA); scene.textInstanceB = append(scene.textInstanceB, instanceB);
+  scene.textInstanceC = append(source.textInstanceC, instanceC); scene.textInstanceCount += instanceA.length / 4;
+  scene.sourceTextCount = scene.textInPageCount = scene.textInstanceCount; scene.textOutOfPageCount = 0;
+  retainEditorAnnotationPlacements(source, scene);
+  let result = scene;
+  if (boldInstances.size) {
+    // Match PDF fill-and-stroke painting, including source translucency. A separate
+    // stroke instance shares the original identity but adds no searchable text.
+    const runs: VectorDrawRun[] = [], runMap = new Map<number, number[]>();
+    (source.drawRuns ?? defaultVectorDrawRuns(source)).forEach((run, index) => {
+      const mapped: number[] = [];
+      if (run.kind !== "text") { mapped.push(runs.length); runs.push({ ...run }); }
+      else for (let id = run.first; id < run.first + run.count; id++) {
+        mapped.push(runs.length); runs.push({ ...run, first: id, count: 1 });
+        const bold = boldInstances.get(id); if (bold !== undefined) { mapped.push(runs.length); runs.push({ ...run, first: bold, count: 1 }); }
+      }
+      runMap.set(index, mapped);
+    });
+    scene.drawRuns = runs;
+    const nodes = (input: readonly ScenePaintNode[]): ScenePaintNode[] => input.flatMap((node): ScenePaintNode[] => node.kind === "draw"
+      ? (runMap.get(node.runIndex) ?? []).map(runIndex => ({ ...node, runIndex })) : node.kind === "group"
+        ? [{ ...node, children: nodes(node.children), ...(node.softMask ? { softMask: { ...node.softMask, children: nodes(node.softMask.children) } } : {}) }] : [{ ...node }]);
+    if (source.paintGraph) scene.paintGraph = { roots: nodes(source.paintGraph.roots) };
+    const reverse = new Map([...boldInstances].map(([original, bold]) => [bold, original]));
+    const partition = source.pageCount > 1 ? new ScenePageViews(source) : null, originalCounts = scenePrimitiveCounts(source);
+    const owners = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind => [kind,
+      partition ? Array.from(partition.owners[kind]) : Array(originalCounts[kind]).fill(0)])) as Record<PrimitiveKind, number[]>;
+    for (const [original, bold] of boldInstances) owners.text[bold] = owners.text[original];
+    const counts = scenePrimitiveCounts(scene), keep = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind =>
+      [kind, new Set(Array.from({ length: counts[kind] }, (_, index) => index))])) as Record<PrimitiveKind, Set<number>>;
+    const origins = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind => [kind,
+      Array.from({ length: counts[kind] }, (_, index) => kind === "text" ? reverse.get(index) ?? index : index)])) as Record<PrimitiveKind, number[]>;
+    remapEditorPaintIdentity(source, scene, origins);
+    result = compactEditorScene(scene, keep, owners);
+    result.pageTextRanges = Uint32Array.from(Array.from({ length: result.pageCount }, (_, page) =>
+      Array.from(result.pagePrimitiveRanges!.subarray(page * PAGE_PRIMITIVE_KINDS.length * 2 + 4, page * PAGE_PRIMITIVE_KINDS.length * 2 + 6))).flat());
+  }
+  if (approximated) {
+    const diagnostic: PdfDiagnostic = { code: "editor.source-text-emphasis-approximation", severity: "warning",
+      message: "Source text emphasis preserves the original glyphs using a synthetic pen and shear; curved pen outlines use bounded vector approximation." };
+    if (onDiagnostic) onDiagnostic(diagnostic); else console.warn(`[HEPR] ${diagnostic.message}`);
+  }
+  return result;
+}
+
 export function bakeEditorSourceScene(source: VectorScene, edits: readonly EditorSourceEdit[], signal?: AbortSignal,
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void, wholeScene = false): VectorScene {
   const colored = applyEditorSourceColors(source, edits);
   const recoloredGradients = colored.gradientCount !== source.gradientCount;
   retainEditorAnnotationPlacements(source, colored); source = colored;
+  const emphasis = edits;
   edits = edits.filter(edit => edit.deleted || !editorMatrixIsIdentity(edit.transform));
   if (!edits.length) {
-    if (!recoloredGradients) return source;
+    if (!recoloredGradients) return applyEditorSourceTextStyles(source, emphasis, signal, onDiagnostic);
     const counts = scenePrimitiveCounts(source), keep = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind =>
       [kind, new Set(Array.from({ length: counts[kind] }, (_, index) => index))])) as Record<PrimitiveKind, Set<number>>;
-    return compactEditorScene(source, keep);
+    return applyEditorSourceTextStyles(compactEditorScene(source, keep), emphasis, signal, onDiagnostic, source);
   }
   const scene: VectorScene = { ...source, rasterLayers: source.rasterLayers.slice(), clipPaths: source.clipPaths?.slice(),
     retainedPages: source.retainedPages?.slice(), pagePrimitiveRanges: undefined };
@@ -500,7 +613,7 @@ export function bakeEditorSourceScene(source: VectorScene, edits: readonly Edito
   compacted.bounds = { ...compacted.pageBounds };
   const counts = scenePrimitiveCounts(compacted);
   for (const kind of PAGE_PRIMITIVE_KINDS) for (let index = 0; index < counts[kind]; index++) compacted.bounds = editorUnionBounds(compacted.bounds, getScenePrimitive(compacted, { kind, index }).bounds);
-  return compacted;
+  return applyEditorSourceTextStyles(compacted, emphasis, signal, onDiagnostic, source);
 }
 
 /** Compact canonical stores and remap paint and text references without rasterization. */

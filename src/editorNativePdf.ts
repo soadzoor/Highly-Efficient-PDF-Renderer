@@ -967,7 +967,7 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
         const resolvePending = async (value: PdfValue | undefined): Promise<PdfValue | undefined> => isPdfRef(value)
           ? writer.get(value) ?? await document.resolveValue(value, options.signal) : value;
         const rawAppearances = await resolvePending(originalDictionary.get("AP"));
-        if (annotationEdit && !affected.some(edit => edit.color !== undefined) && !membershipChanged && isPdfDictionary(rawAppearances)) {
+        if (annotationEdit && !affected.some(edit => edit.color !== undefined || edit.textStyle?.bold || edit.textStyle?.italic) && !membershipChanged && isPdfDictionary(rawAppearances)) {
           const origin = session.sourceScene.pageRects.subarray(pageIndex * 4, pageIndex * 4 + 4);
           const nativeMatrix = computeNativePdfPageGeometry(originalPage).pageMatrix;
           const sourceMatrix = session.sourceScene.pdfPages?.find(page => page.pageIndex === pageIndex)?.pdfToScene

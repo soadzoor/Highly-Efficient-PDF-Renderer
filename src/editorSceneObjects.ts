@@ -8,6 +8,8 @@ import { editorInkBounds, fitEditorInkPaths, type EditorInkSegment } from "./edi
 import { editorShapeGeometry, type EditorShapeGeometry } from "./editorShapeGeometry";
 import { editorReviewShapes } from "./editorReview";
 import { compileEditorFieldGeometry } from "./editorFormFields";
+import { AnnotationLayerBuilder } from "./annotationLayers";
+import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 export { editorArrowHeadPoints } from "./editorShapeGeometry";
 
 type Point = readonly [number, number];
@@ -82,6 +84,18 @@ export async function compileEditorObjectGeometry(object: EditorObject, signal?:
     const first = parts.shift()!, result = page(composeEditorPage(first, parts), [first, ...parts].map(part => part.bounds).reduce((a, b) => editorUnionBounds(a, b)));
     if (object.review.type === "highlight") result.paintGraph = { roots: [{ kind: "group", isolated: true, knockout: false, alpha: 1,
       alphaIsShape: false, blendMode: "Multiply", bounds: result.bounds, children: (result.drawRuns ?? []).map((_, runIndex) => ({ kind: "draw" as const, runIndex })) }] };
+    const review = object.review, bounds = { minX: object.x, minY: object.y, maxX: object.x + object.width, maxY: object.y + object.height },
+      quads = review.quads?.flatMap(quad => quad.flatMap(point => [...point]));
+    result.annotations = [{ id: object.id, name: object.id, pageIndex: 0, sourcePageIndex: object.pageIndex, annotationIndex: 0,
+      subtype: review.type === "highlight" ? "Highlight" : review.type === "underline" ? "Underline" : review.type === "strikeout" ? "StrikeOut" : "Text",
+      bounds, pdfGeometry: { rect: [bounds.minX, bounds.minY, bounds.maxX, bounds.maxY], ...(quads ? { quadPoints: quads } : {}) },
+      ...(quads ? { quadPoints: quads } : {}), flags: object.locked ? 132 : 4, visibleInDefaultView: true, hasAppearance: true,
+      contents: review.contents, author: review.author, color: normalizePrimitiveColor(object.color ?? "#111111"), opacity: object.opacity,
+      border: { width: object.strokeWidth ?? 1, style: "S" } }];
+    const layers = new AnnotationLayerBuilder(result.optionalContent, [...(result.optionalContent?.conditions ?? [])]);
+    result.drawRuns = (result.drawRuns ?? defaultVectorDrawRuns(result)).map(run => ({ ...run, optionalContent: layers.condition(run.optionalContent, object.id) }));
+    result.optionalContent = layers.build();
+    result.pdfPages = [{ pageIndex: 0, sourcePageIndex: object.pageIndex, pdfToScene: [1, 0, 0, 1, 0, 0] }];
     return result;
   }
   if (object.kind === "text") throw new Error("Adding text requires the editor's portable font compiler.");

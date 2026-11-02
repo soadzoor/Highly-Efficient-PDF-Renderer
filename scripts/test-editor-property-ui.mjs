@@ -26,7 +26,7 @@ try {
   for (const name of ["changeAppearance", "applyTextStyle"]) vm.runInContext(sourceFunction(source, name), context);
   const change = (name, value) => context.changeAppearance({ dataset: { prop: name }, value });
   const before = session.revision;
-  for (const tool of ["rectangle", "ink", "text", "highlight", "underline-text", "strikeout-text", "comment", "signature"]) {
+  for (const tool of ["rectangle", "ink", "text", "highlight", "comment", "signature"]) {
     context.tool = tool; change("color", "blue"); change("stroke", "7"); change("font-size", "25"); change("font", "font-choice"); context.applyTextStyle("bold");
   }
   await new Promise(resolve => setImmediate(resolve));

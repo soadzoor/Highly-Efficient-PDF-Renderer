@@ -168,6 +168,9 @@ export interface EditorFieldObject extends EditorObjectBase {
 }
 export interface EditorSourceObject extends EditorObjectBase {
   kind: "source";
+  /** Reversible synthetic emphasis on source glyphs, retaining their original font outlines. */
+  fontWeight?: number | "normal" | "bold";
+  fontStyle?: "normal" | "italic" | "oblique";
   /** Override vector paint RGB on this source copy, retaining its original alpha. */
   color?: EditorColor;
   /** Override existing fill paint only; this does not create or remove source fills. */
@@ -182,7 +185,11 @@ export interface EditorSourceObject extends EditorObjectBase {
 /** Child transforms already include group operations; transform retains the group's selection axes. */
 export interface EditorGroupObject extends EditorObjectBase { kind: "group"; children: readonly string[] }
 export type EditorObject = EditorTextObject | EditorShapeObject | EditorInkObject | EditorImageObject | EditorFieldObject | EditorSourceObject | EditorGroupObject;
-export interface EditorSourceEdit { ref: PrimitiveRef; transform: EditorMatrix; deleted: boolean; color?: EditorColor }
+export interface EditorSourceEdit {
+  ref: PrimitiveRef; transform: EditorMatrix; deleted: boolean; color?: EditorColor;
+  /** Synthetic source-glyph emphasis. Off restores the original source appearance. */
+  textStyle?: { bold?: boolean; italic?: boolean; boldWidth?: number };
+}
 export interface EditorAnnotationEdit { id: string; transform: EditorMatrix; deleted: boolean; contents?: string; author?: string }
 export type EditorObjectInput = EditorObject extends infer T ? T extends EditorObject
   ? Omit<T, "id" | "transform"> & { id?: string; transform?: EditorMatrix } : never : never;
@@ -312,7 +319,7 @@ export interface EditorSession {
   selectAnnotations(ids: readonly string[], options?: { additive?: boolean; toggle?: boolean }): void;
   selectArea(bounds: Bounds, options?: { additive?: boolean; intersects?: boolean; pageIndex?: number }): void;
   addObject(object: EditorObjectInput): string;
-  /** Original source content accepts color/fill patches; geometry uses selection transforms. */
+  /** Source accepts color/fill and synthetic text emphasis; geometry uses selection transforms. */
   updateObject(id: string, patch: Partial<EditorObject>): void;
   /** Matrix is a delta in composed scene coordinates, about the caller's chosen pivot. */
   transformSelection(matrix: EditorMatrix): void;

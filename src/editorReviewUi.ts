@@ -3,8 +3,8 @@ import type { EditorColor, EditorSession } from "./editorTypes";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { addEditorComment, addEditorTextMarkup } from "./editorReview";
 
-export type EditorReviewTool = "highlight" | "underline-text" | "strikeout-text" | "comment";
-export function isEditorReviewTool(value: string): value is EditorReviewTool { return ["highlight", "underline-text", "strikeout-text", "comment"].includes(value); }
+export type EditorReviewTool = "select-text" | "highlight" | "comment";
+export function isEditorReviewTool(value: string): value is EditorReviewTool { return ["select-text", "highlight", "comment"].includes(value); }
 
 interface CommentDraft { id?: string; annotationId?: string; pageIndex: number; x: number; y: number; contents: string; author: string }
 
@@ -20,10 +20,20 @@ export function createEditorReviewController(options: {
   added(ids: readonly string[]): void;
   onError(error: unknown): void;
   onDraftChange?(): void;
+  onSelectionChange?(): void;
 }) {
   const document = options.overlay.ownerDocument, lifetime = new AbortController();
   let tool: EditorReviewTool | null = null, enabled = false, disposed = false, selection: TextSelectionController | null = null;
   let preview: Float32Array | null = null, comment: CommentDraft | null = null, baseline = "", dialog: HTMLDialogElement | null = null;
+  let selectionScene: VectorScene | null = null;
+  let selectionSource = options.session.sourceScene, selectionVisibility = visibilityKey();
+  function visibilityKey(): string { return JSON.stringify(options.session.getLayers().map(layer => [layer.id, layer.defaultVisible])); }
+  function validateSelection(): void {
+    const visibility = visibilityKey();
+    if (selectionSource === options.session.sourceScene && selectionVisibility === visibility) return;
+    selectionSource = options.session.sourceScene; selectionVisibility = visibility; selectionScene = null;
+    selection?.clearSelection();
+  }
   function closeComment(): void { const hadDraft = comment !== null; dialog?.close(); dialog?.remove(); dialog = null; comment = null; if (hadDraft) options.onDraftChange?.(); }
   function commitComment(): boolean {
     if (!comment || !options.canEdit()) return !comment;
@@ -58,23 +68,24 @@ export function createEditorReviewController(options: {
     dialog.append(title, authorLabel, contents, status, actions); document.body.append(dialog); dialog.showModal(); contents.focus();
   }
   function applySelection(): boolean {
-    if (!selection || !tool || tool === "comment" || !options.canEdit()) return false;
+    if (!selection || tool !== "highlight" || !options.canEdit()) return false;
     const spans = selection.getSelectedSpans(); if (!spans.length) return false;
     try {
-      const type = tool === "underline-text" ? "underline" : tool === "strikeout-text" ? "strikeout" : "highlight";
-      const scene = options.getScene(), text = selection.getSelectedText();
-      options.change(() => { const ids = addEditorTextMarkup(options.session, scene, spans, type, { ...options.style(), contents: text }); options.added(ids); });
+      const scene = selectionScene ?? options.getScene(), text = selection.getSelectedText();
+      options.change(() => { const ids = addEditorTextMarkup(options.session, scene, spans, "highlight", { ...options.style(), contents: text }); options.added(ids); });
       selection.clearSelection(); return true;
     } catch (error) { options.onError(error); return false; }
   }
-  function resetSelection(): void { selection?.dispose(); selection = null; preview = null; }
+  function resetSelection(): void { selection?.dispose(); selection = null; preview = null; selectionScene = null; }
   function sync(): void {
     resetSelection();
     if (!enabled || !tool || tool === "comment" || disposed) return;
     selection = createTextSelectionController({ getCanvas: () => options.canEdit() || selection?.isGestureActive() ? options.overlay : null,
-      adapter: { getScene: options.getScene, clientToScenePoint: options.toScene, sceneToClientPoint: options.toClient,
+      adapter: { getScene: () => selectionScene ?? (selectionScene = options.getScene()), clientToScenePoint: options.toScene, sceneToClientPoint: options.toClient,
         setSelectionHighlights: values => { preview = values; } },
-      onSelectionCommit: () => applySelection() });
+      onSelectionChange: () => options.onSelectionChange?.(),
+      onSelectionStart: () => { selectionScene = options.getScene(); },
+      onSelectionCommit: () => { if (tool === "highlight") applySelection(); else options.onSelectionChange?.(); } });
   }
   options.overlay.addEventListener("pointerdown", event => {
     if (!enabled || tool !== "comment" || event.button !== 0 || !options.canEdit()) return;
@@ -92,8 +103,13 @@ export function createEditorReviewController(options: {
     isActive: () => enabled && tool !== null,
     isSelecting: () => Boolean(selection?.isGestureActive()),
     preview: () => preview,
-    updateOverlay: () => selection?.updateOverlay(),
+    updateOverlay() { validateSelection(); selection?.updateOverlay(); },
     clearSelection: () => selection?.clearSelection(),
+    getTextSelection() {
+      validateSelection();
+      const spans = selection?.getSelectedSpans() ?? [];
+      return tool === "select-text" && spans.length && selectionScene ? { scene: selectionScene, spans, text: selection!.getSelectedText() } : null;
+    },
     cancelGesture() { selection?.disable(); selection?.enable(); },
     applySelection,
     flushDraft: commitComment,

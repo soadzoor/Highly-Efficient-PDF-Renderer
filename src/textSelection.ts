@@ -70,6 +70,8 @@ export interface TextSelectionOptions {
   /** Finger movement allowed during the long-press. Defaults to 8 px. */
   longPressMoveTolerancePx?: number;
   onSelectionChange?(range: TextSelectionRange | null, selectedText: string): void;
+  /** Refresh a host's scene snapshot before a new canvas selection gesture. */
+  onSelectionStart?(): void;
   /** Plain mouse/pen click on text, in client CSS pixels; hosts can pick PDF links. */
   onTextClick?(point: TextSelectionPoint): void;
   /** Called after a successful clipboard write. */
@@ -1007,6 +1009,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     if (event.target !== canvas || state !== "idle") {
       return;
     }
+    if (event.button === 0) options.onSelectionStart?.();
 
     if (event.pointerType === "touch") {
       // Never block the touch start: panning must begin normally.

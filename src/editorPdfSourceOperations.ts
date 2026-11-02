@@ -1,5 +1,5 @@
 import type { VectorScene } from "./pdfVectorExtractor";
-import type { EditorMatrix, EditorSession, EditorPdfSaveOptions } from "./editorTypes";
+import type { EditorMatrix, EditorSession, EditorPdfSaveOptions, EditorSourceEdit } from "./editorTypes";
 import { NativePdfDocument } from "./pdf/nativeDocument";
 import { NativePdfWriter, pdfNameValue, pdfNumberValue, pdfStreamValue, serializePdfValue } from "./pdf/nativeWriter";
 import { isPdfDictionary, isPdfName, isPdfStream, type PdfDictionary, type PdfStream, type PdfValue, type PdfRef } from "./pdf/nativeCos";
@@ -305,11 +305,14 @@ export async function prepareEditorPdfSourceOperations(document: NativePdfDocume
 }
 
 type Layers = { groupReference(id: string | null | undefined): PdfRef | undefined };
-interface Change { transform: EditorMatrix; deleted: boolean; layer?: string | null; color?: readonly [number, number, number] }
+interface Change { transform: EditorMatrix; deleted: boolean; layer?: string | null; color?: readonly [number, number, number]; textStyle?: EditorSourceEdit["textStyle"] }
 const unchanged: Change = { transform: EDITOR_IDENTITY, deleted: false };
 const sameChange = (a: Change, b: Change): boolean => a.deleted === b.deleted && a.layer === b.layer && sameMatrix(a.transform, b.transform) &&
+  !!a.textStyle?.bold === !!b.textStyle?.bold && !!a.textStyle?.italic === !!b.textStyle?.italic &&
+  a.textStyle?.boldWidth === b.textStyle?.boldWidth &&
   (a.color === undefined ? b.color === undefined : b.color !== undefined && a.color.every((value, index) => value === b.color![index]));
-const changed = (change: Change): boolean => change.deleted || change.layer !== undefined || change.color !== undefined || !sameMatrix(change.transform, EDITOR_IDENTITY);
+const hasTextStyle = (change: Change): boolean => !!change.textStyle?.bold || !!change.textStyle?.italic;
+const changed = (change: Change): boolean => change.deleted || change.layer !== undefined || change.color !== undefined || hasTextStyle(change) || !sameMatrix(change.transform, EDITOR_IDENTITY);
 
 /** RGB overrides affect this paint only; inherited alpha and all following state survive. */
 function colored(color: Change["color"], bytes: Uint8Array): Uint8Array {
@@ -351,7 +354,8 @@ function pathBody(operation: Operation): Uint8Array {
     return `${matrixText(points)} ${command.operator}\n`;
   }).join("") + operation.operator + "\n");
 }
-function partialText(page: PreparedPage, operation: Operation, source: VectorScene, changes: ReadonlyMap<string, Change>): Uint8Array {
+function partialText(page: PreparedPage, operation: Operation, source: VectorScene, changes: ReadonlyMap<string, Change>,
+  strokeAlpha: (alpha: number) => string): Uint8Array {
   const capture = operation.text; if (!capture) throw new Error("The source text state is unavailable.");
   if (capture.after.renderingMode >= 4 || capture.after.font.type3) throw new Error("Clipping or self-painting source text is an inseparable paint unit.");
   const strings = operation.operator === "TJ" ? operation.operands[0] : [operation.operands.at(-1)];
@@ -366,13 +370,15 @@ function partialText(page: PreparedPage, operation: Operation, source: VectorSce
     offset += size;
   }
   if (codes.length !== capture.glyphs.length) throw new Error("The source text character ownership is ambiguous.");
-  const glyphChanges = new Map<number, Change>(), used = new Set<number>();
+  const glyphChanges = new Map<number, Change>(), glyphColors = new Map<number, readonly number[]>(), glyphAlphas = new Map<number, number>(), used = new Set<number>();
   for (const ref of operation.refs) {
     if (ref.kind !== "text") throw new Error("An outlined source glyph requires its complete paint unit.");
     const offset = ref.index * 4, actual = [source.textInstanceA[offset], source.textInstanceA[offset + 1], source.textInstanceA[offset + 2], source.textInstanceA[offset + 3], source.textInstanceB[offset], source.textInstanceB[offset + 1]];
     const glyph = capture.glyphs.findIndex((item, index) => !used.has(index) && sameMatrix(actual, multiplyEditorMatrices(page.nativeToScene, item.matrix)));
     if (glyph < 0) throw new Error("A source glyph cannot be assigned to its original character code.");
     used.add(glyph); glyphChanges.set(glyph, changes.get(key(ref)) ?? unchanged);
+    glyphColors.set(glyph, Array.from(source.textInstanceC.subarray(offset, offset + 3)));
+    glyphAlphas.set(glyph, source.textInstanceC[offset + 3]);
   }
   if ([...glyphChanges.values()].some(change => change.deleted) && operation.marked.some(scope => scope.actualText))
     throw new Error("Deleting part of an ActualText replacement requires its inseparable marked-content scope.");
@@ -382,9 +388,21 @@ function partialText(page: PreparedPage, operation: Operation, source: VectorSce
     const change = glyphChanges.get(index) ?? unchanged; if (change.deleted) continue;
     if (change.layer !== undefined) throw new Error("A partial source text-show layer assignment requires separate paint units.");
     const { bytes, origin } = codes[index], glyph = capture.glyphs[index];
-    const matrix = multiplyEditorMatrices(invertEditorMatrix(state.transform), multiplyEditorMatrices(glyph.matrix,
-      multiplyEditorMatrices(invertEditorMatrix(scale), [1, 0, 0, 1, -origin[0], -origin[1]])));
-    const body = concatenate([encoder.encode(`${matrixText(matrix)} Tm\n`), serializeOperator("Tj", [bytes])]);
+    const styled = change.textStyle?.italic ? multiplyEditorMatrices(glyph.matrix, [1, 0, .212556, 1, 0, 0]) : glyph.matrix;
+    const glyphMatrix = multiplyEditorMatrices(invertEditorMatrix(state.transform), styled);
+    const localTextMatrix = multiplyEditorMatrices(invertEditorMatrix(scale), [1, 0, 0, 1, -origin[0], -origin[1]]);
+    // Synthetic emboldening follows the existing font outlines. Its stroke uses
+    // the glyph's fill color instead of an unrelated inherited stroking color.
+    const bold = change.textStyle?.bold;
+    if (bold && state.renderingMode !== 0) throw new Error("Source text with a custom rendering mode requires its edited vector appearance.");
+    const width = change.textStyle?.boldWidth;
+    if (bold && !(width !== undefined && Number.isFinite(width) && width > 0)) throw new Error("The source glyph's emboldening width is unavailable.");
+    // Put the pen in the original glyph's local coordinates as well. A local
+    // width remains identical to the editor outline under skew/nonuniform
+    // text matrices, page placements and subsequent object transforms.
+    const paint = bold ? `q ${matrixText(glyphMatrix)} cm /${strokeAlpha(glyphAlphas.get(index) ?? 1)} gs ${matrixText(change.color ?? glyphColors.get(index) ?? [0, 0, 0])} RG ${pdfNumberValue(width!)} w 0 J 0 j 10 M [] 0 d 2 Tr\n` : "";
+    const matrix = bold ? localTextMatrix : multiplyEditorMatrices(glyphMatrix, localTextMatrix);
+    const body = concatenate([encoder.encode(`${paint}${matrixText(matrix)} Tm\n`), serializeOperator("Tj", [bytes]), ...(bold ? [encoder.encode("Q\n")] : [])]);
     parts.push(transformed(page, operation, change.transform, colored(change.color, body)));
   }
   parts.push(textEnd(capture)); return concatenate(parts);
@@ -400,7 +418,8 @@ export async function rewriteEditorPdfSourcePage(writer: NativePdfWriter, sessio
   for (const [identity] of page.byPrimitive) {
     const edit = edits.get(identity), layer = assignments.get(identity);
     changes.set(identity, { transform: edit?.transform ?? EDITOR_IDENTITY, deleted: edit?.deleted ?? false,
-      ...(edit?.color === undefined ? {} : { color: normalizePrimitiveColor(edit.color) }), ...(assignments.has(identity) ? { layer } : {}) });
+      ...(edit?.color === undefined ? {} : { color: normalizePrimitiveColor(edit.color) }), ...(edit?.textStyle ? { textStyle: edit.textStyle } : {}),
+      ...(assignments.has(identity) ? { layer } : {}) });
   }
   for (const [identity, operation] of page.byPrimitive) {
     const ref = operation.refs.find(ref => key(ref) === identity)!;
@@ -461,6 +480,14 @@ export async function rewriteEditorPdfSourcePage(writer: NativePdfWriter, sessio
     const patches: Patch[] = [], resources = new Map(program.resources), rawObjects = await writer.document.resolveValue(resources.get("XObject"), options.signal);
     const objects = new Map(isPdfDictionary(rawObjects) ? rawObjects : []), rawProperties = await writer.document.resolveValue(resources.get("Properties"), options.signal);
     const properties = new Map(isPdfDictionary(rawProperties) ? rawProperties : []);
+    let originalStrokeStates: PdfDictionary | undefined;
+    const strokeAlphas = new Map<number, string>();
+    const strokeAlpha = (alpha: number): string => {
+      const cached = strokeAlphas.get(alpha); if (cached) return cached;
+      const current = resources.get("ExtGState"), states = new Map(isPdfDictionary(current) ? current : originalStrokeStates);
+      let alias = `HEPRBoldAlpha${strokeAlphas.size}`; while (states.has(alias)) alias += "_";
+      states.set(alias, new Map<string, PdfValue>([["CA", alpha]])); resources.set("ExtGState", states); strokeAlphas.set(alpha, alias); return alias;
+    };
     const covered = new Set<Operation>();
     // A complete graphics-state scope owns its clips, masks and text state. Move
     // that scope together rather than leaving its clipping program behind.
@@ -468,7 +495,7 @@ export async function rewriteEditorPdfSourcePage(writer: NativePdfWriter, sessio
       if (scope.operations.some(operation => covered.has(operation))) continue;
       const refs = scope.operations.flatMap(operation => operation.refs), change = uniform(refs);
       if (!refs.length || scope.clip || scope.mask || scope.pathOpen || scope.operations.some(operation => operation.pathStart !== undefined && operation.pathStart < scope.start) ||
-          !change || refs.some(ref => forced.has(key(ref)) || changes.get(key(ref))?.color !== undefined) || change.deleted || change.layer !== undefined || sameMatrix(change.transform, EDITOR_IDENTITY)) continue;
+          !change || refs.some(ref => forced.has(key(ref)) || changes.get(key(ref))?.color !== undefined || hasTextStyle(changes.get(key(ref)) ?? unchanged)) || change.deleted || change.layer !== undefined || sameMatrix(change.transform, EDITOR_IDENTITY)) continue;
       const representative = scope.operations[0], scoped = { ...representative, state: { ...representative.state, matrix: scope.matrix } };
       patches.push({ start: scope.start, end: scope.end, bytes: transformed(page, scoped, change.transform, program.bytes.subarray(scope.start, scope.end)) });
       for (const operation of scope.operations) covered.add(operation);
@@ -491,7 +518,7 @@ export async function rewriteEditorPdfSourcePage(writer: NativePdfWriter, sessio
       if (operation.refs.some(ref => forced.has(key(ref)))) throw new Error("Source optional-content resources require a new canonical membership appearance.");
       if (operation.child && operation.refs.some(ref => changes.get(key(ref))?.layer !== undefined))
         throw new Error("Layer reassignment crosses a Form invocation's inherited optional-content scope.");
-      if (operation.child && (!change || change.layer !== undefined || internalOrder || operation.refs.some(ref => changes.get(key(ref))?.color !== undefined)) && !change?.deleted) {
+      if (operation.child && (!change || change.layer !== undefined || internalOrder || operation.refs.some(ref => changes.get(key(ref))?.color !== undefined || hasTextStyle(changes.get(key(ref)) ?? unchanged))) && !change?.deleted) {
         const nested = await visit(operation.child); if (!nested.changed) continue;
         const dictionary = streamDictionary(operation.child.dictionary!); dictionary.set("Resources", nested.resources);
         let alias = `HEPREdit${operation.id}`; while (objects.has(alias)) alias += "_";
@@ -503,8 +530,14 @@ export async function rewriteEditorPdfSourcePage(writer: NativePdfWriter, sessio
         if (change?.deleted) {
           if (operation.state.textMode >= 4 || operation.marked.some(scope => scope.actualText)) throw new Error("Source text clipping or ActualText requires its complete content scope.");
           body = concatenate([textPrefix(operation), textEnd(operation.text)]); transform = EDITOR_IDENTITY;
-        } else if (change) { prefix = textPrefix(operation); body = textBody(operation); }
-        else { body = partialText(page, operation, session.sourceScene, changes); transform = EDITOR_IDENTITY; }
+        } else if (change && !hasTextStyle(change)) { prefix = textPrefix(operation); body = textBody(operation); }
+        else {
+          if (operation.refs.some(ref => changes.get(key(ref))?.textStyle?.bold) && !originalStrokeStates) {
+            const raw = await writer.document.resolveValue(resources.get("ExtGState"), options.signal);
+            originalStrokeStates = isPdfDictionary(raw) ? raw : new Map();
+          }
+          body = partialText(page, operation, session.sourceScene, changes, strokeAlpha); transform = EDITOR_IDENTITY;
+        }
       } else if (change?.deleted) body = encoder.encode(operation.path ? "n\n" : "");
       else if (operation.path) {
         if (!change) throw new Error("A partial path selection requires bounded geometry replacement.");

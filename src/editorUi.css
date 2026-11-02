@@ -105,6 +105,6 @@ input.hepr-editor-field,textarea.hepr-editor-field{cursor:text}select.hepr-edito
 @media(pointer:coarse){.hepr-editor-layer-columns,.hepr-editor-layer-row{grid-template-columns:36px minmax(0,1fr) 32px 32px}.hepr-editor-layer-row{min-height:44px}.hepr-editor-layer-row>.hepr-editor-layer-grip{align-self:stretch;min-height:40px}.hepr-editor-layer-row>input[type=checkbox]{width:20px;height:20px}}
 .hepr-editor-alignment-guide{stroke:#d927a0;stroke-width:1;stroke-dasharray:5 3;pointer-events:none}
 .hepr-editor-review-selection{fill:#1684ff;fill-opacity:.25;pointer-events:none}
-.hepr-editor-overlay[data-tool="highlight"],.hepr-editor-overlay[data-tool="underline-text"],.hepr-editor-overlay[data-tool="strikeout-text"]{cursor:text}
+.hepr-editor-overlay[data-tool="highlight"],.hepr-editor-overlay[data-tool="select-text"]{cursor:text}
 .hepr-editor-overlay[data-tool="comment"]{cursor:crosshair}
 .hepr-editor-toolbar [data-recovery-status]{font-size:11px;color:#475569;max-width:25em;overflow-wrap:anywhere}

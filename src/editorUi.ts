@@ -29,7 +29,7 @@ import { editorIconButton } from "./editorToolbarIcons";
 import { canEditEditorField, createEditorFieldControl, createEditorFieldOptions, editorFieldDraftSignature, flushEditorFieldDrafts, hasPendingEditorFields, setEditorFieldControlValue, styleEditorFieldControl, updateEditorFieldControlAppearance, type EditorFieldControl } from "./editorFormControls";
 import { createEditorFieldActivation } from "./editorFieldActivation";
 import { editorBoundsClickHit, editorFieldClientGeometry, pickEditorMetadataAnnotation, transformEditorAnnotationText } from "./editorCoordinates";
-import { applyEditorFillOpacity, applyEditorOpacity, applyEditorPropertyPatch, editorFillSelection, editorPropertySelection, editorSelectionLeaves, editorStyledSelection, validateEditorOpacity } from "./editorProperties";
+import { applyEditorFillOpacity, applyEditorOpacity, applyEditorPropertyPatch, editorFillSelection, editorPropertySelection, editorPropertyState, editorSelectionLeaves, editorStyledSelection, validateEditorOpacity } from "./editorProperties";
 import { createEditorPropertyControls } from "./editorPropertyControls";
 import { createEditorCameraPan } from "./editorCameraPan";
 import { createEditorInteractionController } from "./editorInteraction";
@@ -48,6 +48,8 @@ import { createEditorLayerControls } from "./editorLayerControls";
 import { createEditorContextMenu, type EditorObjectMenuAction } from "./editorContextMenu";
 import { alignEditorSelection, distributeEditorSelection, createEditorAlignmentSnap, type EditorAlignment, type EditorAlignmentGuide } from "./editorLayout";
 import { createEditorReviewController, isEditorReviewTool, type EditorReviewTool } from "./editorReviewUi";
+import { editorTextMarkupState, setEditorTextMarkup } from "./editorReview";
+import { editorSelectedSourceTextSpans, editorSelectedTextStyleState, editorSourceTextSpans, setEditorSelectedTextStyle, type EditorTextStyle } from "./editorTextStyles";
 import { createEditorRecovery, editorRecoveryDocumentKey, type EditorRecoveryController } from "./editorRecovery";
 import { showEditorRecoveryDialog } from "./editorRecoveryUi";
 import { createEditorLinkController } from "./editorLinkUi";
@@ -217,9 +219,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     ${editorIconButton("tool", "add-field", "Add a form field: draw its area, then choose its type and properties")}
     ${editorIconButton("action", "edit-field", "Edit the selected form field's properties")}
     ${editorIconButton("tool", "text", "Add a text box")}
+    ${editorIconButton("tool", "select-text", "Select text, then use Bold, Italic, Underline or Strikethrough")}
     ${editorIconButton("tool", "highlight", "Highlight selected text")}
-    ${editorIconButton("tool", "underline-text", "Underline selected text")}
-    ${editorIconButton("tool", "strikeout-text", "Strike out selected text")}
     ${editorIconButton("tool", "comment", "Add a comment")}
     ${editorIconButton("action", "edit-comment", "Edit the selected review comment")}
     ${editorIconButton("action", "link", "Add or edit a link to a URL or another object (Ctrl/Cmd+K)")}
@@ -280,6 +281,33 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     note: query("[data-properties-note]") });
   function updateAppearanceControls(): void {
     appearanceControls.refresh(activeText ? "draft" : tool === "select" && session.getSelection().length ? "selection" : "defaults");
+    if (tool === "select-text" && !activeText) for (const name of ["bold", "italic", "underline", "strikethrough"] as const) {
+      const state = selectedTextStyleState(name), button = query<HTMLButtonElement>(`[data-style="${name}"]`);
+      button.disabled = !state.supported; button.setAttribute("aria-pressed", state.mixed ? "mixed" : String(state.value));
+    }
+    if (tool === "select" && !activeText && session.getSelection().length) for (const name of ["underline", "strikethrough"] as const) {
+      const state = selectedObjectTextDecorationState(name), button = query<HTMLButtonElement>(`[data-style="${name}"]`);
+      button.disabled = !state.supported; button.setAttribute("aria-pressed", state.mixed ? "mixed" : String(state.value));
+    }
+  }
+  function selectedObjectTextDecorationState(name: "underline" | "strikethrough") {
+    const text = editorPropertyState(session, name), spans = editorSelectedSourceTextSpans(session, latestScene);
+    const value = text.ids.length > 0 && !text.mixed && Boolean(text.value);
+    if (!spans.length) return { supported: text.ids.length, value, mixed: text.mixed };
+    const mark = editorTextMarkupState(session, latestScene, spans, name === "underline" ? "underline" : "strikeout");
+    return { supported: text.ids.length + spans.length, value: mark.value && (!text.ids.length || value),
+      mixed: mark.mixed || text.mixed || text.ids.length > 0 && mark.value !== value };
+  }
+  function selectedTextStyleState(name: EditorTextStyle) {
+    const selected = review.getTextSelection();
+    if (!selected) return { supported: 0, value: false, mixed: false };
+    const text = editorSelectedTextStyleState(session, selected.scene, selected.spans, name);
+    if (name === "bold" || name === "italic") return text;
+    const source = editorSourceTextSpans(session, selected.scene, selected.spans);
+    if (!source.length) return text;
+    const mark = editorTextMarkupState(session, selected.scene, source, name === "underline" ? "underline" : "strikeout");
+    return { supported: text.supported + source.length, value: mark.value && (!text.supported || text.value),
+      mixed: mark.mixed || text.mixed || text.supported > 0 && mark.value !== text.value };
   }
   function setStatus(text: string): void {
     status.textContent = text; if (!active) host.onStatus?.(text);
@@ -382,7 +410,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     toScene: (x, y) => host.clientToScenePoint(x, y), toClient: (x, y) => host.sceneToClientPoint(x, y),
     style: () => ({ color: property("color").value, opacity: objectOpacity }),
     change(change) { change(); void refreshScene(); }, added: ids => { for (const id of ids) pendingDrawings.add(id); }, onError: report,
-    onDraftChange: () => recovery?.draftChanged()
+    onDraftChange: () => recovery?.draftChanged(), onSelectionChange: () => updateAppearanceControls()
   });
   const links = createEditorLinkController({ document, session,
     canEdit: () => active && !disposed && !running && !structuralRunning && !recoveryRunning && !activeText && !pointer && !pendingPick && !cameraPan.isPanning() && !isSceneSettling(),
@@ -802,12 +830,12 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     textRequest++;
     // Restore creation controls before applying the next tool's own defaults.
     appearanceControls.refresh("defaults");
-    if (isEditorReviewTool(tool)) reviewDefaults.set(tool, { color: property("color").value, opacity: objectOpacity });
-    if (!isEditorReviewTool(tool) && isEditorReviewTool(next)) drawingDefaults = { color: property("color").value, opacity: objectOpacity };
-    if (isEditorReviewTool(next)) {
+    if (isEditorReviewTool(tool) && tool !== "select-text") reviewDefaults.set(tool, { color: property("color").value, opacity: objectOpacity });
+    if ((!isEditorReviewTool(tool) || tool === "select-text") && isEditorReviewTool(next) && next !== "select-text") drawingDefaults = { color: property("color").value, opacity: objectOpacity };
+    if (isEditorReviewTool(next) && next !== "select-text") {
       const style = reviewDefaults.get(next) ?? { color: next === "highlight" || next === "comment" ? "#ffdc00" : "#e12727", opacity: next === "highlight" ? .35 : 1 };
       property("color").value = style.color; objectOpacity = style.opacity;
-    } else if (isEditorReviewTool(tool) && drawingDefaults) { property("color").value = drawingDefaults.color; objectOpacity = drawingDefaults.opacity; drawingDefaults = null; }
+    } else if (isEditorReviewTool(tool) && tool !== "select-text" && drawingDefaults) { property("color").value = drawingDefaults.color; objectOpacity = drawingDefaults.opacity; drawingDefaults = null; }
     cancelPointerGesture(); polygon = null; signatureHover = null; tool = next; toolRequest++;
     review.setTool(isEditorReviewTool(next) ? next : null);
     for (const button of toolbar.querySelectorAll<HTMLButtonElement>('[data-tool], [data-action="signatures"]'))
@@ -1313,19 +1341,18 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     element.addEventListener("paste", event => { event.preventDefault(); document.execCommand("insertText", false, event.clipboardData?.getData("text/plain") ?? ""); });
     element.addEventListener("input", () => recovery?.draftChanged());
     Object.assign(element.style, { fontFamily: `"${font.id}"`, fontSize: `${object?.fontSize ?? Number(property("font-size").value)}px`,
-      color: object ? colorCss(object.color) : property("color").value, fontWeight: object?.fontWeight ?? (styleEnabled("bold") ? "bold" : "normal"),
-      fontStyle: object?.fontStyle ?? (styleEnabled("italic") ? "italic" : "normal"), whiteSpace: "pre-wrap", textAlign: object?.align ?? query<HTMLSelectElement>('[data-prop="align"]').value,
-      lineHeight: String(object?.lineHeight ?? 1.2),
-      textDecorationLine: [(object?.underline ?? styleEnabled("underline")) && "underline", (object?.strikethrough ?? styleEnabled("strikethrough")) && "line-through"].filter(Boolean).join(" ") });
-    if (object?.runs?.length) {
-      for (const run of object.runs) {
-        const face = await editorServices.fonts.resolve(run); await activateFont(face);
+      color: object ? colorCss(object.color) : property("color").value, fontWeight: "normal", fontStyle: "normal",
+      whiteSpace: "pre-wrap", textAlign: object?.align ?? query<HTMLSelectElement>('[data-prop="align"]').value,
+      lineHeight: String(object?.lineHeight ?? 1.2), textDecorationLine: "none" });
+    if (object) {
+      for (const run of object.runs?.length ? object.runs : [{ text: object.text }]) {
+        const face = await editorServices.fonts.resolve({ ...object, ...run, fontId: run.fontId ?? (run.fontFamily ? undefined : object.fontId) }); await activateFont(face);
         const span = document.createElement("span"); span.textContent = run.text;
         Object.assign(span.style, { fontFamily: `"${face.id}"`, fontSize: `${run.fontSize ?? object.fontSize}px`,
-          fontWeight: String(run.fontWeight ?? object.fontWeight ?? "normal"), fontStyle: run.fontStyle ?? "normal", color: colorCss(run.color ?? object.color),
-          textDecorationLine: [run.underline && "underline", run.strikethrough && "line-through"].filter(Boolean).join(" ") }); element.append(span);
+          fontWeight: String(run.fontWeight ?? object.fontWeight ?? "normal"), fontStyle: run.fontStyle ?? object.fontStyle ?? "normal", color: colorCss(run.color ?? object.color),
+          textDecorationLine: [(run.underline ?? object.underline) && "underline", (run.strikethrough ?? object.strikethrough) && "line-through"].filter(Boolean).join(" ") }); element.append(span);
       }
-    } else element.textContent = object?.text ?? "";
+    } else element.textContent = "";
     if (disposed || !active || running || savePreparing || request !== textRequest) return;
     activeText = { element, objectId: sourceAnnotationId ? undefined : object?.id, sourceAnnotationId, layerId, pageIndex, x, y: object ? y : y - 50,
       width: object?.width ?? 220, height: object?.height ?? 50, transform: object?.transform ?? IDENTITY, opacity: object?.opacity ?? objectOpacity, lineHeight: object?.lineHeight,
@@ -1333,7 +1360,12 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     overlay.append(element); query('[data-action="apply-text"]').hidden = false; query('[data-action="cancel-text"]').hidden = false;
     updateClipboardButtons();
     updateAppearanceControls();
-    updateGeometry(); if (!element.hidden) element.focus(); activeText.baseline.html = element.innerHTML;
+    updateGeometry();
+    if (!element.hidden) {
+      element.focus();
+      if (!object) for (const name of ["bold", "italic", "underline", "strikethrough"]) if (styleEnabled(name)) document.execCommand(name === "strikethrough" ? "strikeThrough" : name);
+    }
+    activeText.baseline.html = element.innerHTML;
   }
   function cancelText(): void {
     const hadDraft = activeText !== null;
@@ -1376,6 +1408,31 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   function applyTextStyle(name: string): void {
     if (structuralRunning || running || savePreparing) return;
+    if (!["bold", "italic", "underline", "strikethrough"].includes(name)) return;
+    if (!activeText && tool === "select" && session.getSelection().length && (name === "underline" || name === "strikethrough")) {
+      const state = selectedObjectTextDecorationState(name); if (!state.supported) return;
+      const enabled = !state.value, spans = editorSelectedSourceTextSpans(session, latestScene);
+      commit(() => session.transaction("Change text style", () => {
+        applyEditorPropertyPatch(session, { [name]: enabled });
+        if (spans.length) setEditorTextMarkup(session, latestScene, spans, name === "underline" ? "underline" : "strikeout", enabled,
+          { color: property("color").value, opacity: objectOpacity });
+      }));
+      updateAppearanceControls(); return;
+    }
+    if (!activeText && tool === "select-text") {
+      const selected = review.getTextSelection(), style = name as EditorTextStyle;
+      if (!selected || !selectedTextStyleState(style).supported) return;
+      const enabled = !selectedTextStyleState(style).value;
+      try { commit(() => session.transaction("Change text style", () => {
+        setEditorSelectedTextStyle(session, selected.scene, selected.spans, style, enabled);
+        if (style === "underline" || style === "strikethrough") {
+          const spans = editorSourceTextSpans(session, selected.scene, selected.spans);
+          if (spans.length) setEditorTextMarkup(session, selected.scene, spans, style === "underline" ? "underline" : "strikeout", enabled,
+            { color: property("color").value, opacity: objectOpacity, contents: selected.text });
+        }
+      })); updateAppearanceControls(); } catch (error) { report(error); }
+      return;
+    }
     const button = query(`[data-style="${name}"]`); button.setAttribute("aria-pressed", String(!styleEnabled(name)));
     if (activeText) { activeText.element.focus(); document.execCommand(name === "strikethrough" ? "strikeThrough" : name); recovery?.draftChanged(); }
     else if (tool === "select") {
@@ -1383,6 +1440,15 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if (editorPropertySelection(session, "fontStyle").length) commit(() => { applyEditorPropertyPatch(session, patch); });
     }
   }
+  document.addEventListener("selectionchange", () => {
+    if (!activeText) return;
+    const selection = document.getSelection();
+    if (!selection?.anchorNode || !activeText.element.contains(selection.anchorNode)) return;
+    for (const name of ["bold", "italic", "underline", "strikethrough"]) {
+      const command = name === "strikethrough" ? "strikeThrough" : name;
+      query(`[data-style="${name}"]`).setAttribute("aria-pressed", document.queryCommandIndeterm(command) ? "mixed" : String(document.queryCommandState(command)));
+    }
+  }, { signal: lifetime.signal });
   function updateFonts(): void {
     const select = query<HTMLSelectElement>('[data-prop="font"]'), selected = select.value; select.replaceChildren();
     for (const [value, label] of [["", "Liberation Sans"], ["bundled:serif", "Liberation Serif"], ["bundled:mono", "Liberation Mono"]]) {
@@ -1936,7 +2002,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
           inputTarget(event.target) && !["Tab", "Shift", "Control", "Meta", "Alt"].includes(event.key)) event.preventDefault();
       return;
     }
-    if (event.key === "Escape") { polygon = null; cancelPointerGesture(); cancelText(); operation?.abort(); if (tool === "signature") setTool("select"); session.select([]); return; }
+    if (event.key === "Escape") { polygon = null; cancelPointerGesture(); review.clearSelection(); cancelText(); operation?.abort(); if (tool === "signature") setTool("select"); session.select([]); return; }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") { event.preventDefault(); void save("pdf"); return; }
     const dialog = (event.target as Element | null)?.closest?.("dialog");
     if (dialog && dialog !== layerDialog) return;
