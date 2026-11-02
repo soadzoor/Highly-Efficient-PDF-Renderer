@@ -903,6 +903,10 @@ function testMacintoshSymbolCmap() {
     assert.equal(macFont.mapSymbolCode(0xff), 1, `Macintosh format ${format} accepts the highest byte`);
     assert.equal(macFont.mapSymbolCode(0x04), 0, "unmapped symbol codes select .notdef");
     assert.equal(macFont.mapSymbolCode(0x100), 0, "symbol codes are limited to single bytes");
+    assert.equal(macFont.mapMacRomanCode(0x03), 2, `Macintosh format ${format} supports Roman code lookup`);
+    assert.equal(macFont.mapMacRomanCode(0xff), 1, "Roman lookup accepts the highest byte");
+    assert.equal(macFont.mapMacRomanCode(0x04), 0, "unmapped Roman codes select .notdef");
+    assert.equal(macFont.mapMacRomanCode(0x100), 0, "Roman codes are limited to single bytes");
     assert.equal(macFont.mapCodePoint(0x03), 0, "(1,0) is never treated as a Unicode cmap");
     assert.equal(macFont.mapCodePoint(0xff), 0, "high-byte Macintosh codes are not Unicode");
   }
@@ -913,6 +917,8 @@ function testMacintoshSymbolCmap() {
     { platform: 3, encoding: 0, bytes: cmapFormat0([[0x20, 1]]) }
   ]));
   assert.equal(NativeSfntFont.parse(buildSfnt(both)).mapSymbolCode(0x20), 1, "(3,0) keeps precedence over (1,0)");
+  assert.equal(NativeSfntFont.parse(buildSfnt(both)).mapMacRomanCode(0x20), 2,
+    "Roman lookup uses (1,0) independently of the Windows symbol cmap");
 
   const withUnicode = cloneTables(fixture.tables);
   withUnicode.set("cmap", buildCmap([

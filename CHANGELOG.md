@@ -138,6 +138,10 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
+- Render nonsymbolic embedded TrueType subsets with Macintosh Roman character
+  maps, restoring spaces, digits and letters that appeared as rectangles.
+  Translate PDF encodings and glyph-name differences without changing text
+  extraction, PDF spacing or existing Unicode/symbol character-map selection.
 - Compile links attached to original page primitives and groups with their exact
   layer visibility, keeping same-document destinations usable in Read mode and
   preventing failed Edit re-entry. Wait for the current committed frame before

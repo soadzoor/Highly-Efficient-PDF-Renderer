@@ -826,6 +826,12 @@ async function parseSimpleFont(
         glyphId = unicodeScalar >= 0 ? sfnt.mapCodePoint(unicodeScalar) : 0;
         if (glyphId === 0 && descriptor.flags & 4) {
           glyphId = sfnt.mapSymbolCode(code);
+        } else if (glyphId === 0 && glyphUnicode) {
+          // Nonsymbolic subsets can retain only a Macintosh Roman cmap.
+          // Translate the PDF Encoding (including Differences) to its byte
+          // codes; neither raw WinAnsi bytes nor ToUnicode select these glyphs.
+          const macRomanCode = MAC_ROMAN_SELECTION_CODES.get(glyphUnicode);
+          if (macRomanCode !== undefined) glyphId = sfnt.mapMacRomanCode(macRomanCode);
         }
       }
       const standardWidth = widths.has(code) || standardMetricFace === null
@@ -3395,6 +3401,7 @@ export class NativeSfntFont {
   private readonly tables: ReadonlyMap<string, SfntTable>;
   private readonly unicodeCmap: CmapLookup | null;
   private readonly symbolCmap: CmapLookup | null;
+  private readonly macRomanCmap: CmapLookup | null;
   private readonly variationCmaps: readonly VariationCmapLookup[];
   private readonly limits: Readonly<NativeSfntParserLimits>;
   private readonly validation: "strict" | "pdf-embedded";
@@ -3578,8 +3585,9 @@ export class NativeSfntFont {
     if (cmapDiagnostics.length > 0) this.diagnosticData = Object.freeze([...this.diagnosticData, ...cmapDiagnostics]);
     // (1,0) Macintosh subtables map single-byte codes, never Unicode scalar values.
     this.unicodeCmap = cmaps.base.find((cmap) => cmap.platform !== 1 && (cmap.platform !== 3 || cmap.encoding !== 0)) ?? null;
+    this.macRomanCmap = cmaps.base.find((cmap) => cmap.platform === 1 && cmap.encoding === 0) ?? null;
     this.symbolCmap = cmaps.base.find((cmap) => cmap.platform === 3 && cmap.encoding === 0) ??
-      cmaps.base.find((cmap) => cmap.platform === 1 && cmap.encoding === 0) ?? null;
+      this.macRomanCmap;
     this.variationCmaps = cmaps.variation;
     if (
       this.tables.has("glyf") !== this.tables.has("loca") &&
@@ -3771,6 +3779,13 @@ export class NativeSfntFont {
     const privateUse = cmap.lookup(0xf000 + code);
     if (privateUse > 0) return this.validateMappedGlyphId(privateUse, "symbol cmap");
     return 0;
+  }
+
+  /** Select a glyph by its Macintosh Roman byte, separately from Unicode/symbol cmaps. */
+  mapMacRomanCode(code: number): number {
+    if (!Number.isSafeInteger(code) || code < 0 || code > 0xff) return 0;
+    const glyph = this.macRomanCmap?.lookup(code) ?? 0;
+    return glyph > 0 ? this.validateMappedGlyphId(glyph, "Macintosh Roman cmap") : 0;
   }
 
   /** Recover text from the selected Unicode cmap without changing painted glyphs. */
@@ -5346,6 +5361,13 @@ const PREFERRED_GLYPH_NAMES = new Map<string, string>();
 for (const [name, unicode] of Object.entries(AGL)) {
   if (!PREFERRED_GLYPH_NAMES.has(unicode)) PREFERRED_GLYPH_NAMES.set(unicode, name);
 }
+
+// Invert the PDF MacRoman encoding, including its space/currency conventions.
+// Preserve the first byte for aliases, just as glyph-name encoding lookup does.
+const MAC_ROMAN_SELECTION_CODES = new Map<string, number>();
+createBaseEncoding("MacRomanEncoding", "", false).selectionUnicode.forEach((unicode, code) => {
+  if (unicode !== null && !MAC_ROMAN_SELECTION_CODES.has(unicode)) MAC_ROMAN_SELECTION_CODES.set(unicode, code);
+});
 
 function asciiGlyphName(code: number): string {
   if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) return String.fromCharCode(code);
