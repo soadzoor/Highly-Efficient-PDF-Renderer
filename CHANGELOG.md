@@ -22,6 +22,8 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   undoable resizing that preserves actual content size and top-left placement.
   Open valid blank PDF/HEP pages, retain the previous document when replacement
   fails or is cancelled, and resume never-saved new-document drafts locally.
+  Keep New PDF beside Open in the shared toolbar after initialization, with
+  primary controls wrapping within narrow screens.
 - Add optional automatic page numbers with header/footer placement, margins,
   fonts, color, starting numbers, cover exclusion and page-total formats.
   Renumber with page operations and Undo/Redo; retain adjustable settings in

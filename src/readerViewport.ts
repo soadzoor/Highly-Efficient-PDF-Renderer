@@ -92,7 +92,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   }
   // Move controls rather than duplicate IDs or attach a second set of handlers.
   const primary = query<HTMLDivElement>(".reader-primary-controls");
-  for (const selector of [".package-version", "#open-file", "#example-dropdown"]) {
+  for (const selector of [".package-version", "#open-file", "#new-pdf", "#example-dropdown"]) {
     const element = document.querySelector<HTMLElement>(selector);
     if (element) primary.append(element);
   }

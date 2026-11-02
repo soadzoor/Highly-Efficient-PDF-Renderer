@@ -280,6 +280,36 @@ try {
   const { READER_ACTUAL_SIZE_ZOOM, readerContentMetrics, readerViewFromScroll } = await import("../src/readerGeometry.ts");
   const { createViewerLinkNavigation, resolveAnnotationView } = await import("../src/viewerLinkNavigation.ts");
   const { createAnnotationInteractionController } = await import("../src/annotationInteraction.ts");
+  for (const width of [320, 1000]) for (const settingsId of ["hud", "panel"]) {
+    const env = environment(width), doc = env.document;
+    const settings = doc.createElement("aside"); settings.id = settingsId; settings.classList.add("collapsed");
+    const startup = doc.createElement("div"); startup.className = "startup-controls";
+    const open = doc.createElement("button"); open.id = "open-file";
+    const create = doc.createElement("button"); create.id = "new-pdf";
+    const examples = doc.createElement("div"); examples.id = "example-dropdown";
+    startup.append(open, create, examples); settings.append(startup); doc.body.append(settings);
+    let creations = 0; create.addEventListener("click", () => creations++);
+    env.options.settingsPanel = settings;
+    const reader = createReaderViewport(env.options), primary = doc.querySelector(".reader-primary-controls");
+    assert(doc.body.classList.contains("has-reader-toolbar"));
+    assert.deepEqual(primary.children.map(node => node.id), ["open-file", "new-pdf", "example-dropdown"], "New PDF moves beside Open before the startup controls are hidden");
+    assert.equal(doc.querySelector("#new-pdf"), create, "toolbar mounting retains the original button and its handlers");
+    assert.equal(doc.body.descendants().filter(node => node.id === "new-pdf").length, 1, "New PDF has one live button");
+    assert(!create.closest(".startup-controls") && !create.closest(".viewer-settings"), "New PDF stays outside hidden startup controls and closed Settings");
+    assert(!doc.querySelector(".reader-toolbar").hidden, "creation is available before opening a document");
+    create.emit("click"); assert.equal(creations, 1);
+    reader.setDocument({ identity: "creation-toolbar", pageRects: pageRects(2) });
+    for (const layout of ["reader", "grid"]) {
+      reader.setLayout(layout); assert.equal(create.parentElement, primary);
+      create.emit("click");
+    }
+    assert.equal(creations, 3, "creation remains connected in Reader and Grid");
+    doc.querySelector('[data-reader="hide-toolbar"]').emit("click");
+    const restore = doc.querySelector('[data-reader="show-toolbar"]'); assert(!restore.hidden);
+    restore.emit("click"); assert(!doc.querySelector(".reader-toolbar").hidden);
+    create.emit("click"); assert.equal(creations, 4, "restoring the toolbar also restores access to New PDF");
+    reader.dispose();
+  }
   for (const width of [320, 700, 1000]) {
     const env = environment(width), doc = env.document;
     const settings = doc.createElement("aside"); settings.id = "hud";

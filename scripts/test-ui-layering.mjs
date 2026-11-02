@@ -31,6 +31,10 @@ assert(!shell.has("z-index") || shell.get("z-index") === "auto");
 for (const property of ["transform", "filter", "backdrop-filter", "isolation", "contain", "will-change"])
   assert(!shell.has(property), `${property} must not reintroduce a containing stacking context around the document and toolbar`);
 assert(!shell.has("opacity") || Number(shell.get("opacity")) === 1);
+const primaryControls = declarations(reader, ".reader-primary-controls");
+assert.equal(primaryControls.get("flex-wrap"), "wrap", "primary actions including New PDF wrap on narrow screens");
+assert.equal(primaryControls.get("min-width"), "0", "the primary control group can shrink within the viewport");
+assert.equal(primaryControls.get("max-width"), "100%", "the primary control group stays within the toolbar width");
 const documentLayer = z(editor, ".hepr-editor-overlay"), editorToolbar = z(editor, ".hepr-editor-toolbar");
 assert.equal(declarations(editor, ".hepr-editor-toolbar").get("box-sizing"), "border-box",
   "the canvas-constrained toolbar width includes padding and borders in both viewers");

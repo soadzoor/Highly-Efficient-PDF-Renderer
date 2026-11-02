@@ -47,6 +47,12 @@
   gap: 6px;
 }
 
+.reader-primary-controls {
+  flex-wrap: wrap;
+  min-width: 0;
+  max-width: 100%;
+}
+
 .reader-toolbar button, .reader-toolbar select, .reader-toolbar input {
   height: 30px;
   margin: 0;
