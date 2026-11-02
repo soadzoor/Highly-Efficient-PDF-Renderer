@@ -4,9 +4,10 @@ import "./editorPagesUi.css";
 import "./editorReviewUi.css";
 import "./editorRecoveryUi.css";
 import "./editorLinkUi.css";
+import "./editorFieldUi.css";
 import "./toolbarIcons.css";
 import { openEditorSession } from "./editorSession";
-import type { EditorColor, EditorMatrix, EditorObject, EditorObjectInput, EditorSelectionFrame, EditorSession, EditorState, EditorTextObject } from "./editorTypes";
+import type { EditorColor, EditorFieldObject, EditorMatrix, EditorObject, EditorObjectInput, EditorSelectionFrame, EditorSession, EditorState, EditorTextObject } from "./editorTypes";
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import { ScenePrimitivePicker, getSceneAnnotationRuns, type PrimitivePoint, type PrimitiveRef } from "./scenePrimitives";
 import { createEditorAppServices } from "./editorAppServices";
@@ -54,6 +55,7 @@ import { normalizePrimitiveColor } from "./colorInput";
 import { resolveEditorColorPreviewRefs } from "./editorColorPreview";
 import { applyEditorSourceColors } from "./editorSourceColors";
 import { captureEditorPageChanges, changedEditorPages } from "./editorPageChanges";
+import { showEditorFieldDialog, type EditorFieldDialog } from "./editorFieldUi";
 
 export interface EditorUiHost {
   getCanvas(): HTMLCanvasElement;
@@ -100,7 +102,7 @@ export interface EditorUi {
   dispose(): void;
 }
 
-type Tool = "select" | "pan" | "form" | "text" | "rectangle" | "ellipse" | "line" | "arrow" | "polygon" | "polyline" | "ink" | "signature" | "image" | EditorReviewTool;
+type Tool = "select" | "pan" | "form" | "add-field" | "text" | "rectangle" | "ellipse" | "line" | "arrow" | "polygon" | "polyline" | "ink" | "signature" | "image" | EditorReviewTool;
 type EditorImageData = Omit<Extract<EditorObjectInput, { kind: "image" }>, "pageIndex" | "x" | "y" | "width" | "height">;
 type EditorInkInput = Extract<EditorObjectInput, { kind: "ink" }>;
 type EditorShapeInput = Extract<EditorObjectInput, { kind: "shape" }>;
@@ -156,6 +158,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   const fieldActivation = createEditorFieldActivation();
   const pdfProtection = createEditorPdfProtectionState();
   let passwordDialog: EditorPdfPasswordDialog | null = null;
+  let fieldDialog: EditorFieldDialog | null = null, fieldDialogCreating = false;
+  let fieldDefaults: Partial<EditorFieldObject> = { fieldType: "text" };
   let pagesDialog: EditorPagesDialog | null = null, structuralRunning = false;
   let currentSourceScene = session.sourceScene;
   let latestScene = session.sourceScene;
@@ -207,6 +211,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     ${editorIconButton("tool", "select", "Select, move, resize or rotate objects")}
     ${editorIconButton("tool", "pan", "Pan the document")}
     ${editorIconButton("tool", "form", "Fill PDF form fields")}
+    ${editorIconButton("tool", "add-field", "Add a form field: draw its area, then choose its type and properties")}
+    ${editorIconButton("action", "edit-field", "Edit the selected form field's properties")}
     ${editorIconButton("tool", "text", "Add a text box")}
     ${editorIconButton("tool", "highlight", "Highlight selected text")}
     ${editorIconButton("tool", "underline-text", "Underline selected text")}
@@ -607,10 +613,11 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     query<HTMLButtonElement>('[data-action="lock"]').disabled = !state.selection.some(id => !session.isObjectLocked(id));
     query<HTMLButtonElement>('[data-action="unlock"]').disabled = !selectionLocked();
     query<HTMLButtonElement>('[data-action="edit-comment"]').disabled = !canEditComment();
+    query<HTMLButtonElement>('[data-action="edit-field"]').disabled = !selectedEditorField() || selectionLocked();
     updateLinkButtons();
     for (const button of toolbar.querySelectorAll<HTMLButtonElement>('[data-action^="align-"], [data-action^="distribute-"]')) button.disabled = !state.selection.length || selectionLocked();
     updateClipboardButtons();
-    if (tool === "form") for (const control of fieldDrafts.keys()) control.disabled = session.isObjectLocked(`annotation:${control.dataset.fieldId}`);
+    if (tool === "form") for (const control of fieldDrafts.keys()) control.disabled = session.isObjectLocked(fieldObjectOwner(control.dataset.fieldId!));
     const bounds = session.getSelectionBounds(), frame = session.getSelectionFrame(), size = frame && editorFrameSize(frame);
     for (const [name, value] of Object.entries({ x: bounds?.minX, y: bounds?.minY, width: size?.width, height: size?.height })) {
       const input = query<HTMLInputElement>(`[data-transform="${name}"]`); input.disabled = !bounds || selectionLocked();
@@ -835,7 +842,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
           updateFieldPaint();
         }), { usePdfAppearance: currentAnnotation.hasAppearance || Boolean(appearances.get(annotation.id)?.length) });
       if (input) {
-        input.disabled = session.isObjectLocked(`annotation:${annotation.id}`);
+        input.disabled = session.isObjectLocked(fieldObjectOwner(annotation.id));
         input.hidden = Boolean(host.subscribeToFrames);
         input.addEventListener("input", () => { updateFieldPaint(input); recovery?.draftChanged(); });
         fieldDrafts.set(input, editorFieldDraftSignature(input)); fields.append(input);
@@ -860,7 +867,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   function fieldAtClientPoint(client: PrimitivePoint): string | null {
     for (const annotation of [...(latestScene.annotations ?? [])].reverse()) {
-      if (!canEditEditorField(annotation) || !session.isAnnotationVisible(annotation.id) || session.isObjectLocked(`annotation:${annotation.id}`)) continue;
+      if (!canEditEditorField(annotation) || !session.isAnnotationVisible(annotation.id) || session.isObjectLocked(fieldObjectOwner(annotation.id))) continue;
       const source = getEditorAnnotationSource(latestScene, annotation.id) ?? annotation;
       const geometry = editorFieldClientGeometry(source, latestScene.pdfPages,
         (point, pageIndex) => host.sceneToClientPoint(point.x, point.y, pageIndex), getEditorAnnotationFrameTransform(latestScene, annotation.id));
@@ -889,6 +896,10 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       tool === "select" && !activeText && !links.isOpen() && !cameraPan.isPanning() &&
       (!presented || presented.sourceScene === session.sourceScene && presented.revision === session.revision);
   }
+  function fieldObjectOwner(id: string): string {
+    try { if (session.getObject(id).kind === "field") return id; } catch { /* Source widgets use annotation-owned identities. */ }
+    return `annotation:${id}`;
+  }
   function activateField(id: string): void {
     setTool("form");
     pendingFieldFocus = { id, sourceScene: session.sourceScene };
@@ -913,7 +924,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     const appearanceRuns = getSceneAnnotationRuns(session.sourceScene);
     const metadataOwners = new Map<string, string>();
     const metadata = (latestScene.annotations ?? []).filter(annotation => {
-      const owner = annotation.subtype === "Link" ? editorLinkSelectionOwner(session, annotation) : `annotation:${annotation.id}`;
+      const owner = annotation.subtype === "Link" ? editorLinkSelectionOwner(session, annotation) : fieldObjectOwner(annotation.id);
       if (!owner || (annotation.subtype === "Link" ? !session.isObjectVisible(owner) : !session.isAnnotationVisible(annotation.id))) return false;
       metadataOwners.set(annotation.id, owner); return true;
     });
@@ -1003,6 +1014,49 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       width: Math.abs(end[0] - start[0]), height: Math.abs(end[1] - start[1]) });
     if (shape.shape === "line" || shape.shape === "arrow") shape.points = [start, end];
   }
+  function selectedEditorField(): EditorFieldObject | null {
+    const selected = editorSelectionLeaves(session);
+    return selected.length === 1 && selected[0].kind === "field" ? selected[0] : null;
+  }
+  async function openFieldEditor(placement?: Pick<EditorFieldObject, "pageIndex" | "x" | "y" | "width" | "height">, defaultSize = false): Promise<void> {
+    if (!active || disposed || running || structuralRunning || savePreparing || fieldDialog) return;
+    const object = placement ? null : selectedEditorField();
+    if (!placement && (!object || session.isObjectLocked(object.id))) return;
+    flushColorDraft(); flushEditorFieldDrafts(fieldDrafts);
+    const sourceScene = session.sourceScene, revision = session.revision, request = toolRequest;
+    const font = object ? null : await selectedFont();
+    if (disposed || !active || running || structuralRunning || savePreparing || request !== toolRequest || sourceScene !== session.sourceScene || revision !== session.revision || fieldDialog) return;
+    const names = new Set([...(session.sourceScene.annotations ?? []).flatMap(annotation => annotation.field?.name ? [annotation.field.name.split(".")[0]] : []),
+      ...session.getObjects({ includeSource: false }).flatMap(item => item.kind === "field" ? [item.name] : [])]);
+    let nextName = 1; while (names.has(`Field${nextName}`)) nextName++;
+    const initial: Partial<EditorFieldObject> = object ?? { ...fieldDefaults, kind: "field", name: `Field${nextName}`,
+      value: "", defaultValue: "", fontSize: Number(property("font-size").value) || 12,
+      fontId: font?.id, fontFamily: font?.family, color: property("color").value, fill: "#ffffff", borderColor: "#555555", strokeWidth: 1 };
+    fieldDialogCreating = Boolean(placement);
+    fieldDialog = showEditorFieldDialog(document, initial, settings => {
+      if (disposed || !active || sourceScene !== session.sourceScene || revision !== session.revision)
+        throw new Error("The document changed while editing field properties. Close this dialog and try again.");
+      if (object && fieldDialog && !fieldDialog.hasDraftChanges()) return;
+      let applied = false, failure: unknown;
+      commit(() => {
+        try {
+          session.transaction(object ? "Edit form field" : "Add form field", () => {
+            if (object) session.updateObject(object.id, settings);
+            else {
+              const height = defaultSize ? settings.fieldType === "list" ? 96 : settings.multiline ? 72 : 24 : placement!.height;
+              const geometry = { ...placement!, height, y: placement!.y + placement!.height - height,
+                width: defaultSize && (settings.fieldType === "checkbox" || settings.fieldType === "radio") ? 24 : placement!.width };
+              const id = session.addObject({ ...settings, ...geometry }); session.select([id]);
+            }
+          });
+          applied = true;
+        } catch (error) { failure = error; throw error; }
+      });
+      if (!applied) throw failure ?? new Error("The field could not be applied. Finish the active operation and try again.");
+      fieldDefaults = { fieldType: settings.fieldType, multiline: settings.multiline, options: settings.options };
+      setTool("select");
+    }, () => { fieldDialog = null; fieldDialogCreating = false; if (!disposed) updateState(session.getState()); });
+  }
   function updatePolygonPreview(hover: readonly [number, number] | null = null): void {
     if (!polygon) return;
     const last = polygon.points[polygon.points.length - 1], points = hover && (!last || hover[0] !== last[0] || hover[1] !== last[1])
@@ -1017,8 +1071,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       ? fieldAtClientPoint({ x: event.clientX, y: event.clientY }) : null;
     fieldActivation.pointerDown(event, fieldId ? { id: fieldId, sourceScene: session.sourceScene, revision: session.revision } : null);
     if (links.isPicking()) { await pickLinkTarget(event); return; }
-    if (!active || running || savePreparing || activeText || pointer || pendingPick ||
-        isSceneSettling() && (!["ink", "rectangle", "ellipse", "line", "arrow", "polygon", "polyline", "signature"].includes(tool) || !presented || presented.sourceScene !== session.sourceScene) ||
+    if (!active || running || savePreparing || activeText || fieldDialog || pointer || pendingPick ||
+        isSceneSettling() && (!["ink", "rectangle", "ellipse", "line", "arrow", "polygon", "polyline", "signature", "add-field"].includes(tool) || !presented || presented.sourceScene !== session.sourceScene) ||
         tool === "pan" || tool === "form" || isEditorReviewTool(tool) || event.button !== 0 || (event.target as Element).closest(".hepr-editor-field")) return;
     // Accept this click before flushing geometry-stable picker edits. The
     // asynchronous pick then commits their old owner before selecting its hit.
@@ -1087,13 +1141,15 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         }
       }
     }
-    const drawingShape = ["rectangle", "ellipse", "line", "arrow"].includes(tool);
+    const drawingShape = ["rectangle", "ellipse", "line", "arrow", "add-field"].includes(tool);
     const pageIndex = tool === "ink" || drawingShape ? pageAt(point) : -1, points: [number, number][] = tool === "ink" ? [pageLocal(point, pageIndex)] : [[point.x, point.y]];
     const ink: EditorInkInput | undefined = tool === "ink" ? { kind: "ink", pageIndex, paths: [points], opacity: objectOpacity, fillOpacity,
       smoothing: editorInkCaptureTolerance(point, p => host.sceneToClientPoint(p.x, p.y, pageIndex)),
       color: property("color").value, strokeWidth: Number(property("stroke").value), fill: property("fill-enabled").checked ? property("fill").value : null } : undefined;
     if (ink && (!Number.isFinite(ink.strokeWidth) || ink.strokeWidth! < 0)) throw new RangeError("Stroke width must be a finite number at least 0.");
-    const shape = drawingShape ? createShapeDraft(tool as EditorShapeInput["shape"], pageIndex) : undefined;
+    const shape: EditorShapeInput | undefined = tool === "add-field" ? { kind: "shape", shape: "rectangle", pageIndex, x: 0, y: 0, width: 0, height: 0,
+      color: "#1765d7", strokeWidth: 1, fill: "#ffffff", opacity: .7, fillOpacity: .5 }
+      : drawingShape ? createShapeDraft(tool as EditorShapeInput["shape"], pageIndex) : undefined;
     pointer = { id: event.pointerId, start: point, startClient: client, last: point, points, ink, shape, bounds: session.getSelectionBounds(), frame: gestureFrame ?? session.getSelectionFrame() ?? undefined, action, additive, handle: handle ?? undefined,
       freeResize: event.shiftKey, scaleText: event.altKey, freeRotation: event.altKey };
     alignmentSnap = action === "move" ? createEditorAlignmentSnap(session) : null;
@@ -1198,6 +1254,10 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
             else commit(() => interaction.applyTransform(matrix));
           } else commit(() => interaction.applyTransform(matrix));
         }
+      } else if (tool === "add-field" && p.shape) {
+        const [x, y] = pageLocal(p.start, p.shape.pageIndex);
+        void openFieldEditor({ pageIndex: p.shape.pageIndex, x: moved ? p.shape.x : x, y: moved ? p.shape.y : y - 24,
+          width: moved ? Math.max(1, p.shape.width) : 160, height: moved ? Math.max(1, p.shape.height) : 24 }, !moved).catch(report);
       } else if (moved || tool === "ink") {
         const object = p.ink ?? p.shape; if (!object) return;
         commit(() => { const id = session.addObject(object); pendingDrawings.add(id); session.select([id]); });
@@ -1423,6 +1483,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   async function save(kind: "pdf" | "flatten" | "hep" | "print"): Promise<void> {
     if (disposed || running || savePreparing || structuralRunning || recoveryRunning || recoveryDialog) return;
     if (links.isOpen()) { setStatus("Apply or cancel the pending link before saving or printing."); return; }
+    if (fieldDialog && !fieldDialog.apply()) return;
     if ((kind === "pdf" || kind === "flatten") && passwordDialog && !passwordDialog.apply()) return;
     if (colorDraft) { cancelPointerGesture(); flushColorDraft(); }
     flushEditorFieldDrafts(fieldDrafts);
@@ -1564,6 +1625,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       case "lock": commit(() => session.setObjectsLocked(session.getSelection(), true)); break;
       case "unlock": commit(() => session.setObjectsLocked(session.getSelection(), false)); break;
       case "edit-comment": try { review.editSelection(); } catch (error) { report(error); } break;
+      case "edit-field": void openFieldEditor().catch(report); break;
       case "link": openLinkEditor(); break;
       case "remove-link": links.removeSelection(); break;
       case "guides": button.setAttribute("aria-pressed", String(button.getAttribute("aria-pressed") !== "true")); break;
@@ -1882,7 +1944,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   window.addEventListener("keydown", transformModifiers, { signal: lifetime.signal });
   window.addEventListener("keyup", transformModifiers, { signal: lifetime.signal });
   function hasUnsavedChanges(): boolean {
-    return session.getState().dirty || Boolean(colorDraft && colorDraft.sourceScene === session.sourceScene) || hasPendingEditorTextChanges(activeText) || hasPendingEditorFields(fieldDrafts) ||
+    return session.getState().dirty || Boolean(fieldDialog && (fieldDialogCreating || fieldDialog.hasDraftChanges())) || Boolean(colorDraft && colorDraft.sourceScene === session.sourceScene) || hasPendingEditorTextChanges(activeText) || hasPendingEditorFields(fieldDrafts) ||
       pdfProtection.hasChanges() || Boolean(passwordDialog?.hasDraftChanges()) || review.hasDraftChanges() || links.hasDraftChanges() || structuralRunning;
   }
   async function initializeRecovery(): Promise<void> {
@@ -1974,6 +2036,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       const signal = AbortSignal.any([lifetime.signal, ...(externalSignal ? [externalSignal] : [])]);
       signal.throwIfAborted();
       contextMenu.close();
+      if (!value && fieldDialog && !fieldDialog.apply()) return;
       if (!value) recoveryDialog?.close();
       if (!value && clipboardRunning) operation?.abort();
       if (!value && colorDraft) { cancelPointerGesture(); flushColorDraft(); }
@@ -2021,7 +2084,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if (disposed) return; stopColorPreview(true); disposed = true; active = false; cancelPointerGesture(false); lifetime.abort(); scenePreparation?.abort(); operation?.abort(); window.cancelAnimationFrame(frame);
       colorDraft = null;
       cameraPan.dispose();
-      review.dispose(); links.dispose(); recoveryDialog?.close();
+      review.dispose(); links.dispose(); recoveryDialog?.close(); fieldDialog?.close();
       if (discardRecovery && recovery) { const controller = recovery; void controller.discard().finally(() => controller.dispose()).catch(() => {}); }
       else recovery?.dispose();
       pendingFieldFocus = null;

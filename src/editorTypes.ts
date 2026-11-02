@@ -130,6 +130,36 @@ export interface EditorImageObject extends EditorObjectBase {
   /** Canonical RGBA pixels. Callers retain ownership; the session copies on insertion. */
   data: Uint8Array;
 }
+export type EditorFieldType = "text" | "number" | "date" | "email" | "tel" | "url" | "checkbox" | "radio" | "dropdown" | "list";
+/** Authored AcroForm widget. Typed text inputs remain ordinary PDF /Tx fields. */
+export interface EditorFieldObject extends EditorObjectBase {
+  kind: "field";
+  fieldType: EditorFieldType;
+  name: string;
+  x: number; y: number; width: number; height: number;
+  value?: EditorFieldValue;
+  defaultValue?: EditorFieldValue;
+  tooltip?: string;
+  readOnly?: boolean;
+  required?: boolean;
+  multiline?: boolean;
+  maxLength?: number;
+  options?: readonly { value: string; label: string }[];
+  /** Export value for a checked button; common radio names define one group. */
+  onValue?: string;
+  multiSelect?: boolean;
+  fontFamily?: string;
+  fontId?: string;
+  /** Zero or omission fits text automatically. */
+  fontSize?: number;
+  fontWeight?: number | "normal" | "bold";
+  fontStyle?: "normal" | "italic" | "oblique";
+  color?: EditorColor;
+  fill?: EditorColor | null;
+  borderColor?: EditorColor;
+  strokeWidth?: number;
+  align?: "left" | "center" | "right";
+}
 export interface EditorSourceObject extends EditorObjectBase {
   kind: "source";
   /** Override vector paint RGB on this source copy, retaining its original alpha. */
@@ -145,7 +175,7 @@ export interface EditorSourceObject extends EditorObjectBase {
 }
 /** Child transforms already include group operations; transform retains the group's selection axes. */
 export interface EditorGroupObject extends EditorObjectBase { kind: "group"; children: readonly string[] }
-export type EditorObject = EditorTextObject | EditorShapeObject | EditorInkObject | EditorImageObject | EditorSourceObject | EditorGroupObject;
+export type EditorObject = EditorTextObject | EditorShapeObject | EditorInkObject | EditorImageObject | EditorFieldObject | EditorSourceObject | EditorGroupObject;
 export interface EditorSourceEdit { ref: PrimitiveRef; transform: EditorMatrix; deleted: boolean; color?: EditorColor }
 export interface EditorAnnotationEdit { id: string; transform: EditorMatrix; deleted: boolean; contents?: string; author?: string }
 export type EditorObjectInput = EditorObject extends infer T ? T extends EditorObject

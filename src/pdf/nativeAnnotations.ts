@@ -1,4 +1,4 @@
-import { ANNOTATION_LIMITS, transformAnnotationGeometry, type PdfAnnotation, type AnnotationAction,
+import { ANNOTATION_LIMITS, ANNOTATION_FIELD_INPUT_TYPES, transformAnnotationGeometry, type PdfAnnotation, type AnnotationAction,
   type AnnotationDestination, type AnnotationGeometry, type AnnotationField, type AnnotationBorder } from "../annotationData";
 import type { PdfBox, PdfMatrix } from "../heprDocumentData";
 import { isPdfDictionary, isPdfName, isPdfRef, isPdfString, pdfRefKey,
@@ -161,6 +161,10 @@ class AnnotationReader {
       // Rich form discovery is editor-only: ordinary viewing must not traverse
       // /Opt and appearance dictionaries merely to expose editing controls.
       if (this.editingMetadata) {
+        const inputType = await this.optional("HEPRInputType", () => this.fieldEntry(d, "HEPRInputType").then(value => this.text(value, true)));
+        if (inputType && ANNOTATION_FIELD_INPUT_TYPES.includes(inputType as NonNullable<AnnotationField["inputType"]>)) {
+          result.field.inputType = inputType as NonNullable<AnnotationField["inputType"]>;
+        }
         const widget = annotation.widget;
         if (widget?.maxLength !== undefined) result.field.maxLength = widget.maxLength;
         if (widget?.quadding !== undefined) result.field.alignment = widget.quadding;

@@ -48,6 +48,8 @@ function sameObjectPaint(previous: EditorObject | undefined, current: EditorObje
   // Test placement first, so transforming an image never compares its pixel buffer.
   if (previous.kind !== current.kind || previous.pageIndex !== current.pageIndex || !sameValue(previous.transform, current.transform)) return false;
   const ignored = new Set(["id", "kind", "pageIndex", "transform", "locked", "link", "review"]);
+  if (previous.kind === "field" && current.kind === "field") for (const key of ["name", "tooltip", "readOnly", "required", "maxLength", "multiSelect"]) ignored.add(key);
+  if (previous.kind === "field" && current.kind === "field") for (const key of ["name", "tooltip", "readOnly", "required", "maxLength"]) ignored.add(key);
   const a = previous as unknown as Record<string, unknown>, b = current as unknown as Record<string, unknown>;
   for (const key of new Set([...Object.keys(a), ...Object.keys(b)])) if (!ignored.has(key) && !sameValue(a[key], b[key])) return false;
   if (previous.kind === "shape" && current.kind === "shape") {

@@ -8,6 +8,13 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Added
 
+- Add form-field authoring with text, number, date, email, telephone, URL,
+  checkbox, radio, dropdown and list inputs. Draw field areas, edit properties,
+  fill values, transform, duplicate and undo changes; save real AcroForm widgets
+  with embedded fonts and explicit appearances. Typed text hints round-trip in
+  HEPR without PDF scripts; other readers retain standard editable text fields.
+  Flattened PDF and HEP keep ordinary rendered appearances. Keep copied radio
+  groups independent and remove obsolete field search geometry during page edits.
 - Add URL and same-document object links to selected content, including precise
   multi-line highlighted text. Provide toolbar/context actions, Ctrl/Cmd+K and
   destination picking, with undo, locks, copy/page-duplication rebinding and local

@@ -79,6 +79,38 @@ identity. `transformSelection(matrix)` takes a delta in composed scene coordinat
 so a shared gesture can transform a multi-object selection about one pivot.
 Reader/Grid and camera presentation must be converted by the host adapter.
 
+Add editable form widgets through `addObject({ kind: "field", ... })`:
+
+```ts
+const amount = editor.addObject({
+  kind: "field", fieldType: "number", name: "Amount", pageIndex: 0,
+  x: 24, y: 80, width: 160, height: 24, value: "", defaultValue: "",
+  tooltip: "Invoice amount", required: true, fontSize: 12,
+  color: "#111111", fill: "#ffffff", borderColor: "#707070", strokeWidth: 1
+});
+editor.setFieldValue("Amount", "123.45");
+editor.select([amount]); // The normal transforms, locks, clipboard and undo APIs apply.
+```
+
+`EditorFieldObject.fieldType` supports `text`, `number`, `date`, `email`, `tel`,
+`url`, `checkbox`, `radio`, `dropdown` and `list`. Fields accept current/default
+values, tooltips, `readOnly`, `required`, `multiline` (text), `maxLength`, font/style,
+alignment, text/checkmark color, background fill, border color and width.
+`fontSize: 0` requests automatic fitting. Choice `options` contain `{ value, label }`;
+lists can set `multiSelect`. Checkbox/radio `onValue` defaults to `Yes`; radio
+widgets share a name and use distinct `onValue` values. Other authored names
+must be unique, including against existing source fields; new names cannot contain
+periods (reserved for PDF field hierarchies). Required fields may
+remain empty while authoring; `readOnly` restricts filling, independently of the
+object's editing lock. Number values must be finite; dates use `YYYY-MM-DD`.
+
+PDF saves create standard AcroForm field trees and widget appearances, embedding
+the actual font programs for later typing. Text-like fields retain an inert
+`/HEPRInputType` hint for HEPR's native controls; other PDF readers can edit the
+standard text field but need not enforce its specialized input format. No PDF
+scripts are generated or executed. HEP and flattened PDFs bake the appearance;
+HEP does not preserve these authored field models or font programs.
+
 Shapes, ink and signatures accept `fillOpacity` from 0 to 1 independently of
 stroke `opacity`. When omitted, fills retain the legacy `opacity` fallback;
 explicit values also work with fully transparent strokes or fills. Arrowheads

@@ -124,6 +124,8 @@ export interface RetainedTextPositions {
   readonly pens: Float32Array;
   /** One flag per occurrence: an explicit TJ word gap precedes it. */
   readonly gapBefore: Uint8Array;
+  /** Ephemeral ownership spans for annotated or layer-conditioned occurrences. */
+  readonly scopes?: readonly { first: number; count: number; annotationId?: string; optionalContent: readonly number[] }[];
 }
 
 export interface RetainedVectorPageOptions {
@@ -337,10 +339,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const emptyBounds = (): Bounds => ({ minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity });
   const include = (bounds: Bounds, x: number, y: number): void => { bounds.minX = Math.min(bounds.minX, x); bounds.minY = Math.min(bounds.minY, y); bounds.maxX = Math.max(bounds.maxX, x); bounds.maxY = Math.max(bounds.maxY, y); };
   const append = (target: number[], values: readonly number[]): void => { for (const value of values) target.push(value); };
-  const combineLayers = (state: HeprExecutionState, inherited = -1): number | undefined => {
-    const indices = new Set<number>();
-    if (inherited >= 0) indices.add(inherited);
-    for (let scope = state.optionalContent; scope; scope = scope.parent) if (scope.index >= 0) indices.add(scope.index);
+  const combineConditionIndices = (indices: ReadonlySet<number>): number | undefined => {
     if (!indices.size) return undefined;
     if (!options.optionalContent) return undefined;
     if (indices.size === 1) return [...indices][0];
@@ -348,6 +347,12 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     let index = conditionKeys.get(key);
     if (index === undefined) { index = conditions.length; conditions.push({ kind: "and", operands }); conditionKeys.set(key, index); }
     return index;
+  };
+  const combineLayers = (state: HeprExecutionState, inherited = -1): number | undefined => {
+    const indices = new Set<number>();
+    if (inherited >= 0) indices.add(inherited);
+    for (let scope = state.optionalContent; scope; scope = scope.parent) if (scope.index >= 0) indices.add(scope.index);
+    return combineConditionIndices(indices);
   };
   // An appearance's paint inherits its invocation's `Annot` node, however
   // deeply its programs nest. Only the page's own annotation ids qualify, so
@@ -1338,6 +1343,8 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     scene.gradientMeshIndices = Uint32Array.from(gradients.flatMap(part => Array.from(part.gradientMeshIndices ?? [])));
     scene.gradientCount = scene.gradientFillPathCount = gradients.length; scene.gradientFillSegmentCount = gradientSegments;
   }
+  const textScopes = options.textPositions?.scopes?.map(scope => ({ first: scope.first, count: scope.count,
+    condition: annotationLayers.condition(combineConditionIndices(new Set(scope.optionalContent)), scope.annotationId) ?? -1 }));
   const optionalContent = annotationLayers.build();
   if (optionalContent) scene.optionalContent = optionalContent;
   if (!itemRanges.isEmpty) scene.markedContent = {
@@ -1358,7 +1365,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   // Annotation layers alone condition text only when an appearance paints some.
   scene.textIndex = options.omitMetadata ? null : buildRetainedTextIndex(source, glyphInstances, glyphReach,
     options.optionalContent || (optionalContent && glyphConditions.some(condition => condition >= 0)) ? glyphConditions : undefined,
-    options.textPositions, signal);
+    options.textPositions, signal, textScopes);
   scene.sourceTextCount = source.stores.glyphs.glyphIds.length;
   scene.pathCount = scene.fillPathCount + scene.segmentCount;
   scene.imagePaintOpCount = scene.rasterLayers.reduce((sum, layer) => sum + (layer.repeat ? rasterRepeatCount(layer.repeat) : 1), 0);
@@ -1387,7 +1394,8 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
  * are kept, never doubled, leading, or trailing.
  */
 function buildRetainedTextIndex(page: HeprPageData, glyphInstances: Int32Array, glyphReach: Uint8Array,
-  glyphConditions: Int32Array | undefined, positions: RetainedTextPositions | undefined, signal: AbortSignal): SceneTextIndex {
+  glyphConditions: Int32Array | undefined, positions: RetainedTextPositions | undefined, signal: AbortSignal,
+  scopes?: readonly { first: number; count: number; condition: number }[]): SceneTextIndex {
   const source = page.textIndex, fallback = buildNativeFallbackTextIndex(page, signal).pages[0];
   const quadOf = (index: number): Float32Array => {
     const slot = -fallback.charInstance[index] - 2;
@@ -1395,6 +1403,7 @@ function buildRetainedTextIndex(page: HeprPageData, glyphInstances: Int32Array, 
   };
   if (positions && positions.charOccurrences.length === source.charGlyphIndices.length) {
     const builder = new VectorPageTextIndexBuilder();
+    let scopeIndex = 0;
     for (let index = 0; index < source.charGlyphIndices.length;) {
       if ((index & 1023) === 0) signal.throwIfAborted();
       const occurrence = positions.charOccurrences[index];
@@ -1408,9 +1417,11 @@ function buildRetainedTextIndex(page: HeprPageData, glyphInstances: Int32Array, 
       if (positions.gapBefore[occurrence]) builder.appendSeparator();
       if (unicode.trim().length === 0) { builder.appendSeparator(); continue; }
       const instance = glyph >= 0 ? glyphInstances[glyph] : -1, pen = occurrence * 5;
+      while (scopes && scopeIndex < scopes.length && occurrence >= scopes[scopeIndex].first + scopes[scopeIndex].count) scopeIndex++;
+      const scope = scopes?.[scopeIndex], condition = scope && occurrence >= scope.first ? scope.condition : glyph >= 0 ? glyphConditions?.[glyph] ?? -1 : -1;
       builder.appendGlyph(unicode, instance, instance >= 0 ? null : quadOf(first),
         positions.pens[pen], positions.pens[pen + 1], positions.pens[pen + 2], positions.pens[pen + 3],
-        positions.pens[pen + 4], glyph >= 0 ? glyphConditions?.[glyph] ?? -1 : -1);
+        positions.pens[pen + 4], condition);
     }
     return { version: 2, pages: [builder.build()] };
   }

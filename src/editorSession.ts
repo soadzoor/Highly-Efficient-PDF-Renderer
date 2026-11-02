@@ -35,7 +35,7 @@ async function openSingleEditorSession(scene: VectorScene, options: EditorSessio
   }
   const sessionOptions: EditorSessionOptions = {
     ...options,
-    compileObject: options.compileObject ?? (async (object, signal) => object.kind === "text"
+    compileObject: options.compileObject ?? (async (object, signal) => object.kind === "text" || object.kind === "field"
       ? (await getServices()).sessionOptions.compileObject!(object, signal)
       : (await import("./editorSceneObjects")).compileEditorObjectGeometry(object, signal)),
     compileFields: options.compileFields ?? (async (source, values, signal) =>

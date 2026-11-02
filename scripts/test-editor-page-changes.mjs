@@ -77,6 +77,9 @@ try {
     session.selectPrimitives([{ kind: "stroke", index: 0 }]); assert(session.canReorderSelection("bring-to-front")); session.reorderSelection("bring-to-front");
     expect([0], "source artwork ordering is also scoped by page");
 
+    const field = session.addObject({ kind: "field", fieldType: "text", name: "NewField", pageIndex: 1, x: 10, y: 10, width: 40, height: 15, value: "" }); expect([1]);
+    session.updateObject(field, { name: "RenamedField", tooltip: "Accessible label", required: true, maxLength: 100 }); expect([], "authored field metadata changes no page pixels");
+    session.setFieldValue("RenamedField", "Typed"); expect([1], "authored values refresh their page");
     const originalGetter = session.getObjects;
     session.getObjects = () => { throw new Error("Must not clone author geometry for thumbnail invalidation"); };
     assert.deepEqual(changedEditorPages(previous, captureEditorPageChanges(session)), []);

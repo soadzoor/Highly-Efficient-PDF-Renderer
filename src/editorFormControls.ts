@@ -18,22 +18,24 @@ function styleEditorButtonControl(control: HTMLInputElement, annotation: SceneAn
   const border = annotation.border?.width ?? 0, inset = Math.max(border + 1, Math.min(width, height) * .18);
   const left = inset, right = width - inset, top = inset, bottom = height - inset;
   if (!(right > left && bottom > top)) { control.style.backgroundImage = "none"; return; }
-  const stroke = `fill="none" stroke="#000" stroke-width="${Math.max(1, Math.min(width, height) * .1)}" stroke-linecap="round" stroke-linejoin="round"`;
+  const components = annotation.field?.textStyle?.color;
+  const color = components ? `rgb(${components.map(component => Math.round(Math.max(0, Math.min(1, component)) * 255)).join(",")})` : "#000";
+  const stroke = `fill="none" stroke="${color}" stroke-width="${Math.max(1, Math.min(width, height) * .1)}" stroke-linecap="round" stroke-linejoin="round"`;
   let shape: string;
   if (mark === "check") shape = `<path d="M${left} ${bottom - (bottom - top) * .45}L${left + (right - left) * .35} ${bottom}L${right} ${top}" ${stroke}/>`;
   else if (mark === "cross") shape = `<path d="M${left} ${top}L${right} ${bottom}M${left} ${bottom}L${right} ${top}" ${stroke}/>`;
   else if (mark === "circle") {
     const rx = control.type === "radio" ? Math.max(0, (width - border * 2) * .25) : (right - left) / 2;
     const ry = control.type === "radio" ? Math.max(0, (height - border * 2) * .25) : (bottom - top) / 2;
-    shape = `<ellipse cx="${width / 2}" cy="${height / 2}" rx="${rx}" ry="${ry}" fill="#000"/>`;
-  } else if (mark === "diamond") shape = `<path d="M${width / 2} ${top}L${right} ${height / 2}L${width / 2} ${bottom}L${left} ${height / 2}Z" fill="#000"/>`;
-  else if (mark === "square") shape = `<rect x="${left}" y="${top}" width="${right - left}" height="${bottom - top}" fill="#000"/>`;
+    shape = `<ellipse cx="${width / 2}" cy="${height / 2}" rx="${rx}" ry="${ry}" fill="${color}"/>`;
+  } else if (mark === "diamond") shape = `<path d="M${width / 2} ${top}L${right} ${height / 2}L${width / 2} ${bottom}L${left} ${height / 2}Z" fill="${color}"/>`;
+  else if (mark === "square") shape = `<rect x="${left}" y="${top}" width="${right - left}" height="${bottom - top}" fill="${color}"/>`;
   else {
     const points = Array.from({ length: 10 }, (_, index) => {
       const angle = index * Math.PI / 5 - Math.PI / 2, radius = index % 2 ? .45 : 1;
       return `${width / 2 + Math.cos(angle) * (right - left) / 2 * radius},${height / 2 + Math.sin(angle) * (bottom - top) / 2 * radius}`;
     });
-    shape = `<polygon points="${points.join(" ")}" fill="#000"/>`;
+    shape = `<polygon points="${points.join(" ")}" fill="${color}"/>`;
   }
   control.style.backgroundImage = `url("data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">${shape}</svg>`)}")`;
 }
@@ -191,7 +193,12 @@ export function createEditorFieldControl(document: Document, annotation: SceneAn
   if (field.type === "Tx") {
     const text = document.createElement(field.flags & 4096 ? "textarea" : "input");
     if (field.maxLength) text.maxLength = field.maxLength;
-    if (text.tagName === "INPUT" && field.flags & 8192) (text as HTMLInputElement).type = "password";
+    if (text.tagName === "INPUT") {
+      const input = text as HTMLInputElement;
+      input.type = field.flags & 8192 ? "password" : field.inputType ?? "text";
+      if (input.type === "number") { input.step = "any"; input.inputMode = "decimal"; }
+      if (input.type === "date") input.setAttribute("aria-description", "Date in year-month-day format");
+    }
     text.value = String(current ?? ""); input = text; getValue = () => text.value;
   } else if (field.type === "Ch") {
     if (field.flags & 262144) {
@@ -213,6 +220,7 @@ export function createEditorFieldControl(document: Document, annotation: SceneAn
     getValue = () => button.checked ? button.value : "Off";
   } else return null;
   input.dataset.fieldId = annotation.id; input.setAttribute("aria-label", annotation.tooltip || field.name);
+  input.required = Boolean(field.flags & 2);
   input.className = "hepr-editor-field";
   if (options.usePdfAppearance) input.dataset.pdfAppearance = "true";
   styleEditorFieldControl(input, annotation);

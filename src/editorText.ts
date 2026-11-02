@@ -6,6 +6,7 @@ import { normalizePrimitiveColor } from "./primitiveAppearance";
 import createBidi from "bidi-js";
 import { allocateEditorTextCodes } from "./editorTextEncoding";
 import { editorTextGlyphOutline } from "./editorTextGlyphOutline";
+import { choosePdfFormAutoFontSize } from "./pdf/formAutoFontSize";
 
 export interface EditorPositionedGlyph {
   font: EditorFont; glyph: number; unicode: string; x: number; y: number;
@@ -14,14 +15,42 @@ export interface EditorPositionedGlyph {
   logicalIndex: number;
 }
 export interface EditorTextLayout { glyphs: EditorPositionedGlyph[]; width: number; height: number }
+/** Internal field layout; ordinary textbox layout keeps its existing defaults. */
+export interface EditorTextLayoutOptions {
+  wrap?: boolean;
+  verticalAlignment?: "top" | "middle";
+  autoFontSize?: boolean;
+  onFontMetrics?(metrics: { ascent: number; descent: number }): void;
+}
 const bidi = createBidi();
 
 /** Canonical layout used by appearance generation and the visible editor scene. */
 export async function layoutEditorText(object: EditorTextObject, fonts: EditorFontRegistry,
-  signal?: AbortSignal): Promise<EditorTextLayout> {
+  signal?: AbortSignal, options: EditorTextLayoutOptions = {}): Promise<EditorTextLayout> {
   signal?.throwIfAborted();
   if (!(object.width > 0 && object.height > 0 && object.fontSize > 0)) throw new RangeError("Textbox dimensions and font size must be positive.");
   const hb = await import("harfbuzzjs");
+  if (options.autoFontSize) {
+    const probe = await layoutEditorText({ ...object, fontSize: 1 }, fonts, signal, { ...options, autoFontSize: false, wrap: false });
+    let ascent = 0, descent = 0;
+    for (const font of new Set(probe.glyphs.map(glyph => glyph.font))) {
+      const face = new hb.Face(new hb.Blob(font.bytes)), metrics = new hb.Font(face).hExtents();
+      ascent = Math.max(ascent, metrics.ascender / face.upem); descent = Math.min(descent, metrics.descender / face.upem);
+    }
+    const emHeight = Math.max(.01, ascent - descent || 1);
+    if (options.wrap === false) {
+      const size = choosePdfFormAutoFontSize(false, size => probe.width * size <= object.width + 1e-7 && emHeight * size <= object.height + 1e-7);
+      return layoutEditorText({ ...object, fontSize: size }, fonts, signal, { ...options, autoFontSize: false });
+    }
+    let maximum = 12;
+    for (;;) {
+      const size = choosePdfFormAutoFontSize(true, () => true, maximum);
+      const layout = await layoutEditorText({ ...object, fontSize: size }, fonts, signal, { ...options, autoFontSize: false });
+      const lines = Math.max(1, Math.round(layout.height / (size * (object.lineHeight ?? 1.2))));
+      if (size <= 4 || emHeight * size + Math.max(0, lines - 1) * size * (object.lineHeight ?? 1.2) <= object.height + 1e-7) return layout;
+      maximum = size - .001;
+    }
+  }
   const runs = object.runs?.length ? object.runs : [{ text: object.text }];
   const fullText = runs.map(run => run.text).join("");
   const levels = bidi.getEmbeddingLevels(fullText);
@@ -74,7 +103,7 @@ export async function layoutEditorText(object: EditorTextObject, fonts: EditorFo
     signal?.throwIfAborted();
     if (/^[\r\n]+$/.test(token.text)) { lines.push([]); lineWidth = 0; continue; }
     let item = shape(token);
-    if (item.width > object.width && token.text.length > 1 && !/^\s+$/.test(token.text)) {
+    if (options.wrap !== false && item.width > object.width && token.text.length > 1 && !/^\s+$/.test(token.text)) {
       // Break oversized words on grapheme boundaries, then reshape each piece
       // so contextual forms at the line boundaries remain correct.
       let text = "", start = token.start;
@@ -89,15 +118,28 @@ export async function layoutEditorText(object: EditorTextObject, fonts: EditorFo
       }
       item = shape({ ...token, text, start });
     }
-    if (lineWidth && lineWidth + item.width > object.width && !/^\s+$/.test(token.text)) { lines.push([]); lineWidth = 0; }
+    if (options.wrap !== false && lineWidth && lineWidth + item.width > object.width && !/^\s+$/.test(token.text)) { lines.push([]); lineWidth = 0; }
     lines.at(-1)!.push(item); lineWidth += item.width;
   }
-  const glyphs: EditorPositionedGlyph[] = []; let y = object.y + object.height, widest = 0;
+  const glyphs: EditorPositionedGlyph[] = [], metrics = new Map<string, { ascent: number; descent: number }>();
+  let y = object.y + object.height, widest = 0;
   for (const line of lines) {
     const width = line.reduce((sum, item) => sum + item.width, 0);
     widest = Math.max(widest, width);
     const height = Math.max(object.fontSize * (object.lineHeight ?? 1.2), ...line.map(item => item.height));
     y -= height;
+    let baseline = y + height * .2;
+    if (options.verticalAlignment) {
+      let ascent = 0, descent = 0;
+      for (const item of line) for (const glyph of item.glyphs) {
+        let metric = metrics.get(glyph.font.id);
+        if (!metric) { const font = fontCache.get(glyph.font.id)!, extents = font.hExtents();
+          metric = { ascent: extents.ascender / font.face.upem, descent: extents.descender / font.face.upem }; metrics.set(glyph.font.id, metric); }
+        ascent = Math.max(ascent, metric.ascent * glyph.size); descent = Math.min(descent, metric.descent * glyph.size);
+      }
+      baseline = options.verticalAlignment === "middle" && lines.length === 1
+        ? object.y + (object.height - (ascent - descent)) / 2 - descent : y + height - ascent;
+    }
     const first = line[0]?.start ?? 0, end = line.at(-1)?.end ?? first;
     const order = Array.from({ length: Math.max(0, end - first + 1) }, (_, i) => i + first);
     for (const [a, b] of bidi.getReorderSegments(fullText, levels, first, end)) {
@@ -108,17 +150,19 @@ export async function layoutEditorText(object: EditorTextObject, fonts: EditorFo
       Math.min(...order.filter(i => i >= b.start && i <= b.end).map(i => rank.get(i)!)));
     let x = object.x + (object.align === "right" ? object.width - width : object.align === "center" ? (object.width - width) / 2 : 0);
     for (const item of visual) {
-      for (const glyph of item.glyphs) glyphs.push({ ...glyph, x: glyph.x + x, y: glyph.y + y + height * 0.2 });
+      for (const glyph of item.glyphs) glyphs.push({ ...glyph, x: glyph.x + x, y: glyph.y + baseline });
       x += item.width;
     }
   }
+  if (metrics.size) options.onFontMetrics?.({ ascent: Math.max(...[...metrics.values()].map(metric => metric.ascent)),
+    descent: Math.min(...[...metrics.values()].map(metric => metric.descent)) });
   return { glyphs, width: widest, height: object.y + object.height - y };
 }
 
 /** A portable PDF appearance using embedded source fonts and positioned glyphs. */
 export async function editorTextPdf(object: EditorTextObject, fonts: EditorFontRegistry,
-  signal?: AbortSignal): Promise<Uint8Array> {
-  const layout = await layoutEditorText(object, fonts, signal);
+  signal?: AbortSignal, options?: EditorTextLayoutOptions): Promise<Uint8Array> {
+  const layout = await layoutEditorText(object, fonts, signal, options);
   const hb = await import("harfbuzzjs");
   const writer = new PdfByteWriter({ signal }); const root = writer.reserve(), pages = writer.reserve();
   const fontResources: string[] = []; const codes = new Map<EditorPositionedGlyph, { name: string; code: string }>();

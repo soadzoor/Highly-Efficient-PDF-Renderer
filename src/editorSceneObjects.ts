@@ -7,6 +7,7 @@ import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import { editorInkBounds, fitEditorInkPaths, type EditorInkSegment } from "./editorInkGeometry";
 import { editorShapeGeometry, type EditorShapeGeometry } from "./editorShapeGeometry";
 import { editorReviewShapes } from "./editorReview";
+import { compileEditorFieldGeometry } from "./editorFormFields";
 export { editorArrowHeadPoints } from "./editorShapeGeometry";
 
 type Point = readonly [number, number];
@@ -73,6 +74,7 @@ function inkFill(path: readonly EditorInkSegment[], color: EditorShapeObject["fi
 /** Compile editor geometry into the same canonical vectors as imported PDFs. */
 export async function compileEditorObjectGeometry(object: EditorObject, signal?: AbortSignal): Promise<VectorScene> {
   signal?.throwIfAborted();
+  if (object.kind === "field") return compileEditorFieldGeometry(object, compileEditorObjectGeometry, signal);
   const opacity = object.opacity ?? 1;
   if (object.kind === "shape" && object.review) {
     const parts = await Promise.all(editorReviewShapes(object).map(shape => object.review!.type === "highlight"

@@ -1,4 +1,4 @@
-import type { EditorSession, EditorSessionOptions, EditorState, EditorPageOperationOptions, EditorPdfInsertOptions, EditorMatrix, EditorGroupObject } from "./editorTypes";
+import type { EditorSession, EditorSessionOptions, EditorState, EditorPageOperationOptions, EditorPdfInsertOptions, EditorMatrix, EditorGroupObject, EditorFieldObject } from "./editorTypes";
 import type { VectorScene } from "./pdfVectorExtractor";
 import type { PdfPageOperation } from "./editorPdfPages";
 import type { NativeVectorPdfSession } from "./pdfSession";
@@ -369,19 +369,44 @@ function reseedAuthoredObjects(previous: EditorSession, next: EditorSession, ope
   const originalIds = new Set(objects.map(object => object.id)); let serial = 0;
   const freshId = (): string => { let id: string; do { id = `editor-page:${++serial}`; } while (reserved.has(id) || originalIds.has(id)); return id; };
   const pageCopies = new Map<number, Map<string, string>>(), ids = Object.assign(new Map<string, string>(), { pageCopies });
+  const fieldCopies = new Map<string, string>(), fieldNames = new Set([
+    ...(targetScene.annotations ?? []).flatMap(annotation => annotation.field?.name ? [annotation.field.name] : []),
+    ...objects.flatMap(object => object.kind === "field" ? [object.name] : [])
+  ]);
+  const copiedFieldName = (name: string, cohort: number): string => {
+    const key = `${cohort}:${name}`, existing = fieldCopies.get(key); if (existing) return existing;
+    let index = 1, candidate = name;
+    while ([...fieldNames].some(existing => existing === candidate || existing.startsWith(`${candidate}.`) || candidate.startsWith(`${existing}.`))) candidate = `${name}_${++index}`;
+    fieldNames.add(candidate); fieldCopies.set(key, candidate); return candidate;
+  };
   const targetIds = (page: number): Map<string, string> => { let map = pageCopies.get(page); if (!map) pageCopies.set(page, map = new Map()); return map; };
   const groups = new Map(objects.filter((object): object is EditorGroupObject => object.kind === "group").map(group => [group.id, group]));
+  const radioGroups = new Map<string, { id: string; original: EditorFieldObject }[]>();
   next.transaction("Retain author models", () => {
     if (replaced.size) { next.selectAnnotations([...replaced]); next.setObjectsLocked(next.getSelection(), false); next.deleteSelection(); }
     // Restore every original before its copies, so existing object IDs survive
     // even when the copied pages were inserted before their original pages.
     for (const copy of [false, true]) for (const object of authored) for (const target of targets[object.pageIndex]) {
       if ((target !== targets[object.pageIndex][0]) !== copy) continue;
-      const id = next.addObject({ ...object, id: copy || reserved.has(object.id) ? freshId() : object.id,
+      const id = next.addObject({ ...object, ...(object.kind === "field" && copy ? { name: copiedFieldName(object.name, targets[object.pageIndex].indexOf(target)) } : {}), id: copy || reserved.has(object.id) ? freshId() : object.id,
+        ...(object.kind === "field" && object.fieldType === "radio" ? { value: "Off", defaultValue: "Off", locked: false } : {}),
         ...(object.layerCondition === undefined ? {} : { layerId: null, layerCondition: undefined }),
         pageIndex: target, transform: multiplyEditorMatrices(delta(object.pageIndex, target), object.transform) });
       if (object.layerCondition !== undefined) next.copyObjectLayerMembership(`annotation:${annotations.get(`${target}:${object.id}`)![0].id}`, id);
       targetIds(target).set(object.id, id); if (!copy) ids.set(object.id, id); reserved.add(id);
+      if (object.kind === "field" && object.fieldType === "radio") {
+        const name = (next.getObject(id) as EditorFieldObject).name, peers = radioGroups.get(name) ?? []; peers.push({ id, original: object }); radioGroups.set(name, peers);
+      }
+    }
+    for (const peers of radioGroups.values()) {
+      // The selected member may be restored after its siblings, or may have
+      // been removed with another page. Restore group values only once every
+      // surviving/copied widget has been inserted.
+      const allowed = new Set<unknown>(["", "Off", undefined, null, ...peers.map(({ original }) => original.onValue ?? "Yes")]);
+      const original = peers[0].original;
+      next.updateObject(peers[0].id, { value: allowed.has(original.value) ? original.value : "Off",
+        defaultValue: allowed.has(original.defaultValue) ? original.defaultValue : "Off" });
+      for (const peer of peers) if (peer.original.locked) next.setObjectsLocked([peer.id], true);
     }
     const visiting = new Set<string>();
     const restoreGroup = (id: string, target: number): boolean => {

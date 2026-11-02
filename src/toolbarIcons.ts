@@ -2,6 +2,8 @@ const icons = {
   select: '<path d="m5 3 14 9-7 1-3 7Z"/>',
   pan: '<path d="M8 12V6a1.5 1.5 0 0 1 3 0v5m0-5V4a1.5 1.5 0 0 1 3 0v7m0-5a1.5 1.5 0 0 1 3 0v6m0-3a1.5 1.5 0 0 1 3 0v6c0 4-2 6-6 6h-2c-2 0-3-1-4-3l-4-5a1.5 1.5 0 0 1 2-2l2 2"/>',
   form: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 8h10M11 13h6M11 17h6m-7-4-2 2-1-1"/>',
+  "add-field": '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9v6m-2-6h4m-4 6h4m6-3h6m-3-3v6"/>',
+  "edit-field": '<path d="M20 12v7H3V5h9M7 9v6m-2-6h4m-4 6h4m4-4 1-4 5-5 3 3-5 5Z"/>',
   text: '<path d="M4 6V3h16v3M12 3v18m-4 0h8"/>',
   highlight: '<path d="m4 14 9-11 7 6-10 10-6-5Zm0 0-2 7 8-2M2 23h20"/>',
   "underline-text": '<path d="M5 3v9a7 7 0 0 0 14 0V3M3 23h18"/>',

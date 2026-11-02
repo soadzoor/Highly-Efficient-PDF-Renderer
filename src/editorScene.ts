@@ -69,6 +69,40 @@ export function editorTransformBounds(bounds: Bounds, m: ArrayLike<number>): Bou
 }
 export function editorRefKey(ref: PrimitiveRef): string { return `${ref.kind}:${ref.index}`; }
 export function editorMatrixIsIdentity(m: ArrayLike<number>): boolean { return EDITOR_IDENTITY.every((value, i) => value === m[i]); }
+function everyPaintRef(runs: readonly VectorDrawRun[], test: (ref: PrimitiveRef) => boolean): boolean {
+  for (const run of runs) for (let index = run.first; index < run.first + run.count; index++) if (!test({ kind: run.kind, index })) return false;
+  return true;
+}
+function compactEditorTextIndex(source: VectorScene, removedAnnotations: ReadonlySet<string>, instances?: ReadonlyMap<number, number>): VectorScene["textIndex"] {
+  const removedGroups = new Set(source.optionalContent?.groups.filter(group => group.annotationId && removedAnnotations.has(group.annotationId)).map(group => group.id));
+  const deletedConditions = new Map<number, boolean>();
+  const removedTextCondition = (index: number): boolean => {
+    if (index < 0 || !source.optionalContent) return false;
+    const known = deletedConditions.get(index); if (known !== undefined) return known;
+    const condition = source.optionalContent.conditions[index];
+    const deleted = condition?.kind === "group" ? removedGroups.has(condition.groupId) : condition?.kind === "and"
+      ? condition.operands.some(removedTextCondition) : condition?.kind === "or" && condition.operands.length > 0 ? condition.operands.every(removedTextCondition) : false;
+    deletedConditions.set(index, deleted); return deleted;
+  };
+  return source.textIndex ? { version: 2, pages: source.textIndex.pages.map(page => {
+    let text = "", refs: number[] = [], conditions: number[] = [];
+    const fallback: number[] = [], fallbacks = new Map<number, number>();
+    for (let i = 0; i < page.text.length; i++) {
+      const old = page.charInstance[i]; let next = old >= 0 && instances ? instances.get(old) : old;
+      if (old <= -2) {
+        if (removedTextCondition(page.optionalContent?.[i] ?? -1)) continue;
+        let mapped = fallbacks.get(old);
+        if (mapped === undefined) {
+          mapped = -2 - fallback.length / 4; fallbacks.set(old, mapped);
+          const offset = (-old - 2) * 4; for (let j = offset; j < offset + 4; j++) fallback.push(page.fallbackQuads[j]);
+        }
+        next = mapped;
+      }
+      if (next === undefined) continue; text += page.text[i]; refs.push(next); conditions.push(page.optionalContent?.[i] ?? -1);
+    }
+    return { text, charInstance: Int32Array.from(refs), fallbackQuads: Float32Array.from(fallback), ...(page.optionalContent ? { optionalContent: Int32Array.from(conditions) } : {}) };
+  }) } : null;
+}
 
 interface EditorClipOwnership {
   paths: Map<number, Set<string>>;
@@ -171,6 +205,8 @@ export function bakeEditorAnnotationEdits(scene: VectorScene, edits: readonly Ed
       ...(original.inkList ? { inkList: original.inkList.map(path => transformAnnotationPoints(path, pdfMatrix as PdfMatrix)) } : {}) } }];
   });
   const result = { ...scene, annotations }; retainEditorPaintIdentity(scene, result);
+  const removed = new Set([...pending.values()].filter(edit => edit.deleted).map(edit => edit.id));
+  if (removed.size) { result.textIndex = compactEditorTextIndex(scene, removed); result.textContent = undefined; }
   annotationTransforms.set(result, transforms); annotationSources.set(result, sources); return result;
 }
 
@@ -418,7 +454,11 @@ export function bakeEditorSourceScene(source: VectorScene, edits: readonly Edito
   }
   setEditorPaintIdentity(scene, ref => replacementsByIdentity.get(editorRefKey(ref)) ?? identity(ref));
   setEditorPaintRole(scene, ref => replacementRoles.has(editorRefKey(ref)) ? replacementRoles.get(editorRefKey(ref))! : role(ref));
-  const compacted = compactEditorScene(scene, kept, owners);
+  const deletedAnnotations = new Set([...pending.values()].some(edit => edit.deleted) ? (source.annotations ?? []).flatMap(annotation => {
+    const runs = getSceneAnnotationRuns(source).get(annotation.id) ?? [];
+    return runs.length && everyPaintRef(runs, ref => pending.get(editorRefKey(ref))?.deleted === true) ? [annotation.id] : [];
+  }) : []);
+  const compacted = compactEditorScene(scene, kept, owners, deletedAnnotations);
   if (outlinedApproximation) {
     const diagnostic: PdfDiagnostic = { code: "editor.stroke-outline-approximation", severity: "warning",
       message: "Nonuniformly transformed stroke pens remain vector outlines; curved centerlines use at most 0.01 page-unit subdivision error." };
@@ -464,7 +504,7 @@ export function bakeEditorSourceScene(source: VectorScene, edits: readonly Edito
 }
 
 /** Compact canonical stores and remap paint and text references without rasterization. */
-export function compactEditorScene(source: VectorScene, keep: Record<PrimitiveKind, ReadonlySet<number>>, suppliedOwners?: Record<PrimitiveKind, ArrayLike<number>>): VectorScene {
+export function compactEditorScene(source: VectorScene, keep: Record<PrimitiveKind, ReadonlySet<number>>, suppliedOwners?: Record<PrimitiveKind, ArrayLike<number>>, removedAnnotationIds?: ReadonlySet<string>): VectorScene {
   const scene: VectorScene = { ...source, pagePrimitiveRanges: undefined }, ids = {} as Record<PrimitiveKind, number[]>, maps = {} as Record<PrimitiveKind, Map<number, number>>;
   retainEditorAnnotationPlacements(source, scene);
   const partition = !suppliedOwners && source.pageCount > 1 ? new ScenePageViews(source) : null;
@@ -515,14 +555,13 @@ export function compactEditorScene(source: VectorScene, keep: Record<PrimitiveKi
       ...(node.softMask ? { softMask: { ...node.softMask, children: nodes(node.softMask.children) } } : {}) }] : [];
   });
   if (source.paintGraph) scene.paintGraph = { roots: nodes(source.paintGraph.roots) };
-  scene.textIndex = source.textIndex ? { version: 2, pages: source.textIndex.pages.map(page => {
-    let text = "", refs: number[] = [], conditions: number[] = [];
-    for (let i = 0; i < page.text.length; i++) {
-      const old = page.charInstance[i], next = old >= 0 ? maps.text.get(old) : old;
-      if (next === undefined) continue; text += page.text[i]; refs.push(next); conditions.push(page.optionalContent?.[i] ?? -1);
-    }
-    return { text, charInstance: Int32Array.from(refs), fallbackQuads: page.fallbackQuads, ...(page.optionalContent ? { optionalContent: Int32Array.from(conditions) } : {}) };
-  }) } : null;
+  const removedAnnotations = new Set(removedAnnotationIds);
+  const countsBeforeCompaction = scenePrimitiveCounts(source);
+  if (PAGE_PRIMITIVE_KINDS.some(kind => keep[kind].size < countsBeforeCompaction[kind])) for (const annotation of source.annotations ?? []) {
+    const runs = getSceneAnnotationRuns(source).get(annotation.id) ?? [];
+    if (runs.length && everyPaintRef(runs, ref => !keep[ref.kind].has(ref.index))) removedAnnotations.add(annotation.id);
+  }
+  scene.textIndex = compactEditorTextIndex(source, removedAnnotations, maps.text);
   scene.textContent = undefined;
   scene.pageTextRanges = new Uint32Array(source.pageCount * 2);
   for (let page = 0; page < source.pageCount; page++) {

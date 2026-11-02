@@ -52,12 +52,17 @@ export interface AnnotationFieldTextStyle {
   contentInset?: number;
 }
 
+/** Typed text entry is an inert hint; standard PDF text fields remain /Tx. */
+export const ANNOTATION_FIELD_INPUT_TYPES = Object.freeze(["text", "number", "date", "email", "tel", "url"] as const);
+export type AnnotationFieldInputType = typeof ANNOTATION_FIELD_INPUT_TYPES[number];
+
 export interface AnnotationField {
   type?: string;
   name?: string;
   flags: number;
   value?: string | number | boolean | null | readonly string[];
   defaultValue?: string | number | boolean | null | readonly string[];
+  inputType?: AnnotationFieldInputType;
   /** Detached AcroForm editing metadata. Older HEP files may omit these. */
   maxLength?: number;
   options?: readonly { value: string; label: string }[];
@@ -286,6 +291,7 @@ export function validateAnnotations(value: unknown, options: {
       const field = record(a.field);
       if (!integer(field.flags) || field.flags > 0xffff_ffff) fail();
       for (const key of ["type", "name"]) if (field[key] !== undefined) string(field[key]);
+      if (field.inputType !== undefined && !ANNOTATION_FIELD_INPUT_TYPES.includes(field.inputType as AnnotationFieldInputType)) fail();
       for (const key of ["onValue", "appearanceState"]) if (field[key] !== undefined) string(field[key]);
       if (field.maxLength !== undefined && (!integer(field.maxLength) || field.maxLength === 0)) fail();
       if (field.alignment !== undefined && ![0, 1, 2].includes(field.alignment as number)) fail();

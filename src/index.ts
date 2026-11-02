@@ -264,7 +264,7 @@ export type { PdfPasswordError, PdfPasswordErrorReason } from "./pdfObjectGenera
 export { createAnnotationOverlay, pickSceneAnnotation } from "./annotationOverlay";
 export type { AnnotationOverlay, AnnotationOverlayOptions, AnnotationOverlayAdapter, AnnotationPoint } from "./annotationOverlay";
 export type { PdfAnnotation, SceneAnnotation, ScenePdfPage, AnnotationGeometry, AnnotationAction,
-  AnnotationDestination, AnnotationField, AnnotationFieldTextStyle, AnnotationBorder, AnnotationAppearanceMode } from "./annotationData";
+  AnnotationDestination, AnnotationField, AnnotationFieldInputType, AnnotationFieldTextStyle, AnnotationBorder, AnnotationAppearanceMode } from "./annotationData";
 export { annotationLayerId } from "./annotationLayers";
 export type { SceneContentItem, SceneMarkedContent, StructureElement, StructureUserProperty } from "./structureData";
 

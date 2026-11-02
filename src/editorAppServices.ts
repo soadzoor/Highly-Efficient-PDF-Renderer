@@ -5,7 +5,7 @@ import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import type { NativeMissingFontResolver } from "./pdf/nativeFont";
 import { createBundledStandardFontResolver } from "./standardFontResolver";
 import { createEditorFontRegistry } from "./editorFonts";
-import { editorTextPdf } from "./editorText";
+import { editorTextPdf, type EditorTextLayoutOptions } from "./editorText";
 import { compileEditorObjectGeometry } from "./editorSceneObjects";
 import { openPdf, type NativeVectorPdfSession } from "./pdfSession";
 import { NativePdfDocument } from "./pdf/nativeDocument";
@@ -23,6 +23,7 @@ import { AnnotationLayerBuilder } from "./annotationLayers";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 import { createEditorFieldAppearanceReader } from "./editorFormAppearance";
 import { createLoadYielder, waitForLoad } from "./loadCancellation";
+import { compileEditorFieldGeometry } from "./editorFormFields";
 
 export interface EditorAppServicesOptions {
   sourcePdf?: Uint8Array;
@@ -70,10 +71,11 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
     waiters: number; promise: Promise<FieldAppearancePages> } | undefined;
   const sourceServices = new Set<EditorAppServices>();
   const diagnostic = (message: string) => options.onDiagnostic?.({ code: "editor.appearance-regenerated", severity: "warning", message });
-  const compileObject = async (object: EditorObject, signal?: AbortSignal): Promise<VectorScene> => {
+  const compileObject = async (object: EditorObject, signal?: AbortSignal, textLayout?: EditorTextLayoutOptions): Promise<VectorScene> => {
     signal?.throwIfAborted();
+    if (object.kind === "field") return compileEditorFieldGeometry(object, compileObject, signal);
     if (object.kind !== "text") return compileEditorObjectGeometry(object, signal);
-    const bytes = await editorTextPdf(object, fonts, signal);
+    const bytes = await editorTextPdf(object, fonts, signal, textLayout);
     const parser = await openPdf({ kind: "bytes", bytes }, { signal });
     try { return await (parser as NativeVectorPdfSession).compileVectorPage(0, { signal,
       optimization: "none" }); }

@@ -140,6 +140,25 @@ Other source content can select as individual strokes, glyphs, fills or images;
 use multi-selection and grouping when the original document has no useful
 object boundaries. An existing raster island moves as a whole image.
 
+Use **Add a form field** in Edit, then drag out its area (or click for a default
+size). Choose text, number, date, email, telephone, URL, checkbox, radio button,
+dropdown or list in the properties dialog. Set its name, current/default value,
+accessible tooltip, required/read-only state, multiline/maximum length, choices,
+font and colors. List options use one line per choice, optionally `value | label`.
+Radio buttons with the same name form a group and need different checked export
+values; other names must be unique. Select a newly added field and choose
+**Edit field properties** to change its settings. Move, resize, rotate, duplicate,
+delete and undo fields with the ordinary editing tools. Copied fields receive
+independent names; copied radio buttons retain their copied group relationships.
+
+Use Fill, or double-click the field with Select, to enter values. Dates use
+`YYYY-MM-DD`; number inputs accept decimal and exponent notation. Save PDF keeps
+real editable AcroForm fields and embeds fonts for later typing. Number/date and
+other typed text fields use native controls in HEPR; other PDF readers receive
+ordinary editable text fields and may not enforce the specialized format.
+No PDF scripts are added. HEP and flattened PDF retain the rendered appearance;
+HEP does not retain the field authoring model or font programs.
+
 The Fill tool shows controls for ordinary AcroForm text, checkbox, radio and
 choice fields, respecting read-only flags and text limits. With Select active,
 double-click a field to switch to Fill and focus that widget for typing or
@@ -152,7 +171,7 @@ after losing focus, until its matching regenerated appearance is drawn. This
 also covers shared widgets and cleared fields, so the previous value does not
 flash while the document updates. Failed regeneration keeps the current value
 visible for correction or retry.
-Pending checkbox/radio marks use black vector shapes following the PDF's standard
+Pending checkbox/radio marks use vector shapes following the field's color and PDF
 mark choice, including checkmarks on radio fields, while retaining radio-group
 and keyboard behavior. The document's own appearance takes over after rendering.
 Field borders and controls follow the document's rendered zoom and pan frames
@@ -523,6 +542,13 @@ In Reader layout with Select active, scroll over empty space, selected objects,
 and their handles. Repeat with a drawing tool; check wheel/trackpad scrolling,
 Shift-wheel horizontal movement and Ctrl/Cmd-wheel zoom in both viewers/backends.
 Double-click empty, filled, rotated and resized form fields with Select active.
+Create each form-field type in both viewers/backends, including a radio group,
+multiline text and a multi-select list. Test click/drag placement, property edits,
+required/read-only behavior, fonts, long values, colors, transforms, copy/paste
+and undo/redo. Save/reopen in HEPR and Chrome, enter characters absent from the
+initial value, and verify field values and appearances remain editable. Rotate,
+reorder and duplicate pages, checking independent copied names/radio groups and
+no doubled search text or appearances. Check flattened PDF, HEP and printing.
 Check that Fill activates and the clicked widget receives focus without moving
 the viewport or changing its value. Test shared widgets and read-only fields;
 switch tools or leave Edit before a pending frame and verify focus is cancelled.

@@ -6272,6 +6272,7 @@ function buildInvocationOrderedTextIndex(
   const charOccurrences: number[] = [];
   const pens: number[] = [];
   const gapBefore: number[] = [];
+  const textScopes: { first: number; count: number; annotationId?: string; optionalContent: readonly number[] }[] = [];
   const activePrograms = new Set<number>();
   const compilation = accumulated.compilation;
   const maxTextCodeUnits = Math.min(
@@ -6287,8 +6288,15 @@ function buildInvocationOrderedTextIndex(
   const gaps = compilation.glyphGapBefore?.length === glyphCount ? compilation.glyphGapBefore : undefined;
 
   // The same pen geometry an ordinary vector page derives its word breaks from.
-  const appendPen = (glyphIndex: number, outerTransform: PdfMatrix): number => {
+  type TextScope = { annotationId?: string; optionalContent: readonly number[] };
+  const appendPen = (glyphIndex: number, outerTransform: PdfMatrix, scope?: TextScope): number => {
     const occurrence = gapBefore.length;
+    if (scope) {
+      const previous = textScopes[textScopes.length - 1];
+      if (previous && previous.first + previous.count === occurrence && previous.annotationId === scope.annotationId &&
+          previous.optionalContent.length === scope.optionalContent.length && previous.optionalContent.every((value, index) => value === scope.optionalContent[index])) previous.count++;
+      else textScopes.push({ first: occurrence, count: 1, ...scope });
+    }
     const offset = compilation.glyphs.transformIndices[glyphIndex] * 6, values = compilation.transforms.values;
     const matrix = multiplyPdfMatrices(outerTransform, [values[offset], values[offset + 1], values[offset + 2],
       values[offset + 3], values[offset + 4], values[offset + 5]]);
@@ -6334,7 +6342,8 @@ function buildInvocationOrderedTextIndex(
   const appendGlyph = (
     glyphIndex: number,
     outerTransform: PdfMatrix,
-    directReference: boolean
+    directReference: boolean,
+    scope?: TextScope
   ): boolean => {
     signal.throwIfAborted();
     const prefix = accumulated.glyphPrefixes[glyphIndex] ?? "";
@@ -6350,7 +6359,7 @@ function buildInvocationOrderedTextIndex(
       });
     }
     const invisible = (compilation.glyphs.flags[glyphIndex] & HEPR_GLYPH_FLAG.Invisible) !== 0;
-    const occurrence = appendPen(glyphIndex, outerTransform);
+    const occurrence = appendPen(glyphIndex, outerTransform, scope);
     if (directReference && !invisible) {
       appendCodeUnits(text, glyphIndex, occurrence);
       return true;
@@ -6376,7 +6385,8 @@ function buildInvocationOrderedTextIndex(
     glyphOffset: number,
     outerTransform: PdfMatrix,
     invocationProgramIndices: Uint32Array,
-    directReferences: boolean
+    directReferences: boolean,
+    inherited?: TextScope
   ): boolean => {
     let appended = false;
     for (let offset = 0; offset < source.paintRuns.length; offset += 3) {
@@ -6384,12 +6394,16 @@ function buildInvocationOrderedTextIndex(
       const kind = source.paintRuns[offset];
       const first = source.paintRuns[offset + 1];
       const count = source.paintRuns[offset + 2];
+      const condition = source.paintRunOptionalContentIndices[offset / 3] ?? -1;
+      const scope = condition < 0 || inherited?.optionalContent.includes(condition) ? inherited
+        : { annotationId: inherited?.annotationId, optionalContent: [...(inherited?.optionalContent ?? []), condition] };
       if (kind === DENSE_PDF_PAINT_RUN_GLYPH) {
         for (let index = 0; index < count; index += 1) {
           appended = appendGlyph(
             glyphOffset + first + index,
             outerTransform,
-            directReferences
+            directReferences,
+            scope
           ) || appended;
         }
       } else if (kind === DENSE_PDF_PAINT_RUN_FORM) {
@@ -6404,7 +6418,8 @@ function buildInvocationOrderedTextIndex(
         boundaryPending = true;
         const childAppended = walkProgram(
           programIndex,
-          multiplyPdfMatrices(outerTransform, paint.transform)
+          multiplyPdfMatrices(outerTransform, paint.transform),
+          scope
         );
         if (childAppended) {
           appended = true;
@@ -6417,7 +6432,7 @@ function buildInvocationOrderedTextIndex(
     return appended;
   };
 
-  const walkProgram = (programIndex: number, invocationTransform: PdfMatrix): boolean => {
+  const walkProgram = (programIndex: number, invocationTransform: PdfMatrix, scope?: TextScope): boolean => {
     if (activePrograms.has(programIndex)) {
       throw new PdfError("unsupported-content", "The reusable text program graph is cyclic.", {
         details: { reason: "text-index-program-cycle", programIndex }
@@ -6436,7 +6451,8 @@ function buildInvocationOrderedTextIndex(
         program.glyphOffset,
         multiplyPdfMatrices(invocationTransform, program.matrix),
         program.invocationProgramIndices,
-        false
+        false,
+        scope
       );
     } finally {
       activePrograms.delete(programIndex);
@@ -6459,7 +6475,8 @@ function buildInvocationOrderedTextIndex(
   for (const annotation of forms.annotations) {
     const previousBoundary: boolean = boundaryPending;
     boundaryPending = true;
-    const appended = walkProgram(annotation.programIndex, annotation.transform);
+    const appended = walkProgram(annotation.programIndex, annotation.transform, annotation.annotationId !== undefined || annotation.optionalContentIndex >= 0
+      ? { annotationId: annotation.annotationId, optionalContent: annotation.optionalContentIndex >= 0 ? [annotation.optionalContentIndex] : [] } : undefined);
     boundaryPending = appended ? true : previousBoundary;
   }
   return {
@@ -6472,7 +6489,8 @@ function buildInvocationOrderedTextIndex(
     positions: widthEms ? {
       charOccurrences: Int32Array.from(charOccurrences),
       pens: Float32Array.from(pens),
-      gapBefore: Uint8Array.from(gapBefore)
+      gapBefore: Uint8Array.from(gapBefore),
+      ...(textScopes.length ? { scopes: textScopes } : {})
     } : undefined
   };
 }

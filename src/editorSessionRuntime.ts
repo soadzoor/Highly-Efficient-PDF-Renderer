@@ -6,7 +6,8 @@ import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 import { PAGE_PRIMITIVE_KINDS, ScenePageViews, scenePrimitiveCounts } from "./scenePageViews";
 import type { ScenePaintNode } from "./scenePaintGraph";
 import type { EditorAnnotationEdit, EditorFieldValue, EditorMatrix, EditorObject, EditorObjectInput, EditorSession, EditorSessionOptions,
-  EditorSourceEdit, EditorSourceObject, EditorState, EditorSelectionFrame, EditorLayerEdits, EditorStackingAction, EditorRecoverySnapshot, EditorLink, EditorColor, EditorPaintColors } from "./editorTypes";
+  EditorSourceEdit, EditorSourceObject, EditorState, EditorSelectionFrame, EditorLayerEdits, EditorStackingAction, EditorRecoverySnapshot, EditorLink, EditorColor, EditorPaintColors, EditorFieldObject } from "./editorTypes";
+import { editorFieldAnnotation, validateEditorFieldObject, validateEditorFieldValue } from "./editorFormFields";
 import { normalizePrimitiveColor } from "./colorInput";
 import { applyEditorSourceColors, editorSourcePaintColors } from "./editorSourceColors";
 import { applyEditorSourceFieldColors } from "./editorSourceFieldColors";
@@ -93,14 +94,19 @@ function validateObject(object: EditorObject, pageCount: number): void {
   if ((object.kind === "shape" || object.kind === "ink" || object.kind === "signature") && object.fillOpacity !== undefined) {
     finite(object.fillOpacity, "Fill opacity", 0); if (object.fillOpacity > 1) throw new RangeError("Fill opacity must not exceed one.");
   }
-  if (object.kind === "text" || object.kind === "shape" || object.kind === "image") {
+  if (object.kind === "text" || object.kind === "shape" || object.kind === "image" || object.kind === "field") {
     finite(object.x, "X"); finite(object.y, "Y"); finite(object.width, "Width", 0); finite(object.height, "Height", 0);
     if (![object.x, object.y, object.width, object.height].every(value => Number.isFinite(Math.fround(value)))) throw new RangeError("Editor bounds exceed the scene's representable coordinate range.");
   }
   if (object.kind === "text") {
     if (typeof object.text !== "string") throw new TypeError("Text content must be a string."); finite(object.fontSize, "Font size", Number.MIN_VALUE);
     if (object.runs) for (const run of object.runs) { if (typeof run.text !== "string") throw new TypeError("Text runs require text."); if (run.fontSize !== undefined) finite(run.fontSize, "Run font size", Number.MIN_VALUE); }
-  } else if (object.kind === "image") {
+  } else if (object.kind === "field") {
+    object.color ??= 0; if (object.fill === undefined) object.fill = "#ffffff";
+    object.fontSize ??= 0; object.fontFamily ??= "Liberation Sans";
+    validateEditorFieldObject(object);
+  }
+  else if (object.kind === "image") {
     if (!Number.isSafeInteger(object.imageWidth) || object.imageWidth < 1 || !Number.isSafeInteger(object.imageHeight) || object.imageHeight < 1 ||
       !(object.data instanceof Uint8Array) || object.data.length !== object.imageWidth * object.imageHeight * 4) throw new TypeError("An editor image requires complete RGBA pixels and positive integer dimensions.");
   } else if (object.kind === "shape") {
@@ -150,6 +156,40 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     let id: string;
     do { id = `editor:${++nextId}`; } while (sourceObjectIds.has(id) || state.objects.has(id) || sourceObjects.has(id));
     return id;
+  };
+  const liveSourceField = (name: string, snapshot: Pick<Snapshot, "annotationEdits"> = state): boolean => !!sourceScene.annotations?.some(annotation => {
+    const sourceName = annotation.field?.name;
+    return sourceName && (sourceName === name || sourceName.startsWith(`${name}.`) || name.startsWith(`${sourceName}.`)) && !snapshot.annotationEdits.get(annotation.id)?.deleted;
+  });
+  const authoredFields = (name: string, snapshot = state): EditorFieldObject[] => [...snapshot.objects.values()].filter((object): object is EditorFieldObject => object.kind === "field" && object.name === name);
+  const validateFieldName = (object: EditorObject, peers: Iterable<EditorObject> = state.objects.values(), snapshot: Pick<Snapshot, "annotationEdits"> = state): void => {
+    if (object.kind !== "field") return;
+    if (liveSourceField(object.name, snapshot)) throw new RangeError("An existing PDF field already uses this name. Choose a new field name.");
+    for (const peer of peers) if (peer.kind === "field" && peer.id !== object.id && peer.name === object.name) {
+      if (object.fieldType !== "radio" || peer.fieldType !== "radio") throw new RangeError("A form field already uses this name.");
+      if ((object.onValue ?? "Yes") === (peer.onValue ?? "Yes")) throw new RangeError("Radio buttons in one group require distinct export values.");
+    }
+  };
+  const freshFieldName = (name: string, reserved = new Set<string>()): string => {
+    let next = name, index = 1;
+    while (liveSourceField(next) || authoredFields(next).length || reserved.has(next)) next = `${name}_${++index}`;
+    reserved.add(next); return next;
+  };
+  const fieldValues = (snapshot = state): Map<string, EditorFieldValue> => {
+    const result = new Map([...snapshot.fields].map(([name, value]) => [name, copy(value)]));
+    for (const object of snapshot.objects.values()) if (object.kind === "field") result.set(object.name, copy(object.value !== undefined ? object.value : object.defaultValue ?? (object.fieldType === "checkbox" ? false : "")));
+    return result;
+  };
+  const normalizeRadioGroups = (): void => {
+    const groups = new Map<string, EditorFieldObject[]>();
+    for (const object of state.objects.values()) if (object.kind === "field" && object.fieldType === "radio") {
+      const peers = groups.get(object.name) ?? []; peers.push(object); groups.set(object.name, peers);
+    }
+    for (const peers of groups.values()) {
+      const allowed = new Set<unknown>(["", "Off", undefined, null, ...peers.map(object => object.onValue ?? "Yes")]);
+      const first = peers[0], value = allowed.has(first.value) ? first.value : "Off", defaultValue = allowed.has(first.defaultValue) ? first.defaultValue : "Off";
+      for (const object of peers) if (object.value !== value || object.defaultValue !== defaultValue) state.objects.set(object.id, { ...object, value: copy(value), defaultValue: copy(defaultValue) });
+    }
   };
   let cache: { revision: number; previewSequence: number; scene: VectorScene } | null = null, sourcePartition: ScenePageViews | null = null;
   let committedSceneCache: { identity: object; scene: VectorScene } | null = null;
@@ -704,9 +744,20 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     for (const kind of PAGE_PRIMITIVE_KINDS) if (!Array.isArray(data.paintOwners[kind]) || data.paintOwners[kind].length !== counts[kind] || data.paintOwners[kind].some(value => typeof value !== "string")) throw new TypeError("Recovery source ownership is incomplete.");
     for (const [id, object] of [...candidate.objects, ...data.sourceObjects]) {
       if (id !== object.id) throw new TypeError("Recovery object identity is invalid."); validateObject(object, pageCount);
+      if (candidate.objects.has(id)) validateFieldName(object, candidate.objects.values(), candidate);
       if (object.layerId != null) editorLayer(catalog, object.layerId);
       if (object.layerCondition !== undefined) importEditorLayerCondition(catalog, catalog, object.layerCondition);
       if (object.kind === "source") for (const ref of object.primitives) getScenePrimitive(sourceScene, ref);
+    }
+    const radioGroups = new Map<string, EditorFieldObject[]>();
+    for (const object of candidate.objects.values()) if (object.kind === "field" && object.fieldType === "radio") {
+      const peers = radioGroups.get(object.name) ?? []; peers.push(object); radioGroups.set(object.name, peers);
+    }
+    for (const peers of radioGroups.values()) {
+      const first = peers[0], allowed = new Set<unknown>(["", "Off", undefined, null, ...peers.map(object => object.onValue ?? "Yes")]);
+      if (!allowed.has(first.value) || !allowed.has(first.defaultValue) || peers.some(object =>
+          (object.value ?? object.defaultValue) !== (first.value ?? first.defaultValue) || object.defaultValue !== first.defaultValue ||
+          Boolean(object.readOnly) !== Boolean(first.readOnly) || Boolean(object.required) !== Boolean(first.required))) throw new TypeError("Recovered radio group values and flags must agree.");
     }
     const resolve = (id: string): EditorObject => { const object = candidate.objects.get(id) ?? data.sourceObjects.get(id);
       if (!object) throw new RangeError("Recovery refers to an unknown object."); return object; };
@@ -810,7 +861,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     },
     select: selection,
     selectPrimitives(refs, selectionOptions) { selection(refs.map(promoteSource), selectionOptions); },
-    selectAnnotations(ids, selectionOptions) { selection(ids.map(id => `annotation:${id}`), selectionOptions); },
+    selectAnnotations(ids, selectionOptions) { selection(ids.map(id => state.objects.get(id)?.kind === "field" ? id : `annotation:${id}`), selectionOptions); },
     selectArea(bounds, selectionOptions = {}) {
       assertLive(); for (const value of Object.values(bounds)) finite(value, "Selection bound");
       const found = new Set<string>(), hit = (box: Bounds) => selectionOptions.intersects
@@ -846,10 +897,28 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       validateObjectLayer(object);
       if (object.kind === "text" && object.runs !== undefined) object.text = object.runs.map(run => run.text).join("");
       validateObject(object, pageCount);
+      validateFieldName(object);
+      const radioPeers = object.kind === "field" && object.fieldType === "radio" ? authoredFields(object.name) : [];
+      if (object.kind === "field" && radioPeers.length) {
+        const shared = radioPeers[0];
+        for (const key of ["readOnly", "required"] as const) {
+          if (object[key] !== undefined && Boolean(object[key]) !== Boolean(shared[key])) throw new TypeError(`Radio buttons in one group must share ${key}.`);
+          object[key] = shared[key];
+        }
+        object.value = copy(object.value === (object.onValue ?? "Yes") ? object.value : shared.value !== undefined ? shared.value : shared.defaultValue ?? "Off");
+        object.defaultValue = copy(object.defaultValue === (object.onValue ?? "Yes") ? object.defaultValue : shared.defaultValue);
+      }
+      if (object.kind === "field" && object.fieldType === "radio") {
+        const allowed = new Set<unknown>([object.onValue ?? "Yes", ...radioPeers.map(peer => peer.onValue ?? "Yes"), "Off", "", null, undefined]);
+        if (!allowed.has(object.value) || !allowed.has(object.defaultValue)) throw new RangeError("Select an available radio button value.");
+      }
       if (object.kind === "source") { object.isClone = true; for (const ref of object.primitives) getScenePrimitive(sourceScene, ref); }
       if (object.kind === "group") object.children.forEach(internalObject);
       if (object.kind === "source") cloneLayers.set(object, layerEdits());
-      change(() => { state.objects.set(id, object); if (object.layerId != null || object.layerCondition !== undefined) state.layers = { ...state.layers }; state.selection = [id]; state.selectionBasis = undefined; }); return id;
+      change(() => {
+        if (object.kind === "field") for (const peer of radioPeers) state.objects.set(peer.id, { ...peer, value: copy(object.value), defaultValue: copy(object.defaultValue) });
+        state.objects.set(id, object); if (object.layerId != null || object.layerCondition !== undefined) state.layers = { ...state.layers }; state.selection = [id]; state.selectionBasis = undefined;
+      }); return id;
     },
     updateObject(id, patch) {
       assertLive(); assertUnlocked([id]); const original = internalObject(id);
@@ -874,13 +943,42 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         if (object.runs !== undefined) object.text = object.runs.map(run => run.text).join("");
       }
       validateObject(object, pageCount);
+      validateFieldName(object);
       validateObjectLayer(object);
+      if (object.kind === "field" && object.fieldType === "radio" && original.kind === "field" && original.fieldType === "radio" &&
+          (object.onValue ?? "Yes") !== (original.onValue ?? "Yes")) {
+        if (object.value === (original.onValue ?? "Yes")) object.value = object.onValue ?? "Yes";
+        if (object.defaultValue === (original.onValue ?? "Yes")) object.defaultValue = object.onValue ?? "Yes";
+      }
+      const radioPeers = object.kind === "field" && object.fieldType === "radio" ? authoredFields(object.name).filter(peer => peer.id !== id) : [];
+      if (object.kind === "field" && object.fieldType === "radio" && original.kind === "field" && original.fieldType === "radio" && original.name !== object.name) {
+        const shared = radioPeers[0];
+        if (object.value === original.value) object.value = copy(shared ? shared.value !== undefined ? shared.value : shared.defaultValue ?? "Off"
+          : (object.value ?? object.defaultValue) === (object.onValue ?? "Yes") ? object.onValue ?? "Yes" : "Off");
+        if (object.defaultValue === original.defaultValue) object.defaultValue = copy(shared ? shared.defaultValue : object.defaultValue === (object.onValue ?? "Yes") ? object.defaultValue : "Off");
+      }
+      if (object.kind === "field" && radioPeers.length) {
+        const shared = radioPeers[0];
+        for (const key of ["readOnly", "required"] as const) if (!Object.hasOwn(patch, key)) Object.assign(object, { [key]: shared[key] });
+        if (!Object.hasOwn(patch, "defaultValue") && !(original.kind === "field" && original.defaultValue === (original.onValue ?? "Yes"))) object.defaultValue = copy(shared.defaultValue);
+        if (!Object.hasOwn(patch, "value")) {
+          object.value = copy(original.kind === "field" && original.name === object.name &&
+            (original.value ?? original.defaultValue) === (original.onValue ?? "Yes") ? object.onValue ?? "Yes" : shared.value !== undefined ? shared.value : shared.defaultValue ?? "Off");
+        }
+      }
+      if (object.kind === "field" && object.fieldType === "radio") {
+        const allowed = new Set<unknown>([object.onValue ?? "Yes", ...radioPeers.map(peer => peer.onValue ?? "Yes"), "Off", "", null, undefined]);
+        if (!allowed.has(object.value) || !allowed.has(object.defaultValue)) throw new RangeError("Select an available radio button value.");
+      }
       if (object.kind === "group") throw new TypeError("Use group and ungroup operations to change group membership.");
       if (Object.keys(patch).every(key => key === "transform" || key === "pageIndex")) geometryOrigins.set(object, geometryOrigins.get(original) ?? original);
       const inherited = cloneLayers.get(original); if (inherited) cloneLayers.set(object, inherited);
       const captured = capturedSource(original); if (captured) capturedSources.set(object, captured);
       const inheritedColors = sourceCopyColors(original); if (inheritedColors.length) cloneColors.set(object, inheritedColors);
-      change(() => { state.objects.set(id, object); if (object.layerId !== original.layerId || object.layerCondition !== original.layerCondition) state.layers = { ...state.layers }; });
+      change(() => {
+        if (object.kind === "field") for (const peer of radioPeers) state.objects.set(peer.id, { ...peer, value: copy(object.value), defaultValue: copy(object.defaultValue), readOnly: object.readOnly, required: object.required });
+        state.objects.set(id, object); normalizeRadioGroups(); if (object.layerId !== original.layerId || object.layerCondition !== original.layerCondition) state.layers = { ...state.layers };
+      });
     },
     transformSelection(input) {
       const matrix = editorMatrix(input); if (editorMatrixIsIdentity(matrix) || !state.selection.length) return;
@@ -921,17 +1019,21 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
           if (children.length !== object.children.length) state.objects.set(id, { ...object, children }); return true;
         };
         for (const object of state.objects.values()) if (object.kind === "group") pruneGroup(object.id);
-        state.selection = []; state.selectionBasis = undefined;
+        normalizeRadioGroups(); state.selection = []; state.selectionBasis = undefined;
       });
     },
     cloneSelection(offset = [12, -12]) {
       assertUnlocked(state.selection);
       finite(offset[0], "Clone X offset"); finite(offset[1], "Clone Y offset"); const clones: string[] = [], copiedIds = new Map<string, string>();
       const basis = selectionFrame()?.transform;
+      const fieldNames = new Map<string, string>();
       session.transaction("Duplicate", () => {
         const selected = expand(state.selection);
         for (const id of selected) {
           const original = internalObject(id), clone = copy(original); clone.id = nextObjectId();
+          if (clone.kind === "field") {
+            const name = fieldNames.get(clone.name) ?? freshFieldName(clone.name); fieldNames.set(clone.name, name); clone.name = name;
+          }
           copiedIds.set(id, clone.id);
           const link = readLink(id); if (link) clone.link = copy(link);
           if (clone.kind === "source" && !state.objects.has(id)) {
@@ -955,6 +1057,13 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
             const replacement: EditorObject = { ...object, link: { type: "object", objectId: copiedIds.get(object.link.objectId)! } };
             geometryOrigins.set(replacement, geometryOrigins.get(object) ?? object); state.objects.set(id, replacement);
           } }
+        for (const id of clones) {
+          const object = state.objects.get(id)!;
+          if (object.kind === "field" && object.fieldType === "radio" && !authoredFields(object.name).some(member => member.onValue === object.value || (member.onValue ?? "Yes") === object.value)) {
+            state.objects.set(id, { ...object, value: "Off" });
+          }
+        }
+        normalizeRadioGroups();
         state.selection = clones; state.selectionBasis = clones.length > 1 ? basis : undefined;
         session.transformSelection([1, 0, 0, 1, offset[0], offset[1]]);
       }); return clones;
@@ -998,19 +1107,27 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       finite(offset[0], "Paste X offset"); finite(offset[1], "Paste Y offset");
       const destination = session.getActiveLayer(); if (destination !== null) editorLayer(state.layers.catalog, destination);
       const ids = new Map([...captured.objects.keys()].map(id => [id, nextObjectId()])), additions: EditorObject[] = [];
+      const fieldNames = new Map<string, string>(), reservedFieldNames = new Set<string>();
       for (const [id, original] of captured.objects) {
         const object = copy(original); object.id = ids.get(id)!;
+        if (object.kind === "field") {
+          const name = fieldNames.get(object.name) ?? freshFieldName(object.name, reservedFieldNames); fieldNames.set(object.name, name); object.name = name;
+        }
         if (object.link?.type === "object" && ids.has(object.link.objectId)) object.link = { type: "object", objectId: ids.get(object.link.objectId)! };
         if (object.kind === "group") { object.children = object.children.map(child => ids.get(child)!); delete object.layerId; delete object.layerCondition; }
         else { object.layerId = destination; delete object.layerCondition; }
         validateObject(object, pageCount);
+        validateFieldName(object, additions);
         const source = captured.sources.get(id); if (source) capturedSources.set(object, source);
         additions.push(object);
       }
       const roots = captured.roots.map(id => ids.get(id)!);
+      for (const object of additions) if (object.kind === "field" && object.fieldType === "radio" &&
+        !additions.some(member => member.kind === "field" && member.name === object.name && (member.onValue ?? "Yes") === object.value)) object.value = "Off";
       session.transaction("Paste", () => {
         change(() => {
           for (const object of additions) state.objects.set(object.id, object);
+          normalizeRadioGroups();
           state.layers = { ...state.layers }; state.selection = roots; state.selectionBasis = roots.length > 1 ? captured.basis : undefined;
         });
         session.transformSelection([1, 0, 0, 1, offset[0], offset[1]]);
@@ -1036,14 +1153,24 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       } state.selection = [...new Set(selected)]; state.selectionBasis = state.selection.length > 1 ? basis : undefined; });
     },
     setFieldValue(name, value) {
+      assertLive();
       if (!name || typeof name !== "string") throw new TypeError("A field name is required.");
       if (!(value === null || typeof value === "string" || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value)) ||
         (Array.isArray(value) && value.every(item => typeof item === "string")))) throw new TypeError("Invalid PDF field value.");
+      const authored = authoredFields(name);
+      if (authored.length) {
+        if (authored.some(object => object.readOnly)) throw new Error("This PDF field is read-only.");
+        assertUnlocked(authored.map(object => object.id));
+        authored.forEach(object => validateEditorFieldValue(object, value));
+        if (authored[0].fieldType === "radio" && value !== null && value !== "" && value !== "Off" && !authored.some(object => (object.onValue ?? "Yes") === value)) throw new RangeError("Select an available radio button value.");
+        if (authored.every(object => JSON.stringify(object.value !== undefined ? object.value : object.defaultValue ?? (object.fieldType === "checkbox" ? false : "")) === JSON.stringify(value))) return;
+        change(() => { for (const object of authored) state.objects.set(object.id, { ...object, value: copy(value) }); }); return;
+      }
       if (sourceScene.annotations?.some(annotation => annotation.field?.name === name && (annotation.field.flags & 1) !== 0)) throw new Error("This PDF field is read-only.");
       if (!sourceScene.annotations?.some(annotation => annotation.field?.name === name)) throw new RangeError(`Unknown PDF field ${name}.`);
       change(() => state.fields.set(name, copy(value)));
     },
-    getFieldValues() { return new Map([...state.fields].map(([name, value]) => [name, copy(value)])); },
+    getFieldValues() { return fieldValues(); },
     getSourceEdits() { return [...state.edits.values()].map(copy); },
     getAnnotationEdits() { return [...state.annotationEdits.values()].map(copy); },
     updateAnnotation(id, patch) {
@@ -1153,7 +1280,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     getLayerRevision() { assertLive(); return layerRevision; },
     isObjectVisible(id) { assertLive(); return objectVisible(id); },
     isPrimitiveVisible(ref) { assertLive(); return !state.edits.get(editorRefKey(ref))?.deleted && visibility().isPrimitiveVisible(ref); },
-    isAnnotationVisible(id) { assertLive(); return !state.annotationEdits.get(id)?.deleted && visibility().isAnnotationVisible(id); },
+    isAnnotationVisible(id) { assertLive(); return state.objects.get(id)?.kind === "field" ? objectVisible(id) : !state.annotationEdits.get(id)?.deleted && visibility().isAnnotationVisible(id); },
     getPrimitivePaintRank(ref) { assertLive(); return visibility().getPrimitivePaintRank(ref); },
     getObjectPaintRank(id) {
       assertLive(); const object = internalObject(id), ranks = visibility();
@@ -1359,7 +1486,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
           const local = await waitForLoad(promise, signal); signal?.throwIfAborted(); const origin = pageOrigin(object.pageIndex);
           geometry = { ...local }; retainEditorAnnotationPlacements(local, geometry);
           const colorOnly = object.kind === "text" || object.kind === "shape" && object.shape === "arrow";
-          setEditorPaintRole(geometry, ref => ref.kind === "raster" ? null : colorOnly ? "color"
+          if (object.kind !== "field") setEditorPaintRole(geometry, ref => ref.kind === "raster" ? null : colorOnly ? "color"
             : ref.kind === "fill" || ref.kind === "gradient-fill" ? "fill" : "color");
           geometry = transformWholeEditorScene(geometry, multiplyEditorMatrices([1, 0, 0, 1, ...origin], object.transform), signal, options.onDiagnostic);
         }
@@ -1379,6 +1506,17 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       let result = composeOverlappingVectorScenes(composedPages); signal.throwIfAborted();
       composeEditorPaintIdentity(composedPages, result);
       retainEditorAnnotationPlacements(base, result);
+      if (additions.some(object => object.kind === "field")) result.pdfPages = Array.from({ length: pageCount }, (_, pageIndex) =>
+        sourceScene.pdfPages?.find(page => page.pageIndex === pageIndex) ?? { pageIndex, sourcePageIndex: pageIndex, pdfToScene: [1, 0, 0, 1, ...pageOrigin(pageIndex)] });
+      for (const object of additions) if (object.kind === "field") {
+        const page = sourceScene.pdfPages?.find(page => page.pageIndex === object.pageIndex), origin = pageOrigin(object.pageIndex);
+        const placement = multiplyEditorMatrices([1, 0, 0, 1, ...origin], object.transform);
+        const canonical = { ...editorFieldAnnotation(object), pageIndex: object.pageIndex, sourcePageIndex: page?.sourcePageIndex ?? object.pageIndex };
+        const mapping = page?.pdfToScene ?? [1, 0, 0, 1, ...origin];
+        setEditorAnnotationSource(result, canonical, multiplyEditorMatrices(placement, invertEditorMatrix(mapping)));
+        result.annotations = result.annotations?.map(annotation => annotation.id === object.id ? { ...annotation, pageIndex: object.pageIndex,
+          bounds: editorTransformBounds(canonical.bounds, placement) } : annotation);
+      }
       result.pagesPerRow = sourceScene.pagesPerRow; result.sourcePdfByteLength = sourceScene.sourcePdfByteLength;
       result = reorderEditorSceneLayers(result, layerEdits(snapshot));
       if (objectOrder) result = applyEditorObjectOrdering(result, objectOrder);
@@ -1429,7 +1567,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         getSelection: () => snapshot.selection.slice(),
         getSelectionBounds: () => withSnapshot(() => session.getSelectionBounds()),
         getSelectionFrame: () => withSnapshot(() => session.getSelectionFrame()),
-        getFieldValues: () => new Map([...snapshot.fields].map(([name, value]) => [name, copy(value)])),
+        getFieldValues: () => fieldValues(snapshot),
         getSourceEdits: () => [...snapshot.edits.values()].map(copy),
         getAnnotationEdits: () => [...snapshot.annotationEdits.values()].map(copy),
         getLayers: () => withSnapshot(() => session.getLayers()), getLayerOrder: () => withSnapshot(() => session.getLayerOrder()),
@@ -1491,7 +1629,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       saveOptions.signal?.throwIfAborted();
       // Extra form controls are editor state, not an expansion of HEP's
       // established compact field metadata schema.
-      const exportScene: VectorScene = scene.annotations?.some(annotation => annotation.field && ["maxLength", "options", "selectedIndices", "alignment", "textStyle", "buttonMark", "onValue", "appearanceState"].some(key => key in annotation.field!))
+      const exportScene: VectorScene = scene.annotations?.some(annotation => annotation.field && ["inputType", "maxLength", "options", "selectedIndices", "alignment", "textStyle", "buttonMark", "onValue", "appearanceState"].some(key => key in annotation.field!))
         ? { ...scene, annotations: scene.annotations.map(annotation => {
           if (!annotation.field) return annotation;
           const { type, name, flags, value, defaultValue } = annotation.field;

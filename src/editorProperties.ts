@@ -23,6 +23,10 @@ export function editorSupportsAppearance(object: EditorObject, property: EditorA
     return session ? session.getObjectPaintColors(object.id)[property].length > 0 : property === "color" ? object.primitives.some(ref => ref.kind !== "raster")
       : object.primitives.some(ref => ref.kind === "fill" || ref.kind === "gradient-fill");
   }
+  if (object.kind === "field") {
+    if (textProperties.has(property)) return object.fieldType !== "checkbox" && object.fieldType !== "radio" && property !== "underline" && property !== "strikethrough";
+    return property === "color" || property === "strokeWidth" || property === "fill";
+  }
   if (textProperties.has(property)) return object.kind === "text";
   if (property === "color") return object.kind !== "image";
   if (property === "strokeWidth") return object.kind === "shape" || object.kind === "ink" || object.kind === "signature";
