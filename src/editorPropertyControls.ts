@@ -3,7 +3,7 @@ import { editorFillSelection, editorPropertyState, type EditorAppearanceProperty
 
 const controls: readonly [string, EditorAppearanceProperty][] = [["color", "color"], ["stroke", "strokeWidth"], ["fill", "fill"],
   ["font", "fontId"], ["font-size", "fontSize"], ["align", "align"]];
-const styles: readonly [string, EditorAppearanceProperty][] = [["bold", "fontWeight"], ["italic", "fontStyle"], ["underline", "underline"], ["strikethrough", "strikethrough"]];
+const styles: readonly [string, EditorAppearanceProperty][] = [["bold", "fontWeight"], ["italic", "fontStyle"], ["underline", "underline"], ["strikethrough", "strikethrough"], ["highlight", "backgroundColor"]];
 
 /** Contextual readback lives outside gesture/publication state and is never run per pointer pose. */
 export function createEditorPropertyControls(options: {

@@ -12,6 +12,7 @@ export interface EditorPositionedGlyph {
   font: EditorFont; glyph: number; unicode: string; x: number; y: number;
   size: number; color: readonly number[]; underline: boolean; strikethrough: boolean;
   advance: number; italic: boolean; bold: boolean;
+  backgroundColor: readonly number[] | null; ascent: number; descent: number;
   logicalIndex: number;
 }
 export interface EditorTextLayout { glyphs: EditorPositionedGlyph[]; width: number; height: number }
@@ -84,12 +85,13 @@ export async function layoutEditorText(object: EditorTextObject, fonts: EditorFo
     const used = new Set<number>(); let x = 0;
     const scale = token.size / font.face.upem;
     const color = normalizePrimitiveColor(token.style.color ?? 0x000000);
+    const backgroundColor = token.style.backgroundColor == null ? null : normalizePrimitiveColor(token.style.backgroundColor), extents = font.hExtents();
     const glyphs = values.map(glyph => {
       const end = boundaries[boundaries.indexOf(glyph.cluster) + 1] ?? token.text.length;
       const unicode = used.has(glyph.cluster) ? "" : token.text.slice(glyph.cluster, end); used.add(glyph.cluster);
       const item: EditorPositionedGlyph = { font: token.font, glyph: glyph.codepoint, unicode,
         x: x + (glyph.xOffset ?? 0) * scale, y: (glyph.yOffset ?? 0) * scale,
-        size: token.size, color, logicalIndex: token.start + glyph.cluster,
+        size: token.size, color, backgroundColor, ascent: extents.ascender * scale, descent: extents.descender * scale, logicalIndex: token.start + glyph.cluster,
         underline: !!token.style.underline, strikethrough: !!token.style.strikethrough,
         advance: (glyph.xAdvance ?? 0) * scale,
         italic: (token.style.fontStyle === "italic" || token.style.fontStyle === "oblique") && token.font.fontStyle !== "italic",
@@ -222,6 +224,12 @@ export async function editorTextPdf(object: EditorTextObject, fonts: EditorFontR
   const opacity = object.opacity ?? 1;
   const alpha = writer.add(`<< /Type /ExtGState /ca ${n(opacity)} /CA ${n(opacity)} >>`);
   const commands = ["q", "/HEPRTextAlpha gs", `${n(object.x)} ${n(object.y)} ${n(object.width)} ${n(object.height)} re W n`];
+  // All backgrounds precede glyph paint, so highlights never cover neighboring
+  // letters or combining marks and remain attached to textbox reflow/transforms.
+  for (const glyph of layout.glyphs) if (glyph.backgroundColor && glyph.advance !== 0) {
+    const x = Math.min(glyph.x, glyph.x + glyph.advance), height = Math.max(0, glyph.ascent - glyph.descent);
+    commands.push(`${glyph.backgroundColor.map(n).join(" ")} rg`, `${n(x)} ${n(glyph.y + glyph.descent)} ${n(Math.abs(glyph.advance))} ${n(height)} re f`);
+  }
   // Absolute positions determine appearance. Emit clusters in logical order so
   // searchable Unicode retains bidi semantics without collapsing a whole box
   // into one ActualText selection quad.

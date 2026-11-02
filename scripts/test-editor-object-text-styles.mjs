@@ -43,7 +43,7 @@ try {
     }
     const inputs = new Map(["color", "stroke", "fill", "font", "font-size", "align", "fill-enabled"].map(name => [name, new Control(["font", "align"].includes(name) ? "SELECT" : "INPUT")]));
     inputs.get("color").value = "#111111";
-    const buttons = new Map(["bold", "italic", "underline", "strikethrough"].map(name => [name, new Control("BUTTON")]));
+    const buttons = new Map(["bold", "italic", "underline", "strikethrough", "highlight"].map(name => [name, new Control("BUTTON")]));
     const appearanceControls = createEditorPropertyControls({ session, control: name => inputs.get(name), style: name => buttons.get(name), focused: () => null, note: new Control("SPAN") });
     const context = editorUiTestContext({ ...properties, ...styles, ...review, session, latestScene: scene, activeText: null, tool: "select", appearanceControls, objectOpacity: 1,
       query: selector => buttons.get(selector.match(/data-style="([^"]+)"/)[1]), property: name => inputs.get(name),
@@ -52,7 +52,7 @@ try {
     for (const name of ["selectedObjectTextDecorationState", "updateAppearanceControls", "applyTextStyle"]) vm.runInContext(sourceFunction(source, name), context);
     context.updateAppearanceControls();
     assert(!buttons.get("bold").disabled && !buttons.get("italic").disabled);
-    for (const name of ["underline", "strikethrough"]) {
+    for (const name of ["underline", "strikethrough", "highlight"]) {
       const button = buttons.get(name); assert.equal(button.disabled, false, `${name} is enabled for normal Select source text`);
       const before = session.revision; context.applyTextStyle(name);
       assert.equal(session.revision, before + 1); assert.equal(button.getAttribute("aria-pressed"), "true");
@@ -64,13 +64,17 @@ try {
       session.redo(); context.updateAppearanceControls(); assert.equal(button.getAttribute("aria-pressed"), "false");
     }
     const text = session.addObject({ kind: "text", pageIndex: 0, x: 20, y: 20, width: 60, height: 12, text: "Added", fontSize: 10, color: "red" });
-    session.select(selection); context.applyTextStyle("underline");
-    session.select([...selection, text]); context.updateAppearanceControls();
-    assert.equal(buttons.get("underline").getAttribute("aria-pressed"), "mixed");
-    context.applyTextStyle("underline"); assert.equal(session.getObject(text).underline, true); assert.equal(buttons.get("underline").getAttribute("aria-pressed"), "true");
-    const revision = session.revision; context.applyTextStyle("underline"); assert.equal(session.revision, revision + 1, "mixed authored/source removal is one transaction");
-    assert.equal(session.getObject(text).underline, false); session.undo(); context.updateAppearanceControls();
-    assert.equal(session.getObject(text).underline, true); assert.equal(buttons.get("underline").getAttribute("aria-pressed"), "true");
+    for (const name of ["underline", "highlight"]) {
+      const key = name === "highlight" ? "backgroundColor" : name, button = buttons.get(name);
+      session.select(selection); context.applyTextStyle(name);
+      session.select([...selection, text]); context.updateAppearanceControls();
+      assert.equal(button.getAttribute("aria-pressed"), "mixed");
+      context.applyTextStyle(name); assert(session.getObject(text)[key]); assert.equal(button.getAttribute("aria-pressed"), "true");
+      const revision = session.revision; context.applyTextStyle(name); assert.equal(session.revision, revision + 1, "mixed authored/source removal is one transaction");
+      assert(!session.getObject(text)[key]); session.undo(); context.updateAppearanceControls();
+      assert(session.getObject(text)[key]); assert.equal(button.getAttribute("aria-pressed"), "true");
+      session.redo(); context.updateAppearanceControls();
+    }
     session.select(selection); session.setObjectsLocked(selection, true); context.updateAppearanceControls();
     assert(buttons.get("underline").disabled && buttons.get("strikethrough").disabled);
     const locked = session.revision; context.applyTextStyle("underline"); assert.equal(session.revision, locked);

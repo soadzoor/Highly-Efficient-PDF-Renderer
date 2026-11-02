@@ -1,10 +1,10 @@
 import { createTextSelectionController, type TextSelectionController } from "./textSelection";
 import type { EditorColor, EditorSession } from "./editorTypes";
 import type { VectorScene } from "./pdfVectorExtractor";
-import { addEditorComment, addEditorTextMarkup } from "./editorReview";
+import { addEditorComment } from "./editorReview";
 
-export type EditorReviewTool = "select-text" | "highlight" | "comment";
-export function isEditorReviewTool(value: string): value is EditorReviewTool { return ["select-text", "highlight", "comment"].includes(value); }
+export type EditorReviewTool = "select-text" | "comment";
+export function isEditorReviewTool(value: string): value is EditorReviewTool { return ["select-text", "comment"].includes(value); }
 
 interface CommentDraft { id?: string; annotationId?: string; pageIndex: number; x: number; y: number; contents: string; author: string }
 
@@ -67,15 +67,6 @@ export function createEditorReviewController(options: {
       if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); commitComment(); } });
     dialog.append(title, authorLabel, contents, status, actions); document.body.append(dialog); dialog.showModal(); contents.focus();
   }
-  function applySelection(): boolean {
-    if (!selection || tool !== "highlight" || !options.canEdit()) return false;
-    const spans = selection.getSelectedSpans(); if (!spans.length) return false;
-    try {
-      const scene = selectionScene ?? options.getScene(), text = selection.getSelectedText();
-      options.change(() => { const ids = addEditorTextMarkup(options.session, scene, spans, "highlight", { ...options.style(), contents: text }); options.added(ids); });
-      selection.clearSelection(); return true;
-    } catch (error) { options.onError(error); return false; }
-  }
   function resetSelection(): void { selection?.dispose(); selection = null; preview = null; selectionScene = null; }
   function sync(): void {
     resetSelection();
@@ -85,7 +76,7 @@ export function createEditorReviewController(options: {
         setSelectionHighlights: values => { preview = values; } },
       onSelectionChange: () => options.onSelectionChange?.(),
       onSelectionStart: () => { selectionScene = options.getScene(); },
-      onSelectionCommit: () => { if (tool === "highlight") applySelection(); else options.onSelectionChange?.(); } });
+      onSelectionCommit: () => options.onSelectionChange?.() });
   }
   options.overlay.addEventListener("pointerdown", event => {
     if (!enabled || tool !== "comment" || event.button !== 0 || !options.canEdit()) return;
@@ -111,7 +102,6 @@ export function createEditorReviewController(options: {
       return tool === "select-text" && spans.length && selectionScene ? { scene: selectionScene, spans, text: selection!.getSelectedText() } : null;
     },
     cancelGesture() { selection?.disable(); selection?.enable(); },
-    applySelection,
     flushDraft: commitComment,
     hasDraftChanges: () => comment !== null && JSON.stringify(comment) !== baseline,
     getDraft: () => comment ? { ...comment } : null,

@@ -154,6 +154,14 @@ function readTextModel(value: unknown): EditorTextObject | null {
       try { normalizePrimitiveColor(input.color as EditorColor); } catch { return false; }
       target.color = Array.isArray(input.color) ? [...input.color] as [number, number, number] : input.color;
     }
+    if (input.backgroundColor !== undefined) {
+      if (input.backgroundColor === null) target.backgroundColor = null;
+      else {
+        if (!(typeof input.backgroundColor === "string" || typeof input.backgroundColor === "number" || Array.isArray(input.backgroundColor))) return false;
+        try { normalizePrimitiveColor(input.backgroundColor as EditorColor); } catch { return false; }
+        target.backgroundColor = Array.isArray(input.backgroundColor) ? [...input.backgroundColor] as [number, number, number] : input.backgroundColor;
+      }
+    }
     return true;
   };
   if (!style(input, model)) return null;

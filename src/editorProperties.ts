@@ -2,8 +2,8 @@ import type { EditorObject, EditorSession, EditorTextObject } from "./editorType
 import { normalizePrimitiveColor } from "./colorInput";
 
 export type EditorAppearanceProperty = "color" | "strokeWidth" | "fill" | "fontId" | "fontFamily" | "fontSize" | "align" |
-  "fontWeight" | "fontStyle" | "underline" | "strikethrough";
-const textProperties = new Set<EditorAppearanceProperty>(["fontId", "fontFamily", "fontSize", "align", "fontWeight", "fontStyle", "underline", "strikethrough"]);
+  "fontWeight" | "fontStyle" | "underline" | "strikethrough" | "backgroundColor";
+const textProperties = new Set<EditorAppearanceProperty>(["fontId", "fontFamily", "fontSize", "align", "fontWeight", "fontStyle", "underline", "strikethrough", "backgroundColor"]);
 const appearanceProperties: readonly EditorAppearanceProperty[] = ["color", "strokeWidth", "fill", ...textProperties];
 
 /** Resolve temporary groups once and never pass group containers to updateObject. */
@@ -25,7 +25,7 @@ export function editorSupportsAppearance(object: EditorObject, property: EditorA
       : object.primitives.some(ref => ref.kind === "fill" || ref.kind === "gradient-fill");
   }
   if (object.kind === "field") {
-    if (textProperties.has(property)) return object.fieldType !== "checkbox" && object.fieldType !== "radio" && property !== "underline" && property !== "strikethrough";
+    if (textProperties.has(property)) return object.fieldType !== "checkbox" && object.fieldType !== "radio" && property !== "underline" && property !== "strikethrough" && property !== "backgroundColor";
     return property === "color" || property === "strokeWidth" || property === "fill";
   }
   if (textProperties.has(property)) return object.kind === "text";
@@ -52,6 +52,7 @@ export function editorPropertyState(session: EditorSession, property: EditorAppe
     if (property === "align") return value ?? "left";
     if (property === "fontWeight") return value === "bold" || typeof value === "number" && value >= 600;
     if (property === "fontStyle") return value === "italic" || value === "oblique";
+    if (property === "backgroundColor") return value != null;
     if (property === "underline" || property === "strikethrough") return value ?? false;
     return value;
   };

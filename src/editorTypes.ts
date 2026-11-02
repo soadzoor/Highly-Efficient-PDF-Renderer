@@ -83,6 +83,8 @@ export interface EditorTextObject extends EditorObjectBase {
   underline?: boolean;
   strikethrough?: boolean;
   color?: EditorColor;
+  /** Text highlight color; null explicitly clears an inherited highlight. */
+  backgroundColor?: EditorColor | null;
   align?: "left" | "center" | "right";
   lineHeight?: number;
 }
@@ -96,6 +98,7 @@ export interface EditorTextRun {
   underline?: boolean;
   strikethrough?: boolean;
   color?: EditorColor;
+  backgroundColor?: EditorColor | null;
 }
 /** PDF text-markup order: top-left, top-right, bottom-left, bottom-right. */
 export type EditorReviewQuad = readonly [readonly [number, number], readonly [number, number], readonly [number, number], readonly [number, number]];

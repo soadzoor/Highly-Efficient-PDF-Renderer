@@ -87,10 +87,10 @@ in a selection; Shift-click adds. Drag anywhere inside the selection frame to
 move the entire selection. Drag an empty area outside it to select every visible
 object fully contained in the rectangle. Selection handles and numeric controls
 apply to the entire selection. Corner resizing keeps proportions by default;
-hold Shift to resize width and height independently. Textbox handles change
-wrapping while preserving the frame's proportions; hold Alt to scale the textbox
-appearance instead, or Alt+Shift to scale it freely. Modifiers can be changed
-during a drag. Use undo/redo, duplicate, delete, grouping,
+hold Shift to resize width and height independently. In Select, textbox resizing
+scales the box and its characters together, matching the drag preview on release.
+While editing textbox content, resizing changes only its bounds and wrapping.
+Modifiers can be changed during a drag. Use undo/redo, duplicate, delete, grouping,
 and arrow-key nudging from the editing tools and shortcuts.
 The selection frame and handles follow the object's rotation and transform.
 Resize along the visible frame's axes; numeric W/H controls use its edge lengths.
@@ -124,7 +124,8 @@ Each source session retains current reusable resource sets rather than an
 appearance history; superseded preparation stops when no active operation needs
 it. Reusable preparation and active export snapshots survive cancellation of a
 single preview, and disposing the source session releases its caches.
-Transform handles appear only in Select. Rotation and resize cursors remain
+Object transform handles appear in Select; textbox bounds handles also appear
+while editing their content. Rotation and resize cursors remain
 visible throughout a drag; Text and Pencil use their own cursors. Switching
 tools or pressing Escape cancels the current gesture.
 Document selection frames, handles and input controls are clipped at the canvas
@@ -133,7 +134,9 @@ drags can continue beyond the viewport; page edges and Reader gaps do not clamp
 their coordinates. Text-selection popups and annotation bubbles stay within the
 visible document area.
 In Reader layout, the mouse wheel scrolls over the selection frame and drawing
-overlay; Ctrl/Cmd-wheel zooms, and Shift-wheel scrolls horizontally.
+overlay, including while editing textbox content; Ctrl/Cmd-wheel zooms, and
+Shift-wheel scrolls horizontally. Wheel navigation keeps the textbox draft open
+and preserves its current text selection.
 
 Source annotations and inseparable mask/compositing groups select together.
 Other source content can select as individual strokes, glyphs, fills or images;
@@ -179,12 +182,23 @@ without replacing focused inputs or their drafts.
 Rotate or resize a field with Select, then return to Fill to type in its original
 local dimensions at the new angle and scale. Saved HEPR PDFs retain that field
 plane when reopened and filled again.
-Textboxes support mixed formatting, sizes, colors,
+Textboxes support mixed formatting, sizes, colors, highlighting,
 underline, strikethrough and alignment. Choose bundled fonts, import TTF/OTF
 files, or request installed fonts in a browser that supports local font access.
 Font bytes are used for committed rendering and PDF output.
-Double-click a textbox created and saved by HEPR to edit it again, including its
-rich formatting and embedded fonts. Ordinary existing page text is transform-only.
+While editing a textbox, drag its edge or corner handles to change its width,
+height and wrapping without scaling characters. Use W/H for exact dimensions;
+arrow keys on a focused handle resize by 1 unit, or 10 with Shift. Escape during
+a drag restores the previous bounds and keeps the content editor open.
+New drafts grow vertically until manually resized. Reopened and manually sized
+boxes keep their chosen height; excess text remains editable but is clipped to
+the box after applying or saving. Increase its height to display that text.
+Outside content editing, numeric W/H scales the textbox and its characters together.
+Click outside a textbox to apply its draft and return to Select. Double-click a
+textbox to edit it again, or select it and click **Edit text**. The **Text** tool
+also opens an existing textbox when clicked inside it. Saved HEPR textboxes retain
+their rich formatting and embedded fonts when reopened. Existing PDF page text
+supports transforms and formatting; rewriting its words requires an editable textbox.
 
 Use shapes, polygon/polyline and pencil tools for vector markup, with stroke
 width, color, opacity and optional closed-area fill. **Color opacity** controls
@@ -291,7 +305,7 @@ outlines, Unicode mappings and images that remain; it needs no original PDF.
 Hold the middle mouse button and drag to pan the camera while any editing tool
 is active. Release to resume that tool. This also works over selected artwork
 and does not create an undo step. Wheel scrolling and zooming remain available.
-Right-click with Select to **Duplicate**, **Copy**, **Cut**, **Paste**, change
+Right-click with Select to **Duplicate**, **Copy**, **Cut**, **Paste**, **Delete**, change
 drawing order, **Lock**, **Unlock**, or **Edit comment** when supported.
 
 Use the six alignment icons with **Relative to: Selection** or **Page** to align
@@ -302,21 +316,23 @@ page centers, and known editable objects. Hold Alt/Option to bypass snapping.
 Unvisited source primitives are not exhaustively indexed for guides during a
 drag; selecting source artwork makes it available as a target.
 
-Choose **Select text**, drag over searchable text, then click **B**, **I**, **U**
-or **S** to toggle bold, italic, underline or strikethrough. The selection stays
+Choose **Select text**, drag over searchable text, then click **B**, **I**, **U**,
+**S** or **Highlight** to toggle formatting. The selection stays
 active so styles can be combined or removed with another click. Mixed selections
 receive the style on the first click. Textbox selections retain other run styles;
 double-click a textbox to format text while typing. Existing PDF glyphs use
 synthetic bold/italic that preserve their original outlines and positions;
 toggling these off restores the original font appearance. Saved source emphasis
 is baked into its appearance, without editable font-style metadata.
-The normal **Select** tool also supports underline and strikethrough on selected
+The normal **Select** tool also supports underline, strikethrough and highlighting on selected
 PDF text objects and groups, with the same toggle, mixed-state and Undo behavior.
 
-Choose **Highlight** and drag over searchable text to create a highlight
-annotation following its glyph positions, including rotated text. Underline and
-strikethrough buttons also recognize saved review annotations and can remove
-only the selected portion. **Comment** places a note; enter its text and optional author, then Apply.
+**Highlight** adds a yellow background after text has been selected. Click it
+again to remove highlighting. Textbox highlights follow their text through edits
+and wrapping; existing PDF text uses translucent glyph-bound review annotations,
+including rotated text. Highlight, Underline and Strikethrough also recognize
+saved review annotations and can remove only the selected portion.
+**Comment** places a note; enter its text and optional author, then Apply.
 Double-click a review annotation or use **Edit comment** to edit its note.
 Comments support Ctrl/Cmd+Enter to apply and Escape to cancel. PDF saves retain
 standard annotation types, text quadrilaterals and explicit appearances. HEP
@@ -647,8 +663,10 @@ several shapes or stamp signatures while earlier drawings are pending, then
 return to View; verify independent, continuous handoffs to the rendered document.
 Resize images, shapes, signatures and multi-selections with and without Shift;
 press and release Shift during the drag and check both preview and final size.
-Check textbox wrapping with plain/Shift resizing and appearance scaling with
-Alt/Alt+Shift, including textboxes on rotated pages.
+Check textbox appearance scaling with plain/Shift resizing in Select, including
+textboxes on rotated pages; the released result must match the drag preview.
+Open content editing and resize the box with handles or W/H; wrapping should
+change while character size stays fixed.
 Open saved textboxes in Chrome or another independent reader and check letters,
 spacing and formatting, including imported fonts and Unicode.
 Switch to each drawing, placement, form and Pan tool with objects selected;

@@ -16,6 +16,7 @@ const context = vm.createContext({
     isPrimitiveVisible: () => true, getObjectBounds: () => box
   },
   IDENTITY: [1, 0, 0, 1, 0, 0], getSceneAnnotationRuns: () => new Map(),
+  fieldObjectOwner: id => `annotation:${id}`,
   editorBoundsClickHit: (bounds, point) => point.x >= bounds.minX && point.x <= bounds.maxX && point.y >= bounds.minY && point.y <= bounds.maxY,
   host: { sceneToClientPoint: (x, y) => ({ x, y }), clientToScenePoint: (x, y) => ({ x, y }) },
   latestScene: scene, pickEditorMetadataAnnotation: annotations => annotations[0]?.id,

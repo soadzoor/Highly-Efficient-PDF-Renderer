@@ -1,15 +1,19 @@
 import type { EditorObjectInput, EditorSession, EditorTextRun } from "./editorTypes";
 import type { EditorFont } from "./editorFonts";
 import { rebindEditorLinkTarget } from "./editorLinks";
+import { editorTextEditingSourceFontId } from "./editorTextEditingMetrics";
+import type { EditorTextBoxBounds } from "./editorTextResizeControls";
 
-export interface EditorTextDraftBaseline { html: string; align: string; opacity: number }
+export interface EditorTextDraftBaseline { html: string; align: string; opacity: number; bounds?: EditorTextBoxBounds }
 export function hasPendingEditorTextChanges(draft: {
   element: Pick<HTMLElement, "innerHTML"> & { style: Pick<CSSStyleDeclaration, "textAlign"> };
   opacity?: number;
+  x?: number; y?: number; width?: number; height?: number;
   baseline: EditorTextDraftBaseline;
 } | null): boolean {
   return draft !== null && (draft.element.innerHTML !== draft.baseline.html ||
-    draft.element.style.textAlign !== draft.baseline.align || (draft.opacity ?? 1) !== draft.baseline.opacity);
+    draft.element.style.textAlign !== draft.baseline.align || (draft.opacity ?? 1) !== draft.baseline.opacity ||
+    Boolean(draft.baseline.bounds && (draft.x !== draft.baseline.bounds.x || draft.y !== draft.baseline.bounds.y || draft.width !== draft.baseline.bounds.width || draft.height !== draft.baseline.bounds.height)));
 }
 
 export function normalizeEditorTextColor(value: string): string {
@@ -46,17 +50,26 @@ export function commitEditorText(session: EditorSession, object: Extract<EditorO
 export function readRichTextRuns(element: HTMLElement, window: Pick<Window, "getComputedStyle">,
   fonts: readonly Pick<EditorFont, "id" | "family">[] = [], defaultFontId?: string, defaultFamily?: string): EditorTextRun[] {
   const runs: EditorTextRun[] = [];
+  function background(parent: HTMLElement): string | null {
+    // The root's white backdrop belongs to editing chrome, not PDF text paint.
+    for (let current: HTMLElement | null = parent; current && current !== element; current = current.parentElement) {
+      const color = window.getComputedStyle(current).backgroundColor;
+      if (color && color !== "transparent" && !/^rgba\([^)]*,\s*0(?:\.0+)?\s*\)$/.test(color)) return normalizeEditorTextColor(color);
+    }
+    return null;
+  }
   function newline(): void {
     if (runs.length && !runs[runs.length - 1].text.endsWith("\n")) runs.push({ ...runs[runs.length - 1], text: "\n" });
   }
   function walk(node: Node): void {
     if (node.nodeType === 3) {
       const parent = node.parentElement ?? element, style = window.getComputedStyle(parent), decoration = style.textDecorationLine;
-      const family = style.fontFamily.split(",")[0].trim().replace(/^['"]|['"]$/g, ""), font = fonts.find(item => item.id === family);
+      const cssFamily = style.fontFamily.split(",")[0].trim().replace(/^['"]|['"]$/g, "");
+      const family = editorTextEditingSourceFontId(cssFamily) ?? cssFamily, font = fonts.find(item => item.id === family);
       runs.push({ text: node.textContent ?? "", fontId: font?.id ?? (family === defaultFamily ? defaultFontId : undefined),
         fontFamily: font?.family ?? (family || defaultFamily), fontSize: parseFloat(style.fontSize) || 12,
         fontWeight: style.fontWeight === "bold" ? 700 : parseInt(style.fontWeight, 10) || 400,
-        fontStyle: style.fontStyle === "italic" || style.fontStyle === "oblique" ? "italic" : "normal", color: normalizeEditorTextColor(style.color),
+        fontStyle: style.fontStyle === "italic" || style.fontStyle === "oblique" ? "italic" : "normal", color: normalizeEditorTextColor(style.color), backgroundColor: background(parent),
         underline: decoration.includes("underline") || Boolean(parent.closest("u")),
         strikethrough: decoration.includes("line-through") || Boolean(parent.closest("s,strike")) });
     } else if (node.nodeType === 1) {

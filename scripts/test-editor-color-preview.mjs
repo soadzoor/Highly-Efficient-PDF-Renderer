@@ -49,7 +49,7 @@ try {
       input.blur = () => { focused = null; };
       controls.set(name, input);
     }
-    for (const name of ["bold", "italic", "underline", "strikethrough"]) buttons.set(name, new Control("BUTTON"));
+    for (const name of ["bold", "italic", "underline", "strikethrough", "highlight"]) buttons.set(name, new Control("BUTTON"));
     const appearanceControls = createEditorPropertyControls({ session, control: name => controls.get(name), style: name => buttons.get(name), focused: () => focused, note: new Control("SPAN") });
     const a = session.addObject(shape(35, "red", "blue")), b = session.addObject(shape(60, "purple", null));
     const compiled = await session.getScene({ preview: false });

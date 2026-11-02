@@ -8,15 +8,18 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Added
 
-- Add a Select text workflow with selection-based bold, italic, underline and
-  strikethrough toggles, mixed-state controls and undoable partial text changes.
-  Also apply and remove underline/strikethrough on original PDF text selected
-  with the normal Select tool, retaining object selection and mixed text edits.
-  Replace persistent underline/strikeout tools; retain the selection while
-  combining or removing styles. Remove only selected portions of saved review
-  marks and retain review metadata in HEP. Existing PDF fonts use reversible
+- Add a Select text workflow with selection-based bold, italic, underline,
+  strikethrough and highlight toggles, mixed-state controls and undoable partial
+  text changes. Also apply and remove underline/strikethrough/highlight on
+  original PDF text selected with the normal Select tool, retaining object
+  selection and mixed text edits. Replace persistent underline/strikeout/highlight
+  tools; retain the selection while combining or removing styles. Remove only
+  selected portions of saved review marks and retain review metadata in HEP.
+  Existing PDF fonts use reversible
   synthetic emphasis in the session; saved source emphasis retains its visible
   appearance rather than editable font-style metadata.
+  Textbox highlights follow their text through edits and wrapping, retain
+  per-run background colors in editable PDFs and keep visible backgrounds in HEP.
 - Create PDFs from scratch in both viewers and through `createPdf()`, with
   preset/custom paper sizes, orientation, page count, blank-page insertion and
   undoable resizing that preserves actual content size and top-left placement.
@@ -137,7 +140,8 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   pause layout controls only while another operation is running.
 - Pan the camera with the held middle mouse button in any editing tool across
   native/Three.js Reader and Grid layouts. Restore the complete object context
-  menu, including Duplicate, Copy, Cut and Paste alongside drawing order.
+  menu, including Duplicate, Copy, Cut, Paste and undoable Delete alongside drawing
+  order. Disable Delete for empty or locked selections and during document operations.
 - Show mixed/contextual appearance properties and apply supported group changes
   to descendants. Keep drawing defaults independent of the selected objects.
   Report browser downloads separately from confirmed file writes, retaining
@@ -170,6 +174,31 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
+- Finish textbox drafts when clicking outside and reopen their content through
+  double-click, the Text tool or the explicit Edit text button. Recognize click
+  pairs across replaced selection overlays, retain font styles and saved HEPR
+  textbox models, and keep locked content protected.
+  Align typing baselines and usable text width with committed text, including
+  mixed fonts/sizes and custom line spacing, without moving existing textboxes.
+  Match editing font registration to CSS family names so fallback fonts do not
+  change text size or width while typing, including in new default-font boxes.
+  Resize textbox bounds while editing through edge/corner handles or numeric
+  W/H without scaling characters. Retain chosen dimensions through Apply,
+  reopening and Undo/Redo; track geometry-only drafts for local recovery and
+  navigation guards. Outside content editing, retain proportional scaling of the
+  box and its characters on release to match the preview; numeric W/H also scales
+  the complete textbox appearance.
+  Keep the applied textbox appearance visible until its committed frame is drawn
+  and defer Select outlines and handles until the resized bounds are presented,
+  preventing the old blue outline from flashing when clicking outside.
+  Retain editing line-break rules during this handoff so long words and whitespace
+  do not briefly rewrap before the committed text appears.
+  Preserve the active handle's resize cursor throughout captured textbox drags,
+  including rotated boxes, and restore the normal cursor on release or cancellation.
+  Keep content-edit resize handles white when hovered or pressed, matching Select
+  handles instead of inheriting the viewer's dark button hover background.
+  Allow document wheel scrolling and zooming while editing textbox content,
+  preserving its draft, focus and text selection as the editor follows the viewport.
 - Refresh Reader thumbnails only for affected edit pages in the native and
   Three.js viewers, including shared form widgets and undo/redo. Retain unaffected
   sidebar images and pending jobs, keep changed thumbnails until replacements

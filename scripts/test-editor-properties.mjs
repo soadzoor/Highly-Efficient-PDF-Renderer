@@ -56,7 +56,7 @@ try {
   }
   const inputs = new Map(["color", "stroke", "fill", "font", "font-size", "align", "fill-enabled"].map(name => [name, new Control(["font", "align"].includes(name) ? "SELECT" : "INPUT")]));
   inputs.get("stroke").value = "2"; inputs.get("font-size").value = "12"; inputs.get("color").value = "#111111";
-  const buttons = new Map(["bold", "italic", "underline", "strikethrough"].map(name => [name, new Control("BUTTON")]));
+  const buttons = new Map(["bold", "italic", "underline", "strikethrough", "highlight"].map(name => [name, new Control("BUTTON")]));
   let focused = null; const note = new Control("SPAN");
   const controls = createEditorPropertyControls({ session, control: name => inputs.get(name), style: name => buttons.get(name), focused: () => focused, note });
   session.select([source]); controls.refresh("selection");

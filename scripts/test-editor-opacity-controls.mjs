@@ -65,7 +65,7 @@ try {
   context.document.activeElement = null;
   selection = ["source"]; refresh(); assert(stroke.disabled && fill.disabled);
   context.tool = "rectangle"; refresh(); assert(!stroke.disabled && !fill.disabled, "creation tools keep both controls available");
-  selection = ["shape"]; context.tool = "highlight"; context.objectOpacity = .35; context.fillOpacity = .6;
+  selection = ["shape"]; context.tool = "comment"; context.objectOpacity = .35; context.fillOpacity = .6;
   const creationPatches = patches.length; refresh();
   assert.equal(numbers.get("opacity").value, "0.35", "a review tool reads its creation opacity instead of the old selection");
   stroke.value = "0.4"; context.changeOpacity(stroke); fill.value = "0.7"; context.changeOpacity(fill);

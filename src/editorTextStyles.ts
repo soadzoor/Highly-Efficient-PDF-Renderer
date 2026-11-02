@@ -5,12 +5,12 @@ import { editorOriginalPaintPrimitive, editorPaintIdentity, editorPaintOwnerObje
 import { isSceneTextCharVisible } from "./optionalContentText";
 import { editorSelectionLeaves } from "./editorProperties";
 
-export type EditorTextStyle = "bold" | "italic" | "underline" | "strikethrough";
-const property = (style: EditorTextStyle) => style === "bold" ? "fontWeight" : style === "italic" ? "fontStyle" : style;
+export type EditorTextStyle = "bold" | "italic" | "underline" | "strikethrough" | "highlight";
+const property = (style: EditorTextStyle) => style === "bold" ? "fontWeight" : style === "italic" ? "fontStyle" : style === "highlight" ? "backgroundColor" : style;
 const enabled = (style: EditorTextStyle, value: unknown): boolean => style === "bold" ? value === "bold" || typeof value === "number" && value >= 600
-  : style === "italic" ? value === "italic" || value === "oblique" : Boolean(value);
+  : style === "italic" ? value === "italic" || value === "oblique" : style === "highlight" ? value != null : Boolean(value);
 const patch = (style: EditorTextStyle, value: boolean): Partial<EditorTextRun> => ({ [property(style)]:
-  style === "bold" ? value ? "bold" : "normal" : style === "italic" ? value ? "italic" : "normal" : value });
+  style === "bold" ? value ? "bold" : "normal" : style === "italic" ? value ? "italic" : "normal" : style === "highlight" ? value ? "#ffdc00" : null : value });
 
 /** The PDF text index collapses whitespace, while textbox runs retain its exact code units. */
 function searchableTextboxText(text: string): { text: string; offsets: readonly (readonly number[])[] } {
@@ -126,7 +126,7 @@ export function editorSelectedTextStyleState(session: EditorSession, scene: Vect
   for (const [id, offsets] of selection.text) {
     const object = session.getObject(id) as EditorTextObject; let offset = 0;
     for (const run of runs(object)) {
-      if ([...offsets].some(index => index >= offset && index < offset + run.text.length)) values.push(enabled(style, run[key] ?? object[key]));
+      if ([...offsets].some(index => index >= offset && index < offset + run.text.length)) values.push(enabled(style, run[key] !== undefined ? run[key] : object[key]));
       offset += run.text.length;
     }
   }

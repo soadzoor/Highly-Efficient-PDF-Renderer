@@ -67,7 +67,7 @@ export function createEditorDrawingPreviewHarness(initialTool = "ink") {
   context.pendingDrawings = createEditorPendingDrawings(context.session);
   for (const name of ["pageAt", "isSceneSettling", "updateGeometry", "drawDrawingPreview", "createShapeDraft", "updateShapeGesture", "updatePolygonPreview", "updatePointerCursor", "clearPreview",
     "cancelPointerGesture", "commit", "refreshScene", "pointerDown", "pointerMove", "pointerUp",
-    "completePolygon", "doubleClick", "setTool", "keydown", "signaturePlacementAt", "drawSignatureGhost", "placeSignature"])
+    "completePolygon", "doubleClick", "editTextObject", "setTool", "keydown", "signaturePlacementAt", "drawSignatureGhost", "placeSignature"])
     vm.runInContext(sourceFunction(source, name), context);
   const methodStart = source.indexOf("  async setEditing(value, externalSignal) {"), methodEnd = source.indexOf("\n  },\n  isEditing:", methodStart);
   assert(methodStart >= 0 && methodEnd > methodStart);

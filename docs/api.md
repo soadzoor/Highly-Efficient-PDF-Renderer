@@ -154,6 +154,10 @@ the original font or moving adjacent glyphs; normal restores the original source
 appearance, including any intrinsic bold/italic in that font. Local recovery
 retains the toggles; PDF/HEP retain their rendered appearance without editable
 source style metadata. Authored textboxes retain their ordinary font/run styles.
+Textbox objects and runs accept `backgroundColor?: EditorColor | null` for text
+highlighting. Runs inherit an omitted background; `null` explicitly clears it.
+Backgrounds follow text wrapping and transforms, remain behind glyphs, and retain
+their style in editable PDF models and their visible vector appearance in HEP.
 Compilation and saving accept `signal` cancellation and `onProgress` callbacks
 with normalized `value` and `stage`; failed saves do not clear dirty state.
 `setPreviewTransform(matrix | null)` previews a gesture without adding history or

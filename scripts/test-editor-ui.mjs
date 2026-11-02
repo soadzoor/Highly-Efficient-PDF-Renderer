@@ -402,6 +402,10 @@ try {
   draftElement.style.textAlign = "left"; guards.activeText.opacity = .5;
   assert.equal(guards.hasUnsavedChanges(), true, "pending opacity changes guard navigation");
   guards.activeText.opacity = 1; assert.equal(guards.hasUnsavedChanges(), false);
+  Object.assign(guards.activeText, { x: 10, y: 20, width: 100, height: 50 });
+  guards.activeText.baseline.bounds = { x: 10, y: 20, width: 100, height: 50 };
+  guards.activeText.width = 120; assert.equal(guards.hasUnsavedChanges(), true, "resizing without changing the textbox content guards pending geometry");
+  guards.activeText.width = 100; assert.equal(guards.hasUnsavedChanges(), false, "restoring textbox bounds clears geometry-only changes");
   guards.activeText = null; guardState.dirty = true; assert.equal(guards.hasUnsavedChanges(), true, "committed session changes remain guarded");
   guardState.dirty = false; assert.equal(guards.hasUnsavedChanges(), false);
   draftField.value = "Bob"; assert.equal(guards.hasUnsavedChanges(), true); assert.equal(guards.confirmDocumentChange(), false, "focused form drafts guard document replacement");
@@ -531,16 +535,34 @@ try {
   assert.deepEqual(viewStatuses, ["Preparing print…", "Print failed"], "View-mode operations expose progress and failures outside the hidden editor toolbar");
   statusHost.active = true; statusHost.setStatus("Editing text");
   assert.equal(viewStatus.textContent, "Editing text"); assert.equal(viewStatuses.length, 2);
-  let resolveFont, fontLoads = 0, installedFonts = 0;
+  const textMetrics = await import("../src/editorTextEditingMetrics.ts");
+  let resolveFont, fontLoads = 0; const registeredFaces = [], installedFonts = new Map();
   const fontLoad = new Promise(resolve => { resolveFont = resolve; });
-  const fontHost = uiContext({ fontFaces: new Map(), fontFaceLoads: new Map(), disposed: false, DOMException,
-    FontFace: class { load() { fontLoads++; return fontLoad; } }, document: { fonts: { add() { installedFonts++; } } } });
+  const fontHost = uiContext({ ...textMetrics, fontFaces: new Map(), fontFaceLoads: new Map(), disposed: false, DOMException,
+    FontFace: class {
+      constructor(family, bytes, descriptors) { Object.assign(this, { family, bytes, descriptors }); registeredFaces.push(this); }
+      async load() { fontLoads++; await fontLoad; return this; }
+    }, document: { fonts: { add(face) { installedFonts.set(face.family, face); } } } });
+  // Blink retains FontFace's literal family argument, whereas CSS removes the
+  // string quotes. Model matching too, so a quoted registration cannot silently
+  // pass while a contenteditable textbox actually uses a fallback font.
+  const matchingFace = cssFamily => installedFonts.get(cssFamily.replace(/^"(.*)"$/, "$1"));
   vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), "activateFont"), fontHost);
   const typingFont = { id: "shared-field-font", bytes: Uint8Array.of(1, 2), fontWeight: 400, fontStyle: "normal" };
   const fieldFontLoads = Array.from({ length: 58 }, () => fontHost.activateFont(typingFont));
   assert.equal(fontLoads, 1, "fields using one font share its in-flight browser font load");
-  resolveFont(); await Promise.all(fieldFontLoads); assert.equal(installedFonts, 1);
+  resolveFont(); await Promise.all(fieldFontLoads); assert.equal(installedFonts.size, 1);
   await fontHost.activateFont(typingFont); assert.equal(fontLoads, 1);
+  await Promise.all(Array.from({ length: 5 }, () => fontHost.activateFont(typingFont, 1.2)));
+  assert.equal(fontLoads, 2, "textbox aliases share one independent browser font load");
+  const typingFamily = textMetrics.editorTextEditingFamily(typingFont.id, 1.2);
+  const typingFace = matchingFace(`"${typingFamily}"`);
+  assert.equal(typingFace, registeredFaces[1], "the CSS textbox family selects the loaded font instead of a fallback");
+  assert.deepEqual(new Uint8Array(typingFace.bytes), typingFont.bytes, "editing and committed text use identical font data");
+  assert.deepEqual({ ...typingFace.descriptors }, { weight: "400", style: "normal", ...textMetrics.editorTextEditingDescriptors(1.2) });
+  assert.equal(registeredFaces[0].family, typingFont.id); assert.equal(registeredFaces[0].descriptors.ascentOverride, undefined, "form fonts keep their original metrics");
+  await fontHost.activateFont(typingFont, 1.5); assert.equal(fontLoads, 3, "custom textbox spacing gets matching editing metrics");
+  assert.equal(matchingFace(textMetrics.editorTextEditingFamily(typingFont.id, 1.5)), registeredFaces[2], "the same safe family also matches the toolbar fontName command");
   const paintedControl = { tagName: "INPUT", type: "text", dataset: { fieldId: "new-appearance" }, value: "focused draft", selectionStart: 4 };
   const paintHost = uiContext({ fieldPaintCache: null, updateEditorFieldControlAppearance,
     latestScene: { annotations: [{ id: "new-appearance", hasAppearance: false, field: { value: "focused draft" } }] },

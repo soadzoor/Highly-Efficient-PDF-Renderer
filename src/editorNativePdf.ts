@@ -1223,7 +1223,9 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
         annotation.set("RC", pdfTextValue(`<body xmlns="http://www.w3.org/1999/xhtml"><p style="text-align:${object.align ?? "left"}">${(object.runs ?? [{ text: object.text }]).map(run => {
           const color = normalizePrimitiveColor(run.color ?? object.color ?? 0).map(value => Math.round(value * 255).toString(16).padStart(2, "0")).join("");
           const decoration = [run.underline ?? object.underline ? "underline" : "", run.strikethrough ?? object.strikethrough ? "line-through" : ""].filter(Boolean).join(" ");
-          return `<span style="font-family:${escape(run.fontFamily ?? (run.fontId ? services.fonts.get(run.fontId).family : undefined) ?? object.fontFamily ?? "Liberation Sans")};font-size:${run.fontSize ?? object.fontSize}pt;font-weight:${run.fontWeight ?? object.fontWeight ?? 400};font-style:${run.fontStyle ?? object.fontStyle ?? "normal"};color:#${color};text-decoration:${decoration || "none"}">${escape(run.text)}</span>`;
+          const highlight = run.backgroundColor !== undefined ? run.backgroundColor : object.backgroundColor;
+          const background = highlight == null ? "transparent" : `#${normalizePrimitiveColor(highlight).map(value => Math.round(value * 255).toString(16).padStart(2, "0")).join("")}`;
+          return `<span style="font-family:${escape(run.fontFamily ?? (run.fontId ? services.fonts.get(run.fontId).family : undefined) ?? object.fontFamily ?? "Liberation Sans")};font-size:${run.fontSize ?? object.fontSize}pt;font-weight:${run.fontWeight ?? object.fontWeight ?? 400};font-style:${run.fontStyle ?? object.fontStyle ?? "normal"};color:#${color};background-color:${background};text-decoration:${decoration || "none"}">${escape(run.text)}</span>`;
         }).join("")}</p></body>`));
       } else if (object.kind === "ink" || object.kind === "signature") {
         const smoothing = object.smoothing ?? 0;

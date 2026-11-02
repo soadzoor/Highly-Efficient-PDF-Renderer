@@ -4,7 +4,7 @@ import { installSelectionTestHost } from "./lib/selectionTestHost.mjs";
 const hooks = registerHooks({ resolve(s, c, n) { return n(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? s + ".ts" : s, c); } });
 const host = installSelectionTestHost();
 try {
-  const { createEditorReviewController } = await import("../src/editorReviewUi.ts");
+  const { createEditorReviewController, isEditorReviewTool } = await import("../src/editorReviewUi.ts");
   const { createEditorSession } = await import("../src/editorSessionRuntime.ts");
   const { buildStrokeScene } = await import("../src/strokeSceneBuilder.ts");
   const doc = globalThis.document;
@@ -47,7 +47,7 @@ try {
     assert.equal(ui.getTextSelection().text, "ABCD"); assert(ui.preview()); assert(selectionChanges > 0);
     latestScene = { ...scene }; ui.updateOverlay();
     assert.equal(ui.getTextSelection().scene, scene, "formatting redraws retain the selected glyph provenance");
-    assert.equal(ui.applySelection(), false, "text selection is never a persistent formatting tool");
+    assert.equal(isEditorReviewTool("highlight"), false, "highlight is a formatting action, never a persistent selection tool");
     host.advanceTime(500); host.pointer("pointerdown", 11, 10); host.pointer("pointermove", 48, 10); host.pointer("pointerup", 48, 10);
     assert.equal(ui.getTextSelection().scene, latestScene, "a fresh selection uses the new document scene");
     const layer = session.createLayer({ name: "Other layer" });
@@ -55,10 +55,10 @@ try {
     host.advanceTime(500); host.pointer("pointerdown", 11, 10); host.pointer("pointermove", 48, 10); host.pointer("pointerup", 48, 10);
     assert(ui.getTextSelection()); session.updateLayer(layer, { defaultVisible: false }); ui.updateOverlay();
     assert.equal(ui.getTextSelection(), null, "hidden-layer geometry cannot remain a formatting target");
-    ui.setTool("highlight");
+    const countBeforeSelect = session.getObjects().length;
     host.pointer("pointerdown", 11, 10); host.pointer("pointermove", 48, 10); host.pointer("pointerup", 48, 10);
-    const mark = session.getObjects().find(object => object.kind === "shape" && object.review?.type === "highlight"); assert(mark, "real selection gesture commits markup");
-    assert.equal(mark.review.contents, "ABCD"); assert.equal(ui.preview(), null);
+    assert.equal(session.getObjects().length, countBeforeSelect, "new text selection never creates highlight markup");
+    assert.equal(ui.getTextSelection().text, "ABCD"); assert(ui.preview(), "selection remains active for formatting actions");
     const countBeforeCancel = session.getObjects().length;
     host.pointer("pointerdown", 11, 10); host.pointer("pointermove", 48, 10); ui.cancelGesture(); host.pointer("pointerup", 48, 10);
     assert.equal(session.getObjects().length, countBeforeCancel, "camera/gesture cancellation cannot commit a pending text review");
@@ -73,6 +73,6 @@ try {
     assert.equal(session.getObject(note.id).review.contents, "Changed note");
     const count = drafts; ui.setActive(false); ui.setActive(false); assert.equal(drafts, count, "idle mode switches do not schedule recovery work");
     assert.equal(host.listenerCount, 0); assert.equal(errors.length, 1);
-    console.log("Editor review UI: selection commit, listener cleanup, comment drafts, failure preservation and edit/apply passed.");
+    console.log("Editor review UI: action-only selection, listener cleanup, comment drafts, failure preservation and edit/apply passed.");
   } finally { ui.dispose(); session.dispose(); }
 } finally { host.close(); hooks.deregister(); }

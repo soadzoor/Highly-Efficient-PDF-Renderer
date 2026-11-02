@@ -17,7 +17,7 @@ function harness() {
   const initialSource = { name: "source" };
   const context = editorUiTestContext({ AbortController, AbortSignal, Set, active: true, disposed: false, running: false, structuralRunning: false,
     cameraPan: { cancel() {}, isPanning: () => false, setActive() {}, dispose() {} },
-    pendingDrawings: { capture() {}, acknowledge() {} },
+    pendingDrawings: { capture() {}, acknowledge() {} }, pendingTextPaints: new Set(),
     currentState: state, presented: null, requestedPreview: null, scenePreparation: null, sceneApplication: null,
     renderRevision: 0, latestScene: initialSource, lifetime: new AbortController(), pointer: null, pendingPick: null, picking: null,
     polygon: null, activeText: null, textRequest: 0, tool: "select", previewGeneration: 0, previewQueued: false, previewRunning: false, previewPending: false,
@@ -47,7 +47,7 @@ function harness() {
     interaction: { cancelTransform() { state = { ...state, previewing: false }; context.currentState = state; } },
     pick: async () => { picks++; return "object"; }, startText: async () => {}
   });
-  for (const name of ["displayedSelection", "isSceneSettling", "updatePointerCursor", "refreshScene", "runPreview", "queuePreview", "clearPreview", "cancelPointerGesture", "updateShapeGesture", "pointerDown", "doubleClick"])
+  for (const name of ["displayedSelection", "isSceneSettling", "updatePointerCursor", "releaseTextPaints", "refreshScene", "runPreview", "queuePreview", "clearPreview", "cancelPointerGesture", "updateShapeGesture", "pointerDown", "doubleClick"])
     vm.runInContext(sourceFunction(source, name), context);
   return { context, preparations, applications, draws, errors, raf,
     preview(x) { state = { ...state, previewing: true }; context.currentState = state; context.requestedPreview = translation(x); },
@@ -63,6 +63,82 @@ function harness() {
     },
     get maximumApplications() { return maximumApplications; }, get picks() { return picks; }
   };
+}
+
+function pendingText(harness, revision, sourceScene = harness.context.session.sourceScene) {
+  const removed = { text: 0, backdrop: 0 }, entry = { sourceScene, revision, editing: {
+    element: { style: { width: "120px", height: "40px", fontSize: "12px" }, remove() { removed.text++; } },
+    backdrop: { remove() { removed.backdrop++; } }
+  } };
+  harness.context.pendingTextPaints.add(entry);
+  return {
+    entry,
+    retained(message) {
+      assert(harness.context.pendingTextPaints.has(entry), message);
+      assert.deepEqual(removed, { text: 0, backdrop: 0 }, message);
+      assert.equal(entry.editing.element.style.width, "120px"); assert.equal(entry.editing.element.style.fontSize, "12px");
+    },
+    released(message) {
+      assert(!harness.context.pendingTextPaints.has(entry), message);
+      assert.deepEqual(removed, { text: 1, backdrop: 1 }, message);
+    }
+  };
+}
+
+// Applying a resized textbox keeps its DOM appearance and original backdrop
+// until its committed dimensions reach an acknowledged canonical draw.
+{
+  const h = harness(), c = h.context, paint = pendingText(h, 2), later = pendingText(h, 3), unrelated = pendingText(h, 1, {});
+  h.canonical(0, 1);
+  const older = c.refreshScene(); await tick(); paint.retained("compilation cannot expose the old textbox size");
+  h.resolve(0); await tick(); paint.retained("installing a host scene is not an acknowledged draw");
+  h.applications[0].acknowledge(); paint.retained("an older revision cannot retire the resized textbox");
+  h.applications[0].finish(); await older;
+  h.canonical(0, 2);
+  const committed = c.refreshScene(); await tick(); paint.retained("the replacement stays visible while its scene compiles");
+  h.resolve(1); await tick(); paint.retained("the replacement stays visible until the renderer draws");
+  h.applications[1].acknowledge(); paint.released("draw acknowledgement retires both the text and original-area backdrop");
+  later.retained("a frame cannot retire a later textbox edit"); unrelated.retained("a frame cannot retire another source's textbox");
+  h.applications[1].finish(); await committed;
+  h.applications[1].onPresented(); paint.released("repeated acknowledgements cannot remove DOM nodes twice");
+  h.canonical(0, 5);
+  const newer = c.refreshScene(); await tick(); h.resolve(2); await tick();
+  h.applications[2].acknowledge(); later.released("a newer canonical revision also contains the committed textbox");
+  h.applications[2].finish(); await newer;
+  c.releaseTextPaints(); unrelated.released("source replacement or disposal can clear remaining passive paint");
+}
+
+for (const kind of ["transform preview", "color preview"]) {
+  const h = harness(), c = h.context, paint = pendingText(h, 2);
+  h.canonical(0, 2);
+  if (kind === "transform preview") h.preview(10);
+  const colorScene = kind === "color preview" ? { id: "temporary color", frame: c.session.getSelectionFrame(), delta: null } : undefined;
+  const temporary = c.refreshScene(undefined, kind === "transform preview", false, colorScene); await tick();
+  if (!colorScene) { h.resolve(0); await tick(); }
+  h.applications[0].acknowledge(); paint.retained(`${kind} cannot retire pending canonical text paint`);
+  h.applications[0].finish(); await temporary;
+  h.canonical(0, 2);
+  const committed = c.refreshScene(); await tick(); h.resolve(colorScene ? 0 : 1); await tick();
+  h.applications[1].finish(); await committed;
+  paint.released("a synchronous/legacy host can acknowledge its canonical draw by resolving");
+}
+
+// Failed and superseded publications leave the passive textbox in place;
+// a later successful draw performs the handoff without recommitting content.
+{
+  const h = harness(), c = h.context, paint = pendingText(h, 2); h.canonical(0, 2);
+  const failedCompile = c.refreshScene(); await tick(); h.preparations[0].reject(new Error("Textbox compile failure")); await failedCompile;
+  paint.retained("a failed compilation keeps the resized appearance visible");
+  const failedApply = c.refreshScene(); await tick(); h.resolve(1); await tick();
+  h.applications[0].fail(new Error("Textbox draw failure")); await failedApply;
+  paint.retained("a failed application keeps the resized appearance visible");
+  const superseded = c.refreshScene(); await tick();
+  const latest = c.refreshScene(); await tick(); h.resolve(2); await superseded;
+  paint.retained("a superseded preparation cannot retire the pending appearance");
+  h.resolve(3); await tick(); paint.retained("the later scene must also draw before retiring the pending appearance");
+  h.applications[1].acknowledge(); paint.released("retrying publication completes the existing text handoff");
+  h.applications[1].finish(); await latest;
+  assert.equal(h.errors.length, 2);
 }
 
 // Slow compilation and publication never let the frame race ahead to pointer
@@ -237,7 +313,7 @@ for (const boundary of ["cancel", "view", "dispose"]) {
     session: { sourceScene: scene, getSelectionBounds() { counts.bounds++; return frame(0).bounds; }, getSelectionFrame() { counts.frames++; return frame(0); } },
     host: { onModeChange() { counts.mode++; } }
   });
-  vm.runInContext(sourceFunction(source, "updateState"), c);
+  for (const name of ["updateTransformControls", "updateState"]) vm.runInContext(sourceFunction(source, name), c);
   const first = { ...initial, selection: [...initial.selection], previewing: true }; c.updateState(first);
   assert.equal(c.currentState, first, "the first preview preserves current state identities for captured publications");
   for (let index = 0; index < 100; index++) c.updateState({ ...first, selection: [...first.selection] });

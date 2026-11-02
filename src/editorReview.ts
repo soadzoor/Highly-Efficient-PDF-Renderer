@@ -79,7 +79,7 @@ export function addEditorTextMarkup(session: EditorSession, scene: VectorScene, 
   }); return ids;
 }
 
-type ToggleMarkup = "underline" | "strikeout";
+type ToggleMarkup = "highlight" | "underline" | "strikeout";
 interface TextMarkup {
   id: string; pageIndex: number; quads: readonly EditorReviewQuad[]; object?: EditorShapeObject;
   style: { color?: EditorColor; opacity?: number; strokeWidth?: number };
@@ -135,7 +135,7 @@ function textMarkups(session: EditorSession, scene: VectorScene, type: ToggleMar
       quads: object.review.quads!.map(quad => quad.map(([px, py]) => { const point = editorPoint(object.transform, px, py); return [point[0] + x, point[1] + y] as const; }) as unknown as EditorReviewQuad),
       style: { color: object.color, opacity: object.opacity, strokeWidth: object.strokeWidth }, contents: object.review.contents, author: object.review.author });
   }
-  const subtype = type === "underline" ? "Underline" : "StrikeOut";
+  const subtype = type === "highlight" ? "Highlight" : type === "underline" ? "Underline" : "StrikeOut";
   for (const annotation of scene.annotations ?? []) {
     if (annotation.subtype !== subtype || !annotation.quadPoints?.length || !session.sourceScene.annotations?.some(source => source.id === annotation.id) || !session.isAnnotationVisible(annotation.id)) continue;
     const quads: EditorReviewQuad[] = [];
@@ -169,7 +169,8 @@ export function setEditorTextMarkup(session: EditorSession, scene: VectorScene, 
     const local = quads.map(quad => quad.map(([px, py]) => [px - x, py - y] as const) as unknown as EditorReviewQuad), points = local.flatMap(quad => [...quad]);
     const bounds = markupBounds(points);
     const id = session.addObject({ kind: "shape", shape: "polygon", pageIndex, x: bounds.minX, y: bounds.minY, width: bounds.maxX - bounds.minX, height: bounds.maxY - bounds.minY, points,
-      color: source?.style.color ?? style.color ?? "#111111", opacity: source?.style.opacity ?? style.opacity ?? 1, strokeWidth: source?.style.strokeWidth ?? 1,
+      color: source?.style.color ?? style.color ?? (type === "highlight" ? "#ffe04a" : "#111111"),
+      opacity: source?.style.opacity ?? style.opacity ?? (type === "highlight" ? .35 : 1), strokeWidth: type === "highlight" ? 0 : source?.style.strokeWidth ?? 1,
       review: { type, quads: local, contents: source?.contents ?? style.contents, author: source?.author ?? style.author } });
     if (source) session.copyObjectLayerMembership(source.id, id);
     added.push(id); return id;

@@ -43,7 +43,7 @@ try {
       input.value = name === "color" ? "#111111" : name === "fill" ? "#ffff00" : name === "stroke" ? "2" : "12";
       controls.set(name, input);
     }
-    for (const name of ["bold", "italic", "underline", "strikethrough"]) buttons.set(name, new Control("BUTTON"));
+    for (const name of ["bold", "italic", "underline", "strikethrough", "highlight"]) buttons.set(name, new Control("BUTTON"));
     const appearanceControls = createEditorPropertyControls({ session, control: name => controls.get(name), style: name => buttons.get(name), focused: () => focused, note: new Control("SPAN") });
     const context = editorUiTestContext({ ...properties, normalizePrimitiveColor, session, active: true, activeText: null, tool: "select",
       colorDraft: null, colorChangeHandled: new WeakSet(), pointer: null, pendingPick: null, currentState: session.getState(), appearanceControls,

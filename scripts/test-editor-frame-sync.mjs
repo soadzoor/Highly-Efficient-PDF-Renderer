@@ -246,6 +246,7 @@ for (const boundary of ["wheel", "blur", "cancel", "locked", "source", "revision
   await h.context.api.setEditing(false); assert.equal(h.geometryReads, 0, "idle View mode does not read toolbar geometry");
   let finishPreparation; h.context.refreshScene = () => new Promise(resolve => { finishPreparation = resolve; });
   const entering = h.context.api.setEditing(true), toolbar = h.context.toolbar;
+  await new Promise(resolve => setImmediate(resolve)); // Cross-realm recovery readiness settles; scene preparation stays pending.
   assert.deepEqual(toolbar.style, { left: "102px", right: "auto", width: "396px" }, "entering Edit places the toolbar before asynchronous scene preparation");
   finishPreparation(); await entering;
   for (const [label, rect, replace] of [

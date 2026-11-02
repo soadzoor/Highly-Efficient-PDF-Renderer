@@ -1,6 +1,7 @@
 import { editorUiTestContext } from "./lib/editorUiTestContext.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { stripTypeScriptTypes } from "node:module";
 import vm from "node:vm";
 import { sourceFunction } from "./lib/sourceFunction.mjs";
 
@@ -88,4 +89,26 @@ for (const boundary of ["request", "document", "source", "selection", "camera", 
   assert.equal(prevented, 1, "inactive tools retain the native keyboard context menu"); h.context.tool = "select";
   h.setSelection([]); h.context.showSelectionContextMenu(); assert.equal(h.shown.length, 2);
 }
-console.log("Editor context integration: selected frame, hit selection, typing/mode guards, async cancellation and keyboard anchor passed.");
+{
+  const h = harness(); let options, locked = false; const deleted = [];
+  h.context.document = {};
+  h.context.runClipboard = () => {};
+  h.context.report = error => assert.fail(String(error));
+  h.context.selectionLocked = () => locked;
+  h.context.commit = change => change();
+  h.context.session.deleteSelection = () => { deleted.push([...h.selection]); h.context.session.select([]); };
+  h.context.createEditorContextMenu = (_document, value) => { options = value; return h.context.contextMenu; };
+  const start = source.indexOf("  const contextMenu = createEditorContextMenu("), end = source.indexOf("\n  const cameraPan =", start);
+  assert(start >= 0 && end > start);
+  vm.runInContext(stripTypeScriptTypes(source.slice(start, end)), h.context);
+  const command = options.extra.find(command => command.action === "delete");
+  assert(command); assert.equal(command.label, "Delete"); assert.equal(command.canRun(), true);
+  locked = true; assert.equal(command.canRun(), false, "locked selections cannot be deleted from the menu"); locked = false;
+  for (const [name, value] of [["active", false], ["disposed", true], ["running", true], ["savePreparing", true], ["structuralRunning", true], ["activeText", {}]]) {
+    const previous = h.context[name]; h.context[name] = value;
+    assert.equal(command.canRun(), false, `${name} prevents context-menu deletion`); h.context[name] = previous;
+  }
+  command.run(); assert.deepEqual(deleted, [["a", "b"]], "Delete uses the current multi-selection through the existing commit/session path");
+  assert.equal(command.canRun(), false, "an empty selection cannot be deleted");
+}
+console.log("Editor context integration: selected frame, hit selection, typing/mode guards, async cancellation, keyboard anchor and selection-aware Delete passed.");

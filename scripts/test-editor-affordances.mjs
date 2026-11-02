@@ -23,6 +23,7 @@ const install = (context, ...names) => {
   context.cameraPan ??= { cancel() {}, isPanning: () => false, setActive() {}, dispose() {} };
   context.updateAppearanceControls ??= () => {};
   if (names.some(name => ["pointerDown", "pointerMove", "pointerUp"].includes(name))) names.push("createShapeDraft", "updateShapeGesture");
+  if (names.includes("doubleClick")) names.push("editTextObject");
   for (const name of names) vm.runInContext(sourceFunction(nested, name), context);
 };
 const bounds = { minX: 10, minY: 20, maxX: 50, maxY: 60 };
@@ -30,6 +31,7 @@ let geometryFrame = { bounds, transform: IDENTITY };
 const shapes = [], overlay = { dataset: {}, style: {} };
 const rotationInput = { value: "", disabled: false, dataset: { transform: "rotation" } }, rotationDocument = { activeElement: null };
 const geometry = editorUiTestContext({
+  active: true,
   pendingDrawings: { visible: () => [] },
   ...frameHelpers,
   currentState: { revision: 0, selection: ["object"] }, presented: null, isSceneSettling: () => false,
@@ -41,9 +43,9 @@ const geometry = editorUiTestContext({
   svg: (tag, attributes) => { const element = { tag, ...attributes, style: {} }; shapes.push(element); return element; }, fields: { querySelectorAll: () => [] },
   pointer: null, pendingPick: null, polygon: null, signature: null, signatureHover: null, activeText: null, running: false, tool: "select", latestScene: {},
   property: () => ({ value: "#123456" }), focusPendingField() {}, updateTextVisibility: () => true,
-  query: () => rotationInput, document: rotationDocument, rotationDraft: null, opacityInput() {}
+  query: selector => selector.includes('data-transform="rotation"') ? rotationInput : {}, document: rotationDocument, rotationDraft: null, opacityInput() {}
 });
-install(geometry, "displayedSelection", "updatePointerCursor", "toolbarInput", "updateRotationValue", "updateGeometry");
+install(geometry, "displayedSelection", "updatePointerCursor", "toolbarInput", "updateRotationValue", "textDraftBounds", "canResizeTextDraft", "updateTransformControls", "updateTextGeometry", "updateGeometry");
 for (const tool of ["select", "pan", "form", "text", "rectangle", "ellipse", "line", "arrow", "polygon", "polyline", "ink", "signature", "image"]) {
   geometry.tool = tool; geometry.updateGeometry();
   const handles = shapes.filter(item => item["data-handle"]);
@@ -57,11 +59,41 @@ assert.equal(shapes.filter(item => item["data-handle"]).length, 0, "busy operati
 assert.equal(shapes.some(item => item.class === "hepr-editor-selection"), false);
 assert.equal(shapes.some(item => item.class === "hepr-editor-selection-hit"), false, "busy operations remove the inactive move surface");
 geometry.running = false;
-geometry.activeText = { pageIndex: 0, x: 1, y: 2, width: 10, height: 10, transform: [1, 0, 0, 1, 0, 0], element: { style: {} } };
+geometry.activeText = { pageIndex: 0, x: 1, y: 2, width: 10, height: 10, transform: [1, 0, 0, 1, 0, 0], element: { style: {}, scrollHeight: 10 } };
 geometry.updateGeometry(); assert.equal(shapes.filter(item => item["data-handle"]).length, 0, "an active textbox owns the editing affordance");
 assert.equal(rotationInput.disabled, true, "finish the textbox draft before changing its selection rotation");
 assert.equal(shapes.some(item => item.class === "hepr-editor-selection-hit"), false);
 geometry.activeText = null;
+// Applying a resized textbox leaves its passive DOM paint in place while the
+// canvas still presents the previous revision. Its old Select frame must not
+// reappear around that retained paint before the matching draw is acknowledged.
+{
+  const previousFrame = geometryFrame, sourceScene = geometry.session.sourceScene;
+  const resizedFrame = { bounds: { minX: 10, minY: 20, maxX: 100, maxY: 44 }, transform: IDENTITY };
+  const retainedText = { style: {}, scrollHeight: 24, removed: false, remove() { this.removed = true; } };
+  const retainedBackdrop = { style: {}, removed: false, remove() { this.removed = true; } };
+  geometryFrame = resizedFrame;
+  geometry.currentState = { revision: 1, selection: ["object"] };
+  geometry.presented = { sourceScene, revision: 0, selection: new Set(["object"]), frame: previousFrame, delta: null };
+  geometry.pendingTextPaints.add({ sourceScene, revision: 1, editing: { pageIndex: 0, x: 10, y: 20, width: 90, height: 24,
+    fixedHeight: true, transform: IDENTITY, element: retainedText, backdrop: retainedBackdrop,
+    originalBounds: { x: 10, y: 20, width: 40, height: 40 } } });
+  install(geometry, "releaseTextPaints");
+  assert.equal(geometry.displayedSelection().frame, previousFrame, "the canvas still owns the old-sized frame before acknowledgement");
+  geometry.updateGeometry();
+  assert.equal(shapes.some(item => item.class === "hepr-editor-selection"), false, "pending textbox paint suppresses the previous-size blue selection outline");
+  assert.equal(shapes.some(item => item.class === "hepr-editor-selection-hit"), false, "pending textbox paint suppresses the old move hit surface");
+  assert.equal(shapes.some(item => item["data-handle"]), false, "pending textbox paint suppresses old resize and rotation handles");
+  assert.equal(retainedText.style.width, "90px", "the retained resized content continues to follow actual overlay geometry");
+  geometry.releaseTextPaints({ sourceScene, revision: 1 });
+  geometry.presented = { sourceScene, revision: 1, selection: new Set(["object"]), frame: resizedFrame, delta: null };
+  geometry.updateGeometry();
+  assert.equal(retainedText.removed, true); assert.equal(retainedBackdrop.removed, true);
+  assert.equal(geometry.pendingTextPaints.size, 0);
+  assert.equal(shapes.find(item => item.class === "hepr-editor-selection").points, "10,44 100,44 100,20 10,20", "the first restored outline uses the newly drawn textbox bounds");
+  assert.equal(shapes.filter(item => item["data-handle"]).length, 5, "the acknowledged frame restores resize and rotation affordances");
+  geometryFrame = previousFrame; geometry.currentState = { revision: 0, selection: ["object"] }; geometry.presented = null;
+}
 for (const [action, handle] of [["move", ""], ["rotate", ""], ["resize", "ne"], ["resize", "sw"], ["draw", ""], ["marquee", ""]]) {
   geometry.pointer = { action, handle }; geometry.updatePointerCursor();
   assert.equal(overlay.dataset.gesture, action); assert.equal(overlay.dataset.resizeHandle, action === "resize" ? handle : "");
@@ -149,17 +181,42 @@ for (const change of ["camera", "source", "revision"]) {
   assert.deepEqual(selected, ["source:fill:2"], `${change} changes invalidate a pending pick before it selects or moves anything`);
 }
 {
-  const forwarded = [];
-  gestures.host.getCanvas = () => ({ dispatchEvent: event => forwarded.push(event) });
+  const forwarded = [], order = [];
+  gestures.host.getCanvas = () => ({ dispatchEvent: event => { order.push("wheel"); forwarded.push(event); } });
   gestures.WheelEvent = class { constructor(type, init) { this.type = type; Object.assign(this, init); } };
   install(gestures, "forwardWheel");
-  const wheel = field => ({ target: { closest: () => field ? {} : null }, preventDefault() {}, stopPropagation() {} });
+  const wheel = (field, extra = {}) => ({ target: { closest: () => field ? {} : null },
+    clientX: 123, clientY: 246, deltaX: -3, deltaY: 41, deltaZ: 2, deltaMode: 0, ctrlKey: false, metaKey: false, shiftKey: false,
+    prevented: 0, stopped: 0, preventDefault() { this.prevented++; }, stopPropagation() { this.stopped++; }, ...extra });
   gestures.pointer = { id: 27, action: "move" }; captures.add(27);
   gestures.alignmentSnap = {}; gestures.requestedGuides = [{}]; gestures.forwardWheel(wheel(false));
   assert.equal(gestures.pointer, null); assert.equal(captures.size, 0); assert.equal(gestures.alignmentSnap, null); assert.equal(gestures.requestedGuides.length, 0);
   assert.equal(forwarded.length, 1, "wheel navigation cancels stale object origins and releases guides before forwarding the camera event");
-  gestures.activeText = {}; gestures.forwardWheel(wheel(false)); gestures.activeText = null; gestures.forwardWheel(wheel(true));
-  assert.equal(forwarded.length, 1, "textboxes and form fields retain their own wheel behavior");
+  const element = { innerHTML: "Draft <b>text</b>", style: { fontSize: "12px" } }, caret = { anchorNode: element, anchorOffset: 5, focusNode: element, focusOffset: 5 };
+  const previousDocument = gestures.document, document = { activeElement: element, getSelection: () => caret };
+  const editing = { element, width: 90, height: 40, resizeControls: { cancel() { order.push("cancel-resize"); } } };
+  const revision = gestures.session.revision, selection = gestures.currentState.selection;
+  gestures.document = document; gestures.activeText = editing;
+  for (const modifiers of [{}, { ctrlKey: true }, { metaKey: true, deltaMode: 1 }, { shiftKey: true, deltaMode: 2 }]) {
+    order.length = 0;
+    const event = wheel(false, modifiers), count = forwarded.length;
+    gestures.forwardWheel(event);
+    assert.equal(forwarded.length, count + 1, "wheel navigation remains available during textbox content editing");
+    assert.deepEqual(order, ["cancel-resize", "wheel"], "camera navigation cancels a captured textbox resize before changing its projection");
+    assert.equal(event.prevented, 1); assert.equal(event.stopped, 1);
+    const forwardedEvent = forwarded.at(-1);
+    assert.equal(forwardedEvent.type, "wheel"); assert.equal(forwardedEvent.bubbles, true); assert.equal(forwardedEvent.cancelable, true);
+    for (const name of ["clientX", "clientY", "deltaX", "deltaY", "deltaZ", "deltaMode", "ctrlKey", "metaKey", "shiftKey"]) assert.equal(forwardedEvent[name], event[name], `forwarded wheel preserves ${name}`);
+    assert.equal(gestures.activeText, editing); assert.equal(editing.element, element);
+    assert.equal(element.innerHTML, "Draft <b>text</b>"); assert.equal(element.style.fontSize, "12px");
+    assert.equal(document.activeElement, element); assert.equal(document.getSelection(), caret); assert.equal(caret.anchorOffset, 5); assert.equal(caret.focusOffset, 5);
+    assert.equal(gestures.session.revision, revision); assert.equal(gestures.currentState.selection, selection, "zooming neither commits the textbox nor changes document selection");
+  }
+  const count = forwarded.length, fieldWheel = wheel(true, { ctrlKey: true }); order.length = 0;
+  gestures.forwardWheel(fieldWheel);
+  assert.equal(forwarded.length, count, "form fields retain their own wheel behavior"); assert.deepEqual(order, []);
+  assert.equal(fieldWheel.prevented, 0); assert.equal(fieldWheel.stopped, 0);
+  gestures.activeText = null; gestures.document = previousDocument;
 }
 gestures.running = true; const preventBeforeBusy = prevented; await gestures.pointerDown(event(13));
 assert.equal(prevented, preventBeforeBusy); assert.equal(gestures.pointer, null, "busy operations cannot start document gestures");
@@ -415,7 +472,7 @@ const resizing = editorUiTestContext({ active: true, running: false, structuralR
   interaction: { previewTransform: matrix => resizePreviews.push(Array.from(matrix)), applyTransform: matrix => resizeCommits.push(Array.from(matrix)) },
   commit: change => change()
 });
-install(resizing, "dragMatrix", "resizeTextBox", "transformModifiers", "updatePointerCursor", "pointerDown", "pointerMove", "pointerUp");
+install(resizing, "dragMatrix", "transformModifiers", "updatePointerCursor", "pointerDown", "pointerMove", "pointerUp");
 const resizeEvent = (x, y, modifiers = {}) => ({ ...event(30, "ne"), clientX: x, clientY: y, shiftKey: false, altKey: false, ...modifiers });
 
 // A stationary Select click must not enqueue the asynchronous transform preview
@@ -460,9 +517,9 @@ for (const action of ["move", "resize", "rotate"]) {
 }
 
 await resizing.pointerDown(resizeEvent(110, 70, { shiftKey: true, altKey: true }));
-assert.equal(resizing.pointer.freeResize, true); assert.equal(resizing.pointer.scaleText, true, "corner press captures Shift and Alt");
+assert.equal(resizing.pointer.freeResize, true, "corner press captures Shift");
 resizing.pointerMove(resizeEvent(210, 45));
-assert.equal(resizing.pointer.freeResize, false); assert.equal(resizing.pointer.scaleText, false, "pointer movement observes released modifiers");
+assert.equal(resizing.pointer.freeResize, false, "pointer movement observes released Shift");
 nearMatrix(resizePreviews.at(-1), [1.7, 0, 0, 1.7, -7, -14], "default selection preview");
 resizing.pointerMove(resizeEvent(210, 45, { shiftKey: true }));
 nearMatrix(resizePreviews.at(-1), [2, 0, 0, .5, -10, 10], "Shift selection preview");
@@ -474,51 +531,48 @@ nearMatrix(resizeCommits.at(-1), [2.6, 0, 0, 2.6, -16, -32], "release reads its 
 resizeSelection = ["textbox"];
 await resizing.pointerDown(resizeEvent(110, 70)); resizing.pointerMove(resizeEvent(210, 45, { shiftKey: true, altKey: true }));
 resizing.pointerUp(resizeEvent(210, 45, { shiftKey: true, altKey: true }));
-nearMatrix(resizeCommits.at(-1), [2, 0, 0, .5, -10, 10], "Alt+Shift explicitly scales textbox appearance freely");
-assert.equal(resizeUpdates.length, 0, "Alt scaling uses the affine edit rather than changing textbox wrapping dimensions");
-for (const freeResize of [false, true]) {
+nearMatrix(resizeCommits.at(-1), [2, 0, 0, .5, -10, 10], "Alt+Shift textbox resizing keeps the previewed appearance scaling");
+for (const freeResize of [false, true]) for (const altKey of [false, true]) {
   const affineBefore = resizeCommits.length;
-  await resizing.pointerDown(resizeEvent(110, 70)); resizing.pointerMove(resizeEvent(210, 45, { shiftKey: freeResize }));
-  const preview = resizePreviews.at(-1); resizing.pointerUp(resizeEvent(210, 45, { shiftKey: freeResize }));
-  const update = resizeUpdates.at(-1), updated = { ...textModel, ...update.patch };
-  assert.equal(update.id, "textbox"); assert.equal(updated.fontSize, 12); assert.equal(resizeCommits.length, affineBefore, "ordinary textbox resizing rewraps instead of scaling its font appearance");
-  near(updated.width, freeResize ? 200 : 170, "textbox width"); near(updated.height, freeResize ? 25 : 85, "textbox height");
-  const beforeCorners = [{ x: textModel.x, y: textModel.y }, { x: textModel.x + textModel.width, y: textModel.y + textModel.height }];
-  const afterCorners = [{ x: updated.x, y: updated.y }, { x: updated.x + updated.width, y: updated.y + updated.height }];
-  beforeCorners.forEach((point, index) => { const expected = transformPoint(preview, point); near(afterCorners[index].x, expected.x, "textbox preview/commit X"); near(afterCorners[index].y, expected.y, "textbox preview/commit Y"); });
+  const modifiers = { shiftKey: freeResize, altKey };
+  await resizing.pointerDown(resizeEvent(110, 70, modifiers)); resizing.pointerMove(resizeEvent(210, 45, modifiers));
+  const preview = resizePreviews.at(-1); resizing.pointerUp(resizeEvent(210, 45, modifiers));
+  assert.equal(resizeCommits.length, affineBefore + 1, "Select-mode textbox resizing applies its appearance transform");
+  nearMatrix(resizeCommits.at(-1), preview, "textbox preview and released appearance scale agree");
+  nearMatrix(preview, freeResize ? [2, 0, 0, .5, -10, 10] : [1.7, 0, 0, 1.7, -7, -14], "Shift frees both textbox axes and Alt does not change resize behavior");
+  assert.equal(resizeUpdates.length, 0, "Select-mode resizing never replaces text scaling with wrapping-dimension edits");
 }
-const wrappingUpdatesBeforeReflection = resizeUpdates.length;
+await resizing.pointerDown(resizeEvent(110, 70)); resizing.pointerMove(resizeEvent(210, 45, { shiftKey: true }));
+resizing.pointerUp(resizeEvent(310, 70));
+nearMatrix(resizeCommits.at(-1), [2.6, 0, 0, 2.6, -16, -32], "textbox release applies final coordinates and released Shift to its appearance");
 await resizing.pointerDown(resizeEvent(110, 70)); resizing.pointerMove(resizeEvent(-40, -5)); resizing.pointerUp(resizeEvent(-40, -5));
 nearMatrix(resizeCommits.at(-1), [-.5, 0, 0, -.5, 15, 30], "reflected textbox resize uses a uniform appearance transform");
-assert.equal(resizeUpdates.length, wrappingUpdatesBeforeReflection, "reflection does not produce negative textbox wrapping dimensions");
-const textCorners = (object, pageOrigin) => [[0, 0], [object.width, 0], [object.width, object.height], [0, object.height]].map(([x, y]) => {
-  const point = transformPoint(object.transform, { x: object.x + x, y: object.y + y });
-  return { x: point.x + pageOrigin.x, y: point.y + pageOrigin.y };
-});
+assert.equal(resizeUpdates.length, 0, "reflection also scales appearance without changing wrapping dimensions");
 for (const [name, transform] of [["rotated", [0, 1, -1, 0, 200, 300]], ["sheared", [1, .25, .4, 1.5, 17, -8]]]) {
-  const pageOrigin = { x: 40, y: 60 }, object = { ...textModel, transform }, corners = textCorners(object, pageOrigin);
+  const pageOrigin = { x: 40, y: 60 }, object = { ...textModel, transform };
   resizing.session.sourceScene = { pageRects: [pageOrigin.x, pageOrigin.y, 1040, 1060] };
-  const bounds = { minX: Math.min(...corners.map(point => point.x)), minY: Math.min(...corners.map(point => point.y)), maxX: Math.max(...corners.map(point => point.x)), maxY: Math.max(...corners.map(point => point.y)) };
-  const start = { x: bounds.minX, y: bounds.maxY }, fixed = { x: bounds.maxX, y: bounds.minY };
-  for (const scale of [1.4, .4]) {
-    const point = { x: fixed.x + scale * (start.x - fixed.x), y: fixed.y + scale * (start.y - fixed.y) };
-    const gesture = { action: "resize", handle: "nw", start, last: point, bounds }, matrix = resizing.dragMatrix(gesture, point);
-    const patch = resizing.resizeTextBox(gesture, object, matrix), updated = { ...object, ...patch }, updatedCorners = textCorners(updated, pageOrigin);
-    near(updated.width, object.width * scale, `${name}: local wrapping width`); near(updated.height, object.height * scale, `${name}: local wrapping height`);
-    near(updated.width / updated.height, object.width / object.height, `${name}: local aspect ratio`);
-    assert.equal(updated.fontSize, object.fontSize); assert.equal(updated.transform, object.transform);
-    corners.forEach((corner, index) => { const expected = transformPoint(matrix, corner); near(updatedCorners[index].x, expected.x, `${name}: projected corner X`); near(updatedCorners[index].y, expected.y, `${name}: projected corner Y`); });
+  resizeFrame = { bounds: resizeBounds, transform: [...transform] };
+  resizeFrame.transform[4] += pageOrigin.x; resizeFrame.transform[5] += pageOrigin.y;
+  resizing.session.getObject = () => object;
+  const start = editorFrameCorners(resizeFrame)[1], point = transformPoint(resizeFrame.transform, { x: 210, y: 45 });
+  for (const shiftKey of [false, true]) for (const altKey of [false, true]) {
+    const modifiers = { shiftKey, altKey };
+    await resizing.pointerDown(resizeEvent(start.x, start.y, modifiers)); resizing.pointerMove(resizeEvent(point.x, point.y, modifiers));
+    const preview = resizePreviews.at(-1); resizing.pointerUp(resizeEvent(point.x, point.y, modifiers));
+    nearMatrix(resizeCommits.at(-1), preview, `${name}: preview and committed textbox content use the same affine scale`);
+    assert.equal(resizeUpdates.length, 0, `${name}: resizing never switches to wrapping edits on release`);
   }
 }
-resizing.session.sourceScene = { pageRects: [0, 0, 400, 300] }; resizeSelection = ["first", "second"];
+resizing.session.sourceScene = { pageRects: [0, 0, 400, 300] }; resizing.session.getObject = () => textModel;
+resizeFrame = { bounds: resizeBounds, transform: IDENTITY }; resizeSelection = ["first", "second"];
 await resizing.pointerDown(resizeEvent(110, 70)); resizing.pointerMove(resizeEvent(210, 45));
 const stationaryPosition = resizing.pointer.last;
 resizing.transformModifiers({ key: "Shift", shiftKey: true, altKey: false });
 assert.equal(resizing.pointer.freeResize, true); nearMatrix(resizePreviews.at(-1), [2, 0, 0, .5, -10, 10], "Shift press previews free scaling without pointer movement");
-resizing.transformModifiers({ key: "Alt", shiftKey: true, altKey: true }); assert.equal(resizing.pointer.scaleText, true);
+resizing.transformModifiers({ key: "Alt", shiftKey: true, altKey: true });
 resizing.transformModifiers({ key: "Shift", shiftKey: false, altKey: true });
 assert.equal(resizing.pointer.freeResize, false); nearMatrix(resizePreviews.at(-1), [1.7, 0, 0, 1.7, -7, -14], "Shift release restores constrained scaling without pointer movement");
-resizing.transformModifiers({ key: "Alt", shiftKey: false, altKey: false }); assert.equal(resizing.pointer.scaleText, false);
+resizing.transformModifiers({ key: "Alt", shiftKey: false, altKey: false });
 assert.equal(resizing.pointer.last, stationaryPosition);
 const modifierPreviews = resizePreviews.length;
 resizing.transformModifiers({ key: "Shift", shiftKey: true, altKey: false, isComposing: true });
@@ -631,8 +685,8 @@ for (const degenerateBounds of [{ minX: 10, minY: 20, maxX: 10, maxY: 70 }, { mi
 }
 geometryFrame = committedFrame; geometry.host.sceneToClientPoint = originalFrameProject; geometry.updateGeometry();
 
-// A rotated textbox's Shift resize follows its own local axes and the same
-// preview transform, while keeping glyph size unchanged.
+// A rotated textbox's Shift resize follows its own local axes, scaling the
+// content by the same affine matrix during preview and after release.
 const pageOrigin = { x: 40, y: 60 }, rotatedText = { ...textModel, transform: initialOrientedFrame.transform };
 resizeFrame = { bounds: resizeBounds, transform: [...rotatedText.transform] };
 resizeFrame.transform[4] += pageOrigin.x; resizeFrame.transform[5] += pageOrigin.y;
@@ -641,10 +695,10 @@ const rotatedStart = editorFrameCorners(resizeFrame)[1], rotatedTarget = transfo
 await resizing.pointerDown(resizeEvent(rotatedStart.x, rotatedStart.y));
 resizing.pointerMove(resizeEvent(rotatedTarget.x, rotatedTarget.y, { shiftKey: true }));
 const rotatedPreview = resizePreviews.at(-1); resizing.pointerUp(resizeEvent(rotatedTarget.x, rotatedTarget.y, { shiftKey: true }));
-const rotatedPatch = resizeUpdates.at(-1).patch, resizedRotatedText = { ...rotatedText, ...rotatedPatch };
-near(resizedRotatedText.width, 200, "rotated Shift textbox width"); near(resizedRotatedText.height, 25, "rotated Shift textbox height"); assert.equal(resizedRotatedText.fontSize, 12);
-const oldTextCorners = textCorners(rotatedText, pageOrigin), newTextCorners = textCorners(resizedRotatedText, pageOrigin);
-oldTextCorners.forEach((corner, index) => { const expected = transformPoint(rotatedPreview, corner); near(newTextCorners[index].x, expected.x, "rotated Shift preview/commit X"); near(newTextCorners[index].y, expected.y, "rotated Shift preview/commit Y"); });
+nearMatrix(resizeCommits.at(-1), rotatedPreview, "rotated Shift textbox preview and committed content scale agree");
+const resizedRotatedFrame = { ...resizeFrame, transform: composeMatrices(resizeCommits.at(-1), resizeFrame.transform) }, resizedRotatedSize = editorFrameSize(resizedRotatedFrame);
+near(resizedRotatedSize.width, 200, "rotated Shift scaled textbox width"); near(resizedRotatedSize.height, 25, "rotated Shift scaled textbox height");
+assert.equal(resizeUpdates.length, 0, "rotated text appearance scales through its transform without rewrapping");
 
 const forcedPageCalls = [];
 resizeFrame = { bounds: resizeBounds, transform: IDENTITY, pageIndex: 4 }; resizeSelection = ["first", "second"];
@@ -664,6 +718,7 @@ let numericFrame = initialOrientedFrame;
 const numericMatrices = [], numericNudges = [];
 const numeric = editorUiTestContext({ ...frameHelpers, activeText: null, pointer: null, currentState: { selection: ["numeric"] }, rotationDraft: null,
   document: rotationDocument, query: () => rotationInput, session: { sourceScene: {}, getSelectionFrame: () => numericFrame,
+  getSelection: () => ["numeric"], getObject: () => ({ id: "numeric", kind: "shape" }),
   getSelectionBounds() { const corners = editorFrameCorners(numericFrame); return { minX: Math.min(...corners.map(point => point.x)), minY: Math.min(...corners.map(point => point.y)), maxX: Math.max(...corners.map(point => point.x)), maxY: Math.max(...corners.map(point => point.y)) }; } },
   commit: change => change(), interaction: { applyTransform(matrix) { numericMatrices.push(Array.from(matrix)); numericFrame = { ...numericFrame, transform: composeMatrices(matrix, numericFrame.transform) }; },
     nudge(x, y) { numericNudges.push([x, y]); } } });

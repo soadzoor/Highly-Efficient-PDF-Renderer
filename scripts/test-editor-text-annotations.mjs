@@ -158,6 +158,8 @@ try {
     for (const payload of [{ version: 2, object: model }, { version: 1, object: { ...model, fontSize: -1 } },
       { version: 1, object: { ...model, transform: [0, 0, 0, 0, 0, 0] } },
       { version: 1, object: { ...model, fontStyle: ["italic"] } },
+      { version: 1, object: { ...model, backgroundColor: { r: 1, g: 1, b: 0 } } },
+      { version: 1, object: { ...model, runs: [{ text: "Bad", backgroundColor: "url(https://invalid.example/)" }] } },
       { version: 1, object: { ...model, runs: [{ text: "Bad", color: "url(https://invalid.example/)" }] } }]) {
       const writer = new NativePdfWriter(sourceDocument), dictionary = new Map(original);
       dictionary.set("HEPRText", pdfTextValue(JSON.stringify(payload))); writer.set(ref, dictionary);

@@ -47,7 +47,15 @@ input.hepr-editor-field[data-pdf-appearance=true]:not([data-pdf-pending=true])[t
 input.hepr-editor-field[data-pdf-pending=true][type=checkbox],input.hepr-editor-field[data-pdf-pending=true][type=radio]{background-color:#eff6ff}
 input.hepr-editor-field[type=checkbox]:focus-visible,input.hepr-editor-field[type=radio]:focus-visible{outline:1px solid #1765d7;outline-offset:1px}
 input.hepr-editor-field,textarea.hepr-editor-field{cursor:text}select.hepr-editor-field{cursor:default}input.hepr-editor-field[type=checkbox],input.hepr-editor-field[type=radio]{cursor:pointer}
-.hepr-editor-text-input{position:absolute;box-sizing:border-box;background:#fffffff0;border:1px solid #1765d7;color:#111;outline:none;padding:2px;transform-origin:top left;overflow:visible;cursor:text;pointer-events:auto;line-height:1.2}
+/* Keep editable line breaking when the applied draft waits for its rendered frame. */
+.hepr-editor-text-input{position:absolute;box-sizing:border-box;background:#fffffff0;border:0;color:#111;outline:1px solid #1765d7;padding:0;transform-origin:top left;overflow:visible;overflow-wrap:break-word;-webkit-line-break:after-white-space;cursor:text;pointer-events:auto;line-height:1.2}
+.hepr-editor-text-input div,.hepr-editor-text-input p{margin:0;padding:0}
+.hepr-editor-text-backdrop{position:absolute;background:#fff;transform-origin:top left;pointer-events:none}
+.hepr-editor-text-resize-controls{position:absolute;inset:0;pointer-events:none;z-index:1}
+.hepr-editor-text-resize-controls[hidden]{display:none}
+.hepr-editor-text-resize-handle{position:absolute;box-sizing:border-box;width:10px;height:10px;padding:0;border:1px solid #1765d7;border-radius:0;background:#fff;transform:translate(-50%,-50%);pointer-events:auto;touch-action:none}
+.hepr-editor-text-resize-handle:hover,.hepr-editor-text-resize-handle:active{background:#fff}
+.hepr-editor-text-resize-handle:focus-visible{outline:2px solid #1765d7;outline-offset:2px}
 .hepr-editor-signature-dialog{border:1px solid #b6c3d4;border-radius:10px;padding:18px;max-width:min(760px,90vw);font:14px system-ui,sans-serif;color:#172333}.hepr-editor-signature-dialog::backdrop{background:#17233366}
 .hepr-editor-signature-dialog h2{margin:0 0 14px;font-size:20px}.hepr-editor-signature-dialog canvas{display:block;box-sizing:border-box;width:100%;height:auto;aspect-ratio:3/1;background:#fff;border:0;outline:1px solid #aab8ca;outline-offset:-1px;margin-top:10px;touch-action:none;cursor:crosshair}
 .hepr-editor-signature-library{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;max-height:240px;overflow:auto;margin-bottom:10px}
@@ -105,6 +113,6 @@ input.hepr-editor-field,textarea.hepr-editor-field{cursor:text}select.hepr-edito
 @media(pointer:coarse){.hepr-editor-layer-columns,.hepr-editor-layer-row{grid-template-columns:36px minmax(0,1fr) 32px 32px}.hepr-editor-layer-row{min-height:44px}.hepr-editor-layer-row>.hepr-editor-layer-grip{align-self:stretch;min-height:40px}.hepr-editor-layer-row>input[type=checkbox]{width:20px;height:20px}}
 .hepr-editor-alignment-guide{stroke:#d927a0;stroke-width:1;stroke-dasharray:5 3;pointer-events:none}
 .hepr-editor-review-selection{fill:#1684ff;fill-opacity:.25;pointer-events:none}
-.hepr-editor-overlay[data-tool="highlight"],.hepr-editor-overlay[data-tool="select-text"]{cursor:text}
+.hepr-editor-overlay[data-tool="select-text"]{cursor:text}
 .hepr-editor-overlay[data-tool="comment"]{cursor:crosshair}
 .hepr-editor-toolbar [data-recovery-status]{font-size:11px;color:#475569;max-width:25em;overflow-wrap:anywhere}
