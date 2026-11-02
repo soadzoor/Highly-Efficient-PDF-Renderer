@@ -138,6 +138,24 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
+- Refresh Reader thumbnails only for affected edit pages in the native and
+  Three.js viewers, including shared form widgets and undo/redo. Retain unaffected
+  sidebar images and pending jobs, keep changed thumbnails until replacements
+  arrive, and skip refreshes for metadata, gesture previews and display residency.
+- Enable Color and Fill color changes on existing PDF/HEP vector artwork and
+  text, including groups, gradients and source copies. Retain opacity, clipping,
+  masks and unrelated shared resources; preserve colors through transforms,
+  Undo/Redo, copying, local recovery and editable PDF/HEP saves. Retain complete
+  form-text recolors when typing regenerates appearances. Keep image pixels
+  and mask-only paint excluded from vector color controls.
+  Bind pending Color/Fill picker changes to their original selection and chosen
+  RGB so selecting another object cannot discard or redirect the change. Preview
+  picker changes live through temporary native/Three RGB overrides, retaining
+  stroke/fill roles through outlined strokes and arrowheads. Coalesce input bursts
+  without changing document state or history; commit the final choice in one Undo
+  step, including saving and mode/tool changes. Escape restores the original paint;
+  returning to the original color adds no Undo step. Custom UI hosts can supply a
+  preview callback or use the coalesced compiled-scene fallback.
 - Render nonsymbolic embedded TrueType subsets with Macintosh Roman character
   maps, restoring spaces, digits and letters that appeared as rectangles.
   Translate PDF encodings and glyph-name differences without changing text

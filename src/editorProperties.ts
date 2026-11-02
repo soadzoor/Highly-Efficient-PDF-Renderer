@@ -16,8 +16,13 @@ export function editorSelectionLeaves(session: EditorSession, ids = session.getS
   }
   ids.forEach(visit); return leaves;
 }
-export function editorSupportsAppearance(object: EditorObject, property: EditorAppearanceProperty): boolean {
-  if (object.kind === "source" || object.kind === "group") return false;
+export function editorSupportsAppearance(object: EditorObject, property: EditorAppearanceProperty, session?: EditorSession): boolean {
+  if (object.kind === "group") return false;
+  if (object.kind === "source") {
+    if (property !== "color" && property !== "fill") return false;
+    return session ? session.getObjectPaintColors(object.id)[property].length > 0 : property === "color" ? object.primitives.some(ref => ref.kind !== "raster")
+      : object.primitives.some(ref => ref.kind === "fill" || ref.kind === "gradient-fill");
+  }
   if (textProperties.has(property)) return object.kind === "text";
   if (property === "color") return object.kind !== "image";
   if (property === "strokeWidth") return object.kind === "shape" || object.kind === "ink" || object.kind === "signature";
@@ -25,14 +30,14 @@ export function editorSupportsAppearance(object: EditorObject, property: EditorA
     ["rectangle", "ellipse", "polygon"].includes(object.shape);
 }
 export function editorPropertySelection(session: EditorSession, property: EditorAppearanceProperty, ids = session.getSelection()): string[] {
-  return editorSelectionLeaves(session, ids).filter(object => !session.isObjectLocked?.(object.id) && editorSupportsAppearance(object, property)).map(object => object.id);
+  return editorSelectionLeaves(session, ids).filter(object => !session.isObjectLocked?.(object.id) && editorSupportsAppearance(object, property, session)).map(object => object.id);
 }
 export function editorPropertyColor(value: unknown): string {
   const color = normalizePrimitiveColor((value ?? "#111111") as Parameters<typeof normalizePrimitiveColor>[0]);
   return `#${color.map(channel => Math.round(channel * 255).toString(16).padStart(2, "0")).join("")}`;
 }
-export function editorPropertyState(session: EditorSession, property: EditorAppearanceProperty) {
-  const leaves = editorSelectionLeaves(session), supported = leaves.filter(object => !session.isObjectLocked?.(object.id) && editorSupportsAppearance(object, property));
+export function editorPropertyState(session: EditorSession, property: EditorAppearanceProperty, ids = session.getSelection()) {
+  const leaves = editorSelectionLeaves(session, ids), supported = leaves.filter(object => !session.isObjectLocked?.(object.id) && editorSupportsAppearance(object, property, session));
   const fallback = (object: EditorObject): unknown => {
     const value = (object as unknown as Record<string, unknown>)[property];
     if (property === "color") return editorPropertyColor(value);
@@ -45,16 +50,19 @@ export function editorPropertyState(session: EditorSession, property: EditorAppe
     if (property === "underline" || property === "strikethrough") return value ?? false;
     return value;
   };
-  const values = supported.flatMap(object => object.kind === "text" && object.runs?.length && property !== "align"
-    ? object.runs.map(run => fallback({ ...object, ...Object.fromEntries(Object.entries(run).filter(([, value]) => value !== undefined)) } as EditorTextObject)) : [fallback(object)]);
+  const values = supported.flatMap(object => object.kind === "source"
+    ? session.getObjectPaintColors(object.id)[property as "color" | "fill"].map(editorPropertyColor)
+    : object.kind === "text" && object.runs?.length && property !== "align"
+      ? object.runs.map(run => fallback({ ...object, ...Object.fromEntries(Object.entries(run).filter(([, value]) => value !== undefined)) } as EditorTextObject)) : [fallback(object)]);
   return { ids: supported.map(object => object.id), total: leaves.length, values,
     mixed: values.some(value => value !== values[0]), value: values[0] };
 }
-/** One undoable change applies only supported properties to authored leaves. */
+/** One undoable change applies only supported properties to selection leaves. */
 export function applyEditorPropertyPatch(session: EditorSession, patch: Partial<EditorObject>, ids = session.getSelection()): number {
   const updates = editorSelectionLeaves(session, ids).flatMap(object => {
     if (session.isObjectLocked?.(object.id)) return [];
-    const supported = Object.fromEntries(appearanceProperties.filter(key => Object.hasOwn(patch, key) && editorSupportsAppearance(object, key))
+    const supported = Object.fromEntries(appearanceProperties.filter(key => Object.hasOwn(patch, key) && editorSupportsAppearance(object, key, session) &&
+      !(object.kind === "source" && key === "fill" && (patch as Record<string, unknown>).fill == null))
       .map(key => [key, (patch as Record<string, unknown>)[key]]));
     if (!Object.keys(supported).length) return [];
     return [{ id: object.id, patch: object.kind === "text" ? { ...supported,
@@ -69,7 +77,7 @@ export function validateEditorOpacity(value: number): number {
   return value;
 }
 
-/** Original page content retains its source appearance; authored objects expose style controls. */
+/** Opacity controls remain limited to authored objects. Source color edits retain paint alpha. */
 export function editorStyledSelection(session: EditorSession, ids = session.getSelection()): string[] {
   const visited = new Set<string>(), result: string[] = [];
   function visit(id: string): void {
@@ -93,7 +101,7 @@ export function applyEditorOpacity(session: EditorSession, opacity: number): voi
 
 export function editorFillSelection(session: EditorSession, styled = editorStyledSelection(session)): string[] {
   return styled.filter(id => {
-    return editorSupportsAppearance(session.getObject(id), "fill");
+    return editorSupportsAppearance(session.getObject(id), "fill", session);
   });
 }
 

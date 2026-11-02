@@ -1,6 +1,6 @@
 import type { Bounds, VectorClipPath, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { composeOverlappingVectorScenes } from "./pdfVectorExtractor";
-import { editorPaintIdentity, setEditorPaintIdentity, retainEditorPaintIdentity, remapEditorPaintIdentity, composeEditorPaintIdentity } from "./editorPaintIdentity";
+import { editorPaintIdentity, setEditorPaintIdentity, retainEditorPaintIdentity, remapEditorPaintIdentity, composeEditorPaintIdentity, editorPaintRole, setEditorPaintRole } from "./editorPaintIdentity";
 import type { PrimitiveKind, PrimitiveRef } from "./scenePrimitives";
 import { getScenePrimitive, getPrimitiveClipChain, getPrimitiveSegmentClipBounds, getSceneAnnotationRuns, validatePrimitiveRef } from "./scenePrimitives";
 import { transformAnnotationGeometry, transformAnnotationPoints } from "./annotationData";
@@ -13,6 +13,7 @@ import { buildNativeGlyphStroke } from "./pdf/nativeGlyphStroke";
 import { rasterRepeatMatrix } from "./rasterRepeat";
 import type { EditorAnnotationEdit, EditorMatrix, EditorSourceEdit } from "./editorTypes";
 import type { SceneAnnotation } from "./annotationData";
+import { applyEditorSourceColors } from "./editorSourceColors";
 
 export const EDITOR_IDENTITY: EditorMatrix = [1, 0, 0, 1, 0, 0];
 const annotationTransforms = new WeakMap<VectorScene, ReadonlyMap<string, EditorMatrix>>();
@@ -176,8 +177,16 @@ export function bakeEditorAnnotationEdits(scene: VectorScene, edits: readonly Ed
 /** Copy only arrays written by the edit; the caller's canonical scene stays immutable. */
 export function bakeEditorSourceScene(source: VectorScene, edits: readonly EditorSourceEdit[], signal?: AbortSignal,
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void, wholeScene = false): VectorScene {
+  const colored = applyEditorSourceColors(source, edits);
+  const recoloredGradients = colored.gradientCount !== source.gradientCount;
+  retainEditorAnnotationPlacements(source, colored); source = colored;
   edits = edits.filter(edit => edit.deleted || !editorMatrixIsIdentity(edit.transform));
-  if (!edits.length) return source;
+  if (!edits.length) {
+    if (!recoloredGradients) return source;
+    const counts = scenePrimitiveCounts(source), keep = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind =>
+      [kind, new Set(Array.from({ length: counts[kind] }, (_, index) => index))])) as Record<PrimitiveKind, Set<number>>;
+    return compactEditorScene(source, keep);
+  }
   const scene: VectorScene = { ...source, rasterLayers: source.rasterLayers.slice(), clipPaths: source.clipPaths?.slice(),
     retainedPages: source.retainedPages?.slice(), pagePrimitiveRanges: undefined };
   const detached = new Set<keyof VectorScene>();
@@ -402,11 +411,13 @@ export function bakeEditorSourceScene(source: VectorScene, edits: readonly Edito
   const kept = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind => [kind, new Set<number>()])) as Record<PrimitiveKind, Set<number>>;
   for (const run of runs) for (let index = run.first; index < run.first + run.count; index++) kept[run.kind].add(index);
   const identity = editorPaintIdentity(source), replacementsByIdentity = new Map<string, string>();
+  const role = editorPaintRole(source), replacementRoles = new Map<string, ReturnType<typeof role>>();
   for (const [original, refs] of replacements) {
-    const [kind, index] = original.split(":"); const owner = identity({ kind: kind as PrimitiveKind, index: Number(index) });
-    for (const ref of refs) replacementsByIdentity.set(editorRefKey(ref), owner);
+    const [kind, index] = original.split(":"), ref = { kind: kind as PrimitiveKind, index: Number(index) }, owner = identity(ref), paintRole = role(ref);
+    for (const ref of refs) { replacementsByIdentity.set(editorRefKey(ref), owner); replacementRoles.set(editorRefKey(ref), paintRole); }
   }
   setEditorPaintIdentity(scene, ref => replacementsByIdentity.get(editorRefKey(ref)) ?? identity(ref));
+  setEditorPaintRole(scene, ref => replacementRoles.has(editorRefKey(ref)) ? replacementRoles.get(editorRefKey(ref))! : role(ref));
   const compacted = compactEditorScene(scene, kept, owners);
   if (outlinedApproximation) {
     const diagnostic: PdfDiagnostic = { code: "editor.stroke-outline-approximation", severity: "warning",

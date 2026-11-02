@@ -24,6 +24,9 @@ export function editorUiTestContext(values = {}) {
     recoveryDialog: null, recoveryRunning: false, discardRecovery: false, exportedRevision: null,
     cameraPan: { cancel() {}, isPanning: () => false, setActive() {}, dispose() {} },
     fieldActivation: { pointerDown() {}, pointerMove() {}, pointerUp: () => null, reset() {} }, canActivateField: () => false,
+    colorDraft: null, colorChangeHandled: new WeakSet(), stageColorDraft: () => false, flushColorDraft() {},
+    queueColorPreview() {}, stopColorPreview() {}, colorPreviewApplied: false, colorPreviewFallback: false, colorPreviewRestore: null,
+    committedPageChanges: undefined, captureEditorPageChanges: () => undefined, changedEditorPages: () => undefined,
     updateAppearanceControls() {}, ...values
   });
 }

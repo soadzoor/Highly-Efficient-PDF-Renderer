@@ -7,6 +7,7 @@ import { invertEditorMatrix, multiplyEditorMatrices } from "./editorScene";
 import { editorOperationPageTargets, rebaseEditorOrderedSource, type EditorRebasedObjectIds } from "./editorPageOrderRebase";
 import { editorClipboardStore, shareEditorClipboard, getEditorCapturedSourceScene, registerEditorCapturedSourceReader } from "./editorClipboard";
 import { editorSourceLinks, registerEditorLinkRebinder, rebindEditorLinkTarget } from "./editorLinks";
+import { captureEditorPageChanges, registerEditorPageChangesReader } from "./editorPageChanges";
 
 export interface EditorDocumentVersion { session: EditorSession; options: EditorSessionOptions }
 interface Version extends EditorDocumentVersion { observedRevision: number; unsubscribe: () => void }
@@ -151,6 +152,7 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
     get revision() { return revision; }, getState,
     getObjects: options => { assertLive(); return current.version.session.getObjects(options); },
     getObject: id => { assertLive(); return current.version.session.getObject(id); },
+    getObjectPaintColors: id => { assertLive(); return current.version.session.getObjectPaintColors(id); },
     isObjectLocked: id => { assertLive(); return current.version.session.isObjectLocked(id); },
     setObjectsLocked: (ids, locked) => { assertLive(); current.version.session.setObjectsLocked(ids, locked); },
     getObjectLink: id => { assertLive(); return current.version.session.getObjectLink(id); },
@@ -326,6 +328,7 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
     }
   };
   shareEditorClipboard(initial.session, session);
+  registerEditorPageChangesReader(session, () => { assertLive(); return captureEditorPageChanges(current.version.session); });
   registerEditorCapturedSourceReader(session, id => getEditorCapturedSourceScene(current.version.session, id));
   registerEditorLinkRebinder(session, (previous, replacement) => { assertLive(); rebindEditorLinkTarget(current.version.session, previous, replacement); });
   return session;

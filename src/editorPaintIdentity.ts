@@ -5,6 +5,15 @@ import { PAGE_PRIMITIVE_KINDS, scenePrimitiveCounts } from "./scenePageViews";
 
 type Resolver = (ref: PrimitiveRef) => string;
 const identities = new WeakMap<VectorScene, Resolver>();
+export type EditorPaintRole = "color" | "fill" | null;
+type RoleResolver = (ref: PrimitiveRef) => EditorPaintRole;
+const roles = new WeakMap<VectorScene, RoleResolver>();
+const defaultRole: RoleResolver = ref => ref.kind === "raster" ? null : ref.kind === "fill" || ref.kind === "gradient-fill" ? "fill" : "color";
+/** Rendering-only paint roles survive outlined strokes and never enter PDF/HEP data. */
+export function editorPaintRole(scene: VectorScene): RoleResolver {
+  return roles.get(scene) ?? defaultRole;
+}
+export function setEditorPaintRole(scene: VectorScene, resolver: RoleResolver): void { roles.set(scene, resolver); }
 export const editorAuthoredOwner = (id: string): string => `object:${JSON.stringify(id)}`;
 export const editorCloneOwner = (id: string, original: string): string => `clone:${JSON.stringify([id, original])}`;
 export function editorPaintOwnerObject(owner: string): string | undefined {
@@ -38,17 +47,26 @@ export function setEditorPaintIdentity(scene: VectorScene, resolver: Resolver | 
 }
 export function retainEditorPaintIdentity(source: VectorScene, target: VectorScene): void {
   const resolver = identities.get(source); if (resolver && !identities.has(target)) identities.set(target, resolver);
+  const role = roles.get(source); if (role && !roles.has(target)) roles.set(target, role);
 }
 export function remapEditorPaintIdentity(source: VectorScene, target: VectorScene, indices: Record<PrimitiveKind, ArrayLike<number>>): void {
   const resolver = editorPaintIdentity(source);
   identities.set(target, ref => resolver({ kind: ref.kind, index: indices[ref.kind][ref.index] }));
+  const role = editorPaintRole(source);
+  roles.set(target, ref => role({ kind: ref.kind, index: indices[ref.kind][ref.index] }));
 }
 export function composeEditorPaintIdentity(sources: readonly VectorScene[], target: VectorScene): void {
   const resolvers = sources.map(editorPaintIdentity), counts = sources.map(scenePrimitiveCounts);
+  const paintRoles = sources.map(editorPaintRole);
   const ends = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind => { let end = 0; return [kind, counts.map(count => end += count[kind])]; })) as Record<PrimitiveKind, number[]>;
   identities.set(target, ref => {
     const limits = ends[ref.kind]; let low = 0, high = limits.length;
     while (low < high) { const middle = (low + high) >>> 1; if (limits[middle] <= ref.index) low = middle + 1; else high = middle; }
     return resolvers[low]({ kind: ref.kind, index: ref.index - (limits[low - 1] ?? 0) });
+  });
+  roles.set(target, ref => {
+    const limits = ends[ref.kind]; let low = 0, high = limits.length;
+    while (low < high) { const middle = (low + high) >>> 1; if (limits[middle] <= ref.index) low = middle + 1; else high = middle; }
+    return paintRoles[low]({ kind: ref.kind, index: ref.index - (limits[low - 1] ?? 0) });
   });
 }

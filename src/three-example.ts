@@ -5,6 +5,7 @@ import { createThreeLinkNavigation } from "./threeLinkNavigation";
 import { createReaderViewport, type ReaderView } from "./readerViewport";
 import { computeReaderPageRects, readerContentMetrics, readerFitZoom, readerViewFromScroll } from "./readerGeometry";
 import type { VectorScene } from "./pdfVectorExtractor";
+import type { ThumbnailPixels } from "./thumbnailTypes";
 import { getEditorSceneTranslationHint } from "./editorScenePreview";
 import { panEditorReader, editorPerspectivePanDelta } from "./editorHostPan";
 import { createAnnotationOverlay, isLinkAnnotation } from "./annotationOverlay";
@@ -334,6 +335,9 @@ let readerPageRects: Float32Array = new Float32Array();
 let readerNavigationSource: VectorScene | null = null;
 let readerNavigationScene: VectorScene | null = null;
 let readerDocumentIdentity: unknown = null;
+let readerEditorThumbnailScene: VectorScene | null = null;
+let readerEditorThumbnailRenderer: import("./thumbnailRenderer").ThumbnailSceneRenderer | null = null;
+const readerEditorThumbnailPages = new WeakMap<VectorScene, import("./scenePageViews").ScenePageViews>();
 
 // Drawing selection always starts off, even if the browser restores form state.
 textSelectionCheckboxElement.disabled = false;
@@ -527,17 +531,51 @@ const reader = createReaderViewport({
     applyReaderCameraView(view, currentPdfObject);
     requestRender();
   },
-  getPageThumbnail: async (pageIndex, options) => {
-    const object = currentPdfObject;
-    if (!object) throw new DOMException("No document is loaded.", "AbortError");
-    return object.getPageThumbnail(pageIndex, { maxDimension: options.maxDimension, backend: "auto",
-      background: readPageBackgroundColor(), vectorOverride: readVectorOverrideColor(),
-      optionalContent: object.getOptionalContentVisibility() ?? undefined, signal: options.signal });
+  getPageThumbnail: getThreeReaderPageThumbnail,
+  releaseThumbnails: () => {
+    readerEditorThumbnailRenderer?.close(); readerEditorThumbnailRenderer = null;
+    currentPdfObject?.releaseThumbnailRenderer();
   },
-  releaseThumbnails: () => currentPdfObject?.releaseThumbnailRenderer(),
   onFind: () => { setPanelCollapsed(false); textSearchInputElement.focus(); },
   onSettings: () => setPanelCollapsed(!panelElement.classList.contains("collapsed"))
 });
+
+async function getThreeReaderPageThumbnail(pageIndex: number, options: { maxDimension: number; signal: AbortSignal }): Promise<ThumbnailPixels> {
+  while (true) {
+    options.signal.throwIfAborted();
+    const object = currentPdfObject;
+    if (!object) throw new DOMException("No document is loaded.", "AbortError");
+    const committedScene = readerEditorThumbnailScene;
+    if (committedScene) {
+      const [{ ThumbnailSceneRenderer }, { ScenePageViews }] = await Promise.all([
+        import("./thumbnailRenderer"), import("./scenePageViews")
+      ]);
+      options.signal.throwIfAborted();
+      let pages = readerEditorThumbnailPages.get(committedScene);
+      if (!pages) { pages = new ScenePageViews(committedScene); readerEditorThumbnailPages.set(committedScene, pages); }
+      readerEditorThumbnailRenderer ??= new ThumbnailSceneRenderer();
+      // The displayed object can contain an uncommitted transform preview.
+      // A committed snapshot also keeps unaffected jobs alive across replacements.
+      const pixels = await readerEditorThumbnailRenderer.render(pages.extract(pageIndex).scene, {
+        maxDimension: options.maxDimension, backend: "auto", background: readPageBackgroundColor(),
+        vectorOverride: readVectorOverrideColor(), optionalContent: object.getOptionalContentVisibility() ?? undefined
+      }, options.signal);
+      options.signal.throwIfAborted();
+      return pixels;
+    }
+    try {
+      const pixels = await object.getPageThumbnail(pageIndex, { maxDimension: options.maxDimension, backend: "auto",
+        background: readPageBackgroundColor(), vectorOverride: readVectorOverrideColor(),
+        optionalContent: object.getOptionalContentVisibility() ?? undefined, signal: options.signal });
+      options.signal.throwIfAborted();
+      if (object === currentPdfObject) return pixels;
+    } catch (error) {
+      // Replacing the displayed object closes its thumbnail renderer too. Keep
+      // an unaffected Reader job alive by retrying against the current object.
+      if (options.signal.aborted || object === currentPdfObject) throw error;
+    }
+  }
+}
 document.querySelector(".reader-primary-controls")?.append(editorModeButton, printPdfButton);
 viewerPrintAction = createViewerPrintAction({ button: printPdfButton, document,
   getDocument: getThreePrintDocument,
@@ -599,13 +637,23 @@ async function ensureThreeEditor(signal?: AbortSignal, setup?: EditorSetupLoadin
       loading.report({ stage: "loading" }); await yieldAfterPaint(controller.signal);
       const { createEditorUi } = await import("./editorUi"); controller.signal.throwIfAborted();
       const { waitForEditorScenePresentation } = await import("./editorPresentation"); controller.signal.throwIfAborted();
+      const { createEditorColorPreviewHost, groupEditorColorPreviewUpdates } = await import("./editorColorPreviewHost"); controller.signal.throwIfAborted();
       const originalSource = { sourceKind: currentPdfObject.sourceKind, sourceBytes: currentPdfObject.sourceBytes,
         sourceOptions: currentPdfObject.sourceOptions };
       let editedSource: typeof originalSource | null = null;
+      const colorPreview = createEditorColorPreviewHost({ getTarget: () => currentPdfObject, getScene: () => currentPdfObject?.sceneData ?? null,
+        apply(target, updates) {
+          for (const group of groupEditorColorPreviewUpdates(updates)) {
+            if (group.color) target.setPrimitiveOverrides(group.refs, { color: group.color });
+            else target.clearPrimitiveOverrides(group.refs);
+          }
+          requestRender();
+        } });
       pdfEditor = await createEditorUi({
         layerControlsContainer: pdfLayersContainer ?? undefined,
         showLayerControls: () => setPanelCollapsed(false),
         getCanvas: () => canvasElement, getScene: () => currentPdfObject?.sceneData ?? null,
+        previewColors: updates => colorPreview.previewColors(updates),
         beginCameraPan() { if (reader.isActive()) reader.cancelActiveGesture(); },
         panCameraByPixels(dx, dy) {
           if (panEditorReader(reader, dx, dy)) return;
@@ -620,14 +668,16 @@ async function ensureThreeEditor(signal?: AbortSignal, setup?: EditorSetupLoadin
           password: currentPdfObject?.sourceOptions?.password, label: currentPdfObject?.sourceLabel ?? "document" }),
         async prepareScene(signal, onProgress) {
           const object = currentPdfObject!; object.pausePageLoading();
-          if (object.sourceKind !== "pdf" || !object.sourceBytes) return object.sceneData;
+          if (object.sourceKind !== "pdf" || !object.sourceBytes) return readerEditorThumbnailScene = object.sceneData;
           const { loadPdfSceneFromSource } = await import("./pdfObjectGenerator");
-          return (await loadPdfSceneFromSource(object.sourceBytes, { ...object.sourceOptions,
+          const prepared = (await loadPdfSceneFromSource(object.sourceBytes, { ...object.sourceOptions,
             compressScans: false, ocrTextOnly: false, segmentMerge: false, invisibleCull: false, pageLoading: "eager",
             onProgress: progress => { if (!signal.aborted && currentPdfObject === object) {
               onProgress?.(progress); setStatus(`Preparing editing data: ${Math.round(progress.value * 100)}%`);
             } }
           }, signal)).scene;
+          signal.throwIfAborted();
+          return readerEditorThumbnailScene = prepared;
         },
         documentChanged(_scene, source) {
           editedSource = source.pdf ? { sourceKind: "pdf", sourceBytes: source.pdf,
@@ -640,15 +690,17 @@ async function ensureThreeEditor(signal?: AbortSignal, setup?: EditorSetupLoadin
           try {
             await waitForLoad(backendChangeCompletion, signal); signal.throwIfAborted();
             const previous = currentPdfObject; if (!previous) throw new DOMException("Document closed.", "AbortError");
-            if (options?.preview && !editedSource && previous.updateEditorPreviewScene(sceneData)) {
+            if (options?.preview && !editedSource && !colorPreview.hasPreview() && previous.updateEditorPreviewScene(sceneData)) {
+              colorPreview.beforeSceneChange();
               requestRender();
               const presentedRenderer = renderer;
-              if (onPresented) await waitForEditorScenePresentation({ signal, onPresented,
+              if (onPresented) await waitForEditorScenePresentation({ signal, onPresented: () => { colorPreview.bind(sceneData, previous.sceneData); onPresented(); },
                 isCurrent: () => renderer === presentedRenderer && currentPdfObject === previous && previous.sceneData === sceneData,
                 subscribe: notify => {
                   pendingRenderedFrameResolvers.push(notify);
                   return () => { const index = pendingRenderedFrameResolvers.indexOf(notify); if (index >= 0) pendingRenderedFrameResolvers.splice(index, 1); };
                 } });
+              else colorPreview.bind(sceneData, previous.sceneData);
               return;
             }
             const snapshot = captureCameraSnapshot();
@@ -660,17 +712,22 @@ async function ensureThreeEditor(signal?: AbortSignal, setup?: EditorSetupLoadin
             try {
               signal.throwIfAborted(); next.position.copy(previous.position); next.quaternion.copy(previous.quaternion); next.scale.copy(previous.scale);
               const layout = await preparePageLayoutReplacement(next, signal); signal.throwIfAborted();
+              colorPreview.beforeSceneChange();
               replacePdfObject(next, { fitCamera: false, pageLayoutView: layout, layout: activePageLayout });
               restoreCameraSnapshot(snapshot);
-              if (!options?.preview) { updateSceneMetrics(next); reader.invalidateThumbnails(); }
+              if (!options?.preview) {
+                readerEditorThumbnailScene = sceneData;
+                updateSceneMetrics(next); reader.invalidateThumbnails(options?.affectedPages);
+              }
               requestRender();
               const presentedRenderer = renderer;
-              if (onPresented) await waitForEditorScenePresentation({ signal, onPresented,
+              if (onPresented) await waitForEditorScenePresentation({ signal, onPresented: () => { colorPreview.bind(sceneData, next.sceneData); onPresented(); },
                 isCurrent: () => renderer === presentedRenderer && currentPdfObject === next,
                 subscribe: notify => {
                   pendingRenderedFrameResolvers.push(notify);
                   return () => { const index = pendingRenderedFrameResolvers.indexOf(notify); if (index >= 0) pendingRenderedFrameResolvers.splice(index, 1); };
                 } });
+              else colorPreview.bind(sceneData, next.sceneData);
             } catch (error) { if (currentPdfObject !== next) next.dispose(); throw error; }
           } finally { editorSceneApplicationActive = false; updateThreeBackendSelectDisabledState(); }
         },
@@ -2257,6 +2314,7 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
     setLoadingProgress(true, "Rendering first frame…");
     loadDiagnostics.checkpoint(activeLoadToken, "first-frame-start");
     replacePdfObject(nextObject, { fitCamera: false, pageLayoutView: pageLayoutReplacement, layout: layoutSnapshot });
+    if (reparseSource) reader.invalidateThumbnails();
     targetInstalled = true;
     const installedObject = nextObject;
     nextObject = null;
@@ -2351,7 +2409,7 @@ function replacePdfObject(
     lastNativeDrawStats = stats;
     drawCallCounter.recordNativeFrame(stats.drawCalls);
   });
-  if (!sameScene) disposeCurrentObject({ clearMetrics: options.fitCamera !== false });
+  if (!sameScene) disposeCurrentObject({ clearMetrics: options.fitCamera !== false, preserveReaderDocument: options.fitCamera === false });
   currentPdfObject = nextObject;
   if (nextObject.sourceKind === "pdf") {
     loadedCompressScansPreference = compressScansCheckboxElement.checked && !nextObject.sourceOptions?.ocrTextOnly;
@@ -2365,7 +2423,8 @@ function replacePdfObject(
       refreshSearchAvailability();
       if (textSearchInputElement.value.trim()) runSearch(textSearchInputElement.value, false);
     }
-    if (event.reason === "pages-loaded" || event.reason === "raster-ready") reader.invalidateThumbnails();
+    // Page-demand thumbnails use canonical pages independently of display
+    // residency; neither page swaps nor raster readiness change their source.
     requestRender();
   });
   resetPageLayout(options.pageLayoutView);
@@ -2415,7 +2474,7 @@ function releasePdfObject(object: HeprThreePdfObject): void {
   object.dispose();
 }
 
-function disposeCurrentObject(options: { clearMetrics?: boolean } = {}): void {
+function disposeCurrentObject(options: { clearMetrics?: boolean; preserveReaderDocument?: boolean } = {}): void {
   if (!currentPdfObject) {
     return;
   }
@@ -2423,9 +2482,12 @@ function disposeCurrentObject(options: { clearMetrics?: boolean } = {}): void {
   const previousObject = currentPdfObject;
   currentPdfObject = null;
   resetPageLayout();
-  reader.setLayout("grid");
-  reader.setDocument({ identity: null, pageRects: new Float32Array() });
-  readerPageRects = new Float32Array();
+  if (!options.preserveReaderDocument) {
+    readerEditorThumbnailScene = null;
+    reader.setLayout("grid");
+    reader.setDocument({ identity: null, pageRects: new Float32Array() });
+    readerPageRects = new Float32Array();
+  }
   readerNavigationSource = readerNavigationScene = null;
   layerControls.objectChanged();
   drawingSelection.sceneChanged();

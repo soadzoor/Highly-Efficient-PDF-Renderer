@@ -33,6 +33,17 @@ uncompressed option and [Node conversion](#node-conversion) for server requireme
 
 ## Editing documents
 
+Select existing vector artwork or text to change **Color**. Use **Fill** to recolor
+existing filled paths separately. Multi-selection and groups support mixed values;
+changes apply to their supported, unlocked members in one undoable step. Original
+opacity, clipping and masks are retained, and saved PDF/HEP files keep the colors.
+Changing a gradient's color retains its alpha and coverage. These controls do not
+recolor imported image pixels or add/remove fills on original page content.
+Picker changes preview live on the selected objects. Only the final color becomes
+an edit, so one Undo restores the previous color. Escape cancels the preview;
+returning to the original color creates no history entry. Clicking another object
+keeps the final choice attached to the objects that were being recolored.
+
 Both viewers start in **View** mode. Choose **Edit** to prepare full-quality
 editing data and show editing tools. A **Loading Edit mode** card appears inside
 the canvas before the editing tools load, even with Settings closed. It remains
@@ -709,6 +720,12 @@ Focus the document viewport to scroll with the arrow keys, Page Up/Down, Home,
 and End; editing the page number, zoom, or search field keeps normal input behavior.
 Reader can also be selected for single-page documents, which retain their
 existing default view.
+
+Editing refreshes thumbnails only for affected pages, including all pages sharing
+a changed form field. Selection, editing locks, link destinations and temporary
+drag/color previews keep the cached images. A changed page keeps its previous
+thumbnail until the replacement is ready. Page insertion/removal/reordering and
+document-wide appearance changes can refresh the whole sidebar.
 
 The demos retain **Grid**, and the Three demo also retains **Sphere** and
 **Helix**. Switching back to Reader restores its zoom and reading position.

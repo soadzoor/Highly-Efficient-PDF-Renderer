@@ -62,12 +62,20 @@ export function createThreePdfLayerControls(options: ThreePdfLayerControlsOption
     controls.setEnabled(true);
     controls.refresh({ resetFilter: !sameScene });
     if (next) {
+      let previousVisibility = next.getOptionalContentVisibility();
       unsubscribeVisibility = next.subscribeLayerVisibility(snapshot => {
         if (token !== generation || current() !== next) return;
+        const changed = previousVisibility.layers.length !== snapshot.layers.length ||
+          previousVisibility.layers.some((layer, index) => layer.id !== snapshot.layers[index].id || layer.visible !== snapshot.layers[index].visible) ||
+          previousVisibility.conditions.length !== snapshot.conditions.length ||
+          previousVisibility.conditions.some((value, index) => value !== snapshot.conditions[index]);
+        previousVisibility = snapshot;
         for (const listener of listeners) {
           try { listener(snapshot); } catch { /* Isolate panel observers. */ }
         }
-        try { options.onVisibilityChange?.(); } finally { options.requestRender(); }
+        // Display page residency republishes the same visibility while replacing
+        // resources. Keep controls current without dirtying host thumbnails.
+        try { if (changed) options.onVisibilityChange?.(); } finally { options.requestRender(); }
       });
       unsubscribeProgress = next.subscribeLayerVisibilityProgress(percentage => {
         if (token === generation && current() === next) controls.setProgress(percentage);

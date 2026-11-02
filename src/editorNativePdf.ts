@@ -1,10 +1,11 @@
 import { NativePdfDocument } from "./pdf/nativeDocument";
 import { NativePdfWriter, pdfAsciiValue, pdfNameValue, pdfStreamValue, pdfTextValue, pdfNumberValue, serializePdfValue } from "./pdf/nativeWriter";
 import { NativePdfFormAppearanceRegistry, decodePdfString, type NativePdfAnnotationAppearance, type NativePdfForm } from "./pdf/nativeForms";
-import { NativePdfAppearanceSynthesizer } from "./pdf/nativeAppearanceSynthesis";
+import { NativePdfAppearanceSynthesizer, parseDefaultAppearance } from "./pdf/nativeAppearanceSynthesis";
+import { convertDeviceCmykToSrgb } from "./pdf/deviceCmyk";
 import { createBundledStandardFontResolver } from "./standardFontResolver";
 import { isPdfDictionary, isPdfName, isPdfRef, isPdfStream, isPdfString, type PdfDictionary, type PdfRef, type PdfValue } from "./pdf/nativeCos";
-import type { EditorFieldValue, EditorMatrix, EditorObject, EditorPdfSaveOptions, EditorSession, EditorTextObject } from "./editorTypes";
+import type { EditorFieldValue, EditorMatrix, EditorObject, EditorPdfSaveOptions, EditorSession, EditorSourceEdit, EditorTextObject } from "./editorTypes";
 import type { PdfBox } from "./heprDocumentData";
 import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import type { EditorFontRegistry } from "./editorFonts";
@@ -15,7 +16,7 @@ import { editorPoint, editorTransformBounds, invertEditorMatrix, multiplyEditorM
 import { ScenePageViews, PAGE_PRIMITIVE_KINDS } from "./scenePageViews";
 import { getSceneAnnotationRuns, getScenePrimitive } from "./scenePrimitives";
 import { compactEditorScene, bakeEditorSourceScene, transformWholeEditorScene, getEditorAnnotationSource, getEditorAnnotationFrameTransform } from "./editorScene";
-import type { PrimitiveKind } from "./scenePrimitives";
+import type { PrimitiveKind, PrimitiveRef } from "./scenePrimitives";
 import { decodePdfDocEncoding } from "./pdf/nativePdfDocEncoding";
 import { computeNativePdfAnnotationPlacement } from "./pdf/nativeFormGeometry";
 import { createNativeOptionalContentRegistry, nativeOptionalContentSceneIdentities } from "./pdf/nativeOptionalContent";
@@ -224,6 +225,39 @@ function fieldPdfValue(value: EditorFieldValue, type?: string, onValue = "Yes"):
   if (type === "Btn") return pdfNameValue(value === true ? onValue : value === false || value === null ? "Off" : String(value));
   if (Array.isArray(value)) return value.map(item => pdfTextValue(item));
   return value === null ? pdfTextValue("") : pdfTextValue(String(value));
+}
+
+/** Keep a complete field text recolor when a PDF reader regenerates its appearance.
+ * A local override preserves shared values and leaves sibling widgets' defaults alone. */
+async function retainEditorWidgetTextColor(document: NativePdfDocument, annotation: NativePdfAnnotationAppearance, fieldType: string | undefined,
+  refs: readonly PrimitiveRef[], edits: readonly EditorSourceEdit[], dictionary: PdfDictionary, signal?: AbortSignal): Promise<void> {
+  if (annotation.subtype !== "Widget" || !["Tx", "Ch"].includes(fieldType ?? "")) return;
+  const key = (ref: PrimitiveRef): string => `${ref.kind}:${ref.index}`;
+  const colors = new Map(edits.filter(edit => edit.color !== undefined && !edit.deleted).map(edit => [key(edit.ref), normalizePrimitiveColor(edit.color!)]));
+  const uniform = (members: readonly PrimitiveRef[]): readonly [number, number, number] | undefined => {
+    const first = members.length ? colors.get(key(members[0])) : undefined;
+    return first && members.every(ref => { const color = colors.get(key(ref)); return color !== undefined && color.every((channel, index) => Math.abs(channel - first[index]) <= 1e-7); }) ? first : undefined;
+  };
+  const color = uniform(refs.filter(ref => ref.kind === "text")) ?? uniform(refs); if (!color) return;
+  // The save loop reads lightweight annotation records. Resolve only this
+  // widget's DA instead of validating unrelated fields and appearances.
+  let before: Uint8Array | undefined, current: PdfDictionary | undefined = dictionary;
+  const visited = new Set<PdfDictionary>();
+  while (current && !visited.has(current)) {
+    signal?.throwIfAborted(); visited.add(current);
+    const value = await document.resolveValue(current.get("DA"), signal);
+    if (isPdfString(value)) { before = value.bytes; break; }
+    const parent = await document.resolveValue(current.get("Parent"), signal); current = isPdfDictionary(parent) ? parent : undefined;
+  }
+  if (!before) {
+    const form = await document.resolveValue(document.catalog.get("AcroForm"), signal);
+    const value = isPdfDictionary(form) ? await document.resolveValue(form.get("DA"), signal) : undefined;
+    if (isPdfString(value)) before = value.bytes;
+  }
+  before ??= new Uint8Array();
+  const suffix = new TextEncoder().encode(`\n${color.map(pdfNumberValue).join(" ")} rg\n`);
+  const bytes = new Uint8Array(before.length + suffix.length); bytes.set(before); bytes.set(suffix, before.length);
+  dictionary.set("DA", { kind: "string", bytes, hex: false });
 }
 
 interface FieldDecoration { reference: PdfRef; form: Pick<NativePdfForm, "bbox" | "matrix"> }
@@ -520,8 +554,14 @@ export async function applyEditorPdfFields(writer: NativePdfWriter, values: Read
         options.signal?.throwIfAborted();
         const [x0, y0, x1, y1] = logicalAnnotation.rectangle; const width = Math.abs(x1 - x0), height = Math.abs(y1 - y0);
         const selected = Array.isArray(value) ? value.join("\n") : String(value ?? "");
+        let color: EditorTextObject["color"] = 0;
+        if (field.defaultAppearance) try {
+          const components = parseDefaultAppearance(field.defaultAppearance.bytes, annotation).color.components;
+          color = components.length === 1 ? [components[0], components[0], components[0]] : components.length === 3
+            ? [components[0], components[1], components[2]] : convertDeviceCmykToSrgb(components[0], components[1], components[2], components[3]);
+        } catch { /* An invalid DA still permits a readable portable appearance. */ }
         const text: EditorTextObject = { id: name, kind: "text", pageIndex: 0, transform: [1, 0, 0, 1, 0, 0],
-          x: 2, y: 2, width: Math.max(1, width - 4), height: Math.max(1, height - 4), text: selected,
+          x: 2, y: 2, width: Math.max(1, width - 4), height: Math.max(1, height - 4), text: selected, color,
           fontSize: Math.min(12, Math.max(1, height * .6)), align: field.quadding === 1 ? "center" : field.quadding === 2 ? "right" : "left" };
         const imported = await importEditorPdfPage(await editorTextPdf(text, fonts, options.signal), writer, options.signal);
         imported.form.set("BBox", [0, 0, width, height]);
@@ -904,6 +944,8 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
         }
         const pendingAnnotation = annotation.ref ? writer.get(annotation.ref) : undefined;
         const originalDictionary = new Map(isPdfDictionary(pendingAnnotation) ? pendingAnnotation : annotation.dictionary);
+        if (affected.some(edit => edit.color !== undefined)) await retainEditorWidgetTextColor(document, annotation,
+          session.sourceScene.annotations?.find(item => item.id === annotation.id)?.field?.type, refs, affected, originalDictionary, options.signal);
         if (annotation.subtype === "Link" && !annotation.ref && !originalDictionary.has("NM")) originalDictionary.set("NM", pdfTextValue(annotation.id));
         if (lockChanged) originalDictionary.set("F", locked ? originalFlags | 128 : originalFlags & ~128);
         if (annotationEdit?.contents !== undefined) originalDictionary.set("Contents", pdfTextValue(annotationEdit.contents));
@@ -920,7 +962,7 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
         const resolvePending = async (value: PdfValue | undefined): Promise<PdfValue | undefined> => isPdfRef(value)
           ? writer.get(value) ?? await document.resolveValue(value, options.signal) : value;
         const rawAppearances = await resolvePending(originalDictionary.get("AP"));
-        if (annotationEdit && !membershipChanged && isPdfDictionary(rawAppearances)) {
+        if (annotationEdit && !affected.some(edit => edit.color !== undefined) && !membershipChanged && isPdfDictionary(rawAppearances)) {
           const origin = session.sourceScene.pageRects.subarray(pageIndex * 4, pageIndex * 4 + 4);
           const nativeMatrix = computeNativePdfPageGeometry(originalPage).pageMatrix;
           const sourceMatrix = session.sourceScene.pdfPages?.find(page => page.pageIndex === pageIndex)?.pdfToScene

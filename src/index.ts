@@ -335,7 +335,7 @@ export type { PdfAnnotationControls, PdfAnnotationControlsController, PdfAnnotat
 export { createThreePdfLayerControls } from "./threePdfLayerControls";
 export type { ThreePdfLayerControlsOptions } from "./threePdfLayerControls";
 export { isSceneTextCharVisible } from "./optionalContentText";
-export type { PrimitiveColorInput, PrimitiveOverride } from "./primitiveAppearance";
+export type { PrimitiveColorInput, PrimitiveColorUpdate, PrimitiveOverride } from "./primitiveAppearance";
 export { createPrimitiveInteractionController } from "./primitiveInteraction";
 export { createThreePrimitiveInteractionController } from "./threePrimitiveInteraction";
 export type {

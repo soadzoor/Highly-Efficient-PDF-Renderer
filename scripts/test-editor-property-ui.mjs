@@ -36,7 +36,11 @@ try {
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(session.getObject(shape).color, "blue"); assert.equal(session.getObject(shape).strokeWidth, 7); assert.equal(session.getObject(shape).fontSize, undefined);
   assert.equal(session.getObject(text).fontSize, 25); assert.equal(session.getObject(text).fontFamily, "Chosen font");
-  session.select(["source:stroke:0"]); const revision = session.revision; change("color", "green"); context.applyTextStyle("italic"); assert.equal(session.revision, revision, "unsupported source controls create no document change");
+  session.select(["source:stroke:0"]); const revision = session.revision; change("color", "green");
+  assert.equal(session.revision, revision + 1, "source colors commit through the same toolbar handler");
+  assert.deepEqual(session.getObjectPaintColors("source:stroke:0").color, [[0, 128 / 255, 0]]);
+  const coloredRevision = session.revision; context.applyTextStyle("italic"); change("font-size", "22");
+  assert.equal(session.revision, coloredRevision, "unsupported source font controls create no document change");
   context.activeText = { element: { focus() {}, style: {} } }; const saved = session.revision;
   change("align", "right"); change("font-size", "18"); context.applyTextStyle("underline");
   assert.equal(context.activeText.element.style.textAlign, "right"); assert.equal(session.revision, saved); assert.equal(draftChanges, 3, "formatting without DOM typing checkpoints the active draft");

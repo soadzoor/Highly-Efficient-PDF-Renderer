@@ -1,5 +1,5 @@
 import type { EditorSession } from "./editorTypes";
-import { editorPropertyState, type EditorAppearanceProperty } from "./editorProperties";
+import { editorFillSelection, editorPropertyState, type EditorAppearanceProperty } from "./editorProperties";
 
 const controls: readonly [string, EditorAppearanceProperty][] = [["color", "color"], ["stroke", "strokeWidth"], ["fill", "fill"],
   ["font", "fontId"], ["font-size", "fontSize"], ["align", "align"]];
@@ -72,14 +72,16 @@ export function createEditorPropertyControls(options: {
       } else if (name === "color" || name === "fill") { if (!state.mixed && state.value != null) control.value = String(state.value); }
       else control.value = state.mixed ? "" : String(state.value ?? "");
     }
-    const fill = editorPropertyState(options.session, "fill"), flags = fill.values.map(value => value !== null);
-    fillEnabled.disabled = !fill.ids.length; fillEnabled.indeterminate = flags.some(value => value !== flags[0]); fillEnabled.checked = flags[0] ?? false;
+    const fill = editorPropertyState(options.session, "fill"), fillToggles = editorPropertyState(options.session, "fill", editorFillSelection(options.session));
+    const flags = fillToggles.values.map(value => value !== null);
+    fillEnabled.disabled = !fillToggles.ids.length; fillEnabled.indeterminate = flags.some(value => value !== flags[0]);
+    fillEnabled.checked = flags[0] ?? fill.ids.length > 0;
     for (const [name, property] of styles) {
       const state = editorPropertyState(options.session, property), button = options.style(name);
       button.disabled = !state.ids.length; button.setAttribute("aria-pressed", state.mixed ? "mixed" : String(Boolean(state.value)));
     }
     options.note.textContent = !editable.size ? options.session.getSelection().some(id => options.session.isObjectLocked?.(id))
-      ? "This selection is locked. Unlock it to edit." : "This selection supports transforms; appearance controls apply to added objects."
+      ? "This selection is locked. Unlock it to edit." : "This selection supports transforms; color controls apply to text and vector objects."
       : editable.size < total ? `Appearance changes apply to ${editable.size} supported ${editable.size === 1 ? "object" : "objects"} in this selection.` : "";
   } };
 }

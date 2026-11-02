@@ -1090,6 +1090,50 @@ try {
     } finally { reader.dispose(); console.warn = originalWarn; }
   }
   {
+    const env = environment(1000), reader = createReaderViewport(env.options), doc = env.document;
+    const copiesBefore = gpu.copies.length;
+    reader.setDocument({ identity: "edited-book", pageRects: pageRects(3) }); reader.setLayout("reader");
+    await until(() => gpu.copies.length === copiesBefore + 3); await tick();
+    const sidebar = doc.querySelector(".reader-thumbnails"), rows = sidebar.children.slice();
+    const images = rows.map(row => row.querySelector(".reader-thumbnail-image").children[0]);
+    const requestsBefore = env.requests.length;
+    reader.setDocument({ identity: "edited-book", pageRects: pageRects(3) });
+    reader.invalidateThumbnails([]);
+    assert.deepEqual(sidebar.children, rows, "recompiling unchanged page geometry retains the existing sidebar rows");
+    assert.equal(env.requests.length, requestsBefore, "scene updates and empty invalidations do not prepare unchanged pages");
+    const pending = deferred();
+    env.preview = page => page === 1 ? pending.promise : Promise.resolve(pageScene(`edited-${page}`));
+    reader.invalidateThumbnails([1, 1, -1, 1.5, 9]);
+    await until(() => env.requests.length === requestsBefore + 1);
+    const request = env.requests.at(-1);
+    assert.equal(request.page, 1, "selective invalidation ignores duplicate and invalid page indices");
+    assert.equal(rows[1].querySelector(".reader-thumbnail-image").children[0], images[1], "the affected preview remains visible while its replacement is prepared");
+    reader.invalidateThumbnails([0]);
+    reader.setDocument({ identity: "edited-book", pageRects: pageRects(3) });
+    assert.equal(request.signal.aborted, false, "refreshing another page and retaining the document preserves unrelated in-flight work");
+    pending.resolve(pageScene("edited-1"));
+    await until(() => gpu.copies.length === copiesBefore + 5); await tick();
+    assert.deepEqual(env.requests.slice(requestsBefore).map(request => request.page), [1, 0], "only the two affected pages are rendered again");
+    assert.equal(rows[2].querySelector(".reader-thumbnail-image").children[0], images[2], "an unaffected page retains the same canvas");
+    assert(images[2].width > 0, "an unaffected cached image remains allocated");
+    assert.equal(images[0].width, 0); assert.equal(images[1].width, 0, "replaced images release their old backing pixels");
+    assert.deepEqual(rows.slice(0, 2).map(row => row.querySelector(".reader-thumbnail-image").children[0].copiedFrame.tag), ["edited-0", "edited-1"]);
+    reader.dispose();
+  }
+  {
+    const env = environment(1000), pending = deferred(); let first = true;
+    env.preview = page => { if (first) { first = false; return pending.promise; } return Promise.resolve(pageScene(`current-${page}`)); };
+    const reader = createReaderViewport(env.options), copiesBefore = gpu.copies.length;
+    reader.setDocument({ identity: "page-revision", pageRects: pageRects(2) }); reader.setLayout("reader");
+    const stale = env.requests[0]; reader.invalidateThumbnails([0]);
+    assert(stale.signal.aborted, "an affected in-flight page is cancelled");
+    pending.resolve(pageScene("stale-page"));
+    await until(() => gpu.copies.length === copiesBefore + 2);
+    assert.deepEqual(env.requests.map(request => request.page), [0, 0, 1]);
+    assert(gpu.copies.slice(copiesBefore).every(copy => copy.copiedFrame.tag.startsWith("current-")), "a cancelled page generation cannot overwrite its replacement");
+    reader.dispose();
+  }
+  {
     const env = environment(1000), pending = deferred(); let old = true;
     env.preview = page => old ? pending.promise : Promise.resolve(pageScene(`replacement-${page}`));
     const reader = createReaderViewport(env.options), doc = env.document;
@@ -1167,7 +1211,7 @@ try {
       assert.deepEqual([...scene.rasterLayers[0].data], [255,0,0,255], "thumbnail replay preserves canonical document pixels");
     } finally { reader.dispose(); }
   }
-  console.log("Reader viewport: bounded scroll/camera mapping, immediate native scroll scheduling, unchanged toolbar writes, animated internal links, extreme zoom and rounded offsets, toolbar visibility, zoom anchors, sidebar/layout restore, gestures, canvas replacement, lazy thumbnails, cancellation, local failures and GPU-to-2D copies passed.");
+  console.log("Reader viewport: bounded scroll/camera mapping, immediate native scroll scheduling, unchanged toolbar writes, animated internal links, extreme zoom and rounded offsets, toolbar visibility, zoom anchors, sidebar/layout restore, gestures, canvas replacement, lazy thumbnails, page-local refresh, cancellation, local failures and GPU-to-2D copies passed.");
 } finally {
   globalThis.ResizeObserver = previousObserver; delete globalThis.__readerViewportGpu; hooks.deregister();
 }

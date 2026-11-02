@@ -62,6 +62,10 @@ for (const [file, ensureName, discardName, setName] of [
     context.importModule = async specifier => {
       events.push(["import", specifier]);
       if (state.importFailure) throw state.importFailure;
+      if (specifier === "./editorColorPreviewHost") return {
+        createEditorColorPreviewHost: () => ({ previewColors: () => true, beforeSceneChange() {}, bind() {}, hasPreview: () => false }),
+        groupEditorColorPreviewUpdates: () => []
+      };
       if (specifier === "./editorUi") return { createEditorUi: async (host, signal) => {
         hosts.push(host); host.onSetupProgress({ stage: "document" });
         await host.prepareScene(signal, progress => host.onSetupProgress({ stage: "document", value: progress.value }));

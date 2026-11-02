@@ -20,6 +20,8 @@ export interface EditorSelectionFrame {
   pageIndex?: number;
 }
 export type EditorColor = string | number | readonly [number, number, number];
+/** Current vector paint colors; empty lists identify unsupported paint channels. */
+export interface EditorPaintColors { color: readonly EditorColor[]; fill: readonly EditorColor[] }
 export type EditorFieldValue = string | number | boolean | null | readonly string[];
 /** Links are inert descriptions. Only ordinary web/contact URIs and local destinations are authored. */
 export type EditorLink = { type: "url"; url: string } | { type: "object"; objectId: string }
@@ -130,6 +132,10 @@ export interface EditorImageObject extends EditorObjectBase {
 }
 export interface EditorSourceObject extends EditorObjectBase {
   kind: "source";
+  /** Override vector paint RGB on this source copy, retaining its original alpha. */
+  color?: EditorColor;
+  /** Override existing fill paint only; this does not create or remove source fills. */
+  fill?: EditorColor;
   /** A new in-session copy; original source objects omit this flag. */
   isClone?: boolean;
   primitives: readonly PrimitiveRef[];
@@ -140,7 +146,7 @@ export interface EditorSourceObject extends EditorObjectBase {
 /** Child transforms already include group operations; transform retains the group's selection axes. */
 export interface EditorGroupObject extends EditorObjectBase { kind: "group"; children: readonly string[] }
 export type EditorObject = EditorTextObject | EditorShapeObject | EditorInkObject | EditorImageObject | EditorSourceObject | EditorGroupObject;
-export interface EditorSourceEdit { ref: PrimitiveRef; transform: EditorMatrix; deleted: boolean }
+export interface EditorSourceEdit { ref: PrimitiveRef; transform: EditorMatrix; deleted: boolean; color?: EditorColor }
 export interface EditorAnnotationEdit { id: string; transform: EditorMatrix; deleted: boolean; contents?: string; author?: string }
 export type EditorObjectInput = EditorObject extends infer T ? T extends EditorObject
   ? Omit<T, "id" | "transform"> & { id?: string; transform?: EditorMatrix } : never : never;
@@ -244,6 +250,8 @@ export interface EditorSession {
   /** Source primitives are materialized only when explicitly requested or selected. */
   getObjects(options?: { pageIndex?: number; includeSource?: boolean }): readonly EditorObject[];
   getObject(id: string): EditorObject;
+  /** Read current vector paint, including original content, gradients and source copies. */
+  getObjectPaintColors(id: string): EditorPaintColors;
   isObjectLocked(id: string): boolean;
   /** Undoable editing locks; unlocking remains available on locked selections. */
   setObjectsLocked(ids: readonly string[], locked: boolean): void;
@@ -260,6 +268,7 @@ export interface EditorSession {
   selectAnnotations(ids: readonly string[], options?: { additive?: boolean; toggle?: boolean }): void;
   selectArea(bounds: Bounds, options?: { additive?: boolean; intersects?: boolean; pageIndex?: number }): void;
   addObject(object: EditorObjectInput): string;
+  /** Original source content accepts color/fill patches; geometry uses selection transforms. */
   updateObject(id: string, patch: Partial<EditorObject>): void;
   /** Matrix is a delta in composed scene coordinates, about the caller's chosen pivot. */
   transformSelection(matrix: EditorMatrix): void;

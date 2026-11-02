@@ -34,6 +34,7 @@ function nativeFixture() {
   });
   const originalRenderer = makeRenderer("original"), loader = { close() { calls.push(["closeLoader"]); } };
   const context = vm.createContext({ AbortController, DOMException, Uint8Array, waitForLoad, waitForEditorScenePresentation,
+    colorPreview: { beforeSceneChange() { calls.push(["clearColor"]); }, bind(...args) { calls.push(["bindColor", ...args]); } },
     renderer: originalRenderer, backendSwitcher: { runWhenIdle(callback) { calls.push(["backendWait"]); return (state.backendGate?.promise ?? Promise.resolve()).then(callback); } },
     editorSceneApplicationActive: false, updateBackendSelectDisabledState() { calls.push(["busy", context.editorSceneApplicationActive]); },
     nativeLayout: "reader", editSourceLayout: "reader", canonicalPagesPerRow: 2, editSourceScene: initial, initialEditScene: initial, originalLayout: "reader",
@@ -43,10 +44,10 @@ function nativeFixture() {
     ScenePageViews: class { constructor(scene) { this.pages = scene.pages ?? [scene]; this.pageCount = this.pages.length; calls.push(["partition", scene]); } extract(index) { return { scene: this.pages[index] }; } },
     composeVectorScenesInGrid(pages, columns) { calls.push(["grid", pages, columns]); return { id: "canonical", pages }; },
     composeVectorScenesInColumn(pages) { calls.push(["column", pages]); return { id: "reader", pages }; },
-    readerViewport: { snapshot() { calls.push(["snapshot"]); return view; }, restore(value) { assert.equal(value, view); calls.push(["restore"]); }, invalidateThumbnails() { calls.push(["thumbnails"]); } },
+    readerViewport: { snapshot() { calls.push(["snapshot"]); return view; }, restore(value) { assert.equal(value, view); calls.push(["restore"]); }, invalidateThumbnails(pages) { calls.push(["thumbnails", pages]); } },
     updateNativePresentation(...args) { calls.push(["presentation", ...args]); }, setDownloadPdfButtonState() { calls.push(["download"]); },
     textSearchController: { setScene(scene) { calls.push(["searchGeometry", scene]); } },
-    applyTextSearchScene(scene) { calls.push(["searchLayers", scene]); }, onRendererFrame() { calls.push(["frame"]); }
+    applyTextSearchScene(scene, pages) { calls.push(["searchLayers", scene]); context.readerViewport.invalidateThumbnails(pages); }, onRendererFrame() { calls.push(["frame"]); }
   });
   vm.runInContext(nativeSource, context);
   return { context, calls, count, state, initial, originalPages, originalRenderer, makeRenderer,
@@ -63,7 +64,9 @@ for (const eligible of [true, false]) {
   for (const name of ["partition", "grid", "column", "searchLayers", "thumbnails", "closeLoader", "presentation"]) assert.equal(f.count(name), 0, `native preview skips ${name}`);
   assert.equal(f.context.documentPageScenes, f.originalPages); assert.equal(f.context.lastCanonicalScene, f.initial);
   assert.equal(f.context.lastParsedScene, next); assert.equal(f.count("searchGeometry"), 1, "lightweight search geometry follows the visible pose");
+  assert.equal(f.count("clearColor"), 1); assert.equal(f.count("bindColor"), 0, "color previews wait for this upload's acknowledged frame");
   f.frame(); await work; assert.equal(ack, 1); assert.equal(f.count("frame"), 1); assert.equal(f.context.editorSceneApplicationActive, false);
+  assert.equal(f.count("bindColor"), 1);
   assert.equal(f.originalRenderer.listener, f.context.onRendererFrame, "the transient listener restores the ordinary frame callback");
 }
 {
@@ -104,7 +107,7 @@ for (const mismatch of ["renderer", "scene", "abort"]) {
 }
 
 function threeFixture() {
-  const calls = [], state = { eligible: true, createGate: null }, options = { textLod: "auto", vectorLod: "auto", backend: "webgl" };
+  const calls = [], state = { eligible: true, createGate: null, colorActive: false }, options = { textLod: "auto", vectorLod: "auto", backend: "webgl" };
   const count = name => calls.filter(call => call[0] === name).length;
   const makeObject = label => ({ label, sceneData: { id: label }, sourceKind: "pdf", sourceLabel: "document", sourceBytes: Uint8Array.of(1), sourceOptions: { password: "old" },
     position: { copy() { calls.push(["position"]); } }, quaternion: { copy() { calls.push(["quaternion"]); } }, scale: { copy() { calls.push(["scale"]); } },
@@ -112,7 +115,9 @@ function threeFixture() {
   });
   const original = makeObject("original");
   const context = vm.createContext({ AbortController, DOMException, Uint8Array, waitForLoad, waitForEditorScenePresentation,
+    colorPreview: { hasPreview: () => state.colorActive, beforeSceneChange() { calls.push(["clearColor"]); state.colorActive = false; }, bind(...args) { calls.push(["bindColor", ...args]); } },
     editorSceneApplicationActive: false, backendChangeCompletion: Promise.resolve(), currentPdfObject: original, editedSource: null,
+    readerEditorThumbnailScene: original.sceneData,
     originalSource: { sourceKind: original.sourceKind, sourceBytes: original.sourceBytes, sourceOptions: original.sourceOptions }, renderer: {},
     updateThreeBackendSelectDisabledState() { calls.push(["busy", context.editorSceneApplicationActive]); }, requestRender() { calls.push(["render"]); },
     pendingRenderedFrameResolvers: [], captureCameraSnapshot() { calls.push(["captureCamera"]); return {}; }, restoreCameraSnapshot() { calls.push(["restoreCamera"]); },
@@ -120,7 +125,7 @@ function threeFixture() {
     async createThreePdfObject(input, received, signal) { calls.push(["create", input, received]); if (state.createGate) await state.createGate.promise; signal.throwIfAborted(); const next = makeObject("next"); next.sceneData = input.scene; return next; },
     async preparePageLayoutReplacement(next) { calls.push(["layout", next]); return {}; },
     replacePdfObject(next) { calls.push(["replace", next]); context.currentPdfObject = next; }, activePageLayout: "reader",
-    updateSceneMetrics() { calls.push(["metrics"]); }, reader: { invalidateThumbnails() { calls.push(["thumbnails"]); } }
+    updateSceneMetrics() { calls.push(["metrics"]); }, reader: { invalidateThumbnails(pages) { calls.push(["thumbnails", pages]); } }
   });
   vm.runInContext(threeSource, context);
   return { context, state, calls, count, original, options, makeObject,
@@ -128,12 +133,23 @@ function threeFixture() {
     frame() { for (const notify of context.pendingRenderedFrameResolvers.splice(0)) notify(); } };
 }
 {
-  const f = threeFixture(), pose = { id: "pose", hint: {} }; let ack = 0;
+  const f = threeFixture(), pose = { id: "pose", hint: {} }, committed = f.context.readerEditorThumbnailScene; let ack = 0;
   const work = f.apply(pose, () => ack++); await until(() => f.context.pendingRenderedFrameResolvers.length);
   assert.equal(f.context.currentPdfObject, f.original); assert.equal(f.original.sceneData, pose); assert.equal(ack, 0);
+  assert.equal(f.context.readerEditorThumbnailScene, committed, "fast previews retain the committed thumbnail source");
   for (const name of ["create", "captureCamera", "restoreCamera", "layout", "replace", "metrics", "thumbnails", "options"]) assert.equal(f.count(name), 0, `Three preview skips ${name}`);
   assert.equal(f.count("partial"), 1); assert.equal(f.count("render"), 1); assert.equal(f.context.editorSceneApplicationActive, true);
   f.frame(); await work; assert.equal(ack, 1); assert.equal(f.context.pendingRenderedFrameResolvers.length, 0); assert.equal(f.context.editorSceneApplicationActive, false);
+}
+{
+  const f = threeFixture(), gate = deferred(); f.state.colorActive = true; f.state.createGate = gate;
+  let ack = 0; const work = f.apply({ id: "committed-color" }, () => ack++, { preview: false });
+  await until(() => f.count("create"));
+  assert.equal(f.count("clearColor"), 0, "the live color remains visible during asynchronous replacement preparation");
+  assert.equal(f.state.colorActive, true); gate.resolve();
+  await until(() => f.context.pendingRenderedFrameResolvers.length);
+  assert.equal(f.count("clearColor"), 1); assert.equal(f.count("replace"), 1); assert.equal(f.count("bindColor"), 0);
+  f.frame(); await work; assert.equal(ack, 1); assert.equal(f.count("bindColor"), 1);
 }
 for (const preview of [true, false]) for (const hinted of [true, false]) {
   const f = threeFixture(); f.state.eligible = false; const pose = { id: "pose", ...(hinted ? { hint: {} } : {}) }; let ack = 0;
@@ -145,6 +161,7 @@ for (const preview of [true, false]) for (const hinted of [true, false]) {
   assert.equal(f.options.textLod, "auto"); assert.equal(f.options.vectorLod, "auto", "transient exact rendering never changes user options");
   assert.equal(f.count("metrics"), preview ? 0 : 1); assert.equal(f.count("thumbnails"), preview ? 0 : 1);
   assert.equal(f.count("partial"), preview ? 1 : 0); assert.equal(ack, 0); assert.notEqual(f.context.currentPdfObject, f.original);
+  assert.equal(f.context.readerEditorThumbnailScene, preview ? f.original.sceneData : pose, "replacement previews retain the committed thumbnail source");
   f.frame(); await work; assert.equal(ack, 1);
 }
 {
@@ -171,4 +188,14 @@ for (const mismatch of ["renderer", "object", "scene", "abort"]) {
   else controller.abort();
   f.frame(); await rejection; assert.equal(ack, 0); assert.equal(f.context.editorSceneApplicationActive, false); assert.equal(f.context.pendingRenderedFrameResolvers.length, 0);
 }
-console.log("Editor host previews: actual native/Three methods skip document rebuilds, preserve full commit/source paths, wait for backend handoff and acknowledge only matching drawn generations.");
+for (const fixture of [nativeFixture, threeFixture]) {
+  const f = fixture(), affectedPages = [1, 3];
+  await f.apply({ id: "localized-edit" }, undefined, { preview: false, affectedPages });
+  assert.equal(f.calls.find(call => call[0] === "thumbnails")[1], affectedPages, "commits forward only the affected pages");
+}
+{
+  const f = nativeFixture(); f.context.editSourceLayout = "grid";
+  await f.apply({ id: "fallback-preview" }, undefined, { preview: true, affectedPages: [] });
+  assert.equal(f.count("thumbnails"), 0, "full preview uploads also leave thumbnails untouched");
+}
+console.log("Editor host previews: actual native/Three methods skip document rebuilds, selectively refresh committed thumbnails, preserve full commit/source paths, wait for backend handoff and acknowledge only matching drawn generations.");

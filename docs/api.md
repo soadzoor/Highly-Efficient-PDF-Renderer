@@ -107,6 +107,15 @@ The session exposes `getObjects`, `getObjectBounds`, `getSelectionBounds`, `getS
 `ungroupSelection`, `setFieldValue`, `transaction`, `undo`, `redo`, `subscribe`,
 `getScene`, `savePdf`, and `saveHep`. Transactions roll back on failure.
 `getState()` reports revision, selection, undo/redo availability and dirty state.
+`getObjectPaintColors(id)` returns detached `color` and `fill` RGB lists, including
+mixed paint on original content and source copies. Empty lists identify channels
+without editable vector paint. `updateObject(sourceId, { color })` changes existing
+vector RGB; `{ fill }` targets existing filled paths only. Original opacity, masks,
+clipping, fonts and geometry are retained. Recoloring a gradient replaces its RGB
+colors while retaining its alpha and spatial coverage. Raster pixels and mask-only
+paint are excluded. Source color patches do not create or remove fill geometry;
+other source geometry changes continue through selection transforms. Color changes
+participate in transactions, Undo/Redo, copying, recovery and PDF/HEP output.
 Compilation and saving accept `signal` cancellation and `onProgress` callbacks
 with normalized `value` and `stage`; failed saves do not clear dirty state.
 `setPreviewTransform(matrix | null)` previews a gesture without adding history or
@@ -382,9 +391,25 @@ Pass `{ pdf: editor.sourcePdf, password }` as `source` after page operations.
 scene installation, canvas and bidirectional client/scene coordinate conversion,
 plus edit-mode notifications. Instantiate it when editing or attachment is requested;
 `setEditing(false)` removes editor frame work while retaining the session.
-`applyScene(scene, signal, onPresented?, { preview? }?)` receives an optional fourth
-argument identifying gesture previews. Existing three-argument hosts remain
-compatible. A host may try its native renderer's optional
+The shared UI previews Color/Fill input without mutating the session. A host may
+provide `previewColors(updates | null): boolean` on `EditorUiHost`: apply the
+`PrimitiveColorUpdate` RGB values to the most recently published canonical scene,
+or restore preview-owned refs for `null`, returning whether the update was applied.
+The native and Three.js examples use their sparse primitive overrides, retaining
+geometry/resources and clearing previews only when the committed scene replaces
+them. Hosts without this callback use coalesced temporary compiled scenes. Final
+picker submission remains a normal transaction; previews never enter exports,
+recovery snapshots or Undo history.
+`applyScene(scene, signal, onPresented?, { preview?, affectedPages? }?)` receives an
+optional fourth argument identifying gesture previews and changed page pixels.
+`affectedPages` contains zero-based page indexes since the last acknowledged
+committed scene: `[]` means no thumbnail changes; `undefined` requests a full
+refresh, including structural source/page changes. Shared form fields include
+every associated widget page, and undo/redo includes both old and new placement.
+Transient previews do not advance this baseline. Hosts can retain unaffected
+thumbnail images and in-flight work; document-wide appearance settings still
+require a full refresh. Existing three-argument hosts remain compatible.
+A host may try its native renderer's optional
 `updateEditorPreviewScene(scene): boolean`, or the matching Three object method,
 before using its normal scene replacement. These methods accept only compatible,
 privately hinted editor scenes; `false` requests the normal path. The first pose

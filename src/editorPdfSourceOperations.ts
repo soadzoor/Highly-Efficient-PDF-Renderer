@@ -14,6 +14,7 @@ import { EDITOR_IDENTITY, editorPoint, editorTransformBounds, invertEditorMatrix
 import { ScenePageViews, PAGE_PRIMITIVE_KINDS } from "./scenePageViews";
 import { getPrimitiveMarkedContent, getSceneAnnotationRuns, getScenePrimitive, getPrimitiveClipChain, type PrimitiveRef } from "./scenePrimitives";
 import { editorPaintIdentity } from "./editorPaintIdentity";
+import { normalizePrimitiveColor } from "./colorInput";
 
 const TAG = "HEPRSourceOperation";
 const PAINT = new Set(["S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "Tj", "TJ", "'", '"', "Do", "sh", "BI"]);
@@ -304,10 +305,18 @@ export async function prepareEditorPdfSourceOperations(document: NativePdfDocume
 }
 
 type Layers = { groupReference(id: string | null | undefined): PdfRef | undefined };
-interface Change { transform: EditorMatrix; deleted: boolean; layer?: string | null }
+interface Change { transform: EditorMatrix; deleted: boolean; layer?: string | null; color?: readonly [number, number, number] }
 const unchanged: Change = { transform: EDITOR_IDENTITY, deleted: false };
-const sameChange = (a: Change, b: Change): boolean => a.deleted === b.deleted && a.layer === b.layer && sameMatrix(a.transform, b.transform);
-const changed = (change: Change): boolean => change.deleted || change.layer !== undefined || !sameMatrix(change.transform, EDITOR_IDENTITY);
+const sameChange = (a: Change, b: Change): boolean => a.deleted === b.deleted && a.layer === b.layer && sameMatrix(a.transform, b.transform) &&
+  (a.color === undefined ? b.color === undefined : b.color !== undefined && a.color.every((value, index) => value === b.color![index]));
+const changed = (change: Change): boolean => change.deleted || change.layer !== undefined || change.color !== undefined || !sameMatrix(change.transform, EDITOR_IDENTITY);
+
+/** RGB overrides affect this paint only; inherited alpha and all following state survive. */
+function colored(color: Change["color"], bytes: Uint8Array): Uint8Array {
+  if (color === undefined) return bytes;
+  const rgb = matrixText(color);
+  return concatenate([encoder.encode(`q ${rgb} rg ${rgb} RG\n`), bytes, encoder.encode("\nQ\n")]);
+}
 
 function textPrefix(operation: Operation): Uint8Array {
   if (operation.operator === "'") return encoder.encode("T*\n");
@@ -376,7 +385,7 @@ function partialText(page: PreparedPage, operation: Operation, source: VectorSce
     const matrix = multiplyEditorMatrices(invertEditorMatrix(state.transform), multiplyEditorMatrices(glyph.matrix,
       multiplyEditorMatrices(invertEditorMatrix(scale), [1, 0, 0, 1, -origin[0], -origin[1]])));
     const body = concatenate([encoder.encode(`${matrixText(matrix)} Tm\n`), serializeOperator("Tj", [bytes])]);
-    parts.push(transformed(page, operation, change.transform, body));
+    parts.push(transformed(page, operation, change.transform, colored(change.color, body)));
   }
   parts.push(textEnd(capture)); return concatenate(parts);
 }
@@ -390,7 +399,8 @@ export async function rewriteEditorPdfSourcePage(writer: NativePdfWriter, sessio
   const changes = new Map<string, Change>();
   for (const [identity] of page.byPrimitive) {
     const edit = edits.get(identity), layer = assignments.get(identity);
-    changes.set(identity, { transform: edit?.transform ?? EDITOR_IDENTITY, deleted: edit?.deleted ?? false, ...(assignments.has(identity) ? { layer } : {}) });
+    changes.set(identity, { transform: edit?.transform ?? EDITOR_IDENTITY, deleted: edit?.deleted ?? false,
+      ...(edit?.color === undefined ? {} : { color: normalizePrimitiveColor(edit.color) }), ...(assignments.has(identity) ? { layer } : {}) });
   }
   for (const [identity, operation] of page.byPrimitive) {
     const ref = operation.refs.find(ref => key(ref) === identity)!;
@@ -458,7 +468,7 @@ export async function rewriteEditorPdfSourcePage(writer: NativePdfWriter, sessio
       if (scope.operations.some(operation => covered.has(operation))) continue;
       const refs = scope.operations.flatMap(operation => operation.refs), change = uniform(refs);
       if (!refs.length || scope.clip || scope.mask || scope.pathOpen || scope.operations.some(operation => operation.pathStart !== undefined && operation.pathStart < scope.start) ||
-          !change || refs.some(ref => forced.has(key(ref))) || change.deleted || change.layer !== undefined || sameMatrix(change.transform, EDITOR_IDENTITY)) continue;
+          !change || refs.some(ref => forced.has(key(ref)) || changes.get(key(ref))?.color !== undefined) || change.deleted || change.layer !== undefined || sameMatrix(change.transform, EDITOR_IDENTITY)) continue;
       const representative = scope.operations[0], scoped = { ...representative, state: { ...representative.state, matrix: scope.matrix } };
       patches.push({ start: scope.start, end: scope.end, bytes: transformed(page, scoped, change.transform, program.bytes.subarray(scope.start, scope.end)) });
       for (const operation of scope.operations) covered.add(operation);
@@ -481,13 +491,15 @@ export async function rewriteEditorPdfSourcePage(writer: NativePdfWriter, sessio
       if (operation.refs.some(ref => forced.has(key(ref)))) throw new Error("Source optional-content resources require a new canonical membership appearance.");
       if (operation.child && operation.refs.some(ref => changes.get(key(ref))?.layer !== undefined))
         throw new Error("Layer reassignment crosses a Form invocation's inherited optional-content scope.");
-      if (operation.child && (!change || change.layer !== undefined || internalOrder) && !change?.deleted) {
+      if (operation.child && (!change || change.layer !== undefined || internalOrder || operation.refs.some(ref => changes.get(key(ref))?.color !== undefined)) && !change?.deleted) {
         const nested = await visit(operation.child); if (!nested.changed) continue;
         const dictionary = streamDictionary(operation.child.dictionary!); dictionary.set("Resources", nested.resources);
         let alias = `HEPREdit${operation.id}`; while (objects.has(alias)) alias += "_";
         objects.set(alias, writer.add(pdfStreamValue(nested.content, dictionary))); body = encoder.encode(`/${alias} Do\n`); transform = EDITOR_IDENTITY;
       } else if (["Tj", "TJ", "'", '"'].includes(operation.operator)) {
         if (!operation.text) throw new Error("The source text program was not retained.");
+        if (operation.text.after.font.type3 && operation.refs.some(ref => changes.get(key(ref))?.color !== undefined))
+          throw new Error("Self-painting source text requires its edited vector appearance.");
         if (change?.deleted) {
           if (operation.state.textMode >= 4 || operation.marked.some(scope => scope.actualText)) throw new Error("Source text clipping or ActualText requires its complete content scope.");
           body = concatenate([textPrefix(operation), textEnd(operation.text)]); transform = EDITOR_IDENTITY;
@@ -500,6 +512,8 @@ export async function rewriteEditorPdfSourcePage(writer: NativePdfWriter, sessio
         prefix = encoder.encode("n\n"); body = pathBody(operation);
       } else {
         if (!change) throw new Error("An inseparable source paint has incompatible primitive edits.");
+        if (change.color !== undefined && ["sh", "BI", "Do"].includes(operation.operator))
+          throw new Error("Intrinsic source paint requires its edited vector appearance.");
         body = program.bytes.subarray(operation.start, operation.end);
         if (operation.operator === "Do" && change.layer !== undefined) {
           const resource = await writer.document.resolveValue(objects.get(String(operation.operands[0])), options.signal);
@@ -510,7 +524,7 @@ export async function rewriteEditorPdfSourcePage(writer: NativePdfWriter, sessio
           }
         }
       }
-      body = transformed(page, operation, transform, body);
+      body = transformed(page, operation, transform, colored(change?.color, body));
       } catch (error) {
         options.signal?.throwIfAborted(); prefix = new Uint8Array(); detached = true;
         const reason = error instanceof Error ? error.message : String(error);

@@ -33,6 +33,7 @@ try {
     const renderer = { getViewState: () => ({}), setViewState() {}, setScene() { events.push("upload"); },
       setFrameListener(value) { listener = value; listenerChanges++; } };
     const context = vm.createContext({ waitForEditorScenePresentation, waitForLoad, DOMException, viewerPrintAction: null, renderer, onRendererFrame: parent,
+      colorPreview: { beforeSceneChange() {}, bind() {}, hasPreview: () => false },
       editorSceneApplicationActive: false, pendingSourceLoadCount: 0, activeSceneLoadToken: null, activeHepExportController: null,
       layoutChangeRunning: false, pdfEditor: {}, lastLoadedSource: null, ocrTextCheckbox: {}, compressScansCheckbox: {},
       pageStreamingCheckbox: {}, backendSelectElement: {}, backendSwitcher: { runWhenIdle: async action => action() },
@@ -84,6 +85,7 @@ try {
     const events = [], waiters = [], previous = { position: {}, quaternion: {}, scale: {}, sourceKind: "hep", sourceLabel: "document" };
     const next = { position: { copy() {} }, quaternion: { copy() {} }, scale: { copy() {} }, dispose() { events.push("dispose"); } };
     const context = vm.createContext({ waitForEditorScenePresentation, waitForLoad, DOMException, viewerPrintAction: null, renderer: {}, currentPdfObject: previous, editedSource: null,
+      colorPreview: { beforeSceneChange() {}, bind() {}, hasPreview: () => false },
       editorSceneApplicationActive: false, backendChangeActive: false, backendChangeCompletion: Promise.resolve(),
       sourceLoadController: null, activeHepExportController: null, backendSelectElement: {}, activeThreeRendererBackend: "webgl",
       lastLoadedSource: {}, setStatus: message => events.push(message), formatBackendLabel: value => value,

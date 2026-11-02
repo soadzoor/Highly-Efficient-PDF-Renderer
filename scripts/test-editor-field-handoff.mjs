@@ -57,7 +57,7 @@ try {
       const job = deferred(); frames.push({ ...job, scene, draw() { signal.throwIfAborted(); onPresented(); job.resolve(); } }); return job.promise;
     } }
   });
-  for (const name of ["renderFields", "updateFieldPaint", "refreshScene", "commit"]) vm.runInContext(sourceFunction(source, name), context);
+  for (const name of ["fieldControlAnnotation", "renderFields", "updateFieldPaint", "refreshScene", "commit"]) vm.runInContext(sourceFunction(source, name), context);
   context.renderFields();
   const field = id => fields.children.find(control => control.dataset.fieldId === id);
   const type = (id, value) => { const control = field(id); document.activeElement = control; control.value = value; control.dispatchEvent(new Event("input")); return control; };

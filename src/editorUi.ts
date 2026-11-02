@@ -8,7 +8,7 @@ import "./toolbarIcons.css";
 import { openEditorSession } from "./editorSession";
 import type { EditorColor, EditorMatrix, EditorObject, EditorObjectInput, EditorSelectionFrame, EditorSession, EditorState, EditorTextObject } from "./editorTypes";
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
-import { ScenePrimitivePicker, getSceneAnnotationRuns, type PrimitivePoint } from "./scenePrimitives";
+import { ScenePrimitivePicker, getSceneAnnotationRuns, type PrimitivePoint, type PrimitiveRef } from "./scenePrimitives";
 import { createEditorAppServices } from "./editorAppServices";
 import { triggerBrowserDownload, formatPdfDownloadFilename } from "./downloadUtils";
 import type { EditorSignature } from "./editorSignatures";
@@ -26,7 +26,7 @@ import { editorIconButton } from "./editorToolbarIcons";
 import { canEditEditorField, createEditorFieldControl, createEditorFieldOptions, editorFieldDraftSignature, flushEditorFieldDrafts, hasPendingEditorFields, setEditorFieldControlValue, styleEditorFieldControl, updateEditorFieldControlAppearance, type EditorFieldControl } from "./editorFormControls";
 import { createEditorFieldActivation } from "./editorFieldActivation";
 import { editorBoundsClickHit, editorFieldClientGeometry, pickEditorMetadataAnnotation, transformEditorAnnotationText } from "./editorCoordinates";
-import { applyEditorFillOpacity, applyEditorOpacity, applyEditorPropertyPatch, editorFillSelection, editorPropertySelection, editorStyledSelection, validateEditorOpacity } from "./editorProperties";
+import { applyEditorFillOpacity, applyEditorOpacity, applyEditorPropertyPatch, editorFillSelection, editorPropertySelection, editorSelectionLeaves, editorStyledSelection, validateEditorOpacity } from "./editorProperties";
 import { createEditorPropertyControls } from "./editorPropertyControls";
 import { createEditorCameraPan } from "./editorCameraPan";
 import { createEditorInteractionController } from "./editorInteraction";
@@ -49,13 +49,22 @@ import { createEditorRecovery, editorRecoveryDocumentKey, type EditorRecoveryCon
 import { showEditorRecoveryDialog } from "./editorRecoveryUi";
 import { createEditorLinkController } from "./editorLinkUi";
 import { editorLinkSelectionOwner } from "./editorLinks";
+import type { PrimitiveColorUpdate } from "./primitiveAppearance";
+import { normalizePrimitiveColor } from "./colorInput";
+import { resolveEditorColorPreviewRefs } from "./editorColorPreview";
+import { applyEditorSourceColors } from "./editorSourceColors";
+import { captureEditorPageChanges, changedEditorPages } from "./editorPageChanges";
 
 export interface EditorUiHost {
   getCanvas(): HTMLCanvasElement;
   getScene(): VectorScene | null;
   prepareScene(signal: AbortSignal, onProgress?: LoadProgressCallback): Promise<VectorScene>;
   /** Acknowledge the matching draw before resolving, so selection chrome can follow the submitted scene. */
-  applyScene(scene: VectorScene, signal: AbortSignal, onPresented?: () => void, options?: { preview?: boolean }): void | Promise<void>;
+  applyScene(scene: VectorScene, signal: AbortSignal, onPresented?: () => void, options?: {
+    preview?: boolean;
+    /** Changed page pixels since the last committed presentation; undefined means all, [] means none. */
+    affectedPages?: readonly number[];
+  }): void | Promise<void>;
   documentChanged?(scene: VectorScene, source: { pdf?: Uint8Array; password?: string; label: string }): void | Promise<void>;
   getSource(): { bytes?: Uint8Array; pdf?: Uint8Array; password?: string; label: string };
   clientToScenePoint(x: number, y: number, pageIndex?: number): PrimitivePoint | null;
@@ -76,6 +85,8 @@ export interface EditorUiHost {
   onStatus?(message: string): void;
   onBusyChange?(busy: boolean): void;
   onSetupProgress?(progress: EditorSetupProgress): void;
+  /** Temporary RGB only. Null restores preview-owned paint; committed scene data stays unchanged. */
+  previewColors?(updates: readonly PrimitiveColorUpdate[] | null): boolean;
 }
 export interface EditorUi {
   setEditing(active: boolean, signal?: AbortSignal): Promise<void>;
@@ -102,6 +113,7 @@ interface PresentedScene {
   selection: ReadonlySet<string>;
   frame: EditorSelectionFrame | null;
   delta: EditorMatrix | null;
+  colorPreview?: boolean;
   drawings?: EditorPendingDrawingFrame;
   guides?: readonly EditorAlignmentGuide[];
 }
@@ -148,6 +160,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   let currentSourceScene = session.sourceScene;
   let latestScene = session.sourceScene;
   let currentState = session.getState(), presented: PresentedScene | null = null;
+  let committedPageChanges = captureEditorPageChanges(session);
   let pendingFieldFocus: { id: string; sourceScene: VectorScene } | null = null;
   let requestedPreview: EditorMatrix | null = null;
   let scenePreparation: AbortController | null = null, sceneApplication: Promise<void> | null = null;
@@ -157,6 +170,13 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   let objectOpacity = 1, fillOpacity = 1;
   let opacityControlSelection = "";
   let rotationDraft: { selection: readonly string[]; sourceScene: VectorScene } | null = null;
+  let colorDraft: { input: HTMLInputElement; property: "color" | "fill"; value: string; selection: readonly string[];
+    fillEnabled: boolean; sourceScene: VectorScene; requested: boolean;
+    preview?: { scene: VectorScene; refs: readonly PrimitiveRef[]; revision: number } } | null = null;
+  const colorChangeHandled = new WeakSet<object>();
+  let colorPreviewGeneration = 0, colorPreviewQueued = false, colorPreviewRunning = false, colorPreviewPending = false, colorPreviewApplied = false, colorPreviewFallback = false;
+  let colorPreviewAbort: AbortController | null = null;
+  let colorPreviewRestore: Promise<void> | null = null;
   let renderRevision = 0, operation: AbortController | null = null, running = false;
   let savePreparing = false;
   let clipboardRunning = false;
@@ -410,6 +430,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     return { frame: display.frame, delta: display.delta ?? undefined };
   }
   function isSceneSettling(): boolean {
+    if (colorDraft && presented?.sourceScene === session.sourceScene && presented.revision === currentState.revision && presented.delta === null) return false;
     return !pointer && (sceneApplication !== null || presented !== null &&
       (presented.sourceScene !== session.sourceScene || presented.revision !== currentState.revision || presented.delta !== null));
   }
@@ -610,7 +631,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     await host.documentChanged?.(currentSourceScene, { pdf: session.sourcePdf, password: source.password, label: source.label });
     if (tool === "form") renderFields(); pagesDialog?.refresh();
   }
-  async function refreshScene(externalSignal?: AbortSignal, preview = false, propagateError = false): Promise<void> {
+  async function refreshScene(externalSignal?: AbortSignal, preview = false, propagateError = false, colorPreviewScene?: VectorScene): Promise<void> {
     const revision = ++renderRevision, abort = new AbortController();
     scenePreparation?.abort(); scenePreparation = abort;
     const signal = AbortSignal.any([lifetime.signal, abort.signal, ...(externalSignal ? [externalSignal] : [])]);
@@ -619,8 +640,9 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if (disposed || revision !== renderRevision) return;
       const state = session.getState(), snapshot: PresentedScene = { sourceScene: session.sourceScene, revision: state.revision,
         selection: new Set(state.selection), frame: session.getSelectionFrame(), delta: preview && state.previewing ? requestedPreview : null,
-        drawings: pendingDrawings.capture(), guides: preview ? requestedGuides : [] };
-      const scene = await session.getScene({ signal, preview });
+        drawings: pendingDrawings.capture(), guides: preview ? requestedGuides : [], colorPreview: Boolean(colorPreviewScene) };
+      const pageChanges = preview ? undefined : captureEditorPageChanges(session);
+      const scene = colorPreviewScene ?? await session.getScene({ signal, preview });
       if (disposed || revision !== renderRevision) return;
       // Preparing a newer pose can supersede older preparation. Once host
       // publication starts, finish its matching draw before applying another.
@@ -629,19 +651,22 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         if (disposed || revision !== renderRevision) return;
       }
       if (scenePreparation === abort) scenePreparation = null;
+      const affectedPages = preview ? [] : changedEditorPages(committedPageChanges, pageChanges);
       let finish: (() => void) | undefined;
       const application = new Promise<void>(resolve => { finish = resolve; }); sceneApplication = application;
       let acknowledged = false;
       const publish = (): void => {
         if (acknowledged || disposed || signal.aborted || sceneApplication !== application) return;
         acknowledged = true; latestScene = scene; presented = snapshot; updatePointerCursor();
+        if (!preview) committedPageChanges = pageChanges;
         pendingDrawings.acknowledge(snapshot.drawings);
         if (tool === "form") updateFieldPaint();
         // Preserve focused field drafts; only reposition existing controls.
         if (active) updateGeometry(true);
+        if (!colorPreviewScene) { colorPreviewApplied = colorPreviewFallback = false; if (colorDraft) queueColorPreview(); }
       };
       try {
-        await host.applyScene(scene, signal, publish, { preview }); signal.throwIfAborted();
+        await host.applyScene(scene, signal, publish, { preview, affectedPages }); signal.throwIfAborted();
         // A synchronous host may finish its draw before returning.
         if (!acknowledged) publish();
       } finally {
@@ -655,6 +680,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   function commit(change: () => void, finishingSaveDraft = false): void {
     if (disposed || structuralRunning || running || savePreparing && !finishingSaveDraft) return;
     if (pointer || pendingPick) cancelPointerGesture();
+    flushColorDraft();
     try { change(); void refreshScene(); } catch (error) { report(error); }
   }
   function changeHistory(redo: boolean): void {
@@ -672,6 +698,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   async function runClipboard(action: EditorObjectMenuAction, inPlace = false): Promise<void> {
     if (!canUseClipboard(action)) return;
+    flushColorDraft();
     contextMenu.close();
     if (action === "paste") {
       if (tool !== "select") setTool("select");
@@ -754,6 +781,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   function setTool(next: Tool, preserveLinkPick = false): void {
     if (structuralRunning || running || savePreparing) return;
+    if (colorDraft) { cancelPointerGesture(); flushColorDraft(); }
     if (next !== tool && !preserveLinkPick && links.isPicking()) links.cancelPick();
     contextMenu.close();
     pendingFieldFocus = null;
@@ -781,12 +809,16 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     updateLinkButtons();
     updateGeometry();
   }
+  function fieldControlAnnotation(current: NonNullable<VectorScene["annotations"]>[number]) {
+    const source = getEditorAnnotationSource(latestScene, current.id) ?? current, style = current.field?.textStyle;
+    return style && source.field && style !== source.field.textStyle ? { ...source, field: { ...source.field, textStyle: style } } : source;
+  }
   function renderFields(): void {
     fields.replaceChildren(); fieldDrafts.clear();
     const appearances = getSceneAnnotationRuns(latestScene);
     const values = session.getFieldValues(), sourceAnnotations = new Map(session.sourceScene.annotations?.map(annotation => [annotation.id, annotation]));
     for (const currentAnnotation of latestScene.annotations ?? []) {
-      const annotation = getEditorAnnotationSource(latestScene, currentAnnotation.id) ?? currentAnnotation;
+      const annotation = fieldControlAnnotation(currentAnnotation);
       const name = annotation.field?.name;
       // Canonical placements retain old field metadata for geometry. Values
       // come from the current session, including its source fallback after Undo.
@@ -798,7 +830,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
           for (const [control] of fieldDrafts) {
             const sibling = latestScene.annotations?.find(item => item.id === control.dataset.fieldId);
             if (!sibling || sibling.field?.name !== name) continue;
-            setEditorFieldControlValue(control, getEditorAnnotationSource(latestScene, sibling.id) ?? sibling, value); fieldDrafts.set(control, editorFieldDraftSignature(control));
+            setEditorFieldControlValue(control, fieldControlAnnotation(sibling), value); fieldDrafts.set(control, editorFieldDraftSignature(control));
           }
           updateFieldPaint();
         }), { usePdfAppearance: currentAnnotation.hasAppearance || Boolean(appearances.get(annotation.id)?.length) });
@@ -811,7 +843,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         if (annotation.field?.textStyle) void editorServices.fonts.resolve(annotation.field.textStyle).then(async font => {
           await activateFont(font);
           const current = latestScene.annotations?.find(item => item.id === annotation.id);
-          if (input.parentElement === fields && current) styleEditorFieldControl(input, getEditorAnnotationSource(latestScene, current.id) ?? current, JSON.stringify(font.id));
+          if (input.parentElement === fields && current) styleEditorFieldControl(input, fieldControlAnnotation(current), JSON.stringify(font.id));
         }).catch(report);
       }
     }
@@ -988,6 +1020,9 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (!active || running || savePreparing || activeText || pointer || pendingPick ||
         isSceneSettling() && (!["ink", "rectangle", "ellipse", "line", "arrow", "polygon", "polyline", "signature"].includes(tool) || !presented || presented.sourceScene !== session.sourceScene) ||
         tool === "pan" || tool === "form" || isEditorReviewTool(tool) || event.button !== 0 || (event.target as Element).closest(".hepr-editor-field")) return;
+    // Accept this click before flushing geometry-stable picker edits. The
+    // asynchronous pick then commits their old owner before selecting its hit.
+    if (colorDraft) colorDraft.requested = true;
     textRequest++;
     const targetHandle = tool === "select" ? (event.target as Element).getAttribute("data-handle") : null;
     const handleFrame = targetHandle && ["nw", "ne", "sw", "se", "rotate"].includes(targetHandle) ? session.getSelectionFrame() : null;
@@ -1035,7 +1070,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         const currentProjection = host.sceneToClientPoint(point.x, point.y);
         if (sourceScene !== session.sourceScene || revision !== session.revision || projection && (!currentProjection ||
             Math.abs(currentProjection.x - projection.x) + Math.abs(currentProjection.y - projection.y) > .1)) { cancelPointerGesture(); return; }
-        pendingPick = null; updatePointerCursor();
+        pendingPick = null; updatePointerCursor(); flushColorDraft(false);
         if (id) {
           interaction.selectHit(id, event);
           if (additive) return;
@@ -1167,7 +1202,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         const object = p.ink ?? p.shape; if (!object) return;
         commit(() => { const id = session.addObject(object); pendingDrawings.add(id); session.select([id]); });
       }
-    } finally { alignmentSnap = null; requestedGuides = []; }
+    } finally { alignmentSnap = null; requestedGuides = []; flushColorDraft(false); }
   }
   function completePolygon(doubleClick = false): void {
     // A double-click's second press finishes the first press's endpoint, even
@@ -1389,6 +1424,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (disposed || running || savePreparing || structuralRunning || recoveryRunning || recoveryDialog) return;
     if (links.isOpen()) { setStatus("Apply or cancel the pending link before saving or printing."); return; }
     if ((kind === "pdf" || kind === "flatten") && passwordDialog && !passwordDialog.apply()) return;
+    if (colorDraft) { cancelPointerGesture(); flushColorDraft(); }
     flushEditorFieldDrafts(fieldDrafts);
     if (hasPendingEditorFields(fieldDrafts)) { setStatus("Check the pending form value before saving or printing."); return; }
     operation?.abort(); const abort = new AbortController(); operation = abort;
@@ -1452,6 +1488,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     lifetime.signal.throwIfAborted(); externalSignal?.throwIfAborted();
     if (running || savePreparing || structuralRunning) throw new Error("Wait for the current operation to finish.");
     if (links.isOpen()) throw new Error("Apply or cancel the pending link before changing pages.");
+    if (colorDraft) { cancelPointerGesture(); flushColorDraft(); }
     flushEditorFieldDrafts(fieldDrafts);
     if (hasPendingEditorFields(fieldDrafts)) throw new Error("Check the pending form value before changing pages.");
     if (activeText) await finishText();
@@ -1568,7 +1605,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (running || savePreparing || structuralRunning) return;
     const input = event.target as HTMLInputElement;
     if (input.dataset.transform === "rotation") rotationDraft = { selection: currentState.selection, sourceScene: session.sourceScene };
-    else opacityInput(event);
+    else if (!stageColorDraft(input)) opacityInput(event);
   }
   toolbar.addEventListener("input", toolbarInput);
   function preventBusyInput(event: InputEvent): void {
@@ -1576,9 +1613,96 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   toolbar.addEventListener("beforeinput", preventBusyInput);
   overlay.addEventListener("beforeinput", preventBusyInput);
-  function changeAppearance(input: HTMLInputElement): void {
+  function stageColorDraft(input: HTMLInputElement): boolean {
+    const name = input.dataset.prop;
+    if (name !== "color" && name !== "fill") return false;
+    if (colorDraft?.input === input && colorDraft.sourceScene === session.sourceScene) { colorDraft.value = input.value; queueColorPreview(); return true; }
+    if (input.disabled || activeText || tool !== "select") return false;
+    const selection = editorPropertySelection(session, name); if (!selection.length) return false;
+    const value = input.value, fillEnabled = property("fill-enabled").checked;
+    colorChangeHandled.delete(input);
+    flushColorDraft();
+    colorDraft = { input, property: name, value, fillEnabled, selection, sourceScene: session.sourceScene, requested: false };
+    queueColorPreview();
+    return true;
+  }
+  async function runColorPreview(): Promise<void> {
+    colorPreviewQueued = false;
+    const draft = colorDraft;
+    if (!draft || !active || disposed || running || savePreparing || structuralRunning || draft.sourceScene !== session.sourceScene) return;
+    if (presented && (presented.sourceScene !== session.sourceScene || presented.revision !== session.revision || presented.delta !== null)) return;
+    colorPreviewPending = false; colorPreviewRunning = true;
+    const generation = colorPreviewGeneration, controller = new AbortController(); colorPreviewAbort = controller;
+    try {
+      if (!draft.preview || draft.preview.revision !== session.revision) {
+        const ids = draft.selection.filter(id => { try {
+          return !session.isObjectLocked(id) && (draft.property !== "fill" || draft.fillEnabled || session.getObject(id).kind === "source");
+        } catch { return false; } });
+        draft.preview = { scene: latestScene, refs: resolveEditorColorPreviewRefs(session, latestScene, ids, draft.property), revision: session.revision };
+      }
+      const color = normalizePrimitiveColor(draft.value), refs = draft.preview.refs;
+      const updates = refs.map(ref => ({ ref, color }));
+      if (host.previewColors?.(updates)) { colorPreviewApplied = true; colorPreviewFallback = false; return; }
+      if (!updates.length && !colorPreviewApplied) return;
+      const scene = applyEditorSourceColors(draft.preview.scene, refs.map(ref => ({ ref, color, transform: IDENTITY, deleted: false })));
+      colorPreviewApplied = colorPreviewFallback = true;
+      await refreshScene(controller.signal, true, false, scene);
+    } catch (error) { if (!controller.signal.aborted && generation === colorPreviewGeneration) report(error); }
+    finally {
+      if (colorPreviewAbort === controller) colorPreviewAbort = null;
+      colorPreviewRunning = false;
+      if (colorPreviewPending && active && !disposed && colorDraft) queueColorPreview();
+    }
+  }
+  function queueColorPreview(): void {
+    colorPreviewPending = true;
+    if (colorPreviewRunning || colorPreviewQueued) return;
+    colorPreviewQueued = true; const generation = colorPreviewGeneration;
+    queueMicrotask(() => {
+      if (generation !== colorPreviewGeneration) return;
+      colorPreviewQueued = false; void runColorPreview();
+    });
+  }
+  function stopColorPreview(restore = false): void {
+    colorPreviewGeneration++; colorPreviewQueued = colorPreviewPending = false;
+    colorPreviewAbort?.abort(); colorPreviewAbort = null;
+    const applied = colorPreviewApplied, fallback = colorPreviewFallback;
+    if (restore) {
+      colorPreviewApplied = colorPreviewFallback = false;
+      const restored = host.previewColors?.(null);
+      if (applied && (fallback || !restored) && active && !disposed) {
+        const restoration = refreshScene(); colorPreviewRestore = restoration;
+        void restoration.finally(() => { if (colorPreviewRestore === restoration) colorPreviewRestore = null; });
+      }
+    }
+  }
+  function cancelColorDraft(): void {
+    const draft = colorDraft; if (!draft) return;
+    colorDraft = null; colorChangeHandled.add(draft.input); stopColorPreview(true);
+    draft.input.blur?.(); updateAppearanceControls();
+  }
+  function flushColorDraft(force = true): void {
+    const draft = colorDraft;
+    if (!draft || !force && !draft.requested || pointer || pendingPick) return;
+    colorDraft = null; colorChangeHandled.add(draft.input);
+    if (disposed || draft.sourceScene !== session.sourceScene) { stopColorPreview(true); return; }
+    const rgb = normalizePrimitiveColor(draft.value), selection = draft.selection.filter(id => { try {
+      if (session.isObjectLocked(id)) return false;
+      const object = session.getObject(id);
+      if (draft.property === "fill" && !draft.fillEnabled && object.kind !== "source") return "fill" in object && object.fill != null;
+      const colors = session.getObjectPaintColors(id)[draft.property];
+      return colors.length > 0 && colors.some(color => normalizePrimitiveColor(color).some((value, index) => Math.abs(value - rgb[index]) > 1e-7));
+    } catch { return false; } });
+    stopColorPreview(!selection.length);
+    if (selection.length) changeAppearance({ dataset: { prop: draft.property }, value: draft.value }, selection, draft.fillEnabled);
+  }
+  function changeAppearance(input: Pick<HTMLInputElement, "dataset" | "value">, targetSelection?: readonly string[], targetFillEnabled?: boolean): void {
     if (running || savePreparing || structuralRunning) return;
-    if (activeText) {
+    if (!targetSelection && (input.dataset.prop === "color" || input.dataset.prop === "fill")) {
+      if (colorDraft?.input === input) { colorDraft.requested = true; flushColorDraft(); return; }
+      if (colorChangeHandled.has(input)) { colorChangeHandled.delete(input); return; }
+    }
+    if (activeText && !targetSelection) {
       activeText.element.focus();
       if (input.dataset.prop === "color") document.execCommand("foreColor", false, input.value);
       if (input.dataset.prop === "font") {
@@ -1590,16 +1714,28 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if (input.dataset.prop === "font-size") applySelectionCss(document, "fontSize", `${Number(input.value)}px`);
       if (input.dataset.prop === "align") activeText.element.style.textAlign = input.value;
       recovery?.draftChanged();
-    } else if (tool === "select") {
-      const selection = session.getSelection(); if (!selection.length || input.value === "__mixed__") return;
+    } else if (tool === "select" || targetSelection) {
+      const selection = targetSelection ?? (input.dataset.prop === "fill-enabled" ? editorFillSelection(session) : session.getSelection());
+      if (!selection.length || input.value === "__mixed__") return;
+      const fillEnabled = targetFillEnabled ?? property("fill-enabled").checked, fillColor = input.dataset.prop === "fill" ? input.value : property("fill").value;
       const patch: Partial<EditorObject> = input.dataset.prop === "color" ? { color: input.value } : input.dataset.prop === "stroke" ? { strokeWidth: Number(input.value) } :
-        input.dataset.prop === "fill" || input.dataset.prop === "fill-enabled" ? { fill: property("fill-enabled").checked ? property("fill").value : null } : {};
+        input.dataset.prop === "fill" || input.dataset.prop === "fill-enabled" ? { fill: fillEnabled ? fillColor : null } : {};
       if (input.dataset.prop === "font-size") Object.assign(patch, { fontSize: Number(input.value) });
       if (input.dataset.prop === "align") Object.assign(patch, { align: input.value });
       if (input.dataset.prop === "font" && editorPropertySelection(session, "fontId", selection).length)
         void selectedFont(input.value).then(font => commit(() => { applyEditorPropertyPatch(session, { fontId: font.id, fontFamily: font.family }, selection); })).catch(report);
       const propertyName = input.dataset.prop === "stroke" ? "strokeWidth" : input.dataset.prop === "font-size" ? "fontSize"
         : input.dataset.prop === "fill-enabled" ? "fill" : input.dataset.prop;
+      if (input.dataset.prop === "fill" && editorPropertySelection(session, "fill", selection).length) {
+        const leaves = editorSelectionLeaves(session, selection), sources = leaves.filter(object => object.kind === "source").map(object => object.id);
+        if (sources.length) {
+          commit(() => session.transaction("Change appearance", () => {
+            applyEditorPropertyPatch(session, patch, leaves.filter(object => object.kind !== "source").map(object => object.id));
+            applyEditorPropertyPatch(session, { fill: fillColor }, sources);
+          }));
+          return;
+        }
+      }
       if (Object.keys(patch).length && ["color", "strokeWidth", "fill", "fontSize", "align"].includes(propertyName ?? "") &&
           editorPropertySelection(session, propertyName as "color" | "strokeWidth" | "fill" | "fontSize" | "align", selection).length)
         commit(() => { applyEditorPropertyPatch(session, patch, selection); });
@@ -1706,6 +1842,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   overlay.addEventListener("dblclick", event => { void doubleClick(event).catch(report); });
   function keydown(event: KeyboardEvent): void {
     if (!active || event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
+    if (event.key === "Escape" && colorDraft) { event.preventDefault(); event.stopPropagation(); cancelColorDraft(); return; }
     if (recoveryDialog) {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") event.preventDefault();
       return;
@@ -1745,7 +1882,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   window.addEventListener("keydown", transformModifiers, { signal: lifetime.signal });
   window.addEventListener("keyup", transformModifiers, { signal: lifetime.signal });
   function hasUnsavedChanges(): boolean {
-    return session.getState().dirty || hasPendingEditorTextChanges(activeText) || hasPendingEditorFields(fieldDrafts) ||
+    return session.getState().dirty || Boolean(colorDraft && colorDraft.sourceScene === session.sourceScene) || hasPendingEditorTextChanges(activeText) || hasPendingEditorFields(fieldDrafts) ||
       pdfProtection.hasChanges() || Boolean(passwordDialog?.hasDraftChanges()) || review.hasDraftChanges() || links.hasDraftChanges() || structuralRunning;
   }
   async function initializeRecovery(): Promise<void> {
@@ -1839,12 +1976,14 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       contextMenu.close();
       if (!value) recoveryDialog?.close();
       if (!value && clipboardRunning) operation?.abort();
+      if (!value && colorDraft) { cancelPointerGesture(); flushColorDraft(); }
       if (!value) pendingFieldFocus = null;
       if (!value) { flushEditorFieldDrafts(fieldDrafts); if (activeText) await finishText(); if (!review.flushDraft() || !links.flushDraft()) return; await recovery?.flush(); }
       if (!value) { toolRequest++; cancelPointerGesture(); polygon = null; signatureHover = null; textRequest++; }
+      if (!value && colorPreviewRestore) await waitForLoad(colorPreviewRestore, signal);
       // Read mode needs the current committed frame, including metadata-only links.
       if (!value) while (pendingDrawings.capture() || presented !== null && (presented.sourceScene !== session.sourceScene ||
-          presented.revision !== session.revision || presented.delta !== null)) {
+          presented.revision !== session.revision || presented.delta !== null || presented.colorPreview)) {
         await refreshScene(signal, false, true); signal.throwIfAborted();
         if (disposed) return;
         cancelPointerGesture();
@@ -1879,7 +2018,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     },
     isEditing: () => active, isBusy: () => running || savePreparing || structuralRunning || recoveryRunning || cameraPan.isPanning() || links.isBusy(), isDirty: hasUnsavedChanges, save, attachDocuments, dropImages, confirmDocumentChange,
     dispose() {
-      if (disposed) return; disposed = true; active = false; cancelPointerGesture(false); lifetime.abort(); scenePreparation?.abort(); operation?.abort(); window.cancelAnimationFrame(frame);
+      if (disposed) return; stopColorPreview(true); disposed = true; active = false; cancelPointerGesture(false); lifetime.abort(); scenePreparation?.abort(); operation?.abort(); window.cancelAnimationFrame(frame);
+      colorDraft = null;
       cameraPan.dispose();
       review.dispose(); links.dispose(); recoveryDialog?.close();
       if (discardRecovery && recovery) { const controller = recovery; void controller.discard().finally(() => controller.dispose()).catch(() => {}); }

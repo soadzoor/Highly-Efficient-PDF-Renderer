@@ -246,6 +246,7 @@ const vectorOpacityInputElement = vectorOpacityInput;
 let renderer: RendererApi;
 let webGpuRendererClass: typeof import("./webGpuPdfRenderer").WebGpuPdfRenderer | null = null;
 let lastParsedScene: VectorScene | null = null;
+let readerThumbnailScene: VectorScene | null = null;
 // Editing and document attachment load the editor, fonts and picking indexes on demand.
 let pdfEditor: import("./editorUi").EditorUi | null = null;
 let editorFrameListener: (() => void) | null = null;
@@ -332,7 +333,8 @@ textSearchController = createTextSearchController({
   navigateToView: navigateNativeView
 });
 
-function applyTextSearchScene(scene: VectorScene): void {
+function applyTextSearchScene(scene: VectorScene, affectedPages?: readonly number[]): void {
+  readerThumbnailScene = scene;
   layerVisibility.sceneChanged();
   pdfLayerControls.refresh();
   annotationControls.sceneChanged();
@@ -343,6 +345,7 @@ function applyTextSearchScene(scene: VectorScene): void {
   textSearchController.setScene(scene);
   const hasText = scene.textIndex?.pages.some((page) => page.text.length > 0) ?? false;
   textSearchWidget.setAvailability(hasText ? "ready" : "no-text-index");
+  readerViewport?.invalidateThumbnails(affectedPages);
 }
 
 const textSelection = createTextSelectionController({
@@ -445,13 +448,15 @@ const layerVisibility = createLayerVisibilityController({
   getScene: () => lastParsedScene,
   getRenderer: () => renderer,
   onProgress: percentage => pdfLayerControls.setProgress(percentage),
-  onChange: () => {
+  onChange: snapshot => {
     textSearchController.refreshVisibility();
     textSelection.clearSelection();
     drawingSelection.onFrame();
     annotationInteraction?.onFrame();
     annotationOverlay.onFrame();
-    readerViewport?.invalidateThumbnails();
+    // Installing a scene publishes revision zero; its changed pages are
+    // invalidated by applyTextSearchScene. Later revisions are viewer toggles.
+    if (snapshot.revision > 0) readerViewport?.invalidateThumbnails();
   }
 });
 const pdfLayerControls = createPdfLayerControls({
@@ -592,8 +597,8 @@ function scheduleDemandPdfUpdate(): void {
       loader.bindDisplayScene(scene, pageScenes);
       await layerVisibility.sceneChanged(true);
       if (activePdfPageLoader !== loader || lastParsedScene !== scene) return;
-      applyTextSearchScene(scene);
-      readerViewport?.invalidateThumbnails();
+      // Display-page residency does not change the canonical thumbnail source.
+      applyTextSearchScene(scene, []);
       const initialUpdate = loader.getDisplayUpdate(scene);
       if (initialUpdate && renderer.prepareRasterLayerUpdates) {
         const staged = renderer.prepareRasterLayerUpdatesAsync
@@ -679,7 +684,7 @@ readerViewport = createReaderViewport({
         ? undefined : layerVisibility.getOptionalContentVisibility() ?? undefined };
     const pageLoader = nativeLoadPreparation ? nativeLoadPreparation.pageLoader : activePdfPageLoader;
     if (pageLoader) return pageLoader.getPageThumbnail(pageIndex, { ...appearance, signal: options.signal });
-    const scene = nativeLoadPreparation?.scene ?? lastParsedScene;
+    const scene = nativeLoadPreparation?.scene ?? readerThumbnailScene ?? lastParsedScene;
     if (!scene) throw new DOMException("No document is loaded.", "AbortError");
     let pages = thumbnailPartitions.get(scene);
     if (!pages) { pages = new ScenePageViews(scene); thumbnailPartitions.set(scene, pages); }
@@ -750,6 +755,7 @@ async function ensureNativeEditor(signal?: AbortSignal, setup?: EditorSetupLoadi
       const { createEditorUi } = await import("./editorUi");
       const { remapEditorPagePoint } = await import("./editorCoordinates");
       const { waitForEditorScenePresentation } = await import("./editorPresentation");
+      const { createEditorColorPreviewHost } = await import("./editorColorPreviewHost");
       controller.signal.throwIfAborted();
       const originalLayout = nativeLayout;
       const originalSource = lastLoadedSource, originalPassword = lastLoadedPdfPassword;
@@ -760,10 +766,14 @@ async function ensureNativeEditor(signal?: AbortSignal, setup?: EditorSetupLoadi
       let editorPanRenderer: typeof renderer | undefined;
       const sourcePlacementMatches = (): boolean => nativeLayout === editSourceLayout &&
         (nativeLayout === "reader" || editSourceScene?.pagesPerRow === canonicalPagesPerRow);
+      const colorPreview = createEditorColorPreviewHost({ getTarget: () => renderer, getScene: () => lastParsedScene,
+        canApply: target => typeof target.setPrimitiveColorUpdates === "function",
+        apply: (target, updates) => target.setPrimitiveColorUpdates!(updates) });
       pdfEditor = await createEditorUi({
         layerControlsContainer: document.querySelector<HTMLDivElement>("#pdf-layers")!,
         showLayerControls: () => setHudCollapsed(false),
         getCanvas: () => canvasElement, getScene: () => lastParsedScene,
+        previewColors: updates => colorPreview.previewColors(updates),
         beginCameraPan() { if (readerViewport?.isActive()) readerViewport.cancelActiveGesture(); else { editorPanRenderer = renderer; renderer.beginPanInteraction(); } },
         panCameraByPixels(dx, dy) { if (!panEditorReader(readerViewport, dx, dy)) renderer.panByPixels(dx, dy); },
         endCameraPan() { if (editorPanRenderer === renderer) editorPanRenderer.endPanInteraction(); editorPanRenderer = undefined; },
@@ -796,11 +806,13 @@ async function ensureNativeEditor(signal?: AbortSignal, setup?: EditorSetupLoadi
           try {
             await waitForLoad(backendSwitcher!.runWhenIdle(() => undefined), signal); signal.throwIfAborted();
             const transient = options?.preview && !pendingEditorSource && sourcePlacementMatches();
-            const partition = transient ? null : new ScenePageViews(scene), pages = partition
-              ? Array.from({ length: partition.pageCount }, (_, index) => partition.extract(index).scene) : documentPageScenes ?? [];
+            const partition = transient ? null : new ScenePageViews(scene), pageViews = partition
+              ? Array.from({ length: partition.pageCount }, (_, index) => partition.extract(index)) : null;
+            const pages = pageViews?.map(view => view.scene) ?? documentPageScenes ?? [];
             const displayedScene = sourcePlacementMatches() ? scene : nativeLayout === "reader" ? composeVectorScenesInColumn(pages) : composeVectorScenesInGrid(pages, canonicalPagesPerRow);
             const structural = pendingEditorSource, readerState = structural ? readerViewport?.snapshot() : undefined;
             const view = renderer.getViewState();
+            colorPreview.beforeSceneChange();
             if (!transient || !renderer.updateEditorPreviewScene?.(displayedScene)) {
               renderer.setScene(displayedScene, { preserveRasterResolution: true }); renderer.setViewState(view);
             }
@@ -821,17 +833,17 @@ async function ensureNativeEditor(signal?: AbortSignal, setup?: EditorSetupLoadi
               else renderer.setViewState(view);
               setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
             }
-            if (transient) textSearchController.setScene(displayedScene);
-            else { applyTextSearchScene(displayedScene); readerViewport?.invalidateThumbnails(); }
+            if (options?.preview && !structural) textSearchController.setScene(displayedScene);
+            else applyTextSearchScene(displayedScene, options?.affectedPages);
             if (onPresented) {
               const target = renderer;
-              await waitForEditorScenePresentation({ signal, onPresented,
+              await waitForEditorScenePresentation({ signal, onPresented: () => { colorPreview.bind(scene, displayedScene, pageViews ?? undefined); onPresented(); },
                 isCurrent: () => renderer === target && lastParsedScene === displayedScene,
                 subscribe: notify => {
                   target.setFrameListener(stats => { try { onRendererFrame(stats); } finally { notify(); } });
                   return () => target.setFrameListener(onRendererFrame);
                 } });
-            }
+            } else colorPreview.bind(scene, displayedScene, pageViews ?? undefined);
           } finally { editorSceneApplicationActive = false; updateBackendSelectDisabledState(); }
         },
         clientToScenePoint: (x, y, pageIndex) => {

@@ -91,7 +91,7 @@ function harness(frameHost = true) {
     styleEditorFieldControl(control, annotation, family) { control.fontStyleAnnotation = annotation; control.fontFamily = family; },
     report: error => assert.fail(String(error))
   });
-  for (const name of ["sceneBoundsToClient", "focusPendingField", "canActivateField", "activateField", "updateTextVisibility", "updateGeometry", "updateFieldPaint", "renderFields", "setTool", "fieldAtClientPoint", "doubleClick"]) vm.runInContext(sourceFunction(nested, name), context);
+  for (const name of ["sceneBoundsToClient", "focusPendingField", "canActivateField", "activateField", "updateTextVisibility", "updateGeometry", "updateFieldPaint", "fieldControlAnnotation", "renderFields", "setTool", "fieldAtClientPoint", "doubleClick"]) vm.runInContext(sourceFunction(nested, name), context);
   vm.runInContext(`${tickSource}\n${apiSource}`, context);
   return {
     context, host, document, fields, controls, callbacks, events, raf,
@@ -435,6 +435,26 @@ for (const boundary of ["tool", "view", "source", "dispose"]) {
   resolveFont({ id: "canonical-field-font" }); await new Promise(resolve => setImmediate(resolve));
   assert.equal(field.fontStyleAnnotation, source, "late font activation uses the latest scene's canonical field dimensions");
   assert.equal(field.fontFamily, '"canonical-field-font"');
+  h.context.api.dispose();
+}
+
+// A source color edit updates typing style while retaining the canonical
+// rotated input rectangle, including value propagation and late font activation.
+{
+  const h = harness(); await h.context.api.setEditing(true);
+  const original = h.context.latestScene, source = original.annotations[0], matrix = [0, 2, -3, 0, 100, -20];
+  source.field.textStyle = { fontSize: 10, color: [1, 0, 0] };
+  const current = { ...source, bounds: { minX: -5, minY: 0, maxX: 40, maxY: 80 },
+    field: { ...source.field, textStyle: { ...source.field.textStyle, color: [0, .5, 0] } } };
+  const scene = { ...original, annotations: [current, original.annotations[1]] };
+  h.setAnnotationPlacement(scene, source.id, source, matrix); h.context.latestScene = scene;
+  h.context.renderFields(); h.draw(); const input = h.controls[0], position = { ...input.style };
+  assert.equal(input.annotation.bounds, source.bounds); assert.equal(input.annotation.pdfGeometry, source.pdfGeometry);
+  assert.deepEqual(input.annotation.field.textStyle.color, [0, .5, 0]);
+  input.onValue("More green text"); assert.deepEqual(input.styledAnnotation.field.textStyle.color, [0, .5, 0]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(input.fontStyleAnnotation.field.textStyle.color, [0, .5, 0]);
+  assert.deepEqual(input.style, position, "updated color and font arrival cannot reset the field's transformed frame");
   h.context.api.dispose();
 }
 

@@ -115,7 +115,9 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   let logicalScroll = { left: 0, top: 0 }, domScroll = { left: 0, top: 0 };
   let resizeFrame = 0, inertiaFrame = 0;
   let thumbnailRevision = 0, thumbnailRunning = false;
+  const thumbnailPageRevisions = new Map<number, number>();
   const thumbnailWanted = new Set<number>(), thumbnailCanvases = new Map<number, HTMLCanvasElement>();
+  const thumbnailDirty = new Set<number>();
   const thumbnailFailed = new Set<number>(), thumbnailJobs = new Map<number, AbortController>();
   const rows: HTMLButtonElement[] = [], rowTops: number[] = [];
   let scratchCanvas: HTMLCanvasElement | null = null, scratchRenderer: WebGlPdfRenderer | null = null;
@@ -316,16 +318,29 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     else resize();
     updateToolbar();
   }
-  function invalidateThumbnails(): void {
-    thumbnailRevision++;
-    for (const job of thumbnailJobs.values()) job.abort();
-    for (const canvas of thumbnailCanvases.values()) { canvas.remove(); canvas.width = canvas.height = 0; }
-    thumbnailCanvases.clear(); thumbnailFailed.clear();
-    for (const row of rows) { row.classList.remove("reader-thumbnail-failed"); row.title = ""; }
+  function invalidateThumbnails(pageIndices?: readonly number[]): void {
+    if (pageIndices?.length === 0) return;
+    const pages = pageIndices === undefined ? rows.map((_, page) => page)
+      : [...new Set(pageIndices)].filter(page => Number.isInteger(page) && page >= 0 && page < rows.length);
+    if (pageIndices === undefined) {
+      thumbnailRevision++; thumbnailPageRevisions.clear();
+      for (const job of thumbnailJobs.values()) job.abort();
+      for (const canvas of thumbnailCanvases.values()) { canvas.remove(); canvas.width = canvas.height = 0; }
+      thumbnailCanvases.clear(); thumbnailDirty.clear(); thumbnailFailed.clear();
+    }
+    for (const page of pages) {
+      if (pageIndices !== undefined) {
+        thumbnailPageRevisions.set(page, (thumbnailPageRevisions.get(page) ?? 0) + 1);
+        thumbnailJobs.get(page)?.abort(); thumbnailDirty.add(page);
+      }
+      thumbnailFailed.delete(page);
+      rows[page].classList.remove("reader-thumbnail-failed"); rows[page].title = "";
+    }
     updateThumbnails();
   }
   function setDocument(next: { identity: unknown; pageRects: Float32Array }): void {
     const same = identity === next.identity && rects.length > 0;
+    const samePages = same && rects.length === next.pageRects.length && rects.every((value, index) => value === next.pageRects[index]);
     const before = getView(), anchor = same ? readerCaptureAnchor(rects, before) : null;
     identity = next.identity; rects = next.pageRects;
     navigationTarget = null;
@@ -335,20 +350,22 @@ export function createReaderViewport(options: ReaderViewportOptions) {
       positionScroll(0, 0); sidebar.scrollTop = 0;
     }
     sidebar.hidden = !active || !sidebarOpen;
-    rows.length = rowTops.length = 0; sidebar.replaceChildren();
-    let top = 12;
-    const fragment = document.createDocumentFragment();
-    for (let page = 0; page < rects.length / 4; page++) {
-      const i = page * 4, width = Math.max(.001, rects[i + 2] - rects[i]), height = Math.max(.001, rects[i + 3] - rects[i + 1]);
-      const scale = Math.min(120 / width, 160 / height);
-      const row = document.createElement("button"); row.type = "button"; row.className = "reader-thumbnail";
-      row.setAttribute("aria-label", `Go to page ${page + 1}`); row.dataset.page = String(page);
-      row.style.height = `${height * scale + 32}px`;
-      row.innerHTML = `<span class="reader-thumbnail-image" style="width:${width * scale}px;height:${height * scale}px"></span><span>${page + 1}</span>`;
-      if (page === currentPage) row.setAttribute("aria-current", "page");
-      rowTops.push(top); top += height * scale + 44; rows.push(row); fragment.append(row);
+    if (!samePages) {
+      rows.length = rowTops.length = 0; sidebar.replaceChildren();
+      let top = 12;
+      const fragment = document.createDocumentFragment();
+      for (let page = 0; page < rects.length / 4; page++) {
+        const i = page * 4, width = Math.max(.001, rects[i + 2] - rects[i]), height = Math.max(.001, rects[i + 3] - rects[i + 1]);
+        const scale = Math.min(120 / width, 160 / height);
+        const row = document.createElement("button"); row.type = "button"; row.className = "reader-thumbnail";
+        row.setAttribute("aria-label", `Go to page ${page + 1}`); row.dataset.page = String(page);
+        row.style.height = `${height * scale + 32}px`;
+        row.innerHTML = `<span class="reader-thumbnail-image" style="width:${width * scale}px;height:${height * scale}px"></span><span>${page + 1}</span>`;
+        if (page === currentPage) row.setAttribute("aria-current", "page");
+        rowTops.push(top); top += height * scale + 44; rows.push(row); fragment.append(row);
+      }
+      sidebar.append(fragment); invalidateThumbnails();
     }
-    sidebar.append(fragment); invalidateThumbnails();
     if (!same) releaseScratch();
     sizeSurface();
     if (anchor) {
@@ -358,14 +375,21 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     resize(); updateToolbar();
   }
 
+  function replaceThumbnail(page: number, box: HTMLElement, image: HTMLCanvasElement): void {
+    const previous = thumbnailCanvases.get(page);
+    box.append(image); thumbnailCanvases.set(page, image); thumbnailDirty.delete(page);
+    if (previous) { previous.remove(); previous.width = previous.height = 0; }
+  }
   async function pumpThumbnails(): Promise<void> {
     if (thumbnailRunning || disposed || !active || !sidebarOpen) return;
     thumbnailRunning = true;
     try {
       while (!disposed && active && sidebarOpen) {
-        const page = [...thumbnailWanted].find(index => !thumbnailCanvases.has(index) && !thumbnailFailed.has(index));
+        const page = [...thumbnailWanted].find(index => (!thumbnailCanvases.has(index) || thumbnailDirty.has(index)) && !thumbnailFailed.has(index));
         if (page === undefined) break;
-        const revision = thumbnailRevision, controller = new AbortController();
+        const revision = thumbnailRevision, pageRevision = thumbnailPageRevisions.get(page) ?? 0, controller = new AbortController();
+        const isCurrent = (): boolean => !disposed && revision === thumbnailRevision
+          && pageRevision === (thumbnailPageRevisions.get(page) ?? 0) && thumbnailWanted.has(page);
         thumbnailJobs.set(page, controller);
         try {
           const box = rows[page].querySelector<HTMLElement>(".reader-thumbnail-image")!;
@@ -375,18 +399,18 @@ export function createReaderViewport(options: ReaderViewportOptions) {
           if (options.getPageThumbnail) {
             const pixels = await options.getPageThumbnail(page, { maxDimension: Math.max(width, height), signal: controller.signal });
             controller.signal.throwIfAborted();
-            if (revision !== thumbnailRevision || disposed || !thumbnailWanted.has(page)) continue;
+            if (!isCurrent()) continue;
             const image = document.createElement("canvas"); image.width = pixels.width; image.height = pixels.height;
             const context = image.getContext("2d");
             if (!context) throw new Error("Page thumbnail canvas is unavailable.");
             context.putImageData(new ImageData(new Uint8ClampedArray(pixels.rgba.buffer, pixels.rgba.byteOffset, pixels.rgba.byteLength), pixels.width, pixels.height), 0, 0);
-            box.append(image); thumbnailCanvases.set(page, image);
+            replaceThumbnail(page, box, image);
             await new Promise<void>(resolve => window.setTimeout(resolve, 0));
             continue;
           }
           if (!options.getPagePreviewScene) throw new Error("Page thumbnails are unavailable.");
           const scene = await options.getPagePreviewScene(page, { maximumDimension: Math.max(16, Math.min(4096, Math.max(width, height))), signal: controller.signal });
-          if (controller.signal.aborted || revision !== thumbnailRevision || !thumbnailWanted.has(page)) continue;
+          if (controller.signal.aborted || !isCurrent()) continue;
           scratchCanvas ??= document.createElement("canvas");
           scratchCanvas.width = width; scratchCanvas.height = height;
           scratchRenderer ??= new WebGlPdfRenderer(scratchCanvas, { preserveDrawingBuffer: true });
@@ -400,11 +424,11 @@ export function createReaderViewport(options: ReaderViewportOptions) {
               const visibility = renderer.getOptionalContentVisibility() ?? createDefaultOptionalContentSnapshot(scene);
               const result = await replay.prepare(visibility, { signal: controller.signal });
               controller.signal.throwIfAborted();
-              if (revision !== thumbnailRevision || disposed || !thumbnailWanted.has(page)) continue;
+              if (!isCurrent()) continue;
               const staged = await renderer.prepareRasterLayerUpdatesAsync(result.layers);
               try {
                 controller.signal.throwIfAborted();
-                if (revision !== thumbnailRevision || disposed || !thumbnailWanted.has(page)) continue;
+                if (!isCurrent()) continue;
                 staged.commit(); result.commit();
               } finally { staged.dispose(); }
             }
@@ -414,10 +438,10 @@ export function createReaderViewport(options: ReaderViewportOptions) {
             const context = image.getContext("2d");
             if (!context) throw new Error("Page thumbnail canvas is unavailable.");
             context.drawImage(sourceCanvas, 0, 0);
-            box.append(image); thumbnailCanvases.set(page, image);
+            replaceThumbnail(page, box, image);
           } finally { replay?.dispose(); }
         } catch (error) {
-          if (!controller.signal.aborted && revision === thumbnailRevision) {
+          if (!controller.signal.aborted && isCurrent()) {
             thumbnailFailed.add(page); rows[page]?.classList.add("reader-thumbnail-failed");
             if (rows[page]) rows[page].title = "Preview unavailable. Select to open this page.";
             console.warn(`[HEPR] Thumbnail for page ${page + 1} could not be prepared.`, error);
@@ -632,7 +656,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     for (const job of thumbnailJobs.values()) job.abort();
     releaseScratch();
     for (const canvas of thumbnailCanvases.values()) { canvas.remove(); canvas.width = canvas.height = 0; }
-    thumbnailCanvases.clear(); thumbnailWanted.clear(); thumbnailFailed.clear(); rows.length = rowTops.length = 0;
+    thumbnailCanvases.clear(); thumbnailWanted.clear(); thumbnailDirty.clear(); thumbnailFailed.clear(); thumbnailPageRevisions.clear(); rows.length = rowTops.length = 0;
     announcement.textContent = "";
   }
   return { setDocument, setLayout, getView, setView, panByPixels, goToPage, resize, canvasChanged,
