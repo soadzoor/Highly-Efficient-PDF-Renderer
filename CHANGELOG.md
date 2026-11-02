@@ -8,6 +8,16 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Added
 
+- Create PDFs from scratch in both viewers and through `createPdf()`, with
+  preset/custom paper sizes, orientation, page count, blank-page insertion and
+  undoable resizing that preserves actual content size and top-left placement.
+  Open valid blank PDF/HEP pages, retain the previous document when replacement
+  fails or is cancelled, and resume never-saved new-document drafts locally.
+- Add optional automatic page numbers with header/footer placement, margins,
+  fonts, color, starting numbers, cover exclusion and page-total formats.
+  Renumber with page operations and Undo/Redo; retain adjustable settings in
+  editable PDF and HEP, including direct PDF-to-HEP export. Flattened copies
+  retain visible numbers; extracted/imported numbers become ordinary content.
 - Add form-field authoring with text, number, date, email, telephone, URL,
   checkbox, radio, dropdown and list inputs. Draw field areas, edit properties,
   fill values, transform, duplicate and undo changes; save real AcroForm widgets

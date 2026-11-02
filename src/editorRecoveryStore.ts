@@ -1,6 +1,6 @@
 import type { EditorRecoveryEnvelope } from "./editorRecoveryCodec";
 
-export interface EditorRecoveryMetadata { key: string; label: string; updatedAt: number; revision: number; protected: boolean }
+export interface EditorRecoveryMetadata { key: string; label: string; updatedAt: number; revision: number; protected: boolean; createdDocument?: boolean }
 export interface EditorRecoveryRecord extends EditorRecoveryMetadata { envelope: EditorRecoveryEnvelope }
 export interface EditorRecoveryStore {
   get(key: string): Promise<EditorRecoveryRecord | undefined>;

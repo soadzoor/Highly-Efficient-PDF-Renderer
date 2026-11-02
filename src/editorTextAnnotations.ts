@@ -166,6 +166,10 @@ function readTextModel(value: unknown): EditorTextObject | null {
   if (input.lineHeight !== undefined) {
     if (!finite(input.lineHeight) || input.lineHeight <= 0) return null; model.lineHeight = input.lineHeight;
   }
+  if (input.pageNumberingId !== undefined) {
+    if (typeof input.pageNumberingId !== "string" || !input.pageNumberingId.trim()) return null;
+    model.pageNumberingId = input.pageNumberingId;
+  }
   if (input.runs !== undefined) {
     if (!Array.isArray(input.runs)) return null;
     const runs: EditorTextRun[] = [];

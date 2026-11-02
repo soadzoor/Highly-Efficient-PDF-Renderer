@@ -101,6 +101,8 @@ export interface PdfAnnotation {
   subject?: string;
   name?: string;
   creationDate?: string;
+  /** Managed page-number appearance; only matching document authoring IDs are regenerated. */
+  pageNumberingId?: string;
   modificationDate?: string;
   iconName?: string;
   open?: boolean;
@@ -272,7 +274,7 @@ export function validateAnnotations(value: unknown, options: {
     if ((pdf.rect as number[]).length !== 4) fail();
     geometry(pdf); geometry(a);
     for (const key of ["contents", "tooltip", "author", "subject", "name", "creationDate", "modificationDate",
-      "iconName", "popupId", "parentId", "replyToId", "replyType", "state", "stateModel"]) if (a[key] !== undefined) string(a[key]);
+      "iconName", "popupId", "parentId", "replyToId", "replyType", "state", "stateModel", "pageNumberingId"]) if (a[key] !== undefined) string(a[key]);
     if (a.open !== undefined && typeof a.open !== "boolean") fail();
     if (a.opacity !== undefined && (typeof a.opacity !== "number" || !Number.isFinite(a.opacity) || a.opacity < 0 || a.opacity > 1)) fail();
     if (a.color !== undefined) {

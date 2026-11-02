@@ -53,6 +53,7 @@ const icons = {
   "save-pdf": '<path d="M4 3h13l4 4v14H3V3Zm3 0v6h10V3M7 21v-8h10v8m-3-18v3"/>',
   flatten: '<path d="m3 7 9-4 9 4-9 4Zm0 5 9 4 9-4M3 17l9 4 9-4m-9-9v10m-3-3 3 3 3-3"/>',
   "save-hep": '<path d="M4 3h13l4 4v14H3V3Zm3 0v6h10V3"/><circle cx="8" cy="17" r="1.5"/><circle cx="16" cy="14" r="1.5"/><circle cx="16" cy="20" r="1.5"/><path d="m9.5 16.5 5-2m-5 3 5 2"/>',
+  "page-numbers": '<path d="M5 2h10l4 4v16H5Z M15 2v5h4M8 15l2-1v5m-2 0h4m2-4h3l-3 4h3"/>',
   print: '<path d="M7 8V3h10v5M7 17H3v-7a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v7h-4M7 14h10v7H7Z"/><path d="M17 11h1"/>',
   open: '<path d="M3 18V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v2M3 18l3-8h16l-3 10H5a2 2 0 0 1-2-2Z"/>',
   edit: '<path d="M13 4H3v17h17V11M9 15l1-5 8-8 4 4-8 8Zm7-11 4 4"/>',

@@ -263,6 +263,7 @@ export class ProcessingSession implements DocumentSession {
       const { resolvePdfPageNumbers, composeVectorScenesInGrid } = await import("./pdfVectorExtractor");
       signal.throwIfAborted();
       const indexes = resolvePdfPageNumbers(this.info.pageCount, options.pages).map(page => page - 1);
+      const completeDocument = indexes.length === this.info.pageCount && indexes.every((page, index) => page === index);
       const prepare = retainScene || options.encodeRasterImages === false ? undefined : (await import("./hepRasterPreparation")).createHepRasterPagePreparer();
       const pages: VectorScene[] = [];
       const diagnosticStart = this.diagnostics.length;
@@ -273,6 +274,7 @@ export class ProcessingSession implements DocumentSession {
           enableSegmentMerge: options.segmentMerge !== false, enableInvisibleCull: options.invisibleCull !== false,
           annotationAppearances: options.annotationAppearances
         });
+        if (!completeDocument) page.documentAuthoring = undefined;
         signal.throwIfAborted();
         await prepare?.(page, signal);
         signal.throwIfAborted();

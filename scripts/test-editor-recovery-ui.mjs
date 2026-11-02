@@ -97,5 +97,38 @@ try {
     modalOptions.onBusyChange(true); assert(context.recoveryRunning && context.toolbar.inert && context.overlay.inert);
     modalOptions.onBusyChange(false); assert(!context.recoveryRunning && !context.toolbar.inert);
   }
-  console.log("Recovery UI: explicit restore/discard/later, current-source eligibility, inert labels, failures, busy escape and stale-dialog cleanup passed.");
+  {
+    const events = []; let configuration;
+    const context = editorUiTestContext({ source: { label: "New PDF", bytes: Uint8Array.of(7), createdDocument: true, initialUnsaved: true, recoveryKey: "original-record-key", resumeRecovery: true },
+      currentSourceScene: {}, recoveryKey: "", recoveryNotice: "", activeText: null, fieldDrafts: new Map(), pointer: null, pendingPick: null,
+      editorRecoveryDocumentKey: async () => assert.fail("resuming a rematerialized snapshot must not hash its replacement bytes"),
+      editorServices: { isSourceProtected: async () => false }, session: { getState: () => ({}) }, query: () => ({}),
+      createEditorRecovery(value) { configuration = value; return { probe: async () => ({ key: "original-record-key" }), restore: async () => events.push("restore"), draftChanged: () => events.push("checkpoint") }; }, report: error => { throw error; } });
+    vm.runInContext(sourceFunction(source, "initializeRecovery"), context); await context.initializeRecovery();
+    assert.equal(configuration.key, "original-record-key"); assert(configuration.createdDocument); assert.deepEqual(events, ["restore", "checkpoint"]); assert.equal(context.recoveryOffered, false);
+  }
+  {
+    const context = editorUiTestContext({ hasUnsavedChanges: () => true, window: { confirm: () => true }, setStatus() {} });
+    vm.runInContext(sourceFunction(source, "confirmDocumentChange"), context);
+    assert(context.confirmDocumentChange({ deferRecoveryDiscard: true })); assert.equal(context.discardRecovery, false, "preparation approval does not delete the retained document's draft");
+    assert(context.confirmDocumentChange()); assert.equal(context.discardRecovery, true);
+  }
+  {
+    const start = source.indexOf("  dispose(options = {}) {"), end = source.indexOf("\n  }\n};", start);
+    assert(start >= 0 && end > start);
+    const dispose = source.slice(start, end + 4).replace(/^  dispose/, "function dispose").replace(/\n  }$/, "\n}");
+    for (const preserve of [true, false]) {
+      const events = [];
+      const context = editorUiTestContext({ recoveryKey: "target-key", discardRecovery: false, active: false, frame: 0,
+        recovery: { async discard() { events.push("discard"); }, dispose() { events.push("dispose"); } },
+        window: { cancelAnimationFrame() {} }, scenePreparation: null, operation: null, pendingFieldFocus: null,
+        pendingDrawings: { clear() {} }, releaseFrameListener: null, passwordDialog: null, pagesDialog: null, pageNumberingDialog: null,
+        pdfProtection: { dispose() {} }, contextMenu: { dispose() {} }, layerControls: { dispose() {} }, layerDialog: null,
+        unsubscribe() {}, picker: null, interaction: { dispose() {} }, session: { dispose() {} }, editorServices: { dispose() {} },
+        toolbar: { remove() {} }, overlay: { remove() {} }, fontFaces: new Map(), document: { body: { classList: { remove() {} } }, fonts: { delete() {} } }, host: { setEditing() {} }, cancelPointerGesture() {} });
+      vm.runInContext(dispose, context); context.dispose({ discardRecovery: true, ...(preserve ? { preserveRecoveryKey: "target-key" } : {}) }); await flush();
+      assert.deepEqual(events, preserve ? ["dispose"] : ["discard", "dispose"], "resuming the same record must preserve its data until the new editor restores it");
+    }
+  }
+  console.log("Recovery UI: explicit restore/discard/later, key-preserving new-document resume, deferred discard and source eligibility passed.");
 } finally { hooks.deregister(); }

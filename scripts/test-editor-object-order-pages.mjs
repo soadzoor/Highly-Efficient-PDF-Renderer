@@ -82,6 +82,11 @@ try {
       await editor.cropPages([0], null);
       assert.deepEqual(await pixel(await editor.getScene(), 0, 15, 15), [255, 0, 0, 255], "resetting a crop reveals retained geometry outside the former visible box");
       assert.deepEqual(await pixel(await editor.getScene(), 0, 30, 30), [255, 0, 0, 255]);
+      await editor.resizePages([0], { width: 120, height: 130 });
+      assert.deepEqual([editor.getPages()[0].width, editor.getPages()[0].height], [120, 130]);
+      assert.deepEqual(await pixel(await editor.getScene(), 0, 30, 30), [255, 0, 0, 255], "paper resizing retains ordered source/annotation interleaving and author models");
+      assert.equal(editor.getObject(id).kind, "shape"); assert(editor.undo());
+      assert.deepEqual([editor.getPages()[0].width, editor.getPages()[0].height], [100, 100]);
       const hep = await loadSceneFromHep(await (await editor.saveHep()).arrayBuffer());
       assert.deepEqual(await pixel(hep, 0, 30, 30), [255, 0, 0, 255], "page changes bake order into normal HEP paint data");
       assert(!("objectOrder" in hep)); assert(!JSON.stringify(hep).includes("source:page:"), "operation-local owner labels are never persisted in HEP");
@@ -136,6 +141,14 @@ try {
   try {
     const mark = initiallyCropped.addObject({ kind: "shape", shape: "rectangle", pageIndex: 0, x: 5, y: 5, width: 40, height: 40, fill: "#00ff00", strokeWidth: 0, layerId: "ref:6:0" });
     initiallyCropped.select([mark]); initiallyCropped.reorderSelection("send-to-back");
+    await initiallyCropped.resizePages([0], { width: 100, height: 100 });
+    for (const [x, y] of [[75, 25], [85, 15]]) {
+      const rgba = await pixel(await initiallyCropped.getScene(), 0, x, y);
+      assert(Math.abs(rgba[0] - 127) <= 1 && rgba[1] === 255 && rgba[2] === 255 && rgba[3] === 255,
+        `paper enlargement reveals native translucent paint exactly once inside and outside the former crop: ${rgba}`);
+    }
+    assert.deepEqual(await pixel(await initiallyCropped.getScene(), 0, 30, 30), [255, 0, 0, 255], "paper enlargement keeps source paint above its authored layer peer");
+    assert(initiallyCropped.undo());
     const { rebaseEditorOrderedSource } = await import("../src/editorPageOrderRebase.ts");
     const fullNative = new Uint8Array(await (await manipulatePdfPages(initiallyCroppedBytes, { kind: "crop", pages: [0], box: null })).arrayBuffer());
     const rebased = rebaseEditorOrderedSource(initiallyCropped, await initiallyCropped.getScene({ preview: false, sourceCopiesOnly: true }), await compile(fullNative),

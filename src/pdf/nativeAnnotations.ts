@@ -138,7 +138,7 @@ class AnnotationReader {
       ...transformAnnotationGeometry(geometry, matrix), flags: annotation.flags,
       visibleInDefaultView: annotation.visibleInDefaultView, hasAppearance: annotation.hasAppearanceDictionary };
     const strings = { Contents: "contents", TU: "tooltip", Subj: "subject", NM: "name", CreationDate: "creationDate",
-      M: "modificationDate", Name: "iconName", RT: "replyType", State: "state", StateModel: "stateModel" } as const;
+      M: "modificationDate", Name: "iconName", RT: "replyType", State: "state", StateModel: "stateModel", HEPRPageNumber: "pageNumberingId" } as const;
     for (const [key, field] of Object.entries(strings)) {
       const value = await this.optional(key, () => this.text(d.get(key), key === "Name" || key === "RT"));
       if (value !== undefined) result[field as typeof strings[keyof typeof strings]] = value;

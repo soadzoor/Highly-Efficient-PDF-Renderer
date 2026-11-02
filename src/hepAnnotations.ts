@@ -2,6 +2,7 @@ import { validateAnnotationAppearanceMode, validateAnnotations, validateScenePdf
   type SceneAnnotation } from "./annotationData";
 import type { HepArchive } from "./hepContainer";
 import type { VectorScene } from "./pdfVectorExtractor";
+import { parseDocumentAuthoring, validateDocumentAuthoring } from "./documentAuthoring";
 
 export const HEP_ANNOTATIONS_PATH = "annotations/annotations.json";
 /** HEP chunk lengths use an unsigned 32-bit wire field. */
@@ -10,15 +11,17 @@ export const MAX_HEP_ANNOTATION_BYTES = 0xffffffff;
 export function writeHepAnnotations(archive: HepArchive, scene: VectorScene): {
   file: string; version: 1; count: number; appearances?: AnnotationAppearanceMode;
 } | undefined {
-  if (scene.annotations === undefined && scene.pdfPages === undefined) return undefined;
+  if (scene.annotations === undefined && scene.pdfPages === undefined && scene.documentAuthoring === undefined) return undefined;
   validateAnnotationAppearanceMode(scene.annotationAppearances);
   const annotations = scene.annotations ?? [];
   validateScenePdfPages(scene.pdfPages, scene.pageCount);
   validateAnnotations(annotations, { pageCount: scene.pageCount, conditionCount: scene.optionalContent?.conditions.length ?? 0 });
   // Loading an older HEP exposes an empty annotation array; do not grow the
   // archive with an empty section on every load/export round trip.
-  if (annotations.length === 0 && !scene.pdfPages?.length) return undefined;
-  const bytes = new TextEncoder().encode(JSON.stringify({ version: 1, annotations, pdfPages: scene.pdfPages }));
+  if (scene.documentAuthoring) validateDocumentAuthoring(scene.documentAuthoring);
+  if (annotations.length === 0 && !scene.pdfPages?.length && !scene.documentAuthoring) return undefined;
+  const bytes = new TextEncoder().encode(JSON.stringify({ version: 1, annotations, pdfPages: scene.pdfPages,
+    documentAuthoring: scene.documentAuthoring }));
   if (bytes.length > MAX_HEP_ANNOTATION_BYTES) throw new Error("Annotation metadata exceeds the HEP section limit.");
   archive.file(HEP_ANNOTATIONS_PATH, bytes);
   // Older readers ignore the optional mode; "render" is recorded by omission.
@@ -44,9 +47,19 @@ export async function readHepAnnotations(archive: HepArchive, descriptor: unknow
   if (!data || data.version !== 1 || !Array.isArray(data.annotations) || data.annotations.length !== meta.count) {
     throw new Error("HEP annotations do not match their manifest entry.");
   }
-  validateAnnotations(data.annotations, { pageCount: scene.pageCount, conditionCount: scene.optionalContent?.conditions.length ?? 0 });
+  const annotations = data.annotations.map((annotation: Record<string, unknown>) => {
+    if (annotation && typeof annotation === "object" && annotation.pageNumberingId !== undefined &&
+        (typeof annotation.pageNumberingId !== "string" || !annotation.pageNumberingId.trim())) {
+      const { pageNumberingId: _invalid, ...ordinary } = annotation;
+      console.warn("[HEPR] Invalid optional page-number ownership was ignored; its visible appearance is retained.");
+      return ordinary;
+    }
+    return annotation;
+  });
+  validateAnnotations(annotations, { pageCount: scene.pageCount, conditionCount: scene.optionalContent?.conditions.length ?? 0 });
   validateScenePdfPages(data.pdfPages, scene.pageCount);
   scene.pdfPages = data.pdfPages;
+  scene.documentAuthoring = parseDocumentAuthoring(data.documentAuthoring, diagnostic => console.warn(`[HEPR] ${diagnostic.message}`));
   if (meta.appearances !== undefined) scene.annotationAppearances = meta.appearances as AnnotationAppearanceMode;
-  return data.annotations as SceneAnnotation[];
+  return annotations as SceneAnnotation[];
 }

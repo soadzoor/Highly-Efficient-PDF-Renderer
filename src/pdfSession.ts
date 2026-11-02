@@ -579,6 +579,7 @@ class NativePdfSession implements NativeVectorPdfSession {
         const { compileNativeOcrTextPage } = await import("./pdf/nativeOcrText");
         const scene = await compileNativeOcrTextPage(this.document, sourcePageIndex, options, signal,
           this.missingFontResolver, this.optionalContent, diagnostic => this.appendDiagnostics([diagnostic]));
+        if (this.document.info.documentAuthoring) scene.documentAuthoring = structuredClone(this.document.info.documentAuthoring);
         scene.pdfOverviewKind = "vector";
         return scene;
       }
@@ -602,6 +603,7 @@ class NativePdfSession implements NativeVectorPdfSession {
             const overview = await compileNativeOcrTextPage(this.document, sourcePageIndex, options, signal,
               this.missingFontResolver, this.optionalContent, diagnostic => this.appendDiagnostics([diagnostic]));
             if (overview.textInstanceCount > 0 && overview.textIndex?.pages.some(page => /[^\s\ufffd]/u.test(page.text))) {
+              if (this.document.info.documentAuthoring) overview.documentAuthoring = structuredClone(this.document.info.documentAuthoring);
               overview.pdfOverviewKind = "ocr";
               return overview;
             }
@@ -618,6 +620,7 @@ class NativePdfSession implements NativeVectorPdfSession {
         }
       }
       const scene = await this.compileVectorPageWithLayerFallback(sourcePageIndex, options, signal);
+      if (this.document.info.documentAuthoring) scene.documentAuthoring = structuredClone(this.document.info.documentAuthoring);
       if (options.previewMaxDimension === undefined) return scene;
       scene.pdfOverviewKind = overviewKind;
       if (overviewKind === "raster") {
@@ -1200,6 +1203,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       scene.annotationAppearances = options.annotationAppearances;
     }
     if (scene.markedContent?.items.length) await this.attachStructureElements(scene, sourcePageIndex, signal);
+    if (this.document.info.documentAuthoring) scene.documentAuthoring = structuredClone(this.document.info.documentAuthoring);
     return scene;
   }
 

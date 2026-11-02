@@ -142,7 +142,7 @@ export function rebaseEditorOrderedSource(previous: EditorSession, canonical: Ve
     kept = { ...kept, pageRects: target.pageRects, pdfPages: target.pdfPages, annotations: undefined };
     setEditorPaintIdentity(kept, ref => `${namespace}retained:${page}:${identity(ref)}`);
     let revealed: VectorScene | undefined;
-    if (operation.kind === "crop" && operation.pages.includes(original)) {
+    if ((operation.kind === "crop" || operation.kind === "resize") && operation.pages.includes(original)) {
       const previousBounds = editorTransformBounds({ minX: origin[0], minY: origin[1], maxX: origin[2], maxY: origin[3] }, matrix);
       const box = target.pageRects;
       const expands = box[0] < previousBounds.minX - .001 || box[1] < previousBounds.minY - .001 ||

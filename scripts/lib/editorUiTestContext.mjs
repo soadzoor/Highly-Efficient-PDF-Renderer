@@ -21,7 +21,7 @@ export function editorUiTestContext(values = {}) {
     tool: "select", appearanceControls: { refresh() {} }, latestScene: {}, toolbar: { querySelectorAll: () => [] },
     alignmentSnap: null, requestedGuides: [], createEditorAlignmentSnap: () => null,
     recovery: null, recoveryReady: Promise.resolve(), recoveryOffered: false,
-    recoveryDialog: null, recoveryRunning: false, discardRecovery: false, exportedRevision: null,
+    recoveryDialog: null, pageNumberingDialog: null, recoveryRunning: false, discardRecovery: false, exportedRevision: null,
     cameraPan: { cancel() {}, isPanning: () => false, setActive() {}, dispose() {} },
     fieldActivation: { pointerDown() {}, pointerMove() {}, pointerUp: () => null, reset() {} }, canActivateField: () => false,
     fieldDialog: null, fieldDialogCreating: false, fieldDefaults: { fieldType: "text" }, selectedEditorField: () => null,

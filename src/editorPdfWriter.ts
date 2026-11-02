@@ -11,11 +11,14 @@ import { PdfByteWriter, pdfNumber, pdfRef, pdfUtf16Hex } from "./editorPdfBytes"
 import { createLoadProgressReporter, type LoadProgressCallback } from "./loadProgress";
 import { validatePdfOutputProtection, type PdfOutputProtection } from "./pdf/pdfProtection";
 import { writeScenePdfLinks } from "./editorPdfLinks";
+import { validateDocumentAuthoring } from "./documentAuthoring";
+import type { PdfDiagnostic } from "./pdf/nativeTypes";
 
 export interface ScenePdfWriteOptions {
   readonly signal?: AbortSignal;
   readonly onWarning?: (message: string) => void;
   readonly onProgress?: LoadProgressCallback;
+  readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   /** Bake the default layer visibility into content instead of retaining PDF layers. */
   readonly flatten?: boolean;
   readonly protection?: PdfOutputProtection;
@@ -52,6 +55,16 @@ function inverse(matrix: Matrix): number[] {
 export async function writeScenePdf(scene: VectorScene, options: ScenePdfWriteOptions = {}): Promise<Blob> {
   options = { ...options, protection: validatePdfOutputProtection(options.protection) };
   options.signal?.throwIfAborted();
+  // Managed appearances must stay replaceable after a compiled scene/HEP is
+  // written directly. The editor removes their old paint and writes standard
+  // FreeText annotations; its source-free base has no owned appearances, so
+  // the ordinary scene writer below remains the recursion-free base path.
+  if (!options.flatten && scene.documentAuthoring && scene.annotations?.some(annotation => annotation.pageNumberingId === scene.documentAuthoring!.id)) {
+    const { openEditorSession } = await import("./editorSession");
+    const editor = await openEditorSession(scene, { signal: options.signal, onDiagnostic: options.onDiagnostic });
+    try { return await editor.savePdf({ ...options, markSaved: false }); }
+    finally { editor.dispose(); }
+  }
   const outputProgress = createLoadProgressReporter(options.onProgress);
   const encrypt = options.protection?.mode === "password";
   const progress = encrypt ? outputProgress.child(0, .85) : outputProgress;
@@ -82,8 +95,12 @@ export async function writeScenePdf(scene: VectorScene, options: ScenePdfWriteOp
       processed: index + 1, total: views.pageCount, pageIndex: index, pageCount: views.pageCount });
   }
   writer.set(pages, `<< /Type /Pages /Count ${pageReferences.length} /Kids [${pageReferences.map(pdfRef).join(" ")}] >>`);
-  writer.set(catalog, `<< /Type /Catalog /Pages ${pdfRef(pages)} ${layers.catalog()} ${links.names} >>`);
-  let bytes = writer.build(catalog);
+  const authoring = options.flatten ? undefined : scene.documentAuthoring;
+  if (authoring) validateDocumentAuthoring(authoring);
+  writer.set(catalog, `<< /Type /Catalog /Pages ${pdfRef(pages)} ${layers.catalog()} ${links.names} ${authoring ? `/HEPRDocument ${pdfUtf16Hex(JSON.stringify(authoring))}` : ""} >>`);
+  const title = scene.documentAuthoring?.title;
+  const info = title === undefined ? undefined : writer.add(`<< /Title ${pdfUtf16Hex(title)} >>`);
+  let bytes = writer.build(catalog, info === undefined ? "" : `/Info ${pdfRef(info)}`);
   if (encrypt) {
     progress.report(1, { stage: "compile", sourceType: "scene" });
     const { rewritePdfProtection } = await import("./editorPdfProtection"), protectionProgress = outputProgress.child(.85, 1);

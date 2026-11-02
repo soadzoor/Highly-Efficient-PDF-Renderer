@@ -5,6 +5,15 @@ import type { EditorPdfSaveOptions, EditorSession } from "./editorTypes";
 import type { PdfOutputProtection } from "./pdf/pdfProtection";
 import type { PdfProtectionChangeOptions } from "./editorPdfProtection";
 import type { PdfPageOperation, PdfPageOperationOptions } from "./editorPdfPages";
+import type { PdfCreateOptions } from "./pdfCreation";
+
+/** Create a blank, editable PDF using a paper preset or custom point dimensions. */
+export async function createPdf(options: PdfCreateOptions = {}): Promise<Blob> {
+  const settings = { ...options, pageSize: typeof options.pageSize === "object" ? { ...options.pageSize } : options.pageSize,
+    pageNumbering: options.pageNumbering ? { ...options.pageNumbering, ...(Array.isArray(options.pageNumbering.color)
+      ? { color: [...options.pageNumbering.color] as [number, number, number] } : {}) } : undefined };
+  return (await import("./pdfCreation")).createPdf(settings);
+}
 
 /** Per-page visual alignment and prepared snapping for custom editor hosts. */
 export async function createEditorLayoutController(session: EditorSession) {

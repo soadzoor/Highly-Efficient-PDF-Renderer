@@ -351,6 +351,58 @@ standard page destinations across save/reopen, rather than binding an old
 primitive index to unrelated content. HEP retains links in existing annotation
 and page-mapping metadata, without a new editor-persistence section.
 
+### New PDFs and automatic page numbers
+
+`createPdf(options?)` creates a PDF Blob without an existing document. It is
+exported from the root, bundler and Node entries. Defaults are one A4 portrait
+page with numbering disabled. Options include `title`, `pageSize`, `orientation`,
+`pageCount`, partial `pageNumbering` settings, `signal`, and `onProgress`.
+
+```ts
+import { createPdf, resolvePdfPageSize } from "@soadzoor/hepr";
+
+const pdf = await createPdf({ title: "My document", pageSize: "A4", pageCount: 3 });
+const landscapeLetter = resolvePdfPageSize("Letter", "landscape");
+const custom = await createPdf({ pageSize: { width: 360, height: 540 } });
+```
+
+`PdfPageSize` accepts ISO A0–A6, `Letter`, `Legal`, `Tabloid`, `Executive`, or
+`{ width, height }` in PDF points (72 per inch). `PDF_PAGE_SIZE_PRESETS` exposes
+the dimensions. Custom dimensions keep their supplied orientation unless an
+explicit `portrait` or `landscape` option sorts the dimensions. Dimensions must
+remain positive finite scene coordinates; there is no application-defined
+paper-size or page-count cap.
+
+`editor.insertBlankPages({ at?, pageSize?, orientation?, pageCount?, signal?,
+onProgress?, onDiagnostic? })` inserts before `at` or appends by default. Omitted
+size inherits the adjacent page. `editor.resizePages(indexes, size, options?)`
+changes paper size, preserving actual content scale and the current visible
+top-left offset. Shrinking clips without deleting content; enlargement may reveal
+hidden paint. Rotation and `UserUnit` are retained. These changes share ordinary
+page-operation history, cancellation, and author-model preservation.
+
+`editor.getPageNumbering()` returns detached settings;
+`editor.setPageNumbering(partialSettings)` updates them in one undoable step.
+Controls include `enabled`, `skipFirstPage`, `startNumber`, `format` (`number`,
+`page`, `page-of-total`), `position` (`header`/`footer`), `align`, `marginX`,
+`marginY`, `fontFamily`, `fontSize`, and `color`. Margins/font size use points.
+Fonts are Liberation Sans, Serif, or Mono. Enabled defaults are centered footer,
+10-point black Sans, 10 mm margins, starting at 1. A skipped cover consumes no
+number; the total is the last logical number in the series. Mixed-size pages
+anchor numbers to their displayed bounds, with margins reduced to fit small pages.
+
+Managed numbers update with page operations and stay locked against ordinary
+object editing. Use their settings, or double-click a number in the stock editor.
+Copying a number produces ordinary unlocked text. Editable PDF and HEP saves
+retain the policy and appearance ownership; flattened copies retain visible text.
+Extraction keeps original numbers as ordinary text, and foreign imports retain
+their displayed numbers without replacing the destination's policy. Optional
+metadata is inert, versioned, and ignored with diagnostics when unsupported.
+
+Both viewers expose New PDF, page-size controls under Pages, and Page Numbers.
+New viewer documents remain unsaved until downloaded as PDF/HEP. API hosts can
+pass `initiallyDirty: true` to `openEditorSession` for the same saved-marker behavior.
+
 `getPages()` returns current page indexes, displayed dimensions and
 rotation. Page indexes are zero-based. `rotatePages(indexes, degrees, options?)`
 accepts clockwise multiples of 90 degrees; `removePages(indexes, options?)`
@@ -586,7 +638,9 @@ without an editor or page rendering. Operations are `{ kind: "rotate", pages,
 degrees }`, `{ kind: "remove", pages }`, `{ kind: "insert", at, bytes,
 pages?, password? }`, `{ kind: "reorder", pages }` (complete permutation),
 `{ kind: "duplicate", pages, at }`, `{ kind: "extract", pages }`, and
-`{ kind: "crop", pages, box }` (`PdfPageCropBox | null`, as above). All return a
+`{ kind: "crop", pages, box }` (`PdfPageCropBox | null`, as above), and
+`{ kind: "resize", pages, width, height }` (displayed points, keeping content at
+its actual size and top-left offset). All return a
 new PDF Blob and leave caller bytes untouched. Options accept the primary `password`, `signal`,
 `onProgress`, and `onDiagnostic`. The root, bundler and Node entries export it.
 It preserves primary encryption, native page resources and editable fields and
@@ -603,8 +657,9 @@ const merged = await manipulatePdfPages(primaryBytes, {
 ```
 
 HEP saves bake current geometry and update searchable text, annotations, clipping
-and LOD. They contain no source PDF/font/editor-history sections. There is no
-new editor persistence schema or application-defined object count limit.
+and LOD. Optional document identity/numbering hints accompany managed number
+appearance ownership. They contain no source PDF/font/editor-history sections
+or application-defined object count limit.
 
 `createEditorSignatureLibrary(storage)` accepts a `getItem`/`setItem` storage
 adapter and exposes `list`, `save`, and `remove`. `normalizeEditorSignature`
@@ -646,6 +701,17 @@ still blocks checkpoints, `list()` returns small management metadata, and
 `discard(key?)` deletes the current or another local draft. `dispose()` cancels
 queued work, detaches its session subscription and closes owned storage.
 An injected `EditorRecoveryStore` can replace IndexedDB for custom hosts/tests.
+
+The New PDF dialog lists locally created drafts with Resume draft actions, so
+never-saved documents do not require an external source file. Each new document
+has a unique identity. Resume validates stored authoring state before replacement
+and retains the original record key even after page operations changed source
+bytes. Custom UI hosts can supply `getSource().createdDocument`, `initialUnsaved`,
+`recoveryKey`, and `resumeRecovery` for this workflow. Deferred replacement can
+use `confirmDocumentChange({ deferRecoveryDiscard: true })`, then
+`dispose({ discardRecovery: true, preserveRecoveryKey?, preserveHostMode? })`
+only at successful commit; preserve the host mode when retiring a previous editor
+after its replacement is already active; cancellation leaves the existing editor and draft intact.
 
 `session.captureRecovery({ signal? })` returns a detached, versioned
 `EditorRecoverySnapshot`. `session.restoreRecovery(snapshot, { signal? })`

@@ -198,11 +198,19 @@ export async function createEditorAppServices(options: EditorAppServicesOptions 
     prepareScene: async (scene, signal) => {
       signal?.throwIfAborted();
       options.onPrepareProgress?.(0);
-      if (!options.sourcePdf || !scene.annotations?.some(annotation => annotation.field)) { options.onPrepareProgress?.(1); return scene; }
+      if (!options.sourcePdf) { options.onPrepareProgress?.(1); return scene; }
       const yieldProgress = options.onPrepareProgress ? createLoadYielder(signal) : undefined;
       const document = await NativePdfDocument.open({ kind: "bytes", bytes: options.sourcePdf }, { password: options.password, signal });
       sourceProtected = Boolean(document.getWriterState().protection);
       try {
+        const completeDocument = scene.pageCount === document.pages.length && Array.from({ length: scene.pageCount }, (_, index) =>
+          scene.pdfPages?.find(page => page.pageIndex === index)?.sourcePageIndex === index).every(Boolean);
+        const documentAuthoring = completeDocument && document.info.documentAuthoring ? structuredClone(document.info.documentAuthoring) : undefined;
+        for (const diagnostic of document.getDiagnostics()) if (diagnostic.code === "authoring.invalid-metadata") options.onDiagnostic?.(diagnostic);
+        if (documentAuthoring !== scene.documentAuthoring) {
+          const prepared = { ...scene, documentAuthoring }; retainEditorAnnotationPlacements(scene, prepared); scene = prepared;
+        }
+        if (!scene.annotations?.some(annotation => annotation.field)) { options.onPrepareProgress?.(1); return scene; }
         const forms = new NativePdfFormAppearanceRegistry(document);
         const optional = await createNativeOptionalContentRegistry(document, { signal });
         const registry = new NativePdfAnnotationMetadataRegistry(document, forms, optional, options.onDiagnostic ?? (() => {}), true);

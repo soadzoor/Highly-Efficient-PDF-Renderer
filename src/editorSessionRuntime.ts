@@ -7,6 +7,9 @@ import { PAGE_PRIMITIVE_KINDS, ScenePageViews, scenePrimitiveCounts } from "./sc
 import type { ScenePaintNode } from "./scenePaintGraph";
 import type { EditorAnnotationEdit, EditorFieldValue, EditorMatrix, EditorObject, EditorObjectInput, EditorSession, EditorSessionOptions,
   EditorSourceEdit, EditorSourceObject, EditorState, EditorSelectionFrame, EditorLayerEdits, EditorStackingAction, EditorRecoverySnapshot, EditorLink, EditorColor, EditorPaintColors, EditorFieldObject } from "./editorTypes";
+import { createDocumentAuthoring, normalizePageNumbering, parseDocumentAuthoring, type DocumentAuthoringData } from "./documentAuthoring";
+import { editorPageNumberObjects } from "./editorPageNumberObjects";
+import { compileEditorPageNumber } from "./editorPageNumbering";
 import { editorFieldAnnotation, validateEditorFieldObject, validateEditorFieldValue } from "./editorFormFields";
 import { normalizePrimitiveColor } from "./colorInput";
 import { applyEditorSourceColors, editorSourcePaintColors } from "./editorSourceColors";
@@ -42,6 +45,7 @@ import { compileEditorLinks, editorSourceLinks, editorSourceLinkAnnotation, vali
 
 interface Snapshot {
   objects: Map<string, EditorObject>;
+  documentAuthoring?: DocumentAuthoringData;
   edits: Map<string, EditorSourceEdit>;
   annotationEdits: Map<string, EditorAnnotationEdit>;
   fields: Map<string, EditorFieldValue>;
@@ -136,7 +140,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
   const initialSourceLocks = new Set((sourceScene.annotations ?? []).filter(annotation => (annotation.flags & 128) !== 0).map(annotation => `annotation:${annotation.id}`));
   let state: Snapshot = { objects: new Map(), edits: new Map(), annotationEdits: new Map(), fields: new Map(), layers: initialLayers, selection: [], sourceLocks: initialSourceLocks, links: new Map(), identity: {} };
   let activeLayer: string | null = null, nextLayerId = 0, layerRevision = 0;
-  let savedIdentity = state.identity, revision = 0, disposed = false, nextId = 0, transactionDepth = 0, transactionStart: Snapshot | null = null;
+  let savedIdentity = options.initiallyDirty ? {} : state.identity, revision = 0, disposed = false, nextId = 0, transactionDepth = 0, transactionStart: Snapshot | null = null;
   let previewTransform: EditorMatrix | null = null, previewSequence = 0;
   const undoStack: Snapshot[] = [], redoStack: Snapshot[] = [], listeners = new Set<(state: EditorState) => void>();
   let sourceObjects = new Map<string, EditorSourceObject>();
@@ -275,7 +279,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
   const objectLocked = (id: string, visiting = new Set<string>()): boolean => {
     if (visiting.has(id)) return false;
     visiting.add(id); const object = internalObject(id);
-    if (object.locked || state.sourceLocks.has(sourceLockKey(object))) return true;
+    if (object.locked || object.kind === "text" && object.pageNumberingId || state.sourceLocks.has(sourceLockKey(object))) return true;
     if (object.kind === "group" && object.children.some(child => objectLocked(child, new Set(visiting)))) return true;
     const contains = (group: EditorObject, seen = new Set<string>()): boolean => {
       if (group.kind !== "group" || seen.has(group.id)) return false;
@@ -284,7 +288,11 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     return [...state.objects.values()].some(group => group.kind === "group" && group.locked && contains(group));
   };
   const assertUnlocked = (ids: readonly string[]): void => {
-    for (const id of ids) if (objectLocked(id)) throw new Error("This selection contains locked objects. Unlock them before editing.");
+    for (const id of ids) if (objectLocked(id)) {
+      const object = internalObject(id);
+      if (object.kind === "text" && object.pageNumberingId) throw new Error("Automatic page numbers are locked. Adjust them through Page numbers.");
+      throw new Error("This selection contains locked objects. Unlock them before editing.");
+    }
   };
   const objectDeleted = (object: EditorObject): boolean => object.kind === "source" && !state.objects.has(object.id) &&
     (!!(object.annotationId && state.annotationEdits.get(object.annotationId)?.deleted) ||
@@ -662,7 +670,9 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     const objects = new Map<string, EditorObject>(), frames = new Map<string, EditorSelectionFrame>();
     const visit = (id: string) => {
       if (objects.has(id)) return;
-      const object = internalObject(id), link = readLink(id); objects.set(id, copy({ ...object, ...(link ? { link } : {}) }));
+      const object = internalObject(id), link = readLink(id), detached = copy({ ...object, ...(link ? { link } : {}) });
+      if (detached.kind === "text" && detached.pageNumberingId) { delete detached.pageNumberingId; detached.locked = false; }
+      objects.set(id, detached);
       if (object.kind === "group") object.children.forEach(visit);
       else if (object.kind === "source") frames.set(id, copy(objectFrame(id, snapshot)));
     };
@@ -731,6 +741,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
   const restoreRecoveryData = (payload: EditorRecoverySnapshot): RecoveryStateData => {
     if (payload?.format !== "hepr-editor-recovery" || payload.version !== 1 || !payload.data || typeof payload.data !== "object") throw new TypeError("Unsupported editor recovery snapshot.");
     const data = copy(payload.data) as RecoveryStateData, candidate = data.state;
+    if (candidate?.documentAuthoring) candidate.documentAuthoring = parseDocumentAuthoring(candidate.documentAuthoring, options.onDiagnostic);
     if (candidate && candidate.links === undefined) candidate.links = new Map();
     if (data.cloneColors === undefined) data.cloneColors = new Map();
     if (!candidate || !(candidate.objects instanceof Map) || !(candidate.edits instanceof Map) || !(candidate.annotationEdits instanceof Map) ||
@@ -787,6 +798,27 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     for (const [id, captured] of data.capturedSources) { if (candidate.objects.get(id)?.kind !== "source" || !captured.scene || !captured.frame) throw new TypeError("Invalid recovered source copy."); editorMatrix(captured.frame.transform); }
     return data;
   };
+  const regeneratePageNumbers = (): void => {
+    const instances = editorPageNumberObjects(sourceScene, state.documentAuthoring);
+    for (const object of instances) validateObject(object, pageCount);
+    for (const [id, object] of state.objects) if (object.kind === "text" && object.pageNumberingId) state.objects.delete(id);
+    const authoring = state.documentAuthoring;
+    if (!authoring) return;
+    for (const annotation of sourceScene.annotations ?? []) if (annotation.pageNumberingId === authoring.id) {
+      state.annotationEdits.set(annotation.id, { id: annotation.id, transform: EDITOR_IDENTITY, deleted: true });
+      for (const run of getSceneAnnotationRuns(sourceScene).get(annotation.id) ?? []) for (let index = run.first; index < run.first + run.count; index++) {
+        const ref = { kind: run.kind, index }; state.edits.set(editorRefKey(ref), { ref, transform: EDITOR_IDENTITY, deleted: true });
+      }
+    }
+    for (const object of instances) state.objects.set(object.id, object);
+    state.selection = state.selection.filter(id => state.objects.has(id) || !id.startsWith("hepr-page-number:"));
+  };
+  state.documentAuthoring = parseDocumentAuthoring(sourceScene.documentAuthoring, options.onDiagnostic);
+  try { regeneratePageNumbers(); }
+  catch {
+    state.documentAuthoring = undefined;
+    options.onDiagnostic?.({ code: "authoring.invalid-metadata", severity: "warning", message: "Unsupported automatic page-number settings were ignored; saved page numbers remain visible." });
+  }
   const session: EditorSession = {
     sourceScene, sourcePdf,
     get revision() { return revision; },
@@ -842,7 +874,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     setObjectsLocked(input, locked) {
       assertLive(); if (typeof locked !== "boolean") throw new TypeError("An editing lock must be true or false.");
       const ids = new Set<string>(), visit = (id: string): void => { if (ids.has(id)) return; ids.add(id); const object = internalObject(id); if (object.kind === "group") object.children.forEach(visit); };
-      input.forEach(visit); if (!ids.size) return;
+      input.forEach(visit); for (const id of ids) { const object = internalObject(id); if (object.kind === "text" && object.pageNumberingId) ids.delete(id); } if (!ids.size) return;
       if ([...ids].every(id => { const object = internalObject(id); return (state.objects.has(id) ? Boolean(object.locked) : state.sourceLocks.has(sourceLockKey(object))) === locked; })) return;
       change(() => { for (const id of ids) {
         const object = internalObject(id);
@@ -1290,6 +1322,17 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         : ranks.getObjectPaintRank(object.annotationId ? `annotation:${object.annotationId}` : id);
       return ranks.getObjectPaintRank(id);
     },
+    getPageNumbering() { assertLive(); return copy(normalizePageNumbering(state.documentAuthoring?.pageNumbering)); },
+    setPageNumbering(settings) {
+      assertLive(); const pageNumbering = normalizePageNumbering({ ...session.getPageNumbering(), ...settings });
+      if (JSON.stringify(pageNumbering) === JSON.stringify(session.getPageNumbering())) return;
+      const authoring = state.documentAuthoring ?? { ...createDocumentAuthoring(), created: undefined };
+      const next = { ...authoring, pageNumbering };
+      editorPageNumberObjects(sourceScene, next); // Validate before replacing the current instances.
+      change(() => { state.documentAuthoring = next; regeneratePageNumbers(); });
+    },
+    async insertBlankPages() { throw new Error("Page operations require an editor document session."); },
+    async resizePages() { throw new Error("Page operations require an editor document session."); },
     getPages() {
       assertLive();
       return Array.from({ length: pageCount }, (_, index) => {
@@ -1407,6 +1450,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       base = bakeEditorAnnotationEdits(base, metadataOnly);
       base = bakeEditorAnnotationEdits(base, [...snapshot.annotationEdits.values()].filter(edit => !edit.deleted && (edit.contents !== undefined || edit.author !== undefined))
         .map(edit => ({ ...edit, transform: EDITOR_IDENTITY, deleted: false })));
+      if (JSON.stringify(base.documentAuthoring) !== JSON.stringify(snapshot.documentAuthoring)) base = { ...base, documentAuthoring: copy(snapshot.documentAuthoring) };
       progress.report(.15, compileMeta); signal.throwIfAborted();
       if (snapshot.fields.size) {
         if (!options.compileFields) throw new Error("Form field updates require the editor's field appearance compiler.");
@@ -1480,7 +1524,9 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
           if (!promise) {
             // Compiled local geometry is shared by render previews and saves.
             // Canceling one consumer must not poison another consumer's work.
-            promise = (options.compileObject ?? compileEditorObjectGeometry)(originObject, lifetime.signal); compiled.set(originObject, promise);
+            promise = originObject.kind === "text" && originObject.pageNumberingId
+              ? compileEditorPageNumber(originObject, (object, signal) => (options.compileObject ?? compileEditorObjectGeometry)(object, signal), lifetime.signal)
+              : (options.compileObject ?? compileEditorObjectGeometry)(originObject, lifetime.signal); compiled.set(originObject, promise);
             void promise.catch(() => compiled.delete(originObject));
           }
           const local = await waitForLoad(promise, signal); signal?.throwIfAborted(); const origin = pageOrigin(object.pageIndex);
@@ -1517,6 +1563,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         result.annotations = result.annotations?.map(annotation => annotation.id === object.id ? { ...annotation, pageIndex: object.pageIndex,
           bounds: editorTransformBounds(canonical.bounds, placement) } : annotation);
       }
+      result.documentAuthoring = copy(snapshot.documentAuthoring);
       result.pagesPerRow = sourceScene.pagesPerRow; result.sourcePdfByteLength = sourceScene.sourcePdfByteLength;
       result = reorderEditorSceneLayers(result, layerEdits(snapshot));
       if (objectOrder) result = applyEditorObjectOrdering(result, objectOrder);
@@ -1581,6 +1628,8 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         getObjectPaintRank: id => withSnapshot(() => session.getObjectPaintRank(id)),
         canReorderSelection: action => withSnapshot(() => session.canReorderSelection(action)), reorderSelection: readOnly,
         getPages: () => withSnapshot(() => session.getPages()),
+        getPageNumbering: () => copy(normalizePageNumbering(snapshot.documentAuthoring?.pageNumbering)), setPageNumbering: readOnly,
+        insertBlankPages: readOnly, resizePages: readOnly,
         async getScene(sceneOptions = {}) {
           sceneOptions.signal?.throwIfAborted(); saveOptions.signal?.throwIfAborted();
           if (sceneOptions.includeObjects !== false) {

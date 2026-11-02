@@ -68,7 +68,7 @@ export async function preparePrintPdf(input: PreparePrintPdfInput, options: Prep
     if (!scene) throw new Error("No PDF or scene is available to print.");
     const { writeScenePdf } = await import("./editorPdfWriter");
     options.signal?.throwIfAborted();
-    return writeScenePdf(scene, options);
+    return writeScenePdf(scene, { ...options, flatten: true });
   }
   const source = { ...sourcePdf }, signal = options.signal, progress = createLoadProgressReporter(options.onProgress);
   progress.report(0, { stage: "source", sourceType: "pdf" });

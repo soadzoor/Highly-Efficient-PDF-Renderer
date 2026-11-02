@@ -19,6 +19,8 @@ import { createViewerPrintAction, type ViewerPrintAction, type ViewerPrintDocume
 import { createViewerFileDropController } from "./viewerFileDrop";
 import { initializeToolbarIcons, setToolbarIconButton, toolbarIconMarkup } from "./toolbarIcons";
 import { createEditorSetupLoading, type EditorSetupLoadingHandle } from "./editorSetupLoading";
+import type { CreatedDocumentSource, NewPdfRequest } from "./newPdfUi";
+import "./newPdfUi.css";
 import "./editorSetupLoading.css";
 import { WebGPURenderer } from "three/webgpu";
 import { MapControls } from "three/addons/controls/MapControls.js";
@@ -366,6 +368,7 @@ const textSelection = createTextSelectionController({
 
 let lastLoadedSource: File | string | null = null;
 let pdfEditor: import("./editorUi").EditorUi | null = null;
+let createdDocumentSource: CreatedDocumentSource | null = null;
 let editorFrameListener: (() => void) | null = null;
 let editorInitialization: AbortController | null = null;
 const editorSetupLoading = createEditorSetupLoading(() => canvasElement);
@@ -620,9 +623,9 @@ async function togglePdfEditing(): Promise<void> {
   }
 }
 
-async function ensureThreeEditor(signal?: AbortSignal, setup?: EditorSetupLoadingHandle): Promise<import("./editorUi").EditorUi> {
+async function ensureThreeEditor(signal?: AbortSignal, setup?: EditorSetupLoadingHandle, preparingDocument = false): Promise<import("./editorUi").EditorUi> {
   signal?.throwIfAborted();
-  if (editorInitialization || sourceLoadController || pageLayoutWarmingUp || backendChangeActive)
+  if (editorInitialization || sourceLoadController && !preparingDocument || pageLayoutWarmingUp || backendChangeActive)
     throw new Error("Wait for the document or renderer change to finish before editing the document.");
   if (!currentPdfObject) throw new Error("Open a PDF or HEP before editing the document.");
   if (pdfEditor) return pdfEditor;
@@ -665,7 +668,7 @@ async function ensureThreeEditor(signal?: AbortSignal, setup?: EditorSetupLoadin
         },
         endCameraPan() { requestRender(); },
         getSource: () => ({ bytes: currentPdfObject?.sourceBytes, pdf: currentPdfObject?.sourceKind === "pdf" ? currentPdfObject.sourceBytes : undefined,
-          password: currentPdfObject?.sourceOptions?.password, label: currentPdfObject?.sourceLabel ?? "document" }),
+          password: currentPdfObject?.sourceOptions?.password, label: currentPdfObject?.sourceLabel ?? "document", ...createdDocumentSource }),
         async prepareScene(signal, onProgress) {
           const object = currentPdfObject!; object.pausePageLoading();
           if (object.sourceKind !== "pdf" || !object.sourceBytes) return readerEditorThumbnailScene = object.sceneData;
@@ -1107,6 +1110,45 @@ lifetimeSignal.addEventListener("abort", () => {
 openButtonElement.addEventListener("click", () => {
   fileInputElement.click();
 }, { signal: lifetimeSignal });
+document.querySelector<HTMLButtonElement>("#new-pdf")!.addEventListener("click", () => { void openNewPdfDialog(); }, { signal: lifetimeSignal });
+
+async function openNewPdfDialog(): Promise<void> {
+  const [{ showNewPdfDialog, readCreatedDocumentRecovery }, { createEditorRecoveryStore }] = await Promise.all([import("./newPdfUi"), import("./editorRecoveryStore")]);
+  showNewPdfDialog(document, {
+    async create(request: NewPdfRequest, signal) {
+      const { createPdf } = await import("./editorApi");
+      const bytes = new Uint8Array(await (await createPdf({ ...request, signal })).arrayBuffer()); signal.throwIfAborted();
+      return openCreatedThreePdf(bytes, request.title, { createdDocument: true, initialUnsaved: true }, signal);
+    },
+    async resume(entry, signal) {
+      const { snapshot } = await readCreatedDocumentRecovery(entry.key, signal);
+      const bytes = snapshot.sourcePdf ?? new Uint8Array(await (await (await import("./editorApi")).writeScenePdf(snapshot.sourceScene, { signal })).arrayBuffer()); signal.throwIfAborted();
+      return openCreatedThreePdf(bytes, snapshot.sourceLabel ?? entry.label, { createdDocument: true, initialUnsaved: true, recoveryKey: entry.key, resumeRecovery: true }, signal);
+    },
+    async listDrafts() { const store = createEditorRecoveryStore(); try { return await store.list(); } finally { store.close?.(); } },
+    onError: error => setStatus(`Could not create PDF: ${error instanceof Error ? error.message : String(error)}`)
+  });
+}
+
+async function openCreatedThreePdf(bytes: Uint8Array, title: string, created: CreatedDocumentSource, signal: AbortSignal): Promise<boolean> {
+  signal.throwIfAborted();
+  if (editorInitialization || sourceLoadController || pageLayoutWarmingUp || backendChangeActive || pdfEditor?.isBusy?.()) throw new Error("Wait for the current document operation to finish.");
+  const previousEditor = pdfEditor, wasEditing = previousEditor?.isEditing() ?? false;
+  if (previousEditor && !previousEditor.confirmDocumentChange({ deferRecoveryDiscard: true })) return false;
+  if (wasEditing) { await previousEditor!.setEditing(false, signal); if (previousEditor!.isEditing()) return false; }
+  let committed = false;
+  try {
+    const label = /\.pdf$/i.test(title) ? title : `${title}.pdf`;
+    const opened = await loadSource(new File([bytes as Uint8Array<ArrayBuffer>], label, { type: "application/pdf" }), { signal, createdDocument: created, retainPrevious: true,
+      async prepareEditor() { pdfEditor = null; const editor = await ensureThreeEditor(signal, undefined, true); await editor.setEditing(true, signal); signal.throwIfAborted(); },
+      beforeCommit() { previousEditor?.dispose({ discardRecovery: true, preserveRecoveryKey: created.recoveryKey, preserveHostMode: true }); committed = true; } });
+    if (!opened) return false;
+  } finally {
+    if (!committed) { if (pdfEditor && pdfEditor !== previousEditor) pdfEditor.dispose(); pdfEditor = previousEditor; if (previousEditor && wasEditing) await previousEditor.setEditing(true); }
+    setLoadControlsEnabled(true);
+  }
+  return committed;
+}
 
 togglePanelButtonElement.addEventListener("click", () => {
   setPanelCollapsed(true);
@@ -1962,10 +2004,10 @@ function readThreeObjectOptions(): Omit<HeprThreeObjectOptions, "rendererType"> 
 
 async function loadSource(
   source: File | string,
-  options: { pdfDownloadHint?: PdfDownloadSource | null; signal?: AbortSignal } = {}
+  options: { pdfDownloadHint?: PdfDownloadSource | null; signal?: AbortSignal; createdDocument?: CreatedDocumentSource; retainPrevious?: boolean; beforeCommit?(): void; prepareEditor?(): Promise<void> } = {}
 ): Promise<boolean> {
   options.signal?.throwIfAborted();
-  if (!discardThreeEditor()) return false;
+  if (!options.retainPrevious && !discardThreeEditor()) return false;
   cancelActiveHepExport();
   const activeLoadToken = ++loadToken;
   sourceLoadController?.abort();
@@ -1989,6 +2031,12 @@ async function loadSource(
   if (currentPdfObject) loadDiagnostics.checkpoint(activeLoadToken, "previous-document", currentPdfObject, renderer);
   const previousPdfObject = currentPdfObject;
   const previousDownloadablePdf = lastDownloadablePdf;
+  const previousSource = lastLoadedSource, previousCreated = createdDocumentSource;
+  const previousLayout = pageLayoutView, previousLayoutMode = activePageLayout;
+  const previousReader = reader.snapshot(), previousCamera = captureCameraSnapshot();
+  const previousThumbnails = readerEditorThumbnailScene;
+  const previousReaderIdentity = readerDocumentIdentity;
+  let replacementInstalled = false, replacementCommitted = false;
   let pendingObject: HeprThreePdfObject | null = null;
   let preparedBackend: PreparedThreeRendererBackend | null = null;
   setStatus(`Loading ${sourceLabel} with ${backend.toUpperCase()}...`);
@@ -2116,9 +2164,11 @@ async function loadSource(
     }
     setLoadingProgress(true, "Rendering first frame…");
     loadDiagnostics.checkpoint(activeLoadToken, "first-frame-start");
-    replacePdfObject(nextObject, { pageLayoutView: initialLayout });
+    replacePdfObject(nextObject, { pageLayoutView: initialLayout, retainPrevious: options.retainPrevious });
+    replacementInstalled = true;
     pendingObject = null;
     lastLoadedSource = source;
+    createdDocumentSource = options.createdDocument ?? null;
     lastDownloadablePdf = downloadablePdf;
     setDownloadDataButtonState(true);
     setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
@@ -2137,6 +2187,10 @@ async function loadSource(
     if (nextObject.sourceOptions?.ocrTextOnly) setStatus("Text-only view: pictures and diagrams are omitted. Pages without stored text are blank.");
     else clearLoadedStatus();
     updateSceneMetrics(nextObject);
+    if (options.prepareEditor) await options.prepareEditor();
+    controller.signal.throwIfAborted(); options.beforeCommit?.();
+    replacementCommitted = true;
+    if (options.retainPrevious && previousPdfObject) releasePdfObject(previousPdfObject);
     loadDiagnostics.finish(activeLoadToken, "complete");
     return true;
   } catch (error) {
@@ -2155,6 +2209,16 @@ async function loadSource(
     return false;
   } finally {
     options.signal?.removeEventListener("abort", abort);
+    if (options.retainPrevious && replacementInstalled && !replacementCommitted && currentPdfObject !== previousPdfObject) {
+      if (previousPdfObject) {
+        readerDocumentIdentity = previousReaderIdentity;
+        replacePdfObject(previousPdfObject, { pageLayoutView: previousLayout, fitCamera: false, layout: previousLayoutMode });
+        restoreCameraSnapshot(previousCamera); reader.restore(previousReader);
+      } else disposeCurrentObject();
+      readerEditorThumbnailScene = previousThumbnails;
+      lastLoadedSource = previousSource; createdDocumentSource = previousCreated; lastDownloadablePdf = previousDownloadablePdf;
+      setDownloadDataButtonState(Boolean(currentPdfObject)); setDownloadPdfButtonState(Boolean(lastDownloadablePdf)); requestRender();
+    }
     if (pendingObject && pendingObject !== currentPdfObject) pendingObject.dispose();
     preparedBackend?.renderer.dispose();
     if (activeLoadToken === loadToken) {
@@ -2396,7 +2460,7 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
 
 function replacePdfObject(
   nextObject: HeprThreePdfObject,
-  options: { fitCamera?: boolean; pageLayoutView?: PageLayoutView | null; layout?: ExamplePageLayout } = {}
+  options: { fitCamera?: boolean; pageLayoutView?: PageLayoutView | null; layout?: ExamplePageLayout; retainPrevious?: boolean } = {}
 ): void {
   const previousObject = currentPdfObject;
   const previousReaderIdentity = readerDocumentIdentity;
@@ -2409,7 +2473,7 @@ function replacePdfObject(
     lastNativeDrawStats = stats;
     drawCallCounter.recordNativeFrame(stats.drawCalls);
   });
-  if (!sameScene) disposeCurrentObject({ clearMetrics: options.fitCamera !== false, preserveReaderDocument: options.fitCamera === false });
+  if (!sameScene) disposeCurrentObject({ clearMetrics: options.fitCamera !== false, preserveReaderDocument: options.fitCamera === false, retainObject: options.retainPrevious });
   currentPdfObject = nextObject;
   if (nextObject.sourceKind === "pdf") {
     loadedCompressScansPreference = compressScansCheckboxElement.checked && !nextObject.sourceOptions?.ocrTextOnly;
@@ -2474,7 +2538,7 @@ function releasePdfObject(object: HeprThreePdfObject): void {
   object.dispose();
 }
 
-function disposeCurrentObject(options: { clearMetrics?: boolean; preserveReaderDocument?: boolean } = {}): void {
+function disposeCurrentObject(options: { clearMetrics?: boolean; preserveReaderDocument?: boolean; retainObject?: boolean } = {}): void {
   if (!currentPdfObject) {
     return;
   }
@@ -2494,7 +2558,8 @@ function disposeCurrentObject(options: { clearMetrics?: boolean; preserveReaderD
   annotationOverlay.sceneChanged();
   annotationControls.sceneChanged();
   annotationInteraction?.sceneChanged();
-  releasePdfObject(previousObject);
+  if (options.retainObject) { previousObject.setFrameListener(null); scene.remove(previousObject); }
+  else releasePdfObject(previousObject);
   lastNativeDrawStats = null;
   if (clearMetrics) {
     drawCallMeter.reset();
@@ -2549,6 +2614,7 @@ function setLoadControlsEnabled(enabled: boolean): void {
     pageStreamingCheckboxElement.checked = currentPdfObject.sourceOptions?.pageLoading === "auto" && !compressScansCheckboxElement.checked;
   }
   openButtonElement.disabled = !enabled;
+  document.querySelector<HTMLButtonElement>("#new-pdf")!.disabled = !enabled;
   fileInputElement.disabled = !enabled;
   exampleDropdown.setDisabled(!enabled);
   for (const button of pageLayoutButtons) {

@@ -7,6 +7,7 @@ import { createNativeOptionalContentRegistry } from "./pdf/nativeOptionalContent
 import { editorPoint, invertEditorMatrix, multiplyEditorMatrices } from "./editorScene";
 import { createLoadProgressReporter, type LoadProgressCallback } from "./loadProgress";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
+import { validatePdfPageDimensions } from "./pdfPageSizes";
 
 export type PdfPageOperation =
   | { readonly kind: "rotate"; readonly pages: readonly number[]; readonly degrees: number }
@@ -15,6 +16,7 @@ export type PdfPageOperation =
   | { readonly kind: "duplicate"; readonly pages: readonly number[]; readonly at: number }
   | { readonly kind: "extract"; readonly pages: readonly number[] }
   | { readonly kind: "crop"; readonly pages: readonly number[]; readonly box: PdfPageCropBox | null }
+  | { readonly kind: "resize"; readonly pages: readonly number[]; readonly width: number; readonly height: number }
   | { readonly kind: "insert"; readonly at: number; readonly bytes: Uint8Array; readonly pages?: readonly number[]; readonly password?: string };
 /** Visible page coordinates in points, measured from its displayed lower left. */
 export interface PdfPageCropBox { readonly x: number; readonly y: number; readonly width: number; readonly height: number }
@@ -29,11 +31,15 @@ type Resolver = (value: PdfValue | undefined) => Promise<PdfValue | undefined>;
 
 /** Native page operations retain PDF resources, forms, fonts and vector content. */
 export async function manipulatePdfPages(primaryBytes: Uint8Array, operation: PdfPageOperation, options: PdfPageOperationOptions = {}): Promise<Blob> {
+  return manipulatePdfPagesInternal(primaryBytes, operation, options);
+}
+
+async function manipulatePdfPagesInternal(primaryBytes: Uint8Array, operation: PdfPageOperation, options: PdfPageOperationOptions, detachAuthoring = false): Promise<Blob> {
   options.signal?.throwIfAborted();
   const progress = createLoadProgressReporter(options.onProgress);
   const diagnostic = (code: string, message: string) => options.onDiagnostic?.({ code, message, severity: "warning" });
   progress.report(0, { stage: "source", sourceType: "pdf" });
-  if (!operation || !["rotate", "remove", "insert", "reorder", "duplicate", "extract", "crop"].includes(operation.kind)) throw new TypeError("Unknown PDF page operation.");
+  if (!operation || !["rotate", "remove", "insert", "reorder", "duplicate", "extract", "crop", "resize"].includes(operation.kind)) throw new TypeError("Unknown PDF page operation.");
   const request = operation.kind === "insert" ? { ...operation, pages: operation.pages ? [...operation.pages] : undefined }
     : operation.kind === "crop" ? { ...operation, pages: [...operation.pages], box: operation.box ? { ...operation.box } : null }
     : { ...operation, pages: [...operation.pages] };
@@ -53,7 +59,7 @@ export async function manipulatePdfPages(primaryBytes: Uint8Array, operation: Pd
       if (!pages.length) throw new RangeError("Select at least one page to extract.");
       const kept = [...pages].sort((a, b) => a - b), remove = primary.pages.map((_, index) => index).filter(index => !pages.includes(index));
       const bytes = remove.length ? new Uint8Array(await (await manipulatePdfPages(primaryBytes, { kind: "remove", pages: remove }, nestedOptions(.1, .55))).arrayBuffer()) : primaryBytes;
-      return await manipulatePdfPages(bytes, { kind: "reorder", pages: pages.map(index => kept.indexOf(index)) }, nestedOptions(remove.length ? .55 : .1, 1));
+      return await manipulatePdfPagesInternal(bytes, { kind: "reorder", pages: pages.map(index => kept.indexOf(index)) }, nestedOptions(remove.length ? .55 : .1, 1), true);
     }
     const writer = new NativePdfWriter(primary), root = primary.getWriterState().xref.trailers.map(trailer => trailer.get("Root")).find(isPdfRef);
     if (!root) throw new Error("The PDF catalog has no indirect reference.");
@@ -105,6 +111,20 @@ export async function manipulatePdfPages(primaryBytes: Uint8Array, operation: Pd
         return { index, box: [Math.min(...points.map(p => p[0])), Math.min(...points.map(p => p[1])), Math.max(...points.map(p => p[0])), Math.max(...points.map(p => p[1]))] };
       });
       for (const { index, box } of changes) slots[index].dictionary.set("CropBox", box);
+    } else if (request.kind === "resize") {
+      const indices = [...validatePages(request.pages, slots.length)], { width, height } = validatePdfPageDimensions(request.width, request.height);
+      for (const index of indices) {
+        const geometry = computeNativePdfPageGeometry(slots[index].page), bounds = geometry.pageBounds;
+        const inverse = invertEditorMatrix(geometry.pageMatrix);
+        // Keeping the displayed top-left fixed changes paper dimensions without
+        // rescaling native content, annotations, or form-field coordinates.
+        const points = [[bounds.minX, bounds.maxY - height], [bounds.minX + width, bounds.maxY - height],
+          [bounds.minX + width, bounds.maxY], [bounds.minX, bounds.maxY]].map(([x, y]) => editorPoint(inverse, x, y));
+        const box = [Math.min(...points.map(point => point[0])), Math.min(...points.map(point => point[1])),
+          Math.max(...points.map(point => point[0])), Math.max(...points.map(point => point[1]))];
+        if (!box.every(Number.isFinite) || box[2] <= box[0] || box[3] <= box[1]) throw new RangeError("The requested page size cannot be represented in this page's native coordinates.");
+        slots[index].dictionary.set("MediaBox", box); slots[index].dictionary.set("CropBox", [...box]);
+      }
     } else if (request.kind === "insert") {
       if (!Number.isSafeInteger(request.at) || request.at < 0 || request.at > slots.length) throw new RangeError("The insertion position is outside the PDF.");
       foreign = await NativePdfDocument.open({ kind: "bytes", bytes: request.bytes }, { password: request.password, signal: options.signal });
@@ -186,6 +206,7 @@ export async function manipulatePdfPages(primaryBytes: Uint8Array, operation: Pd
           if (isPdfName(original.get("Type"), "OCG") && dictionary.has("HEPRLayerId")) {
             const identity = dictionary.get("HEPRLayerId"); if (isPdfString(identity)) dictionary.set("HEPRLayerId", pdfTextValue(layerPrefix + decodePdfString(identity, 0, 0)));
           }
+          if (!selfImport && (dictionary.has("HEPRPageNumber") || dictionary.has("HEPRText"))) await stripManagedPageNumber(dictionary, resolve);
           return dictionary;
         }
         return value;
@@ -247,11 +268,22 @@ export async function manipulatePdfPages(primaryBytes: Uint8Array, operation: Pd
     }
     for (let index = 0; index < slots.length; index++) {
       const slot = slots[index]; slot.dictionary.set("Parent", pagesRoot);
+      if (detachAuthoring) {
+        const raw = await resolve(slot.dictionary.get("Annots")), annotations: PdfValue[] = [];
+        for (const reference of Array.isArray(raw) ? raw : []) {
+          const value = await resolve(reference);
+          if (!isPdfDictionary(value)) { annotations.push(reference); continue; }
+          const annotation = new Map(value); await stripManagedPageNumber(annotation, resolve);
+          if (isPdfRef(reference)) { writer.set(reference, annotation); annotations.push(reference); } else annotations.push(annotation);
+        }
+        if (Array.isArray(raw)) slot.dictionary.set("Annots", annotations);
+      }
       await updateTextMetadata(slot, index, writer, resolve, options.signal);
       writer.set(slot.ref, slot.dictionary);
     }
     writer.set(pagesRoot, new Map<string, PdfValue>([["Type", pdfNameValue("Pages")], ["Kids", slots.map(slot => slot.ref)], ["Count", slots.length]]));
     catalog.set("Pages", pagesRoot);
+    if (detachAuthoring) catalog.delete("HEPRDocument");
     const existingVersion = catalog.get("Version"), versions = ["1.7", primary.info.version, foreign?.info.version, isPdfName(existingVersion) ? existingVersion.value : undefined];
     catalog.set("Version", pdfNameValue(versions.reduce<string>((highest, version) => version && Number(version) > Number(highest) ? version : highest, "1.7")));
     if (request.kind !== "rotate" && slots.some(slot => slot.label)) catalog.set("PageLabels", new Map([["Nums", slots.flatMap((slot, index): PdfValue[] => [index, slot.label ?? new Map<string, PdfValue>([["S", pdfNameValue("D")], ["St", slot.page.sourcePageIndex + 1]])])]]));
@@ -263,6 +295,23 @@ export async function manipulatePdfPages(primaryBytes: Uint8Array, operation: Pd
     progress.complete({ sourceType: "pdf", unit: "bytes", processed: bytes.length, total: bytes.length, pageCount: slots.length });
     return new Blob([bytes as Uint8Array<ArrayBuffer>], { type: "application/pdf" });
   } finally { await foreign?.close(); await primary.close(); }
+}
+
+/** Imported/extracted numbers retain their visible text, without a foreign policy. */
+async function stripManagedPageNumber(dictionary: PdfDictionary, resolve: Resolver): Promise<void> {
+  let managed = dictionary.has("HEPRPageNumber");
+  dictionary.delete("HEPRPageNumber");
+  const stored = await resolve(dictionary.get("HEPRText"));
+  if (isPdfString(stored)) try {
+    const data = JSON.parse(decodePdfString(stored, 0, 0));
+    if (data?.version === 1 && data.object?.kind === "text" && data.object.pageNumberingId !== undefined) {
+      managed = true; delete data.object.pageNumberingId; delete data.object.locked;
+      dictionary.set("HEPRText", pdfTextValue(JSON.stringify(data)));
+    }
+  } catch { /* Unrecognized optional text metadata remains opaque. */ }
+  if (managed) {
+    const flags = await resolve(dictionary.get("F")); if (typeof flags === "number") dictionary.set("F", flags & ~128);
+  }
 }
 
 function validatePages(pages: readonly number[], count: number): Set<number> {
@@ -341,7 +390,9 @@ async function selectedFields(document: NativePdfDocument, pages: readonly Nativ
 async function updateTextMetadata(slot: Slot, pageIndex: number, writer: NativePdfWriter, resolve: Resolver, signal?: AbortSignal): Promise<void> {
   const annotations = await resolve(slot.dictionary.get("Annots")); if (!Array.isArray(annotations)) return;
   const rotation = Number(slot.dictionary.get("Rotate")) as NativePdfPage["rotation"];
-  const before = computeNativePdfPageGeometry(slot.page).pageMatrix, after = computeNativePdfPageGeometry({ ...slot.page, rotation }).pageMatrix;
+  const mediaBox = slot.dictionary.get("MediaBox") as unknown as NativePdfPage["mediaBox"], cropBox = slot.dictionary.get("CropBox") as unknown as NativePdfPage["cropBox"];
+  const userUnit = Number(slot.dictionary.get("UserUnit"));
+  const before = computeNativePdfPageGeometry(slot.page).pageMatrix, after = computeNativePdfPageGeometry({ mediaBox, cropBox, rotation, userUnit }).pageMatrix;
   const delta = multiplyEditorMatrices(after, invertEditorMatrix(before)), result: PdfValue[] = [];
   for (const raw of annotations) {
     signal?.throwIfAborted(); const annotation = await resolve(raw);

@@ -25,6 +25,7 @@ import { validatePdfOutputProtection } from "./pdf/pdfProtection";
 import { scanDensePdfResourceReferences } from "./pdf/nativeContentCompiler";
 import { prepareNativeInlineImages } from "./pdf/nativeInlineImage";
 import { normalizePrimitiveColor } from "./colorInput";
+import { validateDocumentAuthoring } from "./documentAuthoring";
 import { fitEditorInkPaths, flattenEditorInkPaths } from "./editorInkGeometry";
 import { findEditorPdfFormOverlaps } from "./editorPdfFormOverlap";
 import { prepareEditorNativePdfLayers } from "./editorNativeLayers";
@@ -1210,6 +1211,7 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
         if (object.shape === "arrow") annotation.set("LE", [pdfNameValue("None"), pdfNameValue("ClosedArrow")]);
       }
       if (object.kind === "text") {
+        if (object.pageNumberingId) annotation.set("HEPRPageNumber", pdfTextValue(object.pageNumberingId));
         const { layerCondition: _sessionCondition, ...portableObject } = object;
         annotation.set("HEPRText", pdfTextValue(JSON.stringify({ version: 1, object: portableObject })));
         annotation.set("Contents", pdfTextValue(object.runs?.map(run => run.text).join("") ?? object.text));
@@ -1267,6 +1269,15 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
       condition: index => layers.conditionReference(scene.optionalContent!, index) });
     for (const [index, dictionary] of pageDictionaries) { const ref = document.getPage(index).ref; if (!ref) throw new Error("Recovered direct page requires a full scene export."); writer.set(ref, dictionary); }
     await layers.finishRemovals();
+    const root = document.getWriterState().xref.trailers.map(trailer => trailer.get("Root")).find(isPdfRef);
+    if (root && (scene.documentAuthoring || document.catalog.has("HEPRDocument"))) {
+      const pending = writer.get(root), catalog = new Map(isPdfDictionary(pending) ? pending : document.catalog);
+      if (scene.documentAuthoring) {
+        validateDocumentAuthoring(scene.documentAuthoring);
+        catalog.set("HEPRDocument", pdfTextValue(JSON.stringify(scene.documentAuthoring)));
+      } else catalog.delete("HEPRDocument");
+      writer.set(root, catalog);
+    }
     progress.report(.94, { stage: "compile", sourceType: "pdf", unit: "sections", processed: processedObjects, total: objectCount });
     const bytes = await writer.save(options.signal, { protection: options.protection });
     progress.complete({ sourceType: "pdf", unit: "bytes", processed: bytes.length, total: bytes.length });

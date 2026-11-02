@@ -7,6 +7,9 @@ import { droppedFileKind } from "./documentDropFiles";
 import { createEditorLayerDrag, type EditorLayerDropPosition } from "./editorLayerDrag";
 import { toolbarIconMarkup } from "./toolbarIcons";
 import type { PdfPageCropBox } from "./editorPdfPages";
+import { createPdfPageSizeControls } from "./newPdfUi";
+import { resolvePdfPageSize, type PdfPageSize } from "./pdfPageSizes";
+import type { EditorBlankPageOptions } from "./editorTypes";
 
 export function parseEditorPageRange(value: string, count: number): number[] {
   const result = new Set<number>();
@@ -93,6 +96,8 @@ export interface EditorPagesDialogOptions {
   duplicate?(pages: readonly number[], at: number): Promise<void>;
   extract?(pages: readonly number[]): Promise<void>;
   crop?(pages: readonly number[], box: PdfPageCropBox | null): Promise<void>;
+  insertBlank?(options: Pick<EditorBlankPageOptions, "pageSize" | "orientation" | "pageCount">, at: number): Promise<void>;
+  resize?(pages: readonly number[], size: PdfPageSize): Promise<void>;
   cancel(): void;
   onError(error: unknown): void;
   onClose(): void;
@@ -150,6 +155,13 @@ export function showEditorPagesDialog(document: Document, options: EditorPagesDi
   const insert = button("Choose PDFs…", "insert");
   const input = document.createElement("input"); input.type = "file"; input.accept = ".pdf,application/pdf"; input.multiple = true; input.hidden = true;
   insertLabel.append(position, pageNumber, insert, input);
+  const paper = options.insertBlank || options.resize ? createPdfPageSizeControls(document) : null;
+  const paperHelp = document.createElement("p"); paperHelp.textContent = "Resizing keeps content at its actual size and top-left offset. Smaller paper hides overflow without deleting it; larger paper may reveal hidden content.";
+  const blankCountLabel = document.createElement("label"); blankCountLabel.textContent = "Blank page count ";
+  const blankCount = document.createElement("input"); blankCount.type = "number"; blankCount.min = "1"; blankCount.step = "1"; blankCount.value = "1"; blankCount.setAttribute("aria-label", "Blank page count");
+  blankCountLabel.append(blankCount);
+  const addBlank = button("Insert blank pages", "insert-blank"), resize = button("Resize selected pages", "resize"), useSize = button("Use selected page size", "current-size");
+  if (paper) { paper.element.append(paperHelp, useSize); if (options.insertBlank) paper.element.append(blankCountLabel, addBlank); if (options.resize) paper.element.append(resize); }
   const crop = document.createElement("fieldset"); crop.className = "hepr-editor-page-crop";
   const cropTitle = document.createElement("legend"); cropTitle.textContent = "Crop visible page area";
   const cropHelp = document.createElement("p"); cropHelp.textContent = "Points from the displayed lower-left corner. Cropping changes the visible page box; it does not remove hidden content or redact it.";
@@ -164,14 +176,15 @@ export function showEditorPagesDialog(document: Document, options: EditorPagesDi
   const status = document.createElement("p"); status.setAttribute("role", "status");
   const cancel = button("Cancel operation", "cancel"), close = button("Close", "close"); cancel.hidden = true;
   dialog.append(title, help, rangeLabel, rangeButton, all, clear, list, actions, insertLabel);
+  if (paper) dialog.append(paper.element);
   if (options.crop) dialog.append(crop);
   dialog.append(status, cancel, close);
-  let busy = false, closed = false, selected = new Set([0]), warnings: readonly string[] = [], statusText = "", cropDraft = false;
+  let busy = false, closed = false, selected = new Set([0]), warnings: readonly string[] = [], statusText = "", cropDraft = false, paperDraft = false;
   const rows = new Map<number, { element: HTMLElement; checkbox: HTMLInputElement; grip?: HTMLButtonElement }>();
   const selection = (): number[] => [...selected].sort((a, b) => a - b);
   const displayStatus = (text: string): void => { statusText = text; status.textContent = [text, ...warnings].filter(Boolean).join(" "); };
   const controls = [range, rangeButton, all, clear, rotateLeft, rotateRight, rotateHalf, remove, position, pageNumber, insert, input, close,
-    moveUp, moveDown, duplicate, extract, applyCrop, resetCrop, fullCrop, ...Object.values(cropInputs)];
+    moveUp, moveDown, duplicate, extract, applyCrop, resetCrop, fullCrop, blankCount, addBlank, resize, useSize, ...Object.values(cropInputs)];
   const orderFor = (target: string, where: EditorLayerDropPosition) => reorderEditorPageSelection(options.getPages().length, selection(), Number(target), where);
   const changed = (order: readonly number[]) => order.some((page, index) => page !== index);
   const drag = options.reorder ? createEditorLayerDrag({ container: list, getRows: () => [...rows].map(([id, row]) => ({ id: String(id), element: row.element })),
@@ -182,14 +195,18 @@ export function showEditorPagesDialog(document: Document, options: EditorPagesDi
     end() { for (const row of rows.values()) { delete row.element.dataset.dragging; delete row.element.dataset.dropPosition; } }
   }) : { begin: () => false, cancel() {}, dispose() {} };
   function updateCrop(): void {
+    const selectedPage = options.getPages()[selection()[0] ?? 0];
+    if (paper && !paperDraft && selectedPage?.width && selectedPage?.height) paper.setValue({ pageSize: { width: selectedPage.width, height: selectedPage.height } });
     if (cropDraft) return;
     const page = options.getPages()[selection()[0] ?? 0];
     cropInputs.x.value = cropInputs.y.value = "0"; cropInputs.width.value = String(page?.width ?? 0); cropInputs.height.value = String(page?.height ?? 0);
   }
   function updateControls(): void {
     for (const control of controls) control.disabled = busy;
+    if (paper) paper.element.disabled = busy;
     for (const [index, row] of rows) { row.checkbox.disabled = busy; row.checkbox.checked = selected.has(index); if (row.grip) row.grip.disabled = busy; }
     rotateLeft.disabled = rotateRight.disabled = rotateHalf.disabled = duplicate.disabled = extract.disabled = applyCrop.disabled = resetCrop.disabled = busy || !selected.size;
+    resize.disabled = busy || !selected.size;
     remove.disabled = busy || !selected.size || selected.size >= options.getPages().length;
     moveUp.disabled = busy || !selected.size || !changed(nudgeEditorPageSelection(options.getPages().length, selection(), -1));
     moveDown.disabled = busy || !selected.size || !changed(nudgeEditorPageSelection(options.getPages().length, selection(), 1));
@@ -264,6 +281,17 @@ export function showEditorPagesDialog(document: Document, options: EditorPagesDi
   duplicate.addEventListener("click", () => { if (options.duplicate) void run(async () => { const pages = selection(), at = insertionIndex(); await options.duplicate!(pages, at); selected = new Set(pages.map((_, offset) => at + offset)); }); });
   extract.addEventListener("click", () => { if (options.extract) void run(() => options.extract!(selection()), "Extracted PDF prepared for download."); });
   position.addEventListener("change", updateControls); insert.addEventListener("click", () => input.click());
+  paper?.element.addEventListener("input", () => { paperDraft = true; });
+  paper?.element.addEventListener("change", () => { paperDraft = true; });
+  useSize.addEventListener("click", () => { paperDraft = false; updateCrop(); });
+  addBlank.addEventListener("click", () => { if (paper && options.insertBlank) void run(async () => {
+    const pageCount = Number(blankCount.value), at = insertionIndex();
+    if (!Number.isSafeInteger(pageCount) || pageCount < 1) throw new RangeError("Choose a positive whole number of blank pages.");
+    await options.insertBlank!({ ...paper.read(), pageCount }, at); selected = new Set(Array.from({ length: pageCount }, (_, index) => at + index));
+  }); });
+  resize.addEventListener("click", () => { if (paper && options.resize) void run(async () => {
+    const size = paper.read(); await options.resize!(selection(), resolvePdfPageSize(size.pageSize, size.orientation));
+  }); });
   input.addEventListener("change", () => {
     const files = Array.from(input.files ?? []); input.value = ""; if (!files.length) return;
     void run(() => options.insert(files, insertionIndex()));

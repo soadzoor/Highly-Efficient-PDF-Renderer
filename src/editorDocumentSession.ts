@@ -1,6 +1,7 @@
 import type { EditorSession, EditorSessionOptions, EditorState, EditorPageOperationOptions, EditorPdfInsertOptions, EditorMatrix, EditorGroupObject, EditorFieldObject } from "./editorTypes";
 import type { VectorScene } from "./pdfVectorExtractor";
 import type { PdfPageOperation } from "./editorPdfPages";
+import { resolvePdfPageSize } from "./pdfPageSizes";
 import type { NativeVectorPdfSession } from "./pdfSession";
 import { createLoadProgressReporter, type PDFLoadProgress } from "./loadProgress";
 import { invertEditorMatrix, multiplyEditorMatrices } from "./editorScene";
@@ -49,7 +50,7 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
     });
     return version;
   };
-  current = { version: retain(initial), identity: {} }; savedIdentity = current.identity;
+  current = { version: retain(initial), identity: {} }; savedIdentity = initial.options.initiallyDirty ? {} : current.identity;
   const silent = <T>(operation: () => T): T => { suppressed++; try { return operation(); } finally { suppressed--; } };
   const pageIndices = (indices: readonly number[]): number[] => {
     const count = current.version.session.sourceScene.pageCount, result = [...indices];
@@ -214,6 +215,30 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
     canReorderSelection: action => { assertLive(); return current.version.session.canReorderSelection(action); },
     reorderSelection: action => { assertLive(); current.version.session.reorderSelection(action); },
     getPages: () => { assertLive(); return current.version.session.getPages(); },
+    getPageNumbering: () => { assertLive(); return current.version.session.getPageNumbering(); },
+    setPageNumbering: settings => { assertLive(); current.version.session.setPageNumbering(settings); },
+    async insertBlankPages(options = {}) {
+      assertLive(); options = { ...options, pageSize: typeof options.pageSize === "object" ? { ...options.pageSize } : options.pageSize,
+        signal: options.signal ? AbortSignal.any([options.signal, lifetime.signal]) : lifetime.signal };
+      options.signal?.throwIfAborted(); if (busy) throw new Error("Another page operation is already running.");
+      const startedRevision = revision, pages = session.getPages(), at = options.at ?? pages.length;
+      if (!Number.isSafeInteger(at) || at < 0 || at > pages.length) throw new RangeError("Page insertion position is out of range.");
+      const adjacent = pages[Math.min(at, pages.length - 1)];
+      const [{ createBlankPdfScene }, { writeScenePdf }] = await Promise.all([import("./pdfCreation"), import("./editorPdfWriter")]);
+      options.signal?.throwIfAborted();
+      const scene = createBlankPdfScene({ ...options, pageSize: options.pageSize ?? { width: adjacent.width, height: adjacent.height } });
+      const progress = createLoadProgressReporter(options.onProgress);
+      const blob = await writeScenePdf(scene, { signal: options.signal, onProgress: progress.child(0, .1).toCallback() });
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      options.signal?.throwIfAborted(); assertLive();
+      if (revision !== startedRevision) throw new Error("The document changed while preparing blank pages. Try again.");
+      await session.insertPdf(bytes, { ...options, at, onProgress: progress.child(.1, 1).toCallback() });
+    },
+    async resizePages(indices, size, options = {}) {
+      assertLive(); options.signal?.throwIfAborted(); const pages = pageIndices(indices);
+      const { width, height } = resolvePdfPageSize(size);
+      if (pages.length) await perform({ kind: "resize", pages, width, height }, { ...options });
+    },
     async rotatePages(indices, degrees, options = {}) {
       assertLive(); options.signal?.throwIfAborted(); const pages = pageIndices(indices);
       if (!Number.isFinite(degrees) || !Number.isInteger(degrees / 90)) throw new RangeError("Page rotation must be a multiple of 90 degrees.");
@@ -337,7 +362,7 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
 /** Keep in-memory author tools while replacing their baked PDF appearances. */
 function reseedAuthoredObjects(previous: EditorSession, next: EditorSession, operation: PdfPageOperation,
   restoreOrder?: (ids: EditorRebasedObjectIds) => void): void {
-  const objects = previous.getObjects(), sourceScene = previous.sourceScene, targetScene = next.sourceScene;
+  const objects = previous.getObjects().filter(object => object.kind !== "text" || !object.pageNumberingId), sourceScene = previous.sourceScene, targetScene = next.sourceScene;
   const targets = editorOperationPageTargets(sourceScene.pageCount, targetScene.pageCount, operation);
   const oldMatrices = new Map(sourceScene.pdfPages?.map(page => [page.pageIndex, page.pdfToScene]));
   const newMatrices = new Map(targetScene.pdfPages?.map(page => [page.pageIndex, page.pdfToScene]));

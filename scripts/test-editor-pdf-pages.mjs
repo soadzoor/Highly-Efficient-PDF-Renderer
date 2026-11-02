@@ -125,9 +125,30 @@ try {
       assert.equal(after.pageBounds.maxX - after.pageBounds.minX, 70); assert.equal(after.pageBounds.maxY - after.pageBounds.minY, 90);
       assert.deepEqual(transform.slice(0, 4), [1, 0, 0, 1]); assert.deepEqual(transform.slice(4), [-10, -20], "crop origin uses displayed lower-left points including rotation and UserUnit");
       assert.deepEqual(await cropped.getDecodedPageContents(0), await old.getDecodedPageContents(0), "cropping retains hidden vector content");
+      const text = (await new NativePdfFormAppearanceRegistry(cropped).listPageAnnotations(0)).find(value => value.subtype === "FreeText");
+      const stored = JSON.parse(decodePdfString(text.dictionary.get("HEPRText"), 0, 0));
+      const originalText = (await new NativePdfFormAppearanceRegistry(old).listPageAnnotations(0)).find(value => value.subtype === "FreeText");
+      const oldStored = JSON.parse(decodePdfString(originalText.dictionary.get("HEPRText"), 0, 0));
+      assert.deepEqual(stored.object.transform, multiplyEditorMatrices(transform, oldStored.object.transform), "cropped text author models follow the final visible page geometry");
       const reset = await open(await run(croppedBytes, { kind: "crop", pages: [0], box: null }));
       try { assert.deepEqual(reset.pages[0].cropBox, [0, 0, 200, 160]); } finally { await reset.close(); }
     } finally { await old.close(); await cropped.close(); }
+    const resized = await open(await run(input, { kind: "resize", pages: [0], width: 451, height: 631 })), previous = await open(input);
+    try {
+      const before = computeNativePdfPageGeometry(previous.pages[0]), after = computeNativePdfPageGeometry(resized.pages[0]);
+      const transform = multiplyEditorMatrices(after.pageMatrix, invertEditorMatrix(before.pageMatrix));
+      assert.deepEqual([after.pageBounds.maxX - after.pageBounds.minX, after.pageBounds.maxY - after.pageBounds.minY], [451, 631]);
+      assert.deepEqual(transform, [1, 0, 0, 1, 0, 631 - (before.pageBounds.maxY - before.pageBounds.minY)], "resizing keeps actual content size and displayed top-left offsets for every rotation");
+      assert.equal(resized.pages[0].rotation, rotation); assert.equal(resized.pages[0].userUnit, 2);
+      assert.deepEqual(resized.pages[0].cropBox, resized.pages[0].mediaBox, "resize changes the paper size and clears the prior crop");
+      assert.deepEqual(resized.pages[1].mediaBox, previous.pages[1].mediaBox, "unselected page sizes stay unchanged");
+      assert.deepEqual(await resized.getDecodedPageContents(0), await previous.getDecodedPageContents(0), "resize retains exact native vector programs");
+      const annotations = await new NativePdfFormAppearanceRegistry(resized).listPageAnnotations(0), originalAnnotations = await new NativePdfFormAppearanceRegistry(previous).listPageAnnotations(0);
+      assert.deepEqual(annotations.map(annotation => annotation.dictionary.get("Rect")), originalAnnotations.map(annotation => annotation.dictionary.get("Rect")), "annotation and form geometry retain native coordinates");
+      const text = annotations.find(value => value.subtype === "FreeText"), stored = JSON.parse(decodePdfString(text.dictionary.get("HEPRText"), 0, 0));
+      const originalText = originalAnnotations.find(value => value.subtype === "FreeText"), oldStored = JSON.parse(decodePdfString(originalText.dictionary.get("HEPRText"), 0, 0));
+      assert.deepEqual(stored.object.transform, multiplyEditorMatrices(transform, oldStored.object.transform), "resized rich text metadata matches its native appearance");
+    } finally { await resized.close(); await previous.close(); }
   }
   const { manipulatePdfPages: lazyPageOperation } = await import("../src/editorApi.ts");
   for (const operation of [manipulatePdfPages, lazyPageOperation]) {
@@ -139,13 +160,21 @@ try {
       assert.deepEqual([geometry.pageBounds.maxX - geometry.pageBounds.minX, geometry.pageBounds.maxY - geometry.pageBounds.minY], [50, 60], "direct and lazy APIs snapshot mutable crop geometry before awaiting");
       assert.deepEqual(cropped.pages[1].cropBox, [20, 30, 180, 130], "later selection mutations do not crop extra pages");
     } finally { await cropped.close(); }
+    const sizeRequest = { kind: "resize", pages: [0], width: 400, height: 600 }, resizePending = operation(original, sizeRequest);
+    sizeRequest.width = 999; sizeRequest.pages.push(1);
+    const resized = await open(new Uint8Array(await (await resizePending).arrayBuffer()));
+    try {
+      const geometry = computeNativePdfPageGeometry(resized.pages[0]);
+      assert.equal(geometry.pageBounds.maxX - geometry.pageBounds.minX, 400, "resize snapshots mutable dimensions before awaiting");
+      assert.deepEqual(resized.pages[1].mediaBox, [0, 0, 200, 160], "later selection mutations do not resize extra pages");
+    } finally { await resized.close(); }
   }
   const protect = async (bytes, password) => { const document = await open(bytes); try { return await new NativePdfWriter(document).save(undefined, { protection: { mode: "password", password, ownerPassword: password + " owner" } }); } finally { await document.close(); } };
   const protectedMain = await protect(original, "main secret"), protectedForeign = await protect(foreign, "foreign secret");
   const protectedMerged = await run(protectedMain, { kind: "insert", at: 3, bytes: protectedForeign, pages: [0], password: "foreign secret" }, { password: "main secret" });
   for (const password of ["main secret", "main secret owner"]) { const document = await open(protectedMerged, password); try { assert.equal(document.pages.length, 4); assert.equal((await document.getDecodedPageContents(3)).length, 1); } finally { await document.close(); } }
   await assert.rejects(open(protectedMerged, "foreign secret"), error => error.code === "encrypted");
-  for (const request of [{ kind: "reorder", pages: [2, 1, 0] }, { kind: "duplicate", pages: [0], at: 0 }, { kind: "extract", pages: [1] }, { kind: "crop", pages: [0], box: { x: 5, y: 7, width: 50, height: 60 } }]) {
+  for (const request of [{ kind: "reorder", pages: [2, 1, 0] }, { kind: "duplicate", pages: [0], at: 0 }, { kind: "extract", pages: [1] }, { kind: "crop", pages: [0], box: { x: 5, y: 7, width: 50, height: 60 } }, { kind: "resize", pages: [0], width: 400, height: 600 }]) {
     const document = await open(await run(protectedMain, request, { password: "main secret" }), "main secret");
     try { assert((await document.getDecodedPageContents(0)).length); } finally { await document.close(); }
   }
@@ -154,6 +183,7 @@ try {
   try { assert.equal(upgraded.catalog.get("Version").value, "1.7", "catalog declares imported optional-content/transparency capabilities"); }
   finally { await upgraded.close(); }
   for (const request of [{ kind: "remove", pages: [0, 1, 2] }, { kind: "remove", pages: [0, 0] }, { kind: "reorder", pages: [0, 1] }, { kind: "duplicate", pages: [], at: 0 }, { kind: "extract", pages: [] }, { kind: "crop", pages: [0], box: { x: 0, y: 0, width: 999, height: 1 } }, { kind: "rotate", pages: [3], degrees: 90 }, { kind: "rotate", pages: [0], degrees: 45 }, { kind: "insert", at: 4, bytes: foreign }, { kind: "insert", at: 0, bytes: foreign, pages: [0, 0] }]) await assert.rejects(run(original, request), RangeError);
+  for (const width of [0, -1, NaN, Infinity, 1e39, 1e-50]) await assert.rejects(run(original, { kind: "resize", pages: [0], width, height: 600 }), RangeError);
   await assert.rejects(run(original, { kind: "rotate", pages: [0], degrees: 90 }, { signal: AbortSignal.abort() }), { name: "AbortError" });
   assert.deepEqual(original, before, "native page operations do not mutate caller bytes");
   console.log("Native PDF pages: rotation geometry/text metadata, removal/shared fields, selected-page imports/fonts/forms/links/layers, encryption and cancellation passed.");

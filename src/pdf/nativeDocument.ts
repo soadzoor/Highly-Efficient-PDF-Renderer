@@ -34,6 +34,7 @@ import {
   throwIfAborted
 } from "./nativeTypes";
 import { readNativeXref, repairNativeXref, type NativeXrefResult } from "./nativeXref";
+import { parseDocumentAuthoring, type DocumentAuthoringData } from "../documentAuthoring";
 
 export interface NativePdfOpenOptions {
   /** Strict parsing is always attempted first. @default "safe" */
@@ -65,6 +66,8 @@ export interface NativePdfDocumentInfo {
   /** Lower-case hexadecimal first trailer /ID entry, when present. */
   readonly fingerprint?: string;
   readonly metadata: Readonly<NativePdfDocumentMetadata>;
+  /** Optional inert HEPR document settings, decoded once with the catalog. */
+  readonly documentAuthoring?: DocumentAuthoringData;
   readonly hasAcroForm: boolean;
 }
 
@@ -253,6 +256,7 @@ export class NativePdfDocument {
           attemptDiagnostics,
           options.signal
         );
+        const documentAuthoring = await readDocumentAuthoring(bootstrap, catalog, attemptDiagnostics, options.signal);
         const info: NativePdfDocumentInfo = {
           version,
           byteLength: reader.byteLength,
@@ -263,6 +267,7 @@ export class NativePdfDocument {
           language,
           fingerprint,
           metadata,
+          ...(documentAuthoring ? { documentAuthoring } : {}),
           hasAcroForm: catalog.get("AcroForm") !== undefined && catalog.get("AcroForm") !== null
         };
         diagnostics.push(...attemptDiagnostics);
@@ -1695,6 +1700,27 @@ async function readDocumentMetadata(
     metadata[publicKey] = decoded;
   }
   return Object.freeze(metadata);
+}
+
+async function readDocumentAuthoring(document: NativePdfDocument, catalog: PdfDictionary,
+  diagnostics: PdfDiagnostic[], signal?: AbortSignal): Promise<DocumentAuthoringData | undefined> {
+  const raw = catalog.get("HEPRDocument");
+  if (raw === undefined || raw === null) return undefined;
+  const warn = () => diagnostics.push({ code: "authoring.invalid-metadata", severity: "warning",
+    message: "Invalid optional document authoring metadata was ignored; the document remains visible." });
+  let resolved: PdfValue | undefined;
+  try { resolved = await document.resolveValue(raw, signal); }
+  catch (error) { rethrowCriticalMetadataError(error, signal); warn(); return undefined; }
+  const text = decodeDocumentString(resolved);
+  if (text === undefined) { warn(); return undefined; }
+  let value: unknown;
+  try { value = JSON.parse(text); } catch { warn(); return undefined; }
+  const authoring = parseDocumentAuthoring(value, diagnostic => diagnostics.push(diagnostic));
+  if (authoring) {
+    if (Array.isArray(authoring.pageNumbering.color)) Object.freeze(authoring.pageNumbering.color);
+    Object.freeze(authoring.pageNumbering); Object.freeze(authoring);
+  }
+  return authoring;
 }
 
 async function readDocumentFingerprint(

@@ -229,6 +229,7 @@ export class ScenePageViews {
       charInstance: Int32Array.from(text.charInstance, id => id < 0 ? id : maps.text.get(id) ?? -1) }] };
     scene.textContent = source.textContent?.filter(item => item.pageIndex === pageIndex).map(item => ({ ...item, pageIndex: 0 }));
     scene.annotations = source.annotations?.filter(a => a.pageIndex === pageIndex).map(a => ({ ...a, pageIndex: 0 }));
+    scene.documentAuthoring = source.documentAuthoring;
     scene.pdfPages = source.pdfPages?.filter(p => p.pageIndex === pageIndex).map(p => ({ ...p, pageIndex: 0 }));
     // Attribution follows the local primitive order; structure elements are document-wide.
     const markedContent = selectSceneMarkedContent(source, primitives);

@@ -7,6 +7,10 @@ import type { PdfOutputProtection } from "./pdf/pdfProtection";
 import type { PdfPageCropBox } from "./editorPdfPages";
 import type { OptionalContentGroup, OptionalContentOrderNode, SceneOptionalContent } from "./optionalContentData";
 import type { AnnotationDestination } from "./annotationData";
+import type { PageNumberingSettings } from "./documentAuthoring";
+import type { PdfPageSize, PdfPageOrientation } from "./pdfPageSizes";
+export type { PageNumberingSettings, DocumentAuthoringData } from "./documentAuthoring";
+export type { PdfPageSize, PdfPageOrientation } from "./pdfPageSizes";
 export type { PdfOutputProtection } from "./pdf/pdfProtection";
 
 /** Affine [a,b,c,d,e,f], with X right and Y up. */
@@ -66,6 +70,8 @@ export interface EditorLayerEdits {
 }
 export interface EditorTextObject extends EditorObjectBase {
   kind: "text";
+  /** Managed document numbering; edit through setPageNumbering, not object transforms. */
+  pageNumberingId?: string;
   x: number; y: number; width: number; height: number;
   text: string;
   runs?: readonly EditorTextRun[];
@@ -234,8 +240,16 @@ export interface EditorPdfInsertOptions extends EditorPageOperationOptions {
   password?: string;
 }
 export interface EditorPageDuplicateOptions extends EditorPageOperationOptions { at?: number }
+export interface EditorBlankPageOptions extends EditorPageOperationOptions {
+  at?: number;
+  pageSize?: PdfPageSize;
+  orientation?: PdfPageOrientation;
+  pageCount?: number;
+}
 export interface EditorSessionOptions {
   sourcePdf?: Uint8Array;
+  /** New unsaved documents remain dirty until an explicit save. */
+  initiallyDirty?: boolean;
   signal?: AbortSignal;
   password?: string;
   loadFontAsset?: (url: URL) => Promise<Uint8Array>;
@@ -353,6 +367,10 @@ export interface EditorSession {
   getPrimitivePaintRank(ref: PrimitiveRef): number;
   getObjectPaintRank(id: string): number;
   getPages(): readonly EditorPageInfo[];
+  getPageNumbering(): PageNumberingSettings;
+  setPageNumbering(settings: Partial<PageNumberingSettings>): void;
+  insertBlankPages(options?: EditorBlankPageOptions): Promise<void>;
+  resizePages(indices: readonly number[], size: PdfPageSize, options?: EditorPageOperationOptions): Promise<void>;
   rotatePages(indices: readonly number[], degrees: number, options?: EditorPageOperationOptions): Promise<void>;
   removePages(indices: readonly number[], options?: EditorPageOperationOptions): Promise<void>;
   insertPdf(bytes: Uint8Array, options?: EditorPdfInsertOptions): Promise<void>;

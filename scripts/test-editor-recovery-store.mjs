@@ -39,6 +39,7 @@ try {
   const loaded = await store.get("hash"); assert.deepEqual(loaded, record); loaded.envelope.payload[0] = 9;
   assert.equal((await store.get("hash")).envelope.payload[0], 1, "storage returns detached resource data");
   const list = await store.list(); assert.equal(list.length, 1); assert(!("envelope" in list[0]), "management does not load source/font/image payloads");
+  await store.put({ ...record, createdDocument: true, updatedAt: 11 }); assert.equal((await store.list())[0].createdDocument, true, "new-document drafts can be listed for source-free resume");
   await store.put({ ...record, revision: 0, updatedAt: 1 }); assert.equal((await store.get("hash")).revision, 1, "an older tab cannot replace a newer checkpoint");
   await store.put({ ...record, revision: 2, updatedAt: 20 }); assert.equal(fake.tables.get("drafts").size, 1, "only the latest record remains for a document");
   fake.fail(true); await assert.rejects(store.put({ ...record, revision: 3, updatedAt: 30 }), /Quota/); fake.fail(false);

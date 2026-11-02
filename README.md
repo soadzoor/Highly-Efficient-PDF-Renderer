@@ -172,6 +172,23 @@ The same loader accepts `.hep` files, `File`/`Blob` objects, bytes, and base64 d
 
 When removing a document, call `pdf.removeFromParent()` and `pdf.dispose()`. When closing the viewer, also stop its animation loop and dispose its controls and renderer. See the [examples](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/examples.md) to add search, text selection, and drawing selection.
 
+## Create a PDF
+
+Choose **New PDF** in either viewer to start editing blank pages. Select paper
+size, orientation and page count; add or resize pages under **Pages**, and enable
+adjustable automatic numbering under **Page Numbers**. New documents start with
+numbering off. PDF and HEP saves retain numbering settings, and locally created
+unsaved drafts can be resumed from the New PDF dialog.
+
+```js
+import { createPdf } from "@soadzoor/hepr";
+
+const pdf = await createPdf({ title: "My document", pageSize: "A4", pageCount: 3 });
+```
+
+See the [creation and numbering API](docs/api.md#new-pdfs-and-automatic-page-numbers)
+for custom dimensions, blank-page insertion, resizing and numbering controls.
+
 ## Render your own polylines
 
 Use `buildStrokeScene` and `createThreePdfObject` to render your own polylines

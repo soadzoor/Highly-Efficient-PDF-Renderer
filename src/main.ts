@@ -21,6 +21,8 @@ import { createViewerFileDropController } from "./viewerFileDrop";
 import { initializeToolbarIcons, setToolbarIconButton, toolbarIconMarkup } from "./toolbarIcons";
 import { createEditorSetupLoading, type EditorSetupLoadingHandle } from "./editorSetupLoading";
 import { panEditorReader } from "./editorHostPan";
+import type { CreatedDocumentSource, NewPdfRequest } from "./newPdfUi";
+import "./newPdfUi.css";
 import "./editorSetupLoading.css";
 
 import { WebGlPdfRenderer, type DrawStats, type SceneStats, type ViewState } from "./webGlPdfRenderer";
@@ -249,6 +251,7 @@ let lastParsedScene: VectorScene | null = null;
 let readerThumbnailScene: VectorScene | null = null;
 // Editing and document attachment load the editor, fonts and picking indexes on demand.
 let pdfEditor: import("./editorUi").EditorUi | null = null;
+let createdDocumentSource: CreatedDocumentSource | null = null;
 let editorFrameListener: (() => void) | null = null;
 let editorInitialization: AbortController | null = null;
 const editorSetupLoading = createEditorSetupLoading(() => canvasElement);
@@ -737,9 +740,9 @@ async function togglePdfEditing(): Promise<void> {
   }
 }
 
-async function ensureNativeEditor(signal?: AbortSignal, setup?: EditorSetupLoadingHandle): Promise<import("./editorUi").EditorUi> {
+async function ensureNativeEditor(signal?: AbortSignal, setup?: EditorSetupLoadingHandle, preparingDocument = false): Promise<import("./editorUi").EditorUi> {
   signal?.throwIfAborted();
-  if (editorInitialization || pendingSourceLoadCount > 0 || activeSceneLoadToken !== null || layoutChangeRunning || backendSwitcher?.isSwitchInFlight())
+  if (editorInitialization || !preparingDocument && (pendingSourceLoadCount > 0 || activeSceneLoadToken !== null) || layoutChangeRunning || backendSwitcher?.isSwitchInFlight())
     throw new Error("Wait for the document or renderer change to finish before editing the document.");
   if (!lastParsedScene || !lastLoadedSource) throw new Error("Open a PDF or HEP before editing the document.");
   if (pdfEditor) return pdfEditor;
@@ -778,7 +781,7 @@ async function ensureNativeEditor(signal?: AbortSignal, setup?: EditorSetupLoadi
         panCameraByPixels(dx, dy) { if (!panEditorReader(readerViewport, dx, dy)) renderer.panByPixels(dx, dy); },
         endCameraPan() { if (editorPanRenderer === renderer) editorPanRenderer.endPanInteraction(); editorPanRenderer = undefined; },
         getSource: () => ({ bytes: lastLoadedSource?.bytes, pdf: lastLoadedSource?.kind === "pdf" ? lastLoadedSource.bytes : undefined,
-          password: lastLoadedPdfPassword, label: lastLoadedSource?.label ?? "document" }),
+          password: lastLoadedPdfPassword, label: lastLoadedSource?.label ?? "document", ...createdDocumentSource }),
         async prepareScene(signal, onProgress) {
           const source = lastLoadedSource!;
           activePdfPageLoader?.pause();
@@ -1103,6 +1106,9 @@ interface LoadPdfOptions {
   preserveView?: boolean;
   /** Password for a PDF that requires one; used only while parsing. */
   password?: string;
+  createdDocument?: CreatedDocumentSource;
+  beforeCommit?(): void;
+  prepareEditor?(): Promise<void>;
 }
 
 const LOAD_PROGRESS_PARSE_END = 0.34;
@@ -1205,6 +1211,65 @@ void loadExampleManifest();
 openButtonElement.addEventListener("click", () => {
   fileInputElement.click();
 });
+document.querySelector<HTMLButtonElement>("#new-pdf")!.addEventListener("click", () => { void openNewPdfDialog(); });
+
+async function openNewPdfDialog(): Promise<void> {
+  const [{ showNewPdfDialog, readCreatedDocumentRecovery }, { createEditorRecoveryStore }] = await Promise.all([import("./newPdfUi"), import("./editorRecoveryStore")]);
+  showNewPdfDialog(document, {
+    async create(request: NewPdfRequest, signal) {
+      const { createPdf } = await import("./editorApi");
+      const bytes = new Uint8Array(await (await createPdf({ ...request, signal })).arrayBuffer()); signal.throwIfAborted();
+      return openCreatedNativePdf(bytes, request.title, { createdDocument: true, initialUnsaved: true }, signal);
+    },
+    async resume(entry, signal) {
+      const { snapshot } = await readCreatedDocumentRecovery(entry.key, signal);
+      const bytes = snapshot.sourcePdf ?? new Uint8Array(await (await (await import("./editorApi")).writeScenePdf(snapshot.sourceScene, { signal })).arrayBuffer());
+      signal.throwIfAborted();
+      return openCreatedNativePdf(bytes, snapshot.sourceLabel ?? entry.label, { createdDocument: true, initialUnsaved: true, recoveryKey: entry.key, resumeRecovery: true }, signal);
+    },
+    async listDrafts() { const store = createEditorRecoveryStore(); try { return await store.list(); } finally { store.close?.(); } },
+    onError: error => setStatus(`Could not create PDF: ${error instanceof Error ? error.message : String(error)}`)
+  });
+}
+
+/** Keep the old authoring session until its replacement has parsed and rendered. */
+async function openCreatedNativePdf(bytes: Uint8Array, title: string, created: CreatedDocumentSource, externalSignal: AbortSignal): Promise<boolean> {
+  externalSignal.throwIfAborted();
+  if (editorInitialization || pendingSourceLoadCount || activeSceneLoadToken !== null || layoutChangeRunning || pdfEditor?.isBusy?.()) throw new Error("Wait for the current document operation to finish.");
+  const previousEditor = pdfEditor, wasEditing = previousEditor?.isEditing() ?? false;
+  if (previousEditor && !previousEditor.confirmDocumentChange({ deferRecoveryDiscard: true })) return false;
+  if (wasEditing) { await previousEditor!.setEditing(false, externalSignal); if (previousEditor!.isEditing()) return false; }
+  const previous = { lastParsedScene, lastCanonicalScene, documentPageScenes, canonicalPagesPerRow, lastParsedSceneLabel, lastLoadedSource,
+    lastLoadedPdfPassword, lastDownloadablePdf, createdDocumentSource, nativeLayout, gridViewState, readerViewState, parsedPdfPageCache,
+    activePdfPageLoader, loadedOcrTextOnly, loadedPageStreaming, loadedCompressScans, loadedCompressScansPreference };
+  cancelActiveHepExport();
+  const token = beginSourceLoad(), signal = AbortSignal.any([externalSignal, sourceLoadController!.signal]);
+  const label = /\.pdf$/i.test(title) ? title : `${title}.pdf`;
+  let committed = false;
+  setPrimaryLoadControlsEnabled(false);
+  try {
+    await loadPdfBuffer(createParseBuffer(bytes), label, { source: { kind: "pdf", bytes, label }, downloadablePdf: { bytes, label },
+      signal, preserveView: false, createdDocument: created,
+      async prepareEditor() { pdfEditor = null; const editor = await ensureNativeEditor(signal, undefined, true); await editor.setEditing(true, signal); signal.throwIfAborted(); },
+      beforeCommit() { previousEditor?.dispose({ discardRecovery: true, preserveRecoveryKey: created.recoveryKey, preserveHostMode: true }); committed = true; }
+    });
+  } finally {
+    finishSourceLoad(token);
+    if (!committed) {
+      if (pdfEditor && pdfEditor !== previousEditor) pdfEditor.dispose(); pdfEditor = previousEditor;
+      const candidateLoader = activePdfPageLoader;
+      ({ lastParsedScene, lastCanonicalScene, documentPageScenes, canonicalPagesPerRow, lastParsedSceneLabel, lastLoadedSource,
+        lastLoadedPdfPassword, lastDownloadablePdf, createdDocumentSource, nativeLayout, gridViewState, readerViewState, parsedPdfPageCache,
+        activePdfPageLoader, loadedOcrTextOnly, loadedPageStreaming, loadedCompressScans, loadedCompressScansPreference } = previous);
+      if (candidateLoader !== activePdfPageLoader) void candidateLoader?.close();
+      if (lastParsedScene) applyTextSearchScene(lastParsedScene); else { readerThumbnailScene = null; textSearchController.setScene(null); }
+      refreshDropIndicator(); setDownloadDataButtonState(Boolean(lastParsedScene)); setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
+      if (previousEditor && wasEditing) await previousEditor.setEditing(true);
+    }
+    setPrimaryLoadControlsEnabled(true);
+  }
+  return committed;
+}
 
 downloadDataButtonElement.addEventListener("click", () => {
   void downloadHep();
@@ -1660,11 +1725,6 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     demandLoader?.bindDisplayScene(scene, pageScenes);
     const rasterLayerCount = listSceneRasterLayers(scene).length;
     const hasRasterLayer = rasterLayerCount > 0;
-    if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer && !demandLoader && !extractionOptions.ocrTextOnly) {
-      setParsingLoader(false);
-      setStatus(`No visible geometry was extracted from ${label}.`);
-      return;
-    }
 
     setStatus(
       `Building LOD / GPU data for ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""}...`
@@ -1717,17 +1777,18 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     activePdfPageLoader = demandLoader;
     activePdfPageLoader?.setPerformanceListener((name, ms) => renderer.recordPerformanceTransition?.(name, ms));
     demandLoader = null;
-    void previousPageLoader?.close();
     if (activePdfPageLoader) parsedPdfPageCache = null;
     if (parsedPages) storeCachedPdfPageScenes(options.source, pageSceneOptionsKey, parsedPages);
     if (!options.preserveView) { gridViewState = null; readerViewState = null; }
-    preparation.commit();
     applyTextSearchScene(scene);
     if (activePdfPageLoader) textSearchWidget.setAvailability("ready");
     refreshDropIndicator();
     setDownloadDataButtonState(true);
 
     updateMetricsPanel(label, scene, sceneStats, parseMs, uploadMs, lodTiming, performance.now() - loadStart);
+    if (options.prepareEditor) await options.prepareEditor();
+    options.signal.throwIfAborted(); options.beforeCommit?.(); preparation.commit();
+    void previousPageLoader?.close();
     if (extractionOptions.ocrTextOnly) setStatus("Text-only view: pictures and diagrams are omitted. Pages without stored text are blank.");
     else clearLoadedStatus();
   } catch (error) {
@@ -1787,11 +1848,6 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
 
     const rasterLayerCount = listSceneRasterLayers(scene).length;
     const hasRasterLayer = rasterLayerCount > 0;
-    if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer) {
-      setParsingLoader(false);
-      setStatus(`No visible geometry was found in ${label}.`);
-      return;
-    }
 
     setStatus(
       `Preparing LOD / GPU data for ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""}...`
@@ -1867,6 +1923,7 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
 }
 
 function commitLoadedSource(options: LoadPdfOptions, ocrTextOnly = false, streaming = false, compressScans = false): void {
+  createdDocumentSource = options.createdDocument ?? null;
   lastLoadedSource = options.source;
   lastLoadedPdfPassword = options.source.kind === "pdf" ? options.password : undefined;
   loadedOcrTextOnly = options.source.kind === "pdf" && ocrTextOnly;
@@ -2317,6 +2374,7 @@ function setDownloadAllDataButtonState(hasExamples: boolean, isBusy = false, pro
 function setPrimaryLoadControlsEnabled(isEnabled: boolean): void {
   if (!isEnabled) viewerPrintAction?.cancel();
   openButtonElement.disabled = !isEnabled;
+  document.querySelector<HTMLButtonElement>("#new-pdf")!.disabled = !isEnabled;
   fileInputElement.disabled = !isEnabled;
   exampleDropdown.setDisabled(!isEnabled);
   viewerPrintAction?.refresh();

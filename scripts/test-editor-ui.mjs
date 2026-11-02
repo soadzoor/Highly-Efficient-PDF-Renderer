@@ -517,6 +517,13 @@ try {
   saveHost.passwordDialog = { apply: () => false }; const downloadsBeforeInvalidPassword = downloads.length;
   await saveHost.save("pdf"); assert.equal(downloads.length, downloadsBeforeInvalidPassword, "invalid dialog passwords prevent export");
   saveHost.passwordDialog = null;
+  let createdSaved = 0; saveHost.source.initialUnsaved = true;
+  saveHost.session.markSaved = () => { createdSaved++; };
+  saveHost.session.savePdf = async () => new Blob(["New PDF"]);
+  await saveHost.save("pdf"); assert.equal(createdSaved, 1, "a successful first export marks a newly created document saved");
+  saveHost.session.savePdf = async () => { throw new Error("New document export failure"); };
+  await saveHost.save("pdf"); assert.equal(createdSaved, 1, "failed exports keep a new document unsaved");
+  saveHost.source.initialUnsaved = false;
   const viewStatuses = [], viewStatus = { textContent: "" }, statusHost = uiContext({ active: false, status: viewStatus,
     host: { onStatus: text => viewStatuses.push(text) } });
   vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), "setStatus"), statusHost);

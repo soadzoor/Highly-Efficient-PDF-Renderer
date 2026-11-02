@@ -1,4 +1,6 @@
 import "./editorUi.css";
+import "./newPdfUi.css";
+import { showEditorPageNumberingDialog } from "./editorPageNumberingUi";
 import "./editorContextMenu.css";
 import "./editorPagesUi.css";
 import "./editorReviewUi.css";
@@ -68,7 +70,7 @@ export interface EditorUiHost {
     affectedPages?: readonly number[];
   }): void | Promise<void>;
   documentChanged?(scene: VectorScene, source: { pdf?: Uint8Array; password?: string; label: string }): void | Promise<void>;
-  getSource(): { bytes?: Uint8Array; pdf?: Uint8Array; password?: string; label: string };
+  getSource(): { bytes?: Uint8Array; pdf?: Uint8Array; password?: string; label: string; createdDocument?: boolean; initialUnsaved?: boolean; recoveryKey?: string; resumeRecovery?: boolean };
   clientToScenePoint(x: number, y: number, pageIndex?: number): PrimitivePoint | null;
   sceneToClientPoint(x: number, y: number, pageIndex?: number): PrimitivePoint | null;
   /** Notify synchronously after the document's draw/submission, including camera-only frames. */
@@ -95,11 +97,11 @@ export interface EditorUi {
   isEditing(): boolean;
   isBusy?(): boolean;
   isDirty(): boolean;
-  confirmDocumentChange(): boolean;
+  confirmDocumentChange(options?: { deferRecoveryDiscard?: boolean }): boolean;
   save(kind: "pdf" | "flatten" | "hep" | "print"): Promise<void>;
   attachDocuments(files: readonly File[], signal?: AbortSignal): Promise<void>;
   dropImages(files: readonly File[], client: { x: number; y: number }, signal?: AbortSignal): Promise<void>;
-  dispose(): void;
+  dispose(options?: { discardRecovery?: boolean; preserveRecoveryKey?: string; preserveHostMode?: boolean }): void;
 }
 
 type Tool = "select" | "pan" | "form" | "add-field" | "text" | "rectangle" | "ellipse" | "line" | "arrow" | "polygon" | "polyline" | "ink" | "signature" | "image" | EditorReviewTool;
@@ -147,7 +149,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     services = await createEditorAppServices({ sourcePdf: source.pdf, password: source.password,
       onPrepareProgress: host.onSetupProgress ? value => { if (!lifetime.signal.aborted) host.onSetupProgress?.({ stage: "fields", value }); } : undefined });
     lifetime.signal.throwIfAborted();
-    session = await openEditorSession(scene, { ...services.sessionOptions, signal: lifetime.signal, sourcePdf: source.pdf, sourceLabel: source.label });
+    session = await openEditorSession(scene, { ...services.sessionOptions, signal: lifetime.signal, sourcePdf: source.pdf, sourceLabel: source.label, initiallyDirty: source.initialUnsaved });
     initializedSession = session;
     host.onSetupProgress?.({ stage: "session" });
     if (host.onSetupProgress) await yieldAfterPaint(lifetime.signal);
@@ -161,6 +163,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   let fieldDialog: EditorFieldDialog | null = null, fieldDialogCreating = false;
   let fieldDefaults: Partial<EditorFieldObject> = { fieldType: "text" };
   let pagesDialog: EditorPagesDialog | null = null, structuralRunning = false;
+  let pageNumberingDialog: { close(): void } | null = null;
   let currentSourceScene = session.sourceScene;
   let latestScene = session.sourceScene;
   let currentState = session.getState(), presented: PresentedScene | null = null;
@@ -258,7 +261,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     ${(["left", "center", "right", "top", "middle", "bottom"] as const).map(value => editorIconButton("action", `align-${value}`, `Align ${value}`)).join("")}
     ${editorIconButton("action", "distribute-horizontal", "Distribute horizontal gaps")}${editorIconButton("action", "distribute-vertical", "Distribute vertical gaps")}
     ${editorIconButton("action", "guides", "Snap movement to page and object alignment guides; hold Alt/Option to bypass", 'aria-pressed="true"')}
-    ${editorIconButton("action", "layers", "Add, edit, reorder or remove PDF layers")}${editorIconButton("action", "pages", "Organize, crop or extract PDF pages")}${editorIconButton("action", "pdf-password", "Keep, remove or change PDF password protection")}${editorIconButton("action", "save-pdf", "Download an editable PDF (Ctrl/Cmd+S)")}${editorIconButton("action", "flatten", "Download a flattened PDF copy")}${editorIconButton("action", "save-hep", "Download the edited document as HEP")}${editorIconButton("action", "print", "Print the edited document")}${editorIconButton("action", "recovery", "Manage local recovery drafts")}
+    ${editorIconButton("action", "layers", "Add, edit, reorder or remove PDF layers")}${editorIconButton("action", "pages", "Add, resize, organize, crop or extract PDF pages")}${editorIconButton("action", "page-numbers", "Configure automatic page numbers")}${editorIconButton("action", "pdf-password", "Keep, remove or change PDF password protection")}${editorIconButton("action", "save-pdf", "Download an editable PDF (Ctrl/Cmd+S)")}${editorIconButton("action", "flatten", "Download a flattened PDF copy")}${editorIconButton("action", "save-hep", "Download the edited document as HEP")}${editorIconButton("action", "print", "Print the edited document")}${editorIconButton("action", "recovery", "Manage local recovery drafts")}
     ${editorIconButton("action", "cancel-operation", "Cancel the current operation", "hidden")}<span data-status role="status" aria-live="polite"></span><span data-recovery-status role="status" aria-live="polite"></span>
   </div><div class="hepr-editor-help">Ctrl/Cmd + click toggles objects; Shift + click adds them. Drag empty space to select fully contained objects. Corner resizing keeps proportions; hold Shift to resize freely. Rotation snaps within 5° of multiples of 45°, including 0°; hold Alt/Option to disable snapping. Double-click a new textbox to edit it; resizing changes wrapping, Alt + resize scales text. Escape cancels.</div>`;
   const overlay = document.createElement("div"); overlay.className = "hepr-editor-overlay"; overlay.dataset.tool = tool;
@@ -611,7 +614,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     query("[data-selection]").textContent = state.selection.length ? `${state.selection.length} selected` : "No selection";
     for (const action of ["duplicate", "delete", "group", "ungroup", "copy", "cut", "lock", "unlock"]) query<HTMLButtonElement>(`[data-action="${action}"]`).disabled = !state.selection.length || action !== "copy" && action !== "unlock" && selectionLocked();
     query<HTMLButtonElement>('[data-action="lock"]').disabled = !state.selection.some(id => !session.isObjectLocked(id));
-    query<HTMLButtonElement>('[data-action="unlock"]').disabled = !selectionLocked();
+    query<HTMLButtonElement>('[data-action="unlock"]').disabled = !selectionLocked() || state.selection.every(id => { const object = session.getObject(id); return object.kind === "text" && Boolean(object.pageNumberingId); });
     query<HTMLButtonElement>('[data-action="edit-comment"]').disabled = !canEditComment();
     query<HTMLButtonElement>('[data-action="edit-field"]').disabled = !selectedEditorField() || selectionLocked();
     updateLinkButtons();
@@ -1528,14 +1531,14 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if (kind === "print") {
         const { writeScenePdf } = await import("./editorPdfWriter");
         blob = await writeScenePdf(await session.getScene({ signal, preview: false, onProgress: progress.child(0, .4).toCallback() }),
-          { signal, onWarning, onProgress: progress.child(.4, 1).toCallback() });
+          { signal, flatten: true, onWarning, onProgress: progress.child(.4, 1).toCallback() });
       } else blob = kind === "hep" ? await session.saveHep({ signal, markSaved: false, onProgress: progress.toCallback() })
         : await session.savePdf({ signal, markSaved: false, flatten: outputKind === "flatten", protection, onWarning, onDiagnostic, onProgress: progress.toCallback() });
       signal.throwIfAborted();
       if (!unchanged()) throw new Error("The document changed while preparing the export. Save again.");
       if (kind === "print") printPdfBlob(blob, document, { filename: "edited-print.pdf", title: "Print edited PDF" });
       else { const base = formatPdfDownloadFilename(source.label).replace(/\.pdf$/i, ""); triggerBrowserDownload(blob, `${base}${kind === "hep" ? "-edited.hep" : outputKind === "flatten" ? "-flattened.pdf" : "-edited.pdf"}`); }
-      if (kind !== "print") { exportedRevision = session.revision; await recovery?.flush(); }
+      if (kind !== "print") { exportedRevision = session.revision; if (source.initialUnsaved) session.markSaved(); await recovery?.flush(); }
       setStatus([kind === "print" ? "Print-ready PDF opened" : "Download started; local edits and recovery draft kept.", ...warnings].join(" "));
     } catch (error) { report(error); }
     finally {
@@ -1544,6 +1547,15 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       host.onBusyChange?.(false);
       if (!disposed) { updatePointerCursor(); updateClipboardButtons(); query('[data-action="cancel-operation"]').hidden = true; }
     }
+  }
+  async function openPageNumbering(): Promise<void> {
+    if (disposed || running || savePreparing || structuralRunning || pageNumberingDialog || links.isOpen()) return;
+    if (activeText) await finishText();
+    if (activeText || disposed) return;
+    flushEditorFieldDrafts(fieldDrafts); flushColorDraft();
+    pageNumberingDialog = showEditorPageNumberingDialog(document, { settings: session.getPageNumbering(),
+      apply(settings) { session.setPageNumbering(settings); void refreshScene(); },
+      onClose() { pageNumberingDialog = null; } });
   }
   async function runPageOperation(change: (options: { signal: AbortSignal; onProgress: LoadProgressCallback; onDiagnostic: (diagnostic: PdfDiagnostic) => void }) => Promise<void>, externalSignal?: AbortSignal): Promise<void> {
     lifetime.signal.throwIfAborted(); externalSignal?.throwIfAborted();
@@ -1632,9 +1644,12 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       case "recovery": void openRecovery(); break;
       case "apply-text": void finishText().catch(report); break; case "cancel-text": cancelText(); break;
       case "cancel-operation": operation?.abort(); break;
+      case "page-numbers": void openPageNumbering().catch(report); break;
       case "pages":
         if (!pagesDialog) pagesDialog = showEditorPagesDialog(document, {
           getPages: () => session.getPages(),
+          insertBlank: (value, at) => runPageOperation(options => session.insertBlankPages({ ...value, ...options, at })),
+          resize: (pages, size) => runPageOperation(options => session.resizePages(pages, size, options)),
           rotate: (indices, degrees) => runPageOperation(options => session.rotatePages(indices, degrees, options)),
           remove: indices => runPageOperation(options => session.removePages(indices, options)),
           insert: (files, at) => runPageOperation(options => insertEditorPdfFiles(session, files, at, options)),
@@ -1884,6 +1899,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     const request = ++textRequest;
     const id = await pick(point, { x: event.clientX, y: event.clientY });
     if (!id || disposed || !active || running || tool !== "select" || request !== textRequest) return; const object = session.getObject(id);
+    if (object.kind === "text" && object.pageNumberingId) { await openPageNumbering(); return; }
     if (session.isObjectLocked(id)) return;
     if (object.kind === "text") { await startText(point, object); return; }
     if (object.kind === "shape" && object.review || object.kind === "source" && object.annotationId && latestScene.annotations?.some(annotation =>
@@ -1949,11 +1965,11 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   async function initializeRecovery(): Promise<void> {
     try {
-      recoveryKey = await editorRecoveryDocumentKey({ bytes: source.bytes ?? source.pdf, scene: currentSourceScene }, lifetime.signal);
+      recoveryKey = source.recoveryKey ?? await editorRecoveryDocumentKey({ bytes: source.bytes ?? source.pdf, scene: currentSourceScene }, lifetime.signal);
       const protectedSource = await editorServices.isSourceProtected(lifetime.signal);
       if (disposed) return;
       recovery = createEditorRecovery({ session, key: recoveryKey, label: source.label, password: source.password,
-        protected: protectedSource,
+        protected: protectedSource, createdDocument: source.createdDocument,
         isInteracting: () => Boolean(pointer || pendingPick || cameraPan.isPanning() || review.isSelecting() || links.isPicking() || structuralRunning || running || savePreparing),
         getDraft: async () => { const editing = activeText; return { text: editing ? { object: await readTextDraft(), objectId: editing.objectId,
           sourceAnnotationId: editing.sourceAnnotationId, layerId: editing.layerId } : null,
@@ -1992,8 +2008,10 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         }, onError: report
       });
       recoveryOffered = Boolean(await recovery.probe());
+      if (source.resumeRecovery && recoveryOffered) { await recovery.restore(); recoveryOffered = false; }
+      if (source.initialUnsaved && !recoveryOffered) recovery.draftChanged();
       if (!disposed && recoveryOffered) query("[data-recovery-status]").textContent = "An older recovery draft is available; choose Restore or Discard to resume recovery.";
-    } catch (error) { if (!disposed) { query("[data-recovery-status]").textContent = "Local recovery unavailable"; report(error); } }
+    } catch (error) { if (!disposed) { query("[data-recovery-status]").textContent = "Local recovery unavailable"; report(error); } if (source.resumeRecovery) throw error; }
   }
   async function openRecovery(): Promise<void> {
     await recoveryReady;
@@ -2018,10 +2036,10 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       }
     });
   }
-  function confirmDocumentChange(): boolean {
+  function confirmDocumentChange(options: { deferRecoveryDiscard?: boolean } = {}): boolean {
     if (recoveryRunning) { setStatus("Wait for recovery to finish before opening another document."); return false; }
     const confirmed = !hasUnsavedChanges() || window.confirm("Discard unsaved PDF changes and open another document?");
-    if (confirmed && hasUnsavedChanges()) discardRecovery = true;
+    if (confirmed && hasUnsavedChanges() && !options.deferRecoveryDiscard) discardRecovery = true;
     return confirmed;
   }
   function beforeUnload(event: BeforeUnloadEvent): void {
@@ -2032,12 +2050,13 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   const recoveryReady = initializeRecovery();
   return {
     async setEditing(value, externalSignal) {
+      if (value) await recoveryReady;
       if (disposed || structuralRunning || savePreparing || running && !clipboardRunning || recoveryRunning || active === value) return;
       const signal = AbortSignal.any([lifetime.signal, ...(externalSignal ? [externalSignal] : [])]);
       signal.throwIfAborted();
       contextMenu.close();
       if (!value && fieldDialog && !fieldDialog.apply()) return;
-      if (!value) recoveryDialog?.close();
+      if (!value) { recoveryDialog?.close(); pageNumberingDialog?.close(); }
       if (!value && clipboardRunning) operation?.abort();
       if (!value && colorDraft) { cancelPointerGesture(); flushColorDraft(); }
       if (!value) pendingFieldFocus = null;
@@ -2080,11 +2099,13 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       }
     },
     isEditing: () => active, isBusy: () => running || savePreparing || structuralRunning || recoveryRunning || cameraPan.isPanning() || links.isBusy(), isDirty: hasUnsavedChanges, save, attachDocuments, dropImages, confirmDocumentChange,
-    dispose() {
+    dispose(options = {}) {
+      if (options.discardRecovery && recoveryKey !== options.preserveRecoveryKey) discardRecovery = true;
+      if (options.preserveRecoveryKey === recoveryKey) discardRecovery = false;
       if (disposed) return; stopColorPreview(true); disposed = true; active = false; cancelPointerGesture(false); lifetime.abort(); scenePreparation?.abort(); operation?.abort(); window.cancelAnimationFrame(frame);
       colorDraft = null;
       cameraPan.dispose();
-      review.dispose(); links.dispose(); recoveryDialog?.close(); fieldDialog?.close();
+      review.dispose(); links.dispose(); recoveryDialog?.close(); fieldDialog?.close(); pageNumberingDialog?.close();
       if (discardRecovery && recovery) { const controller = recovery; void controller.discard().finally(() => controller.dispose()).catch(() => {}); }
       else recovery?.dispose();
       pendingFieldFocus = null;
@@ -2092,10 +2113,12 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       releaseFrameListener?.(); releaseFrameListener = null;
       passwordDialog?.close(); pagesDialog?.close(true); pdfProtection.dispose();
       contextMenu.dispose();
+      const preserveLayerMode = options.preserveHostMode && host.layerControlsContainer?.classList.contains("hepr-layer-editor-active");
       layerControls.dispose(); layerDialog?.remove();
+      if (preserveLayerMode) host.layerControlsContainer?.classList.add("hepr-layer-editor-active");
       unsubscribe(); picker?.dispose(); interaction.dispose(); session.dispose(); editorServices.dispose(); toolbar.remove(); overlay.remove();
       for (const face of fontFaces.values()) document.fonts.delete(face); fontFaces.clear();
-      document.body.classList.remove("hepr-editing"); host.setEditing(false); host.onModeChange?.(false);
+      if (!options.preserveHostMode) { document.body.classList.remove("hepr-editing"); host.setEditing(false); host.onModeChange?.(false); }
     }
   };
 }

@@ -26,6 +26,7 @@ export async function editorRecoveryDocumentKey(source: { bytes?: Uint8Array; sc
 /** Debounced committed snapshots; gestures and View frames do no recovery work. */
 export function createEditorRecovery(options: {
   session: EditorSession; key: string; label: string; password?: string; protected?: boolean;
+  createdDocument?: boolean;
   store?: EditorRecoveryStore; debounceMs?: number;
   getDraft?(): unknown | Promise<unknown>;
   applyDraft?(draft: unknown): void | Promise<void>;
@@ -79,7 +80,7 @@ export function createEditorRecovery(options: {
       if (generation !== token || session.revision !== revision) { pending = true; return; }
       const updatedAt = Date.now();
       await store.put({ key: options.key, label: options.protected || options.password !== undefined ? "Protected PDF" : options.label,
-        protected: envelope.encrypted, updatedAt, revision, envelope }); signal.throwIfAborted();
+        protected: envelope.encrypted, ...(options.createdDocument ? { createdDocument: true } : {}), updatedAt, revision, envelope }); signal.throwIfAborted();
       ownedRecord = true; decisionPending = false; lastError = ""; options.onStatus?.({ state: "saved", updatedAt });
     })().catch(report);
     active = task;
