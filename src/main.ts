@@ -710,7 +710,9 @@ function setNativeEditing(active: boolean): void {
   annotationInteraction?.setInteractionEnabled(!active);
   textSelectionCheckbox!.disabled = active;
   for (const control of [ocrTextCheckbox!, pageStreamingCheckbox!, compressScansCheckbox!]) control.disabled = active || Boolean(pdfEditor) || lastLoadedSource?.kind !== "pdf";
-  const layout = document.querySelector<HTMLSelectElement>(".reader-layout"); if (layout) layout.disabled = active;
+  const layout = document.querySelector<HTMLSelectElement>(".reader-layout");
+  if (layout) layout.disabled = Boolean(editorInitialization) || pendingSourceLoadCount > 0 || activeSceneLoadToken !== null ||
+    activeHepExportController !== null || layoutChangeRunning || editorSceneApplicationActive || Boolean(pdfEditor?.isBusy?.()) || Boolean(backendSwitcher?.isSwitchInFlight());
   setToolbarIconButton(editorModeButton, editorInitialization ? "cancel" : active ? "view" : "edit",
     editorInitialization ? "Cancel editing setup" : active ? "View PDF" : "Edit PDF");
   editorModeButton.setAttribute("aria-pressed", String(active));
@@ -724,6 +726,7 @@ async function togglePdfEditing(): Promise<void> {
     if (!pdfEditor?.isEditing()) activeEditorSetup = setup = editorSetupLoading.begin({ stage: pdfEditor ? "display" : "loading" });
     const editor = await ensureNativeEditor(undefined, setup);
     controller = editorInitialization = new AbortController();
+    const layout = document.querySelector<HTMLSelectElement>(".reader-layout"); if (layout) layout.disabled = true;
     setToolbarIconButton(editorModeButton, "cancel", "Cancel editing setup"); editorModeButton.setAttribute("aria-busy", "true");
     if (setup) { setup.report({ stage: "display" }); await yieldAfterPaint(controller.signal); }
     await editor.setEditing(!editor.isEditing(), controller.signal);
@@ -734,6 +737,7 @@ async function togglePdfEditing(): Promise<void> {
     if (controller && editorInitialization === controller) {
       editorInitialization = null; editorModeButton.removeAttribute("aria-busy");
       setToolbarIconButton(editorModeButton, pdfEditor?.isEditing() ? "view" : "edit", pdfEditor?.isEditing() ? "View PDF" : "Edit PDF");
+      const layout = document.querySelector<HTMLSelectElement>(".reader-layout"); if (layout) layout.disabled = layoutChangeRunning || Boolean(pdfEditor?.isBusy?.());
     }
     setup?.finish(); if (activeEditorSetup === setup) activeEditorSetup = null;
     viewerPrintAction?.refresh();
@@ -749,6 +753,7 @@ async function ensureNativeEditor(signal?: AbortSignal, setup?: EditorSetupLoadi
   const loading = setup ?? editorSetupLoading.begin({ stage: "loading" }); activeEditorSetup = loading;
   setToolbarIconButton(editorModeButton, "cancel", "Cancel editing setup"); editorModeButton.setAttribute("aria-busy", "true");
   const controller = editorInitialization = new AbortController();
+  const layout = document.querySelector<HTMLSelectElement>(".reader-layout"); if (layout) layout.disabled = true;
   const abort = (): void => controller.abort(signal?.reason);
   signal?.addEventListener("abort", abort, { once: true });
   try {
@@ -875,6 +880,7 @@ async function ensureNativeEditor(signal?: AbortSignal, setup?: EditorSetupLoadi
     if (editorInitialization === controller) {
       editorInitialization = null; editorModeButton.removeAttribute("aria-busy");
       setToolbarIconButton(editorModeButton, pdfEditor?.isEditing() ? "view" : "edit", pdfEditor?.isEditing() ? "View PDF" : "Edit PDF");
+      const layout = document.querySelector<HTMLSelectElement>(".reader-layout"); if (layout) layout.disabled = layoutChangeRunning || Boolean(pdfEditor?.isBusy?.());
       if (!pdfEditor) activePdfPageLoader?.resume();
     }
     viewerPrintAction?.refresh();
@@ -921,77 +927,87 @@ function updateNativePresentation(layout: "reader" | "grid", pages: VectorScene[
 async function changeNativeLayout(value: string): Promise<void> {
   const nextLayout = value === "reader" ? "reader" : "grid";
   if (nextLayout === nativeLayout) return;
-  if (!lastParsedScene || !documentPageScenes || layoutChangeRunning || activeSceneLoadToken !== null ||
-      pendingSourceLoadCount > 0 || activeHepExportController !== null || backendSwitcher?.isSwitchInFlight()) {
-    readerViewport?.setLayout(nativeLayout);
-    return;
-  }
-  layoutChangeRunning = true;
-  updateBackendSelectDisabledState();
-  const source = lastLoadedSource;
-  const previousScene = lastParsedScene;
-  const previousPages = documentPageScenes;
-  const previousCanonicalScene = lastCanonicalScene;
-  const previousReaderState = readerViewport!.snapshot();
-  const previousGridView = gridViewState;
-  const previousSavedReaderView = readerViewState;
-  const previousView = renderer.getViewState();
-  const previousLayout = nativeLayout;
-  const ratio = canvasElement.width / Math.max(1, canvasElement.getBoundingClientRect().width);
-  const anchor = readerCaptureAnchor(previousScene.pageRects, { centerX: previousView.cameraCenterX,
-    centerY: previousView.cameraCenterY, zoom: previousView.zoom / ratio });
-  try {
-    const pages = activePdfPageLoader?.displayPageScenes ?? documentPageScenes;
-    const scene = nextLayout === "reader" ? composeVectorScenesInColumn(pages)
-      : activePdfPageLoader ? prepareSceneForHepRendering(composeVectorScenesInGrid(pages, canonicalPagesPerRow))
-        : lastCanonicalScene!;
-    if (!activePdfPageLoader) {
-      if (!reuseTextLodForPageTranslation(previousScene, scene) && lastCanonicalScene) {
-        reuseTextLodForPageTranslation(lastCanonicalScene, scene);
-      }
+  if (editorInitialization || pdfEditor?.isBusy?.()) { readerViewport?.setLayout(nativeLayout); return; }
+  const applyLayout = async (): Promise<void> => {
+    if (!lastParsedScene || !documentPageScenes || layoutChangeRunning || activeSceneLoadToken !== null ||
+        pendingSourceLoadCount > 0 || activeHepExportController !== null || backendSwitcher?.isSwitchInFlight()) {
+      readerViewport?.setLayout(nativeLayout);
+      return;
     }
-    await prebuildVectorStrokeLodRuntime(scene, uiControlManager.readVectorLodModeInput(),
-      backendSwitcher?.getActiveBackend() ?? "webgl", { shouldCancel: () => lastLoadedSource !== source || pendingSourceLoadCount > 0 });
-    await prebuildTextLod(scene);
-    if (lastLoadedSource !== source || lastParsedScene !== previousScene || pendingSourceLoadCount > 0) return;
-    const stats = uploadSceneWithRollback(renderer, scene, true);
-    if (previousLayout === "grid") gridViewState = previousView;
-    else readerViewState = previousReaderState;
-    lastParsedScene = scene;
-    documentPageScenes = pages;
-    if (nextLayout === "grid" && activePdfPageLoader) lastCanonicalScene = scene;
-    activePdfPageLoader?.bindDisplayScene(scene, pages);
-    updateNativePresentation(nextLayout, pages, source?.bytes);
-    if (nextLayout === "reader") {
-      if (readerViewState) readerViewport!.restore(readerViewState);
-      else readerViewport!.goToPage(anchor.pageIndex);
-    } else {
-      if (gridViewState) renderer.setViewState(gridViewState);
-      else renderer.fitToBounds(resolveSceneFitBounds(scene), 64);
-    }
-    await layerVisibility.sceneChanged(true);
-    if (lastLoadedSource !== source || lastParsedScene !== scene) return;
-    applyTextSearchScene(scene);
-    updateMetricsPanel(lastParsedSceneLabel ?? "Document", scene, stats, 0, 0, null, null);
-  } catch (error) {
-    if (lastLoadedSource === source) {
-      lastParsedScene = previousScene;
-      lastCanonicalScene = previousCanonicalScene;
-      documentPageScenes = previousPages;
-      gridViewState = previousGridView;
-      readerViewState = previousSavedReaderView;
-      renderer.setScene(previousScene);
-      activePdfPageLoader?.bindDisplayScene(previousScene, previousPages);
-      updateNativePresentation(previousLayout, previousPages, source?.bytes);
-      readerViewport!.restore(previousReaderState);
-      renderer.setViewState(previousView);
-      await layerVisibility.sceneChanged(true);
-      applyTextSearchScene(previousScene);
-      setStatus(`Failed to change layout: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  } finally {
-    layoutChangeRunning = false;
+    layoutChangeRunning = true;
     updateBackendSelectDisabledState();
+    const source = lastLoadedSource;
+    const previousScene = lastParsedScene;
+    const previousPages = documentPageScenes;
+    const previousCanonicalScene = lastCanonicalScene;
+    const previousReaderState = readerViewport!.snapshot();
+    const previousGridView = gridViewState;
+    const previousSavedReaderView = readerViewState;
+    const previousView = renderer.getViewState();
+    const previousLayout = nativeLayout;
+    const ratio = canvasElement.width / Math.max(1, canvasElement.getBoundingClientRect().width);
+    const anchor = readerCaptureAnchor(previousScene.pageRects, { centerX: previousView.cameraCenterX,
+      centerY: previousView.cameraCenterY, zoom: previousView.zoom / ratio });
+    try {
+      const pages = activePdfPageLoader?.displayPageScenes ?? documentPageScenes;
+      const scene = nextLayout === "reader" ? composeVectorScenesInColumn(pages)
+        : activePdfPageLoader ? prepareSceneForHepRendering(composeVectorScenesInGrid(pages, canonicalPagesPerRow))
+          : lastCanonicalScene!;
+      if (!activePdfPageLoader) {
+        if (!reuseTextLodForPageTranslation(previousScene, scene) && lastCanonicalScene) {
+          reuseTextLodForPageTranslation(lastCanonicalScene, scene);
+        }
+      }
+      await prebuildVectorStrokeLodRuntime(scene, uiControlManager.readVectorLodModeInput(),
+        backendSwitcher?.getActiveBackend() ?? "webgl", { shouldCancel: () => lastLoadedSource !== source || pendingSourceLoadCount > 0 });
+      await prebuildTextLod(scene);
+      if (lastLoadedSource !== source || lastParsedScene !== previousScene || pendingSourceLoadCount > 0) return;
+      const stats = uploadSceneWithRollback(renderer, scene, true);
+      if (previousLayout === "grid") gridViewState = previousView;
+      else readerViewState = previousReaderState;
+      lastParsedScene = scene;
+      documentPageScenes = pages;
+      if (nextLayout === "grid" && activePdfPageLoader) lastCanonicalScene = scene;
+      activePdfPageLoader?.bindDisplayScene(scene, pages);
+      updateNativePresentation(nextLayout, pages, source?.bytes);
+      if (nextLayout === "reader") {
+        if (readerViewState) readerViewport!.restore(readerViewState);
+        else readerViewport!.goToPage(anchor.pageIndex);
+      } else {
+        if (gridViewState) renderer.setViewState(gridViewState);
+        else renderer.fitToBounds(resolveSceneFitBounds(scene), 64);
+      }
+      await layerVisibility.sceneChanged(true);
+      if (lastLoadedSource !== source || lastParsedScene !== scene) return;
+      applyTextSearchScene(scene);
+      updateMetricsPanel(lastParsedSceneLabel ?? "Document", scene, stats, 0, 0, null, null);
+    } catch (error) {
+      if (lastLoadedSource === source) {
+        lastParsedScene = previousScene;
+        lastCanonicalScene = previousCanonicalScene;
+        documentPageScenes = previousPages;
+        gridViewState = previousGridView;
+        readerViewState = previousSavedReaderView;
+        renderer.setScene(previousScene);
+        activePdfPageLoader?.bindDisplayScene(previousScene, previousPages);
+        updateNativePresentation(previousLayout, previousPages, source?.bytes);
+        readerViewport!.restore(previousReaderState);
+        renderer.setViewState(previousView);
+        await layerVisibility.sceneChanged(true);
+        applyTextSearchScene(previousScene);
+        setStatus(`Failed to change layout: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } finally {
+      layoutChangeRunning = false;
+      updateBackendSelectDisabledState();
+    }
+  };
+  try {
+    if (pdfEditor) await pdfEditor.runPresentationChange(applyLayout);
+    else await applyLayout();
+  } catch (error) {
+    readerViewport?.setLayout(nativeLayout);
+    setStatus(`Failed to change layout: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -2251,6 +2267,8 @@ function updateBackendSelectDisabledState(): void {
     pendingSourceLoadCount > 0 ||
     activeSceneLoadToken !== null ||
     activeHepExportController !== null || layoutChangeRunning || editorSceneApplicationActive;
+  const layout = backendSelectElement.ownerDocument?.querySelector<HTMLSelectElement>(".reader-layout");
+  if (layout) layout.disabled = backendSelectElement.disabled || Boolean(editorInitialization) || Boolean(pdfEditor?.isBusy?.()) || Boolean(backendSwitcher?.isSwitchInFlight());
   if (activePdfPageLoader) {
     if (pendingSourceLoadCount > 0 || activeSceneLoadToken !== null || activeHepExportController !== null || layoutChangeRunning || editorSceneApplicationActive) activePdfPageLoader.pause();
     else {

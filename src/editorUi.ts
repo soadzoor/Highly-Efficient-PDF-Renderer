@@ -96,6 +96,8 @@ export interface EditorUiHost {
 }
 export interface EditorUi {
   setEditing(active: boolean, signal?: AbortSignal): Promise<void>;
+  /** Change page presentation without committing drafts or changing document history. */
+  runPresentationChange(change: () => void | Promise<void>, signal?: AbortSignal): Promise<void>;
   isEditing(): boolean;
   isBusy?(): boolean;
   isDirty(): boolean;
@@ -1623,6 +1625,37 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       apply(settings) { session.setPageNumbering(settings); void refreshScene(); },
       onClose() { pageNumberingDialog = null; } });
   }
+  async function runPresentationChange(change: () => void | Promise<void>, externalSignal?: AbortSignal): Promise<void> {
+    const signal = AbortSignal.any([lifetime.signal, ...(externalSignal ? [externalSignal] : [])]);
+    signal.throwIfAborted();
+    if (disposed) throw new DOMException("Editor is disposed.", "AbortError");
+    if (running || savePreparing || structuralRunning || recoveryRunning) throw new Error("Wait for the current editor operation to finish before changing layout.");
+    const previousToolbarInert = Boolean(toolbar.inert), previousOverlayInert = Boolean(overlay.inert);
+    running = true; toolbar.inert = overlay.inert = true;
+    host.onBusyChange?.(true);
+    try {
+      contextMenu.close();
+      // Page positions may move, so discard transient pointer/pick coordinates.
+      // Text/form/color drafts remain owned by the same document and controls.
+      cancelPointerGesture(false); stopColorPreview(true);
+      if (colorPreviewRestore) await waitForLoad(colorPreviewRestore, signal);
+      scenePreparation?.abort();
+      while (sceneApplication) await waitForLoad(sceneApplication, signal);
+      await refreshScene(signal, false, true); signal.throwIfAborted();
+      await change(); signal.throwIfAborted();
+      // Hosts remap the same page-local editor geometry into the new layout.
+      await refreshScene(signal, false, true); signal.throwIfAborted();
+    } finally {
+      running = false;
+      toolbar.inert = previousToolbarInert; overlay.inert = previousOverlayInert;
+      host.onBusyChange?.(false);
+      if (!disposed) {
+        updatePointerCursor(); updateClipboardButtons();
+        if (active) updateGeometry(true);
+        if (colorDraft) queueColorPreview();
+      }
+    }
+  }
   async function runPageOperation(change: (options: { signal: AbortSignal; onProgress: LoadProgressCallback; onDiagnostic: (diagnostic: PdfDiagnostic) => void }) => Promise<void>, externalSignal?: AbortSignal): Promise<void> {
     lifetime.signal.throwIfAborted(); externalSignal?.throwIfAborted();
     if (running || savePreparing || structuralRunning) throw new Error("Wait for the current operation to finish.");
@@ -2164,7 +2197,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         throw error;
       }
     },
-    isEditing: () => active, isBusy: () => running || savePreparing || structuralRunning || recoveryRunning || cameraPan.isPanning() || links.isBusy(), isDirty: hasUnsavedChanges, save, attachDocuments, dropImages, confirmDocumentChange,
+    isEditing: () => active, isBusy: () => running || savePreparing || structuralRunning || recoveryRunning || cameraPan.isPanning() || links.isBusy(), isDirty: hasUnsavedChanges, save, attachDocuments, dropImages, confirmDocumentChange, runPresentationChange,
     dispose(options = {}) {
       if (options.discardRecovery && recoveryKey !== options.preserveRecoveryKey) discardRecovery = true;
       if (options.preserveRecoveryKey === recoveryKey) discardRecovery = false;

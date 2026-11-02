@@ -587,14 +587,25 @@ viewerPrintAction = createViewerPrintAction({ button: printPdfButton, document,
   setStatus });
 editorModeButton.addEventListener("click", () => { void togglePdfEditing(); });
 
+/** Read current operation state so an older editor's cleanup cannot enable a newer load. */
+function syncThreeLayoutAvailability(extraBusy = false, editing = pdfEditor?.isEditing() ?? false): void {
+  const busy = extraBusy || editorInitialization !== null || sourceLoadController !== null || backendChangeActive ||
+    editorSceneApplicationActive || pageLayoutWarmingUp || activeHepExportController !== null || Boolean(pdfEditor?.isBusy?.());
+  const layout = document.querySelector<HTMLSelectElement>(".reader-layout");
+  if (layout) {
+    layout.disabled = busy;
+    for (const option of Array.from(layout.options ?? [])) option.disabled = editing && option.value !== "reader" && option.value !== "grid";
+  }
+  for (const button of pageLayoutButtons) button.disabled = busy || editing && button.dataset.pageLayout !== "reader" && button.dataset.pageLayout !== "grid";
+}
+
 function setThreeEditing(active: boolean): void {
   if (active) { drawingSelection.disable(); textSelection.disable(); annotationOverlay.hide(); }
   else if (textSelectionCheckboxElement.checked) textSelection.enable();
   if (!active) currentPdfObject?.resumePageLoading();
   annotationInteraction?.setInteractionEnabled(!active); textSelectionCheckboxElement.disabled = active;
   for (const control of [ocrTextCheckboxElement, pageStreamingCheckboxElement, compressScansCheckboxElement]) control.disabled = active || Boolean(pdfEditor) || currentPdfObject?.sourceKind !== "pdf";
-  const layout = document.querySelector<HTMLSelectElement>(".reader-layout"); if (layout) layout.disabled = active;
-  for (const button of pageLayoutButtons) button.disabled = active;
+  syncThreeLayoutAvailability(false, active);
   setToolbarIconButton(editorModeButton, editorInitialization ? "cancel" : active ? "view" : "edit",
     editorInitialization ? "Cancel editing setup" : active ? "View PDF" : "Edit PDF"); editorModeButton.setAttribute("aria-pressed", String(active));
   viewerPrintAction?.refresh();
@@ -606,7 +617,7 @@ async function togglePdfEditing(): Promise<void> {
   try {
     if (!pdfEditor?.isEditing()) activeEditorSetup = setup = editorSetupLoading.begin({ stage: pdfEditor ? "display" : "loading" });
     const editor = await ensureThreeEditor(undefined, setup);
-    controller = editorInitialization = new AbortController();
+    controller = editorInitialization = new AbortController(); syncThreeLayoutAvailability();
     setToolbarIconButton(editorModeButton, "cancel", "Cancel editing setup"); editorModeButton.setAttribute("aria-busy", "true");
     if (setup) { setup.report({ stage: "display" }); await yieldAfterPaint(controller.signal); }
     await editor.setEditing(!editor.isEditing(), controller.signal);
@@ -619,7 +630,7 @@ async function togglePdfEditing(): Promise<void> {
       setToolbarIconButton(editorModeButton, pdfEditor?.isEditing() ? "view" : "edit", pdfEditor?.isEditing() ? "View PDF" : "Edit PDF");
     }
     setup?.finish(); if (activeEditorSetup === setup) activeEditorSetup = null;
-    viewerPrintAction?.refresh();
+    syncThreeLayoutAvailability(); viewerPrintAction?.refresh();
   }
 }
 
@@ -631,7 +642,7 @@ async function ensureThreeEditor(signal?: AbortSignal, setup?: EditorSetupLoadin
   if (pdfEditor) return pdfEditor;
   const loading = setup ?? editorSetupLoading.begin({ stage: "loading" }); activeEditorSetup = loading;
   setToolbarIconButton(editorModeButton, "cancel", "Cancel editing setup"); editorModeButton.setAttribute("aria-busy", "true");
-  const controller = editorInitialization = new AbortController();
+  const controller = editorInitialization = new AbortController(); syncThreeLayoutAvailability();
   const abort = (): void => controller.abort(signal?.reason);
   signal?.addEventListener("abort", abort, { once: true });
   try {
@@ -741,7 +752,10 @@ async function ensureThreeEditor(signal?: AbortSignal, setup?: EditorSetupLoadin
           return () => { if (editorFrameListener === listener) editorFrameListener = null; };
         },
         requestFrame: requestRender,
-        setEditing: setThreeEditing, onStatus: setStatus, onBusyChange: () => { updateThreeBackendSelectDisabledState(); viewerPrintAction?.refresh(); },
+        setEditing: setThreeEditing, onStatus: setStatus, onBusyChange: busy => {
+          updateThreeBackendSelectDisabledState(); viewerPrintAction?.refresh();
+          syncThreeLayoutAvailability(busy);
+        },
         onSetupProgress: progress => { if (!controller.signal.aborted) loading.report(progress); }
       }, controller.signal);
     }
@@ -754,7 +768,7 @@ async function ensureThreeEditor(signal?: AbortSignal, setup?: EditorSetupLoadin
       setToolbarIconButton(editorModeButton, pdfEditor?.isEditing() ? "view" : "edit", pdfEditor?.isEditing() ? "View PDF" : "Edit PDF");
       if (!pdfEditor) currentPdfObject?.resumePageLoading();
     }
-    viewerPrintAction?.refresh();
+    syncThreeLayoutAvailability(); viewerPrintAction?.refresh();
   }
 }
 
@@ -1275,6 +1289,18 @@ for (const button of pageLayoutButtons) {
 // positioned in the loaded layout. The example tweens their ordinary
 // position/quaternion from the render loop, like three.js' css3d periodic table.
 async function setPageLayout(layout: ExamplePageLayout): Promise<void> {
+  if (layout === activePageLayout) { pageLayoutRequest++; reader.setLayout(activePageLayout); return; }
+  if (!pdfEditor) { await applyPageLayout(layout); return; }
+  if (editorInitialization || sourceLoadController || backendChangeActive || editorSceneApplicationActive || pageLayoutWarmingUp || activeHepExportController) { reader.setLayout(activePageLayout); return; }
+  if (pdfEditor.isEditing() && layout !== "reader" && layout !== "grid") { reader.setLayout(activePageLayout); return; }
+  try { await pdfEditor.runPresentationChange(() => applyPageLayout(layout), lifetimeSignal); }
+  catch (error) {
+    reader.setLayout(activePageLayout);
+    setStatus(`Failed to change layout: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function applyPageLayout(layout: ExamplePageLayout): Promise<void> {
   const pdfObject = currentPdfObject;
   if (!pdfObject) {
     return;
@@ -2598,7 +2624,7 @@ function setPanelCollapsed(collapsed: boolean): void {
 function updateThreeBackendSelectDisabledState(): void {
   backendSelectElement.disabled = editorSceneApplicationActive || backendChangeActive ||
     sourceLoadController !== null || activeHepExportController !== null;
-  viewerPrintAction?.refresh();
+  syncThreeLayoutAvailability(); viewerPrintAction?.refresh();
 }
 
 function setLoadControlsEnabled(enabled: boolean): void {
@@ -2617,9 +2643,7 @@ function setLoadControlsEnabled(enabled: boolean): void {
   document.querySelector<HTMLButtonElement>("#new-pdf")!.disabled = !enabled;
   fileInputElement.disabled = !enabled;
   exampleDropdown.setDisabled(!enabled);
-  for (const button of pageLayoutButtons) {
-    button.disabled = !enabled || (pdfEditor?.isEditing() ?? false);
-  }
+  syncThreeLayoutAvailability(!enabled);
   viewerPrintAction?.refresh();
 }
 

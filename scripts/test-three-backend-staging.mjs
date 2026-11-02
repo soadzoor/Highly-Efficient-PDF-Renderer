@@ -215,7 +215,7 @@ for (const outcome of ["ready", "failed", "superseded"]) {
   const events = [], statuses = [];
   const object = { pageCount: 2, subscribePagePreparationProgress: () => noop, getPages: () => preparation };
   const host = vm.createContext({
-    currentPdfObject: object, activePageLayout: "grid", pageLayoutRequest: 0, pageLayoutView: null,
+    currentPdfObject: object, pdfEditor: null, activePageLayout: "grid", pageLayoutRequest: 0, pageLayoutView: null,
     lifetimeSignal: new AbortController().signal,
     syncPageLayoutControls: () => events.push(`controls:${host.activePageLayout}`),
     syncPageCameraControls: () => events.push(`camera-controls:${host.activePageLayout}`),
@@ -229,6 +229,7 @@ for (const outcome of ["ready", "failed", "superseded"]) {
     applyReaderCameraView: () => events.push(`camera:${host.activePageLayout}`),
     formatPageLayout: layout => layout, requestRender: noop
   });
+  vm.runInContext(sourceFunction(source, "applyPageLayout"), host);
   vm.runInContext(sourceFunction(source, "setPageLayout"), host);
   const changing = host.setPageLayout("reader");
   assert.equal(host.activePageLayout, "grid", "pending Reader preparation leaves the committed mode unchanged");

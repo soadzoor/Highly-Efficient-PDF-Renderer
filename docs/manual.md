@@ -767,6 +767,11 @@ document-wide appearance changes can refresh the whole sidebar.
 
 The demos retain **Grid**, and the Three demo also retains **Sphere** and
 **Helix**. Switching back to Reader restores its zoom and reading position.
+You can switch between **Reader** and **Grid** while staying in Edit mode.
+Edits, selection, unfinished text/form input and Undo/Redo stay with the document;
+switching layout only changes page presentation. Controls pause briefly while
+the layout or another document/editor operation is being prepared. Three's
+Sphere and Helix remain unavailable during Edit mode.
 Reader does not change package loading defaults or the canonical layout saved
 by Download HEP.
 

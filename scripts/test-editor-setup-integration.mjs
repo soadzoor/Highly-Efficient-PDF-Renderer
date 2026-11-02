@@ -16,13 +16,13 @@ for (const [file, ensureName, discardName, setName] of [
   assert.match(source, /import \{ createEditorSetupLoading, type EditorSetupLoadingHandle \} from "\.\/editorSetupLoading"/);
   assert.match(source, /import "\.\/editorSetupLoading.css"/);
   assert.match(source, /const editorSetupLoading = createEditorSetupLoading\(\(\) => canvasElement\)/, "dormant View mode only creates the lightweight controller");
-  const methods = [setName, "togglePdfEditing", ensureName, discardName].map(name => sourceFunction(source, name).replace(/\bimport\(/g, "importModule(")).join("\n");
+  const methods = [...(file === "three-example.ts" ? ["syncThreeLayoutAvailability"] : []), setName, "togglePdfEditing", ensureName, discardName].map(name => sourceFunction(source, name).replace(/\bimport\(/g, "importModule(")).join("\n");
 
   function fixture(kind = "pdf") {
     const events = [], handles = [], hosts = [], scene = { pagesPerRow: 1 }, bytes = new Uint8Array([1]);
     const state = { paintGate: null, prepareGate: null, displayGate: null, importFailure: null, displayFailure: null, currentHandle: null };
     const element = () => ({ checked: false, disabled: false, attributes: {}, setAttribute(name, value) { this.attributes[name] = value; }, removeAttribute(name) { delete this.attributes[name]; } });
-    const button = element();
+    const button = element(), layout = element();
     const context = vm.createContext({
       AbortController, DOMException, Uint8Array,
       pdfEditor: null, editorInitialization: null, activeEditorSetup: null, editorModeButton: button,
@@ -37,6 +37,7 @@ for (const [file, ensureName, discardName, setName] of [
       setToolbarIconButton(target, icon, title) { target.icon = icon; target.title = title; },
       setStatus: status => events.push(["status", status]), clearLoadedStatus: () => events.push(["clear"]),
       pendingSourceLoadCount: 0, activeSceneLoadToken: null, layoutChangeRunning: false, backendSwitcher: null,
+      activeHepExportController: null, editorSceneApplicationActive: false,
       lastParsedScene: scene, lastLoadedSource: { kind, bytes, label: "document" }, lastLoadedPdfPassword: undefined,
       lastDownloadablePdf: null, nativeLayout: "reader", canonicalPagesPerRow: 1,
       activePdfPageLoader: { pause() { events.push(["pause"]); }, resume() { events.push(["resume"]); } },
@@ -44,7 +45,7 @@ for (const [file, ensureName, discardName, setName] of [
       currentPdfObject: { sourceKind: kind, sourceBytes: bytes, sourceOptions: {}, sceneData: scene, sourceLabel: "document",
         pausePageLoading() { events.push(["pause"]); }, resumePageLoading() { events.push(["resume"]); } },
       pdfLayersContainer: {}, canvasElement: {}, requestRender() {},
-      document: { querySelector: () => element() }, setHudCollapsed() {}, setPanelCollapsed() {},
+      document: { querySelector: selector => selector === ".reader-layout" ? layout : element() }, setHudCollapsed() {}, setPanelCollapsed() {},
       createParseBuffer: value => value, getExtractionOptions: () => ({}),
       composeVectorScenesInColumn: pages => pages[0], composeVectorScenesInGrid: pages => pages[0],
       drawingSelection: { disable() {} }, textSelection: { disable() {}, enable() {} }, annotationOverlay: { hide() {} },
@@ -93,7 +94,7 @@ for (const [file, ensureName, discardName, setName] of [
       return { remapEditorPagePoint() {}, waitForEditorScenePresentation() {} };
     };
     vm.runInContext(methods, context);
-    return { context, events, handles, hosts, state, button, ensure: (...args) => context[ensureName](...args), discard: () => context[discardName]() };
+    return { context, events, handles, hosts, state, button, layout, ensure: (...args) => context[ensureName](...args), discard: () => context[discardName]() };
   }
 
   for (const kind of ["pdf", "hep"]) {
@@ -102,12 +103,14 @@ for (const [file, ensureName, discardName, setName] of [
     assert.equal(test.handles.length, 1, `${file}: setup mounts synchronously before the first await`);
     await until(() => test.events.some(([name]) => name === "display"), test.events);
     assert.equal(test.handles.length, 1, "ensure and activation share one uninterrupted indicator");
+    if (file === "three-example.ts") assert(test.layout.disabled, "Three layout changes stay blocked through the first editable frame");
     assert.equal(test.handles[0].finished, false, "upload completion cannot dismiss the setup before presentation");
     assert(test.events.findIndex(([name]) => name === "paint") < test.events.findIndex(([name]) => name === "import"), "the setup can paint before editor modules evaluate");
     if (kind === "pdf") assert(test.events.some(([name, stage, value]) => name === "report" && stage === "document" && value === .25), "measured page preparation progress is forwarded");
     test.state.displayGate.resolve(); await pending;
     assert.equal(test.handles[0].finished, true); assert.equal(test.context.activeEditorSetup, null);
     assert.equal(test.context.editorInitialization, null); assert.equal(test.button.attributes["aria-busy"], undefined);
+    if (file === "three-example.ts") assert(!test.layout.disabled, "completed Three setup restores Reader/Grid selection");
     assert(test.events.findIndex(([name]) => name === "presented") < test.events.findIndex(([name]) => name === "finish"));
     assert.equal(test.button.icon, "view");
     await test.context.togglePdfEditing(); assert.equal(test.handles.length, 1, "returning to View does not mount an Edit setup indicator");
@@ -131,6 +134,7 @@ for (const [file, ensureName, discardName, setName] of [
     if (failure === "cancel") await test.context.togglePdfEditing();
     else { test.state.displayFailure = new Error("upload failed"); test.state.displayGate.resolve(); }
     await pending; assert.equal(test.handles[0].finished, true); assert.equal(test.context.pdfEditor.isEditing(), false);
+    if (file === "three-example.ts") assert(!test.layout.disabled, "failed or cancelled Three setup also restores layout selection");
     assert(test.events.some(([name]) => name === "resume"), "failed activation restores View page loading even though the initialized editor is cached");
     if (failure === "upload") {
       assert(test.events.some(([name, message]) => name === "status" && /upload failed/.test(message)));

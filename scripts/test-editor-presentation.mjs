@@ -84,7 +84,7 @@ try {
   function threeHost() {
     const events = [], waiters = [], previous = { position: {}, quaternion: {}, scale: {}, sourceKind: "hep", sourceLabel: "document" };
     const next = { position: { copy() {} }, quaternion: { copy() {} }, scale: { copy() {} }, dispose() { events.push("dispose"); } };
-    const context = vm.createContext({ waitForEditorScenePresentation, waitForLoad, DOMException, viewerPrintAction: null, renderer: {}, currentPdfObject: previous, editedSource: null,
+    const context = vm.createContext({ waitForEditorScenePresentation, waitForLoad, DOMException, viewerPrintAction: null, syncThreeLayoutAvailability() {}, renderer: {}, currentPdfObject: previous, editedSource: null,
       colorPreview: { beforeSceneChange() {}, bind() {}, hasPreview: () => false },
       editorSceneApplicationActive: false, backendChangeActive: false, backendChangeCompletion: Promise.resolve(),
       sourceLoadController: null, activeHepExportController: null, backendSelectElement: {}, activeThreeRendererBackend: "webgl",

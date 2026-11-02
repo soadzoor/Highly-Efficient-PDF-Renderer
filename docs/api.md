@@ -481,6 +481,13 @@ Pass `{ pdf: editor.sourcePdf, password }` as `source` after page operations.
 scene installation, canvas and bidirectional client/scene coordinate conversion,
 plus edit-mode notifications. Instantiate it when editing or attachment is requested;
 `setEditing(false)` removes editor frame work while retaining the session.
+`runPresentationChange(change, signal?)` synchronizes a host's viewing-layout
+change with the committed editor frame. It cancels transient pointer gestures,
+blocks editing while the callback runs, then republishes and repositions the
+same editor content. It retains unfinished text/form/color drafts, selection,
+dirty state and document history. Both stock viewers use it to switch between
+Reader and Grid while staying in Edit mode; layout controls are disabled only
+while another document, renderer or editor operation is running.
 The shared UI previews Color/Fill input without mutating the session. A host may
 provide `previewColors(updates | null): boolean` on `EditorUiHost`: apply the
 `PrimitiveColorUpdate` RGB values to the most recently published canonical scene,

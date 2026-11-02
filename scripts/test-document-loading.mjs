@@ -179,11 +179,18 @@ assertDocument(65, "A.pdf");
 await assertExport(65, "A.pdf");
 
 nextParse = async () => [{ ...scene(68), segmentCount: 0 }];
-await context.loadPdfFile(file("empty.pdf", 68));
-assertDocument(65, "A.pdf");
-await assertExport(65, "A.pdf");
+assert.equal(await context.loadPdfFile(file("empty.pdf", 68)), true, "valid blank pages can become editable documents");
+assertDocument(68, "empty.pdf");
+await assertExport(68, "empty.pdf");
+assert.equal(await context.loadHepFile(file("empty.hep", 68)), true, "blank HEP pages retain normal loading and export behavior");
+assert.equal(context.lastParsedScene.id, 68); assert.equal(uploadedScene.id, 68);
+assert.equal(context.lastLoadedSource.kind, "hep"); assert.equal(context.lastLoadedSource.label, "empty.hep");
+assert.equal(context.lastDownloadablePdf, null, "a standalone blank HEP has no unrelated source PDF download");
+await assertExport(68, "empty.hep");
 
 nextParse = async (buffer) => [scene(new Uint8Array(buffer)[0])];
+await context.loadPdfFile(file("A.pdf", 65));
+assertDocument(65, "A.pdf");
 failUpload = 69;
 const originalView = { ...view };
 await context.loadPdfFile(file("gpu-failure.pdf", 69));
@@ -694,9 +701,11 @@ async function testScanCompressionPreferences() {
 
   const threeSource = await readFile(new URL("../src/three-example.ts", import.meta.url), "utf8");
   const three = vm.createContext({
+    document: { querySelector: () => ({ disabled: false }) },
     viewerPrintAction: null,
   pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     currentPdfObject: null, loadedCompressScansPreference: true, lastNativeDrawStats: null,
+    editorInitialization: null, sourceLoadController: null, backendChangeActive: false, editorSceneApplicationActive: false, pageLayoutWarmingUp: false, activeHepExportController: null,
     activePageLayout: "grid", readerDocumentIdentity: null, readerPageRects: new Float32Array(),
     readerNavigationSource: null, readerNavigationScene: null, reader: threeReaderMock(),
     getReaderPageRects: () => new Float32Array(), syncPageCameraControls: noop,
@@ -714,7 +723,7 @@ async function testScanCompressionPreferences() {
     refreshSearchAvailability: noop, textSearchInputElement: { value: "" },
     readBackendMode: () => "webgl"
   });
-  for (const name of ["readThreeObjectOptions", "setLoadControlsEnabled", "replacePdfObject",
+  for (const name of ["readThreeObjectOptions", "syncThreeLayoutAvailability", "setLoadControlsEnabled", "replacePdfObject",
     "handleOcrTextChange", "handleCompressScansChange", "handlePageStreamingChange"])
     vm.runInContext(sourceFunction(threeSource, name), three);
   const threeChanges = [];
@@ -881,7 +890,8 @@ async function assertExport(id, label) {
   assert.equal(exports.at(-1).label, label);
   assert.equal(exports.at(-1).options.withVectorLod, true);
   assert.equal(exports.at(-1).options.withTextLod, true);
-  assert.deepEqual(downloads.slice(downloadCount), [`${label}-parsed-data-lod.hep`]);
+  const hasLod = exports.at(-1).scene.segmentCount > 0 || exports.at(-1).scene.textInstanceCount > 0;
+  assert.deepEqual(downloads.slice(downloadCount), [`${label}-parsed-data${hasLod ? "-lod" : ""}.hep`]);
 }
 
 async function testNativeReaderExports() {
@@ -942,7 +952,7 @@ async function testNativeReaderExports() {
   pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
       lastParsedScene: reader, lastCanonicalScene: canonical, documentPageScenes: [scene(94), scene(94)],
       lastLoadedSource: { bytes: Uint8Array.of(94) }, lastParsedSceneLabel: "reader-book.hep", nativeLayout: "reader",
-      layoutChangeRunning: false, activeSceneLoadToken: null, pendingSourceLoadCount: 0, activeHepExportController: null,
+      editorInitialization: null, layoutChangeRunning: false, activeSceneLoadToken: null, pendingSourceLoadCount: 0, activeHepExportController: null,
       activePdfPageLoader: null, canonicalPagesPerRow: 2, gridViewState: null, readerViewState: null,
       backendSwitcher: { isSwitchInFlight: () => false, getActiveBackend: () => "webgl" },
       readerViewport: controls, canvasElement: { width: 800, getBoundingClientRect: () => ({ width: 800 }) },
@@ -1936,6 +1946,8 @@ function demoHost() {
     loadedCompressScansPreference: false, compressScansCheckboxElement: { checked: false },
     annotationOverlay: { sceneChanged: noop }, annotationControls: { sceneChanged: noop }, annotationInteraction: null,
     currentPdfObject: demoObject("A"), loadToken: 0, sourceLoadController: null,
+    createdDocumentSource: null, pageLayoutView: null, activePageLayout: "grid", readerEditorThumbnailScene: null,
+    captureCameraSnapshot: () => ({}), restoreCameraSnapshot: noop,
     reader: threeReaderMock(), readerDocumentIdentity: "original", readerPageRects: new Float32Array(),
     readerNavigationSource: null, readerNavigationScene: null,
     setStatus: noop, clearLoadedStatus: noop, requestRender: noop,

@@ -131,6 +131,10 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Changed
 
+- Allow Reader/Grid switching during Edit in both viewers, preserving edits,
+  selection, unfinished text/form/color drafts and Undo/Redo. Synchronize layout
+  changes with committed frames and remap editor controls to displayed pages;
+  pause layout controls only while another operation is running.
 - Pan the camera with the held middle mouse button in any editing tool across
   native/Three.js Reader and Grid layouts. Restore the complete object context
   menu, including Duplicate, Copy, Cut and Paste alongside drawing order.
