@@ -168,7 +168,7 @@ export async function createPdfDocument(options: T.PdfCompositionOptions = {}): 
   const composer: T.PdfDocumentComposer = {
     fonts: services.fonts,
     registerImage(input) {
-      live(); const snapshot = "encoding" in input ? { ...input, bytes: input.bytes.slice() } : { ...input, data: new Uint8Array(input.data) };
+      live(); const snapshot = "encoding" in input ? { ...input, bytes: new Uint8Array(input.bytes) } : { ...input, data: new Uint8Array(input.data) };
       return operation(async signal => {
         const decoded = "encoding" in snapshot ? await decodeRasterImageToRgba(snapshot.encoding, snapshot.bytes) : snapshot;
         signal.throwIfAborted();
@@ -181,7 +181,7 @@ export async function createPdfDocument(options: T.PdfCompositionOptions = {}): 
       });
     },
     importPdf(bytes, input = {}) {
-      live(); const snapshot = bytes.slice(), password = input.password;
+      live(); const snapshot = new Uint8Array(bytes), password = input.password;
       return operation(async signal => {
         const document = await NativePdfDocument.open({ kind: "bytes", bytes: snapshot }, { password, signal, onDiagnostic: settings.onDiagnostic });
         try { signal.throwIfAborted(); return sourceHandle(document); } catch (error) { await document.close(); throw error; }

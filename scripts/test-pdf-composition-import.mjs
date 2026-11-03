@@ -9,6 +9,7 @@ try {
   const { NativePdfDocument } = await import("../src/pdf/nativeDocument.ts");
   const { NativePdfWriter, pdfNameValue, pdfReference, pdfStreamValue } = await import("../src/pdf/nativeWriter.ts");
   const { prepareCompositionSourcePage, collectCompositionSourceLinks } = await import("../src/pdfCompositionImport.ts");
+  const { importNativePdfValue } = await import("../src/pdfNativeImport.ts");
   const { createNativeOptionalContentRegistry } = await import("../src/pdf/nativeOptionalContent.ts");
   const { openPdf } = await import("../src/pdfSession.ts");
   const decoder = new TextDecoder();
@@ -39,6 +40,8 @@ try {
   const destination = await NativePdfDocument.open({ kind: "bytes", bytes: seed });
   try {
     const writer = new NativePdfWriter(destination), refs = new Map(), diagnostics = [];
+    const repeatedReferences = await importNativePdfValue([pdfReference(11), pdfReference(11)], source, writer);
+    assert.deepEqual(repeatedReferences[0], repeatedReferences[1], "repeated array references retain one imported graph identity");
     const links = await collectCompositionSourceLinks(source, 0, { onDiagnostic: value => diagnostics.push(value) });
     assert.equal(links.length, 2, "safe visible URL and local links survive while active actions/hidden links do not");
     assert.deepEqual(links[0].rect, { x: 20, y: 170, width: 20, height: 20 });

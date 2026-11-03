@@ -254,7 +254,7 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
       assertLive(); options.signal?.throwIfAborted();
       const at = options.at ?? session.sourceScene.pageCount;
       if (!Number.isSafeInteger(at) || at < 0 || at > session.sourceScene.pageCount) throw new RangeError("Page insertion position is out of range.");
-      await perform({ kind: "insert", at, bytes: bytes.slice(), pages: options.pages ? [...options.pages] : undefined, password: options.password }, { ...options });
+      await perform({ kind: "insert", at, bytes: Uint8Array.from(bytes), pages: options.pages ? [...options.pages] : undefined, password: options.password }, { ...options });
     },
     async reorderPages(order, options = {}) {
       assertLive(); options.signal?.throwIfAborted(); const pages = pageIndices(order), count = session.sourceScene.pageCount;
@@ -284,7 +284,10 @@ export function createEditorDocumentSession(initial: EditorDocumentVersion,
       const bytes = new Uint8Array(await (await point.version.session.savePdf({ signal, markSaved: false, onProgress: child(0, .65),
         onDiagnostic: options.onDiagnostic, protection: { mode: "preserve" } })).arrayBuffer());
       signal.throwIfAborted(); if (current !== point || revision !== startedRevision) throw new Error("The document changed while extracting pages. Try again.");
-      const mapping = point.version.session.sourceScene.pdfPages, mapped = pages.map(page => mapping?.find(item => item.pageIndex === page)?.sourcePageIndex ?? page);
+      // Native saves retain source page indexes; source-less scenes are rebuilt
+      // in their displayed order, regardless of any retained PDF provenance.
+      const mapping = point.version.session.sourcePdf ? point.version.session.sourceScene.pdfPages : undefined;
+      const mapped = pages.map(page => mapping?.find(item => item.pageIndex === page)?.sourcePageIndex ?? page);
       const { manipulatePdfPages } = await import("./editorPdfPages");
       const result = await manipulatePdfPages(bytes, { kind: "extract", pages: mapped }, { ...options, signal,
         onProgress: child(.65, 1), password: point.version.options.password });

@@ -23,7 +23,7 @@ class Element extends EventTarget {
   close() { this.open = false; }
   remove() { this.removed = true; }
   replaceChildren(...children) { this.children = []; this.childNodes = []; this.append(...children); }
-  querySelectorAll(selector) { return this.children.flatMap(child => [...(child.tagName === selector.toUpperCase() ? [child] : []), ...child.querySelectorAll(selector)]); }
+  querySelectorAll(selector) { return this.children.flatMap(child => [...(selector === "*" || child.tagName === selector.toUpperCase() ? [child] : []), ...child.querySelectorAll(selector)]); }
   click() { if (!this.disabled) this.dispatchEvent(new Event("click")); }
 }
 const uiContext = values => editorUiTestContext({
@@ -262,6 +262,12 @@ try {
   assert.equal(runs.at(-1).fontId, "font-b"); assert.equal(runs.at(-1).fontFamily, "Custom B");
   assert.equal(runs.at(-1).color, "#ff0000", "computed CSS colors become portable colors supported by the compiler");
   assert.equal(runs.at(-1).fontStyle, "italic"); assert.equal(runs.at(-1).underline, true); assert.equal(runs.at(-1).strikethrough, true);
+  const decorated = new Element("span", { textDecorationLine: "underline line-through" }), resized = new Element("span", { fontSize: "24px" });
+  resized.append(text("Nested size")); decorated.append(resized);
+  const nestedDecorations = readRichTextRuns(decorated, { getComputedStyle: element => element.computedStyle }, fonts);
+  assert.equal(nestedDecorations[0].fontSize, 24);
+  assert.equal(nestedDecorations[0].underline, true, "resizing nested text retains the ancestor's CSS underline on Apply");
+  assert.equal(nestedDecorations[0].strikethrough, true, "nested formatting retains a painted ancestor strikeout");
   const paragraphs = new Element("div"), first = new Element("div"), last = new Element("div"); first.append(text("one")); last.append(text("two")); paragraphs.append(first, last);
   assert.equal(readRichTextRuns(paragraphs, { getComputedStyle: element => element.computedStyle }, fonts).map(run => run.text).join(""), "one\ntwo", "block boundaries produce one newline");
   const injected = new Element("span"); injected.append(text("<script>alert(1)</script>"));
@@ -284,6 +290,25 @@ try {
   assert.deepEqual(editingEvents, [], "an empty new textbox does not modify the document");
 
   const uiSource = await readFile(new URL("../src/editorUi.ts", import.meta.url), "utf8");
+  {
+    const contents = new Element("fragment"), first = new Element("span", { fontSize: "18px", fontWeight: "700" }), second = new Element("span", { fontSize: "10px", color: "rgb(255, 0, 0)" });
+    first.style.fontSize = "18px"; second.style.fontSize = "10px";
+    first.append(text("Bold")); second.append(text(" red")); contents.append(first, second);
+    let inserted, selected;
+    const range = { extractContents: () => contents, insertNode: node => { inserted = node; }, selectNodeContents: node => { selected = node; } };
+    const selection = { rangeCount: 1, isCollapsed: false, getRangeAt: () => range, removeAllRanges() {}, addRange(value) { assert.equal(value, range); } };
+    const sizeDocument = { createElement: tag => new Element(tag), getSelection: () => selection };
+    const sizeHost = uiContext();
+    vm.runInContext(sourceFunction(uiSource, "applySelectionCss"), sizeHost);
+    sizeHost.applySelectionCss(sizeDocument, "fontSize", "30px");
+    const updated = readRichTextRuns(inserted, { getComputedStyle: node => ({ ...node.computedStyle, ...node.style }) }, fonts);
+    assert.deepEqual(updated.map(run => run.fontSize), [30, 30], "one size change overrides all selected run sizes");
+    assert.equal(updated[0].fontWeight, 700); assert.equal(updated[1].color, "#ff0000", "other selected formatting survives resizing");
+    assert.equal(selected, inserted, "the formatted text stays selected for subsequent styling");
+    selection.isCollapsed = true; inserted = null;
+    sizeHost.applySelectionCss(sizeDocument, "fontSize", "40px");
+    assert.equal(inserted, null, "a collapsed caret does not replace surrounding rich text");
+  }
   const { editorIconButton } = await import("../src/editorToolbarIcons.ts");
   const toolbarTemplate = uiSource.match(/toolbar\.innerHTML = (`[\s\S]*?`);/)?.[1];
   assert(toolbarTemplate, "the editor exposes its actual toolbar markup");

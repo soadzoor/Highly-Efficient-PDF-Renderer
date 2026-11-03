@@ -144,7 +144,7 @@ function validateObject(object: EditorObject, pageCount: number): void {
   } else if (object.kind !== "source" && object.kind !== "group") throw new TypeError("Unknown editor object kind.");
 }
 
-export function createEditorSession(sourceScene: VectorScene, options: EditorSessionOptions = {}): EditorSession {
+export function createEditorSession(sourceScene: VectorScene, options: EditorSessionOptions = {}, sourceSnapshot?: Uint8Array): EditorSession {
   const pageCount = sourceScene.pageRects.length / 4;
   if (!Number.isInteger(pageCount) || pageCount < 1) throw new RangeError("An editor requires a complete scene with at least one page.");
   resetEditorOriginalPaintPrimitives(sourceScene);
@@ -226,7 +226,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     const result = { ...scene, ...shared }; retainEditorAnnotationPlacements(scene, result); return result;
   };
   const lifetime = new AbortController();
-  const sourcePdf = options.sourcePdf?.slice();
+  const sourcePdf = sourceSnapshot ?? (options.sourcePdf ? Uint8Array.from(options.sourcePdf) : undefined);
   const assertLive = () => { if (disposed) throw new Error("Editor session is disposed."); };
   const getState = (): EditorState => ({ revision, dirty: state.identity !== savedIdentity, canUndo: undoStack.length > 0,
     canRedo: redoStack.length > 0, selection: state.selection.slice(), previewing: previewTransform !== null });

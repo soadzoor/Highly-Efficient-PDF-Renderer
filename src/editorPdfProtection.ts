@@ -26,7 +26,7 @@ export async function rewritePdfProtection(bytes: Uint8Array, protection: PdfOut
   const policy = validatePdfOutputProtection(protection);
   const progress = createLoadProgressReporter(options.onProgress);
   progress.report(0, { stage: "source", sourceType: "pdf", unit: "bytes", processed: 0, total: bytes.length });
-  const document = await NativePdfDocument.open({ kind: "bytes", bytes: bytes.slice() }, {
+  const document = await NativePdfDocument.open({ kind: "bytes", bytes }, {
     password: options.password, signal: options.signal, onDiagnostic: options.onDiagnostic
   });
   try {

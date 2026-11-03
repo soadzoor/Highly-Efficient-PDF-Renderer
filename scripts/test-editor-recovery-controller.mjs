@@ -4,8 +4,14 @@ const hooks = registerHooks({ resolve(s, c, n) { return n(c.parentURL?.includes(
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 try {
-  const { createEditorRecovery } = await import("../src/editorRecovery.ts");
+  const { createEditorRecovery, editorRecoveryDocumentKey } = await import("../src/editorRecovery.ts");
+  const { editorRecoveryDocumentKey: publicRecoveryDocumentKey } = await import("../src/editorApi.ts");
   const { createEditorRecoveryCodec } = await import("../src/editorRecoveryCodec.ts");
+  const identityBytes = Uint8Array.of(1, 2, 3, 4), expectedKey = await editorRecoveryDocumentKey({ bytes: identityBytes });
+  for (const bytes of [identityBytes.slice(), Buffer.from(identityBytes)]) {
+    const key = publicRecoveryDocumentKey({ bytes }); bytes.fill(0);
+    assert.equal(await key, expectedKey, "public recovery hashing snapshots bytes before loading its implementation");
+  }
   const records = new Map(), puts = [], errors = [], statuses = [], listeners = new Set();
   let revision = 0, preview = false, dirty = false, interacting = false, draft = { text: "draft-0" }, captureGate, captures = 0, restored = 0, fail = false;
   const state = () => ({ revision, previewing: preview, dirty, selection: [], canUndo: dirty, canRedo: false });

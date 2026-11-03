@@ -4,6 +4,7 @@ import { waitForLoad } from "./loadCancellation";
 
 /** Editing is loaded on demand; renderer-only consumers do not load its runtime. */
 export async function openEditorSession(scene: VectorScene, options: EditorSessionOptions = {}): Promise<EditorSession> {
+  options = { ...options, sourcePdf: options.sourcePdf ? Uint8Array.from(options.sourcePdf) : undefined };
   const version = await openSingleEditorSession(scene, options);
   try {
     const { createEditorDocumentSession } = await waitForLoad(import("./editorDocumentSession"), options.signal);
@@ -20,8 +21,8 @@ async function openSingleEditorSession(scene: VectorScene, options: EditorSessio
   const { createEditorSession } = runtime;
   let services: Promise<Awaited<ReturnType<typeof import("./editorAppServices")["createEditorAppServices"]>>> | undefined;
   let disposed = false;
-  const getServices = () => services ??= import("./editorAppServices").then(async ({ createEditorAppServices }) => {
-    const result = await createEditorAppServices(options);
+  const getServices = () => services ??= import("./editorAppServices").then(async ({ createEditorAppServicesFromSnapshot }) => {
+    const result = await createEditorAppServicesFromSnapshot(options);
     if (disposed) result.dispose();
     return result;
   });
@@ -56,7 +57,7 @@ async function openSingleEditorSession(scene: VectorScene, options: EditorSessio
     })
   };
   let session: EditorSession;
-  try { session = createEditorSession(preparedScene, sessionOptions); }
+  try { session = createEditorSession(preparedScene, sessionOptions, options.sourcePdf); }
   catch (error) { disposed = true; if (services) void services.then(value => value.dispose(), () => {}); releaseSource(); throw error; }
   const dispose = session.dispose.bind(session);
   session.dispose = () => {

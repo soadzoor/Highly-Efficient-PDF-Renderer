@@ -25,7 +25,13 @@ export async function importNativePdfValue(value: PdfValue, source: NativePdfDoc
     const target = writer.add(null); refs.set(key, target);
     writer.set(target, await importNativePdfValue(resolved, source, writer, signal, refs)); return target;
   }
-  if (Array.isArray(value)) return await Promise.all(value.map(item => importNativePdfValue(item, source, writer, signal, refs)));
+  if (Array.isArray(value)) {
+    // Each import reserves its destination identity after resolving the source.
+    // Visit entries in order so repeated/cyclic references share that identity.
+    const result: PdfValue[] = [];
+    for (const item of value) result.push(await importNativePdfValue(item, source, writer, signal, refs));
+    return result;
+  }
   if (isPdfStream(value)) return { ...value, dictionary: await importNativePdfValue(value.dictionary, source, writer, signal, refs) as PdfDictionary };
   if (isPdfDictionary(value)) {
     const result: PdfDictionary = new Map(); for (const [key, item] of value) result.set(key, await importNativePdfValue(item, source, writer, signal, refs)); return result;

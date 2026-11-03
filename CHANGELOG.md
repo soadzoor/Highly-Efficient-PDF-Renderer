@@ -184,6 +184,15 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 - Preserve indirect font-stream lengths, filters and decode parameters when
   importing PDF resources, while retaining shared font programs and cyclic metadata.
+  Retain one output identity for repeated references in imported resource arrays.
+- Snapshot caller PDF/image/font bytes, including Node Buffer offset views,
+  before lazy composition, editor, page and protection APIs begin their work.
+  Keep later form edits and recovery keys independent of reused input buffers,
+  while sharing owned editor source bytes to avoid redundant full-PDF copies.
+  Decode Buffer-backed recovery records into independent resource buffers with
+  the correct offsets and no unrelated backing bytes.
+- Extract displayed pages correctly from HEP scenes that retain subset or
+  reordered source-PDF page indexes.
 - Finish textbox drafts when clicking outside and reopen their content through
   double-click, the Text tool or the explicit Edit text button. Recognize click
   pairs across replaced selection overlays, retain font styles and saved HEPR
@@ -192,6 +201,8 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   mixed fonts/sizes and custom line spacing, without moving existing textboxes.
   Match editing font registration to CSS family names so fallback fonts do not
   change text size or width while typing, including in new default-font boxes.
+  Apply selected font sizes across mixed rich-text runs and retain ancestor
+  underline/strikethrough decorations through nested formatting and Apply.
   Resize textbox bounds while editing through edge/corner handles or numeric
   W/H without scaling characters. Retain chosen dimensions through Apply,
   reopening and Undo/Redo; track geometry-only drafts for local recovery and

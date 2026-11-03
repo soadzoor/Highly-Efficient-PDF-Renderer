@@ -44,6 +44,11 @@ export interface EditorAppServices {
 }
 /** Optional complete editing services. Import only after entering Edit mode. */
 export async function createEditorAppServices(options: EditorAppServicesOptions = {}, sharedFonts?: EditorAppServices["fonts"]): Promise<EditorAppServices> {
+  return createEditorAppServicesFromSnapshot({ ...options, sourcePdf: options.sourcePdf ? Uint8Array.from(options.sourcePdf) : undefined }, sharedFonts);
+}
+
+/** @internal Reuse source bytes already owned by the editor document. */
+export async function createEditorAppServicesFromSnapshot(options: EditorAppServicesOptions, sharedFonts?: EditorAppServices["fonts"]): Promise<EditorAppServices> {
   const nodeRuntime = typeof globalThis === "object" && !!(globalThis as { process?: { versions?: { node?: string } } }).process?.versions?.node;
   const fonts = sharedFonts ?? createEditorFontRegistry({ loadAsset: options.loadFontAsset ?? (nodeRuntime ? async url => {
     const moduleName = "node:fs/promises";

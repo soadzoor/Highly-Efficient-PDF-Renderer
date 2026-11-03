@@ -2407,5 +2407,9 @@ function applySelectionCss(document: Document, property: string, value: string):
   const selection = document.getSelection(); if (!selection?.rangeCount || selection.isCollapsed) return;
   const range = selection.getRangeAt(0), span = document.createElement("span");
   (span.style as unknown as Record<string, string>)[property] = value;
-  span.append(range.extractContents()); range.insertNode(span); range.selectNodeContents(span); selection.removeAllRanges(); selection.addRange(range);
+  const contents = range.extractContents();
+  // Extracted run wrappers retain their inline sizes, which would otherwise
+  // override the new size when the selection crosses multiple styled runs.
+  for (const child of contents.querySelectorAll<HTMLElement>("*")) (child.style as unknown as Record<string, string>)[property] = value;
+  span.append(contents); range.insertNode(span); range.selectNodeContents(span); selection.removeAllRanges(); selection.addRange(range);
 }

@@ -11,9 +11,10 @@ try {
   const { openPdf } = await import("../src/pdfSession.ts");
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
   const { openEditorSession } = await import("../src/editorSession.ts");
-  const { createEditorAppServices } = await import("../src/editorAppServices.ts");
+  const { createEditorAppServices, createEditorAppServicesFromSnapshot } = await import("../src/editorAppServices.ts");
+  const { createEditorSession } = await import("../src/editorSessionRuntime.ts");
   const { NativePdfDocument } = await import("../src/pdf/nativeDocument.ts");
-  const { changePdfProtection } = await import("../src/editorApi.ts");
+  const { changePdfProtection, createEditorAppServices: createPublicEditorAppServices } = await import("../src/editorApi.ts");
   const { loadSceneFromHep } = await import("../src/hep.ts");
   const { editorTransformBounds, multiplyEditorMatrices, invertEditorMatrix } = await import("../src/editorScene.ts");
   const compile = async (bytes, password) => {
@@ -40,9 +41,49 @@ try {
         assert.equal(scopedEditor.sourceScene, source); assert.equal(scopedEditor.sourcePdf, sourcePdf); assert.equal(scopedEditor.revision, revision);
         assert.equal(scopedEditor.getObject(object).kind, "shape"); assert(scopedEditor.getState().dirty);
       } finally { scopedEditor.dispose(); }
+      const hepScoped = await openEditorSession(scoped);
+      try {
+        const extracted = await compile(new Uint8Array(await (await hepScoped.extractPages([0])).arrayBuffer()));
+        assert.equal(extracted.pageCount, 1);
+        assert.deepEqual(Array.from(extracted.pageRects), [0, 0, 90, 150],
+          "source-less subsets and reordered scenes extract their displayed page, not its old PDF index");
+      } finally { hepScoped.dispose(); }
     }
   } finally { await scopeParser.close(); }
   const scene = await compile(bytes), services = await createEditorAppServices({ sourcePdf: bytes });
+  const bufferSource = Buffer.from(bytes), openingBufferEditor = openEditorSession(scene, { sourcePdf: bufferSource });
+  bufferSource.fill(0);
+  const bufferEditor = await openingBufferEditor;
+  try {
+    assert.deepEqual(bufferEditor.sourcePdf, bytes, "editor source storage is independent of caller-owned Node buffers");
+    bufferEditor.setFieldValue("Field", "B");
+    assert.equal((await bufferEditor.getScene()).annotations.find(annotation => annotation.field?.name === "Field").field.value, "B",
+      "lazy source field compilers retain the source snapshot captured before opening yielded");
+    assert.equal((await compile(new Uint8Array(await (await bufferEditor.savePdf()).arrayBuffer()))).annotations.find(annotation => annotation.field?.name === "Field").field.value, "B");
+    const incoming = Buffer.from(foreign), inserting = bufferEditor.insertPdf(incoming, { at: 0, pages: [0] });
+    incoming.fill(0);
+    await inserting;
+    assert.equal(bufferEditor.getPages().length, 3, "page import snapshots Node buffer bytes before asynchronous materialization");
+  } finally { bufferEditor.dispose(); }
+  for (const createServices of [createEditorAppServices, createPublicEditorAppServices]) {
+    const serviceSource = Buffer.from(bytes), creatingServices = createServices({ sourcePdf: serviceSource });
+    serviceSource.fill(0);
+    const bufferServices = await creatingServices;
+    let serviceEditor;
+    try {
+      serviceEditor = await openEditorSession(scene, bufferServices.sessionOptions);
+      serviceEditor.setFieldValue("Field", "B");
+      assert.equal((await serviceEditor.getScene()).annotations.find(annotation => annotation.field?.name === "Field").field.value, "B",
+        "directly created services retain source bytes for field compilation after caller buffers are reused");
+      assert.equal((await compile(new Uint8Array(await (await serviceEditor.savePdf()).arrayBuffer()))).annotations.find(annotation => annotation.field?.name === "Field").field.value, "B");
+    } finally { serviceEditor?.dispose(); bufferServices.dispose(); }
+  }
+  const ownedSource = Uint8Array.from(bytes), ownedServices = await createEditorAppServicesFromSnapshot({ sourcePdf: ownedSource });
+  const ownedEditor = createEditorSession(scene, ownedServices.sessionOptions, ownedSource);
+  try {
+    assert.equal(ownedServices.sessionOptions.sourcePdf, ownedSource, "internal services reuse the owned source allocation");
+    assert.equal(ownedEditor.sourcePdf, ownedSource, "the editor runtime reuses its document's owned source allocation");
+  } finally { ownedEditor.dispose(); ownedServices.dispose(); }
   const font = await services.fonts.register(buildTinySfnt(), { family: "Shared page font" });
   const editor = await openEditorSession(scene, services.sessionOptions);
   const shapeInput = { kind: "shape", pageIndex: 0, shape: "rectangle", x: 5, y: 5, width: 12, height: 8, fill: "green" };

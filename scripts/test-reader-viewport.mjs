@@ -253,7 +253,7 @@ const editorWheelSource = sourceFunction(editorUiSource.replace(/^ {2}/gm, ""), 
 function editorWheelBridge(env) {
   const dispatches = []; let handler, cancellations = 0;
   const context = vm.createContext({ activeText: null, pointer: null, pendingPick: null,
-    fieldActivation: { reset() {} },
+    fieldActivation: { reset() {} }, textActivation: { reset() {} },
     cancelPointerGesture() { cancellations++; context.pointer = context.pendingPick = null; },
     overlay: { addEventListener(type, listener) { assert.equal(type, "wheel"); handler = listener; } },
     host: { getCanvas() {
@@ -426,10 +426,15 @@ try {
       const wheel = bridge.wheel({ deltaY: 40, target: { tagName, closest: () => ({}) } });
       assert(!wheel.defaultPrevented && !wheel.propagationStopped, `${tagName} retains its native wheel interaction`);
     }
-    bridge.context.activeText = {};
-    assert(!bridge.wheel({ deltaY: 40 }).defaultPrevented, "active rich text retains the existing wheel exclusion");
-    bridge.context.activeText = null;
     assert.equal(bridge.dispatches.length, dispatchCount); assert.deepEqual(reader.getView(), beforeNested);
+    let resizeCancellations = 0;
+    const draft = { resizeControls: { cancel() { resizeCancellations++; } } }; bridge.context.activeText = draft;
+    assert(bridge.wheel({ deltaY: 40 }).defaultPrevented, "active rich text forwards document wheel navigation");
+    assert.equal(bridge.context.activeText, draft, "wheel navigation preserves the pending text draft");
+    assert.equal(resizeCancellations, 1, "wheel navigation cancels only the pending textbox resize gesture");
+    assert.equal(bridge.dispatches.length, dispatchCount + 1);
+    close(reader.getView().centerY, beforeNested.centerY - 40 / beforeNested.zoom, "active text wheel scrolling updates Reader once");
+    bridge.context.activeText = null;
     for (const gesture of ["pointer", "pendingPick"]) {
       bridge.context[gesture] = { action: "move" }; const before = reader.getView();
       bridge.wheel({ deltaY: 12 });

@@ -88,7 +88,9 @@ export function decodeEditorRecoveryGraph(bytes: Uint8Array): unknown {
     if (node.kind === "buffer") {
       const start = number(node.start), length = number(node.length);
       if (start + length > bytes.length - base) throw new RangeError("Truncated recovery resource.");
-      objects[index] = bytes.slice(base + start, base + start + length).buffer;
+      // Buffer.slice() aliases its backing store, whose origin can precede the
+      // resource. Always copy the exact view into an independently owned buffer.
+      objects[index] = new Uint8Array(bytes.subarray(base + start, base + start + length)).buffer;
     } else if (node.kind === "DataView" || Object.hasOwn(types, node.kind)) {
       const buffer = decode(node.buffer!) as ArrayBuffer; if (!(buffer instanceof ArrayBuffer)) throw new TypeError("Invalid recovery buffer.");
       const offset = number(node.offset), length = number(node.length);

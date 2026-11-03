@@ -54,7 +54,9 @@ try {
     rgba.data.fill(0); const image = await pendingImage;
     const png = createCanvas(1, 1), pngContext = png.getContext("2d"), pngPixels = pngContext.createImageData(1, 1);
     pngPixels.data.set([0, 255, 0, 128]); pngContext.putImageData(pngPixels, 0, 0);
-    const pngImage = await composer.registerImage({ encoding: "png", bytes: png.toBuffer("image/png") });
+    const pngBytes = png.toBuffer("image/png"), pendingPng = composer.registerImage({ encoding: "png", bytes: pngBytes });
+    pngBytes.fill(0);
+    const pngImage = await pendingPng;
     assert.equal(pngImage, image, "decoded PNG and raw RGBA share the same registered pixels");
     const jpeg = createCanvas(2, 2); jpeg.getContext("2d").fillStyle = "cyan"; jpeg.getContext("2d").fillRect(0, 0, 2, 2);
     const jpegImage = await composer.registerImage({ encoding: "jpeg", bytes: jpeg.toBuffer("image/jpeg") });
@@ -78,7 +80,7 @@ try {
     const metrics = await pendingMetrics;
     assert(metrics.width > 80 && metrics.width < 200); assert(metrics.height > 0 && metrics.ascent > 0 && metrics.descent <= 0);
 
-    const inputPdf = sourceFixture(), pendingImport = composer.importPdf(inputPdf); inputPdf.fill(0);
+    const inputPdf = Buffer.from(sourceFixture()), pendingImport = composer.importPdf(inputPdf); inputPdf.fill(0);
     const imported = await pendingImport; assert.deepEqual(imported.pages.map(({ width, height }) => [width, height]), [[60, 140]]);
     const sourcePage = composer.addSourcePage(imported, 0); assert.deepEqual([sourcePage.width, sourcePage.height], [60, 140]);
     sourcePage.drawRectangle({ x: 0, y: 0, width: 10, height: 10, fill: "red" });

@@ -51,6 +51,7 @@ function fixture(layout, backend) {
     describeThreePerformanceScene: scene => ({ pages: scene.pageCount }),
     describeThreeLoadMemory: () => ({ objectNodes: 1, cpuBytes: 0 }),
     loadToken: 0, sourceLoadController: null, currentPdfObject: null, lastLoadedSource: null,
+    createdDocumentSource: null, pageLayoutView: null, readerEditorThumbnailScene: null, readerDocumentIdentity: null,
     lastDownloadablePdf: null, lastLoadTimingText: "", activePageLayout: layout,
     activeThreeRendererBackend: backend, canvasElement: { width: 800, height: 600 },
     backendSelectElement: {}, vectorLodSelectElement: {}, textLodSelectElement: {}, renderer,
@@ -81,7 +82,7 @@ function fixture(layout, backend) {
     waitForLoad: async (promise, signal) => { const result = await promise; signal.throwIfAborted(); return result; },
     warmThreeRenderer: async () => {}, formatLoadTiming: () => "test timing", updateSceneMetrics: noop,
     captureCameraSnapshot: () => ({ position: {}, quaternion: {}, up: {} }), restoreCameraSnapshot: noop,
-    reader: { snapshot: () => ({}), restore: noop, getView: () => ({}) },
+    reader: { snapshot: () => ({}), restore: noop, getView: () => ({}), invalidateThumbnails: noop },
     hasStoredVectorStrokeLod: () => false,
     reserveVectorStrokeLodRuntime: async (_scene, _mode, _backend, options) => {
       options.onProgress({ value: 1 });

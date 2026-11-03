@@ -91,7 +91,7 @@ for (const options of [{ defaultPrevented: true }, { isComposing: true }, { keyC
 }
 {
   const h = harness(); h.setAvailable(true);
-  const event = h.key("v", { target: { closest: () => h.context.layerDialog } }); await flush();
+  const event = h.key("v", { target: { closest: selector => selector === "dialog" ? h.context.layerDialog : null } }); await flush();
   assert(event.prevented); assert(h.calls.some(call => Array.isArray(call) && call[0] === "paste"), "a selected layer row can paste in the custom host's layer dialog");
 }
 {

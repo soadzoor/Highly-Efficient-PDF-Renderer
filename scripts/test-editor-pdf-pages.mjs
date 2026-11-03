@@ -7,6 +7,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 } });
 try {
   const { manipulatePdfPages } = await import("../src/editorPdfPages.ts");
+  const { manipulatePdfPages: manipulatePublicPdfPages } = await import("../src/editorApi.ts");
   const { NativePdfDocument } = await import("../src/pdf/nativeDocument.ts");
   const { NativePdfWriter } = await import("../src/pdf/nativeWriter.ts");
   const { NativePdfFormAppearanceRegistry, decodePdfString } = await import("../src/pdf/nativeForms.ts");
@@ -18,6 +19,14 @@ try {
   const open = (bytes, password) => NativePdfDocument.open({ kind: "bytes", bytes }, { password, repair: "off" });
   const run = async (bytes, request, options) => new Uint8Array(await (await manipulatePdfPages(bytes, request, options)).arrayBuffer());
   const original = fixture("main", true), foreign = fixture("foreign", false), before = original.slice(), diagnostics = [], progress = [];
+  const primaryBuffer = Buffer.from(original), importedBuffer = Buffer.from(foreign);
+  const bufferImport = manipulatePublicPdfPages(primaryBuffer, { kind: "insert", at: 1, bytes: importedBuffer, pages: [1] });
+  primaryBuffer.fill(0); importedBuffer.fill(0);
+  const bufferDocument = await open(new Uint8Array(await (await bufferImport).arrayBuffer()));
+  try {
+    assert.deepEqual(bufferDocument.pages.map(page => decodePdfString(page.dictionary.get("Marker"), 0, 0)),
+      ["main-0", "foreign-1", "main-1", "main-2"], "the public page API snapshots both Node buffers before loading its implementation");
+  } finally { await bufferDocument.close(); }
   const rotated = await run(original, { kind: "rotate", pages: [0, 2], degrees: 90 }, { onDiagnostic: value => diagnostics.push(value), onProgress: value => progress.push(value) });
   const one = await open(rotated), source = await open(original);
   try {

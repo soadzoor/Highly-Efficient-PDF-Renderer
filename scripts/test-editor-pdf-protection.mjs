@@ -67,6 +67,9 @@ try {
     } finally { await document.close(); }
   };
 
+  const sourceBuffer = Buffer.from(bytes), changingBuffer = changePdfProtection(sourceBuffer, { mode: "remove" });
+  sourceBuffer.fill(0);
+  await checkSourceStructure(new Uint8Array(await (await changingBuffer).arrayBuffer()), undefined, "Original title", true);
   const scene = await compile(bytes), initial = await openEditorSession(scene, { sourcePdf: bytes });
   let protectedBytes;
   try {

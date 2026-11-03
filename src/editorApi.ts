@@ -44,7 +44,8 @@ export async function createEditorReviewTools(session: EditorSession) {
 
 /** Complete font, form and preservation-first PDF services, loaded on demand. */
 export async function createEditorAppServices(options: EditorAppServicesOptions = {}) {
-  return (await import("./editorAppServices")).createEditorAppServices(options);
+  const settings = { ...options, sourcePdf: options.sourcePdf ? Uint8Array.from(options.sourcePdf) : undefined };
+  return (await import("./editorAppServices")).createEditorAppServicesFromSnapshot(settings);
 }
 /** Rebuild a vector-first PDF using only a compiled scene (including HEP input). */
 export async function writeScenePdf(scene: VectorScene, options: EditorPdfSaveOptions = {}): Promise<Blob> {
@@ -52,13 +53,13 @@ export async function writeScenePdf(scene: VectorScene, options: EditorPdfSaveOp
 }
 /** Change PDF password protection without compiling or rendering its pages. */
 export async function changePdfProtection(bytes: Uint8Array, protection: PdfOutputProtection, options: PdfProtectionChangeOptions = {}): Promise<Blob> {
-  const policy = { ...protection }, settings = { ...options };
-  return (await import("./editorPdfProtection")).changePdfProtection(bytes, policy, settings);
+  const source = Uint8Array.from(bytes), policy = { ...protection }, settings = { ...options };
+  return (await import("./editorPdfProtection")).changePdfProtection(source, policy, settings);
 }
 /** Rotate, remove or import PDF pages while retaining native page resources. */
 export async function manipulatePdfPages(bytes: Uint8Array, operation: PdfPageOperation, options: PdfPageOperationOptions = {}): Promise<Blob> {
-  const primary = bytes.slice(), settings = { ...options };
-  const request = operation.kind === "insert" ? { ...operation, bytes: operation.bytes.slice(), pages: operation.pages?.slice() }
+  const primary = Uint8Array.from(bytes), settings = { ...options };
+  const request = operation.kind === "insert" ? { ...operation, bytes: Uint8Array.from(operation.bytes), pages: operation.pages?.slice() }
     : operation.kind === "crop" ? { ...operation, pages: operation.pages.slice(), box: operation.box ? { ...operation.box } : null }
     : { ...operation, pages: operation.pages.slice() };
   return (await import("./editorPdfPages")).manipulatePdfPages(primary, request, settings);
@@ -76,5 +77,6 @@ export async function createEditorRecovery(options: Parameters<typeof import("./
   return (await import("./editorRecovery")).createEditorRecovery(options);
 }
 export async function editorRecoveryDocumentKey(source: { bytes?: Uint8Array; scene?: VectorScene }, signal?: AbortSignal): Promise<string> {
-  return (await import("./editorRecovery")).editorRecoveryDocumentKey(source, signal);
+  const snapshot = { ...source, bytes: source.bytes ? Uint8Array.from(source.bytes) : undefined };
+  return (await import("./editorRecovery")).editorRecoveryDocumentKey(snapshot, signal);
 }

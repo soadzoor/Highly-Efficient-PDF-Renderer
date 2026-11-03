@@ -34,7 +34,7 @@ export function createEditorFontRegistry(options: {
     async register(input, metadata = {}) {
       assertLive();
       if (!(input instanceof Uint8Array) || input.length < 12) throw new TypeError("Import a valid TTF or OTF font.");
-      const bytes = input.slice();
+      const bytes = new Uint8Array(input);
       const signature = new DataView(bytes.buffer).getUint32(0);
       if (signature !== 0x00010000 && signature !== 0x4f54544f && signature !== 0x74727565) throw new TypeError("Import an outline TTF or OTF font.");
       const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));

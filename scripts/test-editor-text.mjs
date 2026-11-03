@@ -16,6 +16,14 @@ try {
   const regular = await fonts.loadBundled("Liberation Sans");
   assert.equal(regular.family, "Liberation Sans");
   assert.equal((await fonts.register(regular.bytes)).id, regular.id, "font data is deduplicated");
+  const bufferFonts = createEditorFontRegistry(), paddedFont = Buffer.alloc(regular.bytes.length + 19);
+  paddedFont.set(regular.bytes, 19);
+  try {
+    const registering = bufferFonts.register(paddedFont.subarray(19)); paddedFont.fill(0);
+    const copied = await registering;
+    assert.equal(copied.id, regular.id, "Buffer subarrays retain the supplied font bytes through asynchronous registration");
+    assert.deepEqual(copied.bytes, regular.bytes, "registered fonts own a complete byte snapshot");
+  } finally { bufferFonts.dispose(); }
   const bold = await fonts.resolve({ fontId: regular.id, fontWeight: "bold" });
   assert.equal(bold.fontWeight, 700); assert.notEqual(bold.id, regular.id);
   assert.equal((await fonts.resolve({ fontId: bold.id })).id, bold.id, "an explicit face retains its intrinsic style when no override is supplied");

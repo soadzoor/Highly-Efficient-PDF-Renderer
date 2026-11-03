@@ -61,17 +61,26 @@ export function readRichTextRuns(element: HTMLElement, window: Pick<Window, "get
   function newline(): void {
     if (runs.length && !runs[runs.length - 1].text.endsWith("\n")) runs.push({ ...runs[runs.length - 1], text: "\n" });
   }
+  function decorated(parent: HTMLElement, decoration: string, tags: RegExp): boolean {
+    // CSS text decorations paint through descendants without being inherited
+    // by their computed textDecorationLine (for example after a size edit).
+    for (let current: HTMLElement | null = parent; current; current = current.parentElement) {
+      if (window.getComputedStyle(current).textDecorationLine.includes(decoration) || tags.test(current.tagName)) return true;
+      if (current === element) break;
+    }
+    return false;
+  }
   function walk(node: Node): void {
     if (node.nodeType === 3) {
-      const parent = node.parentElement ?? element, style = window.getComputedStyle(parent), decoration = style.textDecorationLine;
+      const parent = node.parentElement ?? element, style = window.getComputedStyle(parent);
       const cssFamily = style.fontFamily.split(",")[0].trim().replace(/^['"]|['"]$/g, "");
       const family = editorTextEditingSourceFontId(cssFamily) ?? cssFamily, font = fonts.find(item => item.id === family);
       runs.push({ text: node.textContent ?? "", fontId: font?.id ?? (family === defaultFamily ? defaultFontId : undefined),
         fontFamily: font?.family ?? (family || defaultFamily), fontSize: parseFloat(style.fontSize) || 12,
         fontWeight: style.fontWeight === "bold" ? 700 : parseInt(style.fontWeight, 10) || 400,
         fontStyle: style.fontStyle === "italic" || style.fontStyle === "oblique" ? "italic" : "normal", color: normalizeEditorTextColor(style.color), backgroundColor: background(parent),
-        underline: decoration.includes("underline") || Boolean(parent.closest("u")),
-        strikethrough: decoration.includes("line-through") || Boolean(parent.closest("s,strike")) });
+        underline: decorated(parent, "underline", /^U$/),
+        strikethrough: decorated(parent, "line-through", /^(S|STRIKE)$/) });
     } else if (node.nodeType === 1) {
       const child = node as HTMLElement;
       if (child.tagName === "BR") { if (runs.length) runs.push({ ...runs[runs.length - 1], text: "\n" }); else runs.push({ text: "\n" }); return; }

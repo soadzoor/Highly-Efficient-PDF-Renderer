@@ -18,6 +18,13 @@ try {
   const narrow = decodeEditorRecoveryGraph(encodeEditorRecoveryGraph({ pixels: pooled.subarray(101, 104) }));
   assert.deepEqual([...narrow.pixels], [1, 2, 3]); assert(narrow.pixels.buffer.byteLength < pooled.buffer.byteLength);
   assert(!new TextDecoder().decode(new Uint8Array(narrow.pixels.buffer)).includes("unrelated-secret"), "pooled source buffers never leak unrelated bytes into recovery");
+  const encoded = encodeEditorRecoveryGraph({ pixels: Uint8Array.of(7, 8, 9) });
+  const stored = Buffer.alloc(encoded.length + 20, 0x61); stored.set(encoded, 10);
+  const restored = decodeEditorRecoveryGraph(stored.subarray(10, 10 + encoded.length));
+  assert.deepEqual([...restored.pixels], [7, 8, 9], "Buffer-backed recovery envelopes retain their exact resource bytes");
+  assert.equal(restored.pixels.buffer.byteLength, 3, "decoded resources do not retain envelope metadata or unrelated backing bytes");
+  stored.fill(0);
+  assert.deepEqual([...restored.pixels], [7, 8, 9], "decoded resources own their bytes independently of storage");
   const snapshot = { format: "hepr-editor-recovery", version: 1, sourceScene: {}, fonts: [], data: graph };
   const plain = createEditorRecoveryCodec(); const envelope = await plain.encode(snapshot, { text: "Draft" });
   assert(!envelope.encrypted); assert.equal((await plain.decode(envelope)).draft.text, "Draft");
