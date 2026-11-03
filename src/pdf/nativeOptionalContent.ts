@@ -113,12 +113,30 @@ interface GroupDraft {
   readonly index: number;
   readonly membershipIndex: number;
   readonly identity: string;
+  readonly sceneIdentity?: string;
   readonly name: string;
   readonly intents: readonly string[];
   readonly usage: PdfValue | undefined;
   configuredVisible: boolean;
   usedInDefaultView: boolean;
   defaultVisible: boolean;
+}
+
+/** Keep portable identities unique without rejecting valid permutations of PDF refs. */
+export function nativeOptionalContentSceneIdentities(groups: readonly { identity: string; sceneIdentity?: string }[]): Map<string, string> {
+  const counts = new Map<string, number>();
+  for (const group of groups) if (group.sceneIdentity) counts.set(group.sceneIdentity, (counts.get(group.sceneIdentity) ?? 0) + 1);
+  const accepted = new Map<string, string>(), owners = new Map<string, string>(), fallback: string[] = [];
+  for (const group of groups) {
+    if (group.sceneIdentity && counts.get(group.sceneIdentity) === 1) {
+      accepted.set(group.identity, group.sceneIdentity); owners.set(group.sceneIdentity, group.identity);
+    } else fallback.push(group.identity);
+  }
+  for (let index = 0; index < fallback.length; index++) {
+    const identity = fallback[index], owner = owners.get(identity);
+    if (owner !== undefined && owner !== identity && accepted.delete(owner)) fallback.push(owner);
+  }
+  return new Map(groups.map(group => [group.identity, accepted.get(group.identity) ?? group.identity]));
 }
 
 interface ParseContext {
@@ -392,9 +410,16 @@ export class NativeOptionalContentRegistry {
       }
     }
     if (!order.length) order = this.groupDrafts.map(group => ({ kind: "group", groupId: group.identity }));
-    return { groups: this.groupDrafts.map(group => ({ id: group.identity, name: group.name,
+    // Exported editor layers retain their document-local identity across PDF
+    // page operations. Parser/resource identities remain original PDF refs.
+    const identities = nativeOptionalContentSceneIdentities(this.groupDrafts);
+    const identity = (id: string): string => identities.get(id) ?? id;
+    const remapOrder = (nodes: readonly OptionalContentOrderNode[]): OptionalContentOrderNode[] => nodes.map(node => ({ ...node,
+      ...(node.kind === "group" ? { groupId: identity(node.groupId) } : {}), ...(node.children ? { children: remapOrder(node.children) } : {}) }));
+    return { groups: this.groupDrafts.map(group => ({ id: identity(group.identity), name: group.name,
       defaultVisible: group.defaultVisible, usedInView: group.usedInDefaultView, locked: locked.has(group.identity) })),
-      conditions, order, radioGroups };
+      conditions: conditions.map(condition => condition.kind === "group" ? { ...condition, groupId: identity(condition.groupId) } : condition),
+      order: remapOrder(order), radioGroups: radioGroups.map(ids => ids.map(identity)) };
   }
 
   getGroup(index: number): NativeOptionalContentGroup {
@@ -1272,10 +1297,13 @@ export class NativeOptionalContentRegistry {
       ["View"],
       signal
     );
+    const persistentIdentity = await this.resolver.resolveValue(dictionary.get("HEPRLayerId"), signal);
+    const sceneIdentity = isPdfString(persistentIdentity) ? decodePdfTextString(persistentIdentity.bytes) : undefined;
     return {
       index: this.groupDrafts.length,
       membershipIndex,
       identity,
+      ...(sceneIdentity ? { sceneIdentity } : {}),
       name,
       intents,
       usage: dictionary.get("Usage"),

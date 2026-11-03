@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { registerHooks } from "node:module";
+import { registerHooks, stripTypeScriptTypes } from "node:module";
 import vm from "node:vm";
 import { createLoadProgressReporter } from "../src/loadProgress.ts";
 import { waitForLoad } from "../src/loadCancellation.ts";
@@ -11,6 +11,7 @@ import { readMinimumStrokeWidthValue } from "../src/uiControls.ts";
 const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
 const lodPromptSource = await readFile(new URL("../src/hepLodPrompt.ts", import.meta.url), "utf8");
 const lodFilenameHost = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
   resolveHepLodOptions, getCachedTextLod: () => null,
   shouldBuildTextLod: scene => scene.textInstanceCount > 0
 });
@@ -37,7 +38,9 @@ const nativeLoadEvents = [];
 // Missing choices keep both LOD defaults enabled. null is Cancel.
 let hepLodChoice = {};
 const context = vm.createContext({
-  performance, AbortController, Uint8Array, console: { log: noop, warn: noop },
+  viewerPrintAction: null, editorSceneApplicationActive: false,
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
+  performance, AbortController, AbortSignal, Uint8Array, console: { log: noop, warn: noop },
   waitForLoad, createLoadProgressReporter, resolveHepLodOptions, hasSelectedHepLod,
   loadToken: 0, activeSceneLoadToken: null, pendingSourceLoadCount: 0, sourceLoadSerial: 0,
   sourceLoadController: null, activeHepExportController: null,
@@ -140,8 +143,20 @@ for (const name of [
 
 await testNativeVectorLodProgress();
 await testNativeTextLodProgress();
-await context.loadPdfFile(file("A.pdf", 65));
+context.discardNativeEditor = () => false;
+assert.equal(await context.loadPdfFile({ name: "cancelled.pdf", arrayBuffer: () => assert.fail("declining editor discard must not read a PDF") }), false);
+assert.equal(await context.loadHepFile({ name: "cancelled.hep", arrayBuffer: () => assert.fail("declining editor discard must not read a HEP") }), false);
+assert.equal(context.pendingSourceLoadCount, 0, "retaining unsaved edits does not start a new source load");
+context.discardNativeEditor = () => true;
+assert.equal(await context.loadPdfFile(file("A.pdf", 65)), true, "a committed replacement reports success to drop sequencing");
 assertDocument(65, "A.pdf");
+for (const [method, name] of [["loadPdfFile", "cancel-read.pdf"], ["loadHepFile", "cancel-read.hep"]]) {
+  const abort = new AbortController(); let finishRead;
+  const pending = context[method]({ name, arrayBuffer: () => new Promise(resolve => { finishRead = resolve; }) }, abort.signal);
+  abort.abort(); assert.equal(await pending, false, "external cancellation cannot count as a replacement success");
+  assertDocument(65, "A.pdf"); assert.equal(context.pendingSourceLoadCount, 0);
+  finishRead(Uint8Array.of(99).buffer);
+}
 const originalCache = context.parsedPdfPageCache;
 await assertExport(65, "A.pdf");
 await testNativeHepExports();
@@ -152,7 +167,7 @@ assert.equal(exports.length, exportCount);
 hepLodChoice = {};
 
 nextParse = async () => { throw new Error("invalid PDF"); };
-await context.loadPdfFile(file("B.pdf", 66));
+assert.equal(await context.loadPdfFile(file("B.pdf", 66)), false, "failed replacements cannot attach later files to the retained document");
 assertDocument(65, "A.pdf");
 assert.equal(context.parsedPdfPageCache, originalCache);
 await assertExport(65, "A.pdf");
@@ -164,11 +179,18 @@ assertDocument(65, "A.pdf");
 await assertExport(65, "A.pdf");
 
 nextParse = async () => [{ ...scene(68), segmentCount: 0 }];
-await context.loadPdfFile(file("empty.pdf", 68));
-assertDocument(65, "A.pdf");
-await assertExport(65, "A.pdf");
+assert.equal(await context.loadPdfFile(file("empty.pdf", 68)), true, "valid blank pages can become editable documents");
+assertDocument(68, "empty.pdf");
+await assertExport(68, "empty.pdf");
+assert.equal(await context.loadHepFile(file("empty.hep", 68)), true, "blank HEP pages retain normal loading and export behavior");
+assert.equal(context.lastParsedScene.id, 68); assert.equal(uploadedScene.id, 68);
+assert.equal(context.lastLoadedSource.kind, "hep"); assert.equal(context.lastLoadedSource.label, "empty.hep");
+assert.equal(context.lastDownloadablePdf, null, "a standalone blank HEP has no unrelated source PDF download");
+await assertExport(68, "empty.hep");
 
 nextParse = async (buffer) => [scene(new Uint8Array(buffer)[0])];
+await context.loadPdfFile(file("A.pdf", 65));
+assertDocument(65, "A.pdf");
 failUpload = 69;
 const originalView = { ...view };
 await context.loadPdfFile(file("gpu-failure.pdf", 69));
@@ -203,7 +225,7 @@ assertDocument(71, "newer.pdf");
 await assertExport(71, "newer.pdf");
 
 // A successful HEP without an embedded PDF must clear the previous PDF source.
-await context.loadHepFile(file("new.hep", 72));
+assert.equal(await context.loadHepFile(file("new.hep", 72)), true, "committed HEP replacements report success");
 assert.equal(context.lastLoadedSource.kind, "hep");
 assert.equal(context.lastParsedScene.id, 72);
 assert.equal(context.lastDownloadablePdf, null);
@@ -336,6 +358,7 @@ assert.equal(context.loadedOcrTextOnly, false);
 assert.deepEqual(view, beforeOcrView);
 
 await testThreeDocumentReplacement();
+await testViewerDropAdapters();
 await testNativeWarmupLoads();
 await testNativeReaderLoadPreparation();
 await testNativeReaderExports();
@@ -355,6 +378,8 @@ async function testNativeSupersededSceneLoadTokens() {
     const statuses = [];
     let replacementLoad, replacementSourceToken, replacementSceneToken;
     const host = vm.createContext({
+      viewerPrintAction: null,
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
       performance, AbortController, Uint8Array, waitForLoad,
       loadToken: 0, activeSceneLoadToken: null, pendingSourceLoadCount: 0, sourceLoadSerial: 0,
       sourceLoadController: null, lastParsedScene: previousScene, lastLoadedSource: previousSource,
@@ -415,6 +440,7 @@ async function testNativeSupersededSceneLoadTokens() {
 
 function testNativePerformanceStatus() {
   const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     lastParsedScene: scene(77), lastParsedSceneLabel: "loaded.hep",
     loadToken: 8, activeSceneLoadToken: null, pendingSourceLoadCount: 0,
     sourceLoadController: null, layoutChangeRunning: false,
@@ -458,6 +484,7 @@ async function testNativeVectorLodProgress() {
   const events = [], builds = [];
   let mode = "auto", backend = "webgl", stored = false, resets = 0, consumes = 0;
   const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     shouldUseVectorStrokeLod, loadToken: 7,
     uiControlManager: { readVectorLodModeInput: () => mode },
     backendSwitcher: { getActiveBackend: () => backend },
@@ -514,6 +541,7 @@ async function testNativeTextLodProgress() {
   const value = { textInstanceCount: 1000 };
   let cached = null, mode = "auto";
   const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     loadToken: 7,
     getCachedTextLod: scene => { assert.equal(scene, value); return cached; },
     uiControlManager: { readTextLodModeInput: () => mode },
@@ -561,6 +589,8 @@ async function testScanCompressionPreferences() {
   const pdf = { kind: "pdf", bytes: Uint8Array.of(1), label: "scans.pdf" };
   const hep = { kind: "hep", bytes: Uint8Array.of(2), label: "scans.hep" };
   const host = vm.createContext({
+    viewerPrintAction: null, editorSceneApplicationActive: false,
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     AbortController, loadedOcrTextOnly: false, loadedPageStreaming: false,
     loadedCompressScans: false, loadedCompressScansPreference: true,
     ocrTextCheckbox: { checked: false }, pageStreamingCheckbox: { checked: false },
@@ -671,7 +701,11 @@ async function testScanCompressionPreferences() {
 
   const threeSource = await readFile(new URL("../src/three-example.ts", import.meta.url), "utf8");
   const three = vm.createContext({
+    document: { querySelector: () => ({ disabled: false }) },
+    viewerPrintAction: null,
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     currentPdfObject: null, loadedCompressScansPreference: true, lastNativeDrawStats: null,
+    editorInitialization: null, sourceLoadController: null, backendChangeActive: false, editorSceneApplicationActive: false, pageLayoutWarmingUp: false, activeHepExportController: null,
     activePageLayout: "grid", readerDocumentIdentity: null, readerPageRects: new Float32Array(),
     readerNavigationSource: null, readerNavigationScene: null, reader: threeReaderMock(),
     getReaderPageRects: () => new Float32Array(), syncPageCameraControls: noop,
@@ -689,7 +723,7 @@ async function testScanCompressionPreferences() {
     refreshSearchAvailability: noop, textSearchInputElement: { value: "" },
     readBackendMode: () => "webgl"
   });
-  for (const name of ["readThreeObjectOptions", "setLoadControlsEnabled", "replacePdfObject",
+  for (const name of ["readThreeObjectOptions", "syncThreeLayoutAvailability", "setLoadControlsEnabled", "replacePdfObject",
     "handleOcrTextChange", "handleCompressScansChange", "handlePageStreamingChange"])
     vm.runInContext(sourceFunction(threeSource, name), three);
   const threeChanges = [];
@@ -788,28 +822,41 @@ async function testScanCompressionPreferences() {
 function testNativePageDemandFrames() {
   let now = 1000;
   let zoom = .4;
-  const views = [];
+  const views = [], frameEvents = [], borderZooms = [];
   const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
+    editorFrameListener: null,
     performance: { now: () => now }, activePdfPageLoader: { update: view => views.push(view) },
     lastParsedScene: { pageRects: Float32Array.of(0, 0, 600, 800) },
     activeSceneLoadToken: null, pendingSourceLoadCount: 0, activeHepExportController: null, layoutChangeRunning: false,
     lastRuntimeTextUpdate: now,
-    renderer: { getPresentedViewState: () => ({ cameraCenterX: 300, cameraCenterY: 400, zoom }) },
+    renderer: { getPresentedViewState: () => ({ cameraCenterX: 300, cameraCenterY: 400, zoom }),
+      getViewState: () => ({ zoom }) },
     canvasElement: { width: 400, height: 500 }, updateFpsMetric: noop, drawCallMeter: { update: noop },
     textSelection: { updateOverlay: noop }, drawingSelection: { onFrame: noop },
-    annotationInteraction: null, annotationOverlay: { onFrame: noop }
+    annotationInteraction: null, annotationOverlay: { onFrame: () => frameEvents.push("annotations") }
   });
   vm.runInContext(sourceFunction(source, "onRendererFrame"), host);
   host.onRendererFrame({ drawCalls: 0 });
+  assert.deepEqual(frameEvents, ["annotations"], "View mode retains no editor frame listener");
+  host.editorFrameListener = () => { borderZooms.push(host.renderer.getViewState().zoom); frameEvents.push("editor"); };
   now += 16; zoom = .1;
   host.onRendererFrame({ drawCalls: 0 });
   assert.deepEqual(views.map(view => view.zoom), [.4, .1],
     "a final zoom-out frame within 100 ms still updates the page display demand");
   assert.equal(views[1].width, 400);
   assert.equal(views[1].height, 500);
+  assert.deepEqual(borderZooms, [.1], "editor borders follow the submitted zoom even while the HUD is throttled");
+  assert.deepEqual(frameEvents, ["annotations", "annotations", "editor"], "editor geometry updates synchronously with the other submitted-frame overlays");
+  host.renderer = { getPresentedViewState: () => ({ cameraCenterX: 300, cameraCenterY: 400, zoom: .2 }),
+    getViewState: () => ({ zoom: .2 }) };
+  now += 16; host.onRendererFrame({ drawCalls: 0 });
+  assert.deepEqual(borderZooms, [.1, .2], "the editor frame listener follows a replacement renderer without subscribing to the disposed renderer");
+  host.editorFrameListener = null;
   host.activeHepExportController = {};
   host.onRendererFrame({ drawCalls: 0 });
-  assert.equal(views.length, 2, "exports continue to suspend page-demand updates");
+  assert.equal(views.length, 3, "exports continue to suspend page-demand updates");
+  assert.deepEqual(borderZooms, [.1, .2], "detaching Edit mode stops editor geometry work");
 }
 
 function file(name, id) {
@@ -843,7 +890,8 @@ async function assertExport(id, label) {
   assert.equal(exports.at(-1).label, label);
   assert.equal(exports.at(-1).options.withVectorLod, true);
   assert.equal(exports.at(-1).options.withTextLod, true);
-  assert.deepEqual(downloads.slice(downloadCount), [`${label}-parsed-data-lod.hep`]);
+  const hasLod = exports.at(-1).scene.segmentCount > 0 || exports.at(-1).scene.textInstanceCount > 0;
+  assert.deepEqual(downloads.slice(downloadCount), [`${label}-parsed-data${hasLod ? "-lod" : ""}.hep`]);
 }
 
 async function testNativeReaderExports() {
@@ -901,9 +949,10 @@ async function testNativeReaderExports() {
     const controls = { snapshot: () => readerState, restore: state => restored.push(state), setLayout: noop,
       goToPage: () => assert.fail("returning to Reader must restore its saved scroll and fit state") };
     const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
       lastParsedScene: reader, lastCanonicalScene: canonical, documentPageScenes: [scene(94), scene(94)],
       lastLoadedSource: { bytes: Uint8Array.of(94) }, lastParsedSceneLabel: "reader-book.hep", nativeLayout: "reader",
-      layoutChangeRunning: false, activeSceneLoadToken: null, pendingSourceLoadCount: 0, activeHepExportController: null,
+      editorInitialization: null, layoutChangeRunning: false, activeSceneLoadToken: null, pendingSourceLoadCount: 0, activeHepExportController: null,
       activePdfPageLoader: null, canonicalPagesPerRow: 2, gridViewState: null, readerViewState: null,
       backendSwitcher: { isSwitchInFlight: () => false, getActiveBackend: () => "webgl" },
       readerViewport: controls, canvasElement: { width: 800, getBoundingClientRect: () => ({ width: 800 }) },
@@ -1038,6 +1087,7 @@ async function testThreeHepExports() {
     object.pageCount = 1;
     object.sourceLabel = "scans.pdf";
     const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
       AbortController, console: { log: noop }, currentPdfObject: object,
       resolveHepLodOptions, hasSelectedHepLod,
       loadToken: 0, sourceLoadController: null, activeHepExportController: null,
@@ -1048,7 +1098,7 @@ async function testThreeHepExports() {
         return cancel === "dialog" ? null
           : mode === "eager" ? { withVectorLod: true, vectorLodPrecision: "compact" } : {};
       },
-      setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop, setLoadControlsEnabled: noop,
+      setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop, setLoadControlsEnabled: noop, updateThreeBackendSelectDisabledState: noop,
       backendSelectElement: {}, vectorLodSelectElement: {}, textLodSelectElement: {},
       setLoadingProgress: (visible, label) => {
         if (visible && label?.endsWith("Building HEP")) progress.push(Number.parseFloat(label) / 100);
@@ -1102,11 +1152,12 @@ async function testThreeHepExports() {
   object.isPageDemandLoaded = true;
   object.resumePageLoading = () => { resumes++; };
   const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     AbortController, console: { log: noop }, currentPdfObject: object,
     resolveHepLodOptions, hasSelectedHepLod,
     activeHepExportController: null, lastDownloadablePdf: null,
     promptForHepLod: async () => ({}),
-    setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop, setLoadControlsEnabled: noop,
+    setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop, setLoadControlsEnabled: noop, updateThreeBackendSelectDisabledState: noop,
     backendSelectElement: {}, vectorLodSelectElement: {}, textLodSelectElement: {},
     setLoadingProgress: noop, formatLoadProgressStage: String, yieldToBrowserPaint: async () => {},
     setStatus: noop, buildHep: async input => { built.push(input); return { size: 1 }; },
@@ -1143,6 +1194,7 @@ async function testHepLodPrompt() {
     focus() {}
   }
   const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     AbortController, resolveHepLodOptions,
     getCachedTextLod: () => null, shouldBuildTextLod: value => value.textInstanceCount > 0,
     document: { body: new Element("body"), createTextNode: text => ({ textContent: text }),
@@ -1229,6 +1281,7 @@ async function testNativeBackendLoading() {
     constructor(canvas) { this.canvas = canvas; }
   }
   const host = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     webGpuRendererClass: null,
     initializeRendererCommon: renderer => initialized.push(renderer),
     loadWebGpuModule: async () => {
@@ -1258,6 +1311,7 @@ async function testNativeBackendLoading() {
   const previousRenderer = {}, provisionalRenderer = {};
   let attachedCanvas = replacementCanvas;
   const rollbackHost = vm.createContext({
+  pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true,
     canvasElement: replacementCanvas, canvasResizeObserver: { disconnect: noop, observe: noop },
     readerViewport: { canvasChanged: () => { attachedCanvas = rollbackHost.canvasElement; } }
   });
@@ -1349,14 +1403,15 @@ async function testThreeDocumentReplacement() {
     formatLoadTiming: () => "timing",
     updateSceneMetrics: object => loadEvents.push({ event: "metrics", id: object.id })
   });
+  Object.assign(host, { pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true });
   vm.createContext(host);
   vm.runInContext(sourceFunction(source, "loadSource"), host);
   const previous = host.currentPdfObject;
   const b = host.loadSource("B");
   await metadataReady;
   assert.equal(host.currentPdfObject, previous, "metadata preparation must not replace the visible object");
-  await host.loadSource("C");
-  await b;
+  assert.equal(await host.loadSource("C"), true, "Three reports a fully installed replacement");
+  assert.equal(await b, false, "superseded Three source loads cannot continue a drop sequence");
   assert.equal(host.currentPdfObject.id, "C");
   assert.equal(host.lastLoadedSource, "C");
   assert.equal(host.lastDownloadablePdf.label, "C");
@@ -1378,7 +1433,7 @@ async function testThreeDocumentReplacement() {
   assert.equal(host.currentPdfObject.id, "E");
   assert.equal(objects.get("D").disposals, 1);
   assert.equal(c.disposals, 1);
-  await host.loadSource("F");
+  assert.equal(await host.loadSource("F"), false, "Three shader preparation failures cannot continue a drop sequence");
   assert.equal(host.currentPdfObject.id, "E", "a compilation failure keeps the old document");
   assert.equal(objects.get("E").disposals, 0);
   assert.equal(objects.get("F").disposals, 1);
@@ -1407,6 +1462,53 @@ async function testThreeDocumentReplacement() {
   assert.equal(host.lastDownloadablePdf.label, "H");
   assert(!loadEvents.some(event => event.id === "G" && ["metrics", "ready"].includes(event.event)),
     "cancelled warm-up cannot publish stale metrics or hide the newer loader");
+  const external = new AbortController(), retained = host.currentPdfObject;
+  const cancelled = host.loadSource("B", { signal: external.signal });
+  await new Promise(resolve => setImmediate(resolve)); external.abort();
+  assert.equal(await cancelled, false, "drop cancellation aborts Three source preparation without reporting success");
+  assert.equal(host.currentPdfObject, retained); assert.equal(host.sourceLoadController, null);
+}
+
+async function testViewerDropAdapters() {
+  const threeSource = await readFile(new URL("../src/three-example.ts", import.meta.url), "utf8");
+  for (const [kind, body, ensureName] of [["native", source, "ensureNativeEditor"], ["three", threeSource, "ensureThreeEditor"]]) {
+    const attachments = [], images = [], documentBytes = Uint8Array.of(1), dropSignal = new AbortController().signal;
+    let editing = false;
+    const editor = { isEditing: () => editing, isBusy: () => false,
+      setEditing: () => assert.fail("attachment preparation must preserve View mode"),
+      attachDocuments: async (...args) => attachments.push(args), dropImages: async (...args) => images.push(args) };
+    const host = vm.createContext({ document: {}, lifetimeSignal: new AbortController().signal,
+      createViewerFileDropController: options => options, setStatus: noop, refreshDropIndicator: noop,
+      pdfEditor: editor, editorInitialization: null, editorSceneApplicationActive: false,
+      lastParsedScene: {}, lastLoadedSource: { bytes: documentBytes, label: "current.pdf" },
+      currentPdfObject: { sourceBytes: documentBytes, sourceLabel: "current.pdf" },
+      pendingSourceLoadCount: 0, activeSceneLoadToken: null, layoutChangeRunning: false,
+      sourceLoadController: null, backendChangeActive: false, pageLayoutWarmingUp: false,
+      activeHepExportController: null, isBatchExampleExportRunning: false, fileInputElement: { disabled: false },
+      backendSwitcher: { isSwitchInFlight: () => false }
+    });
+    vm.runInContext(sourceFunction(body, ensureName), host);
+    assert.equal(await host[ensureName](dropSignal), editor, `${kind}: inactive editors are reused without toggling their mode`);
+    const start = body.indexOf("const fileDropController = createViewerFileDropController("), end = body.indexOf("\n});", start);
+    assert(start >= 0 && end > start);
+    vm.runInContext(`${stripTypeScriptTypes(body.slice(start, end + "\n});".length))}\nglobalThis.dropOptions = fileDropController;`, host);
+    const options = host.dropOptions, files = [{ name: "append.pdf" }], client = { x: 120, y: 180 };
+    assert.equal(options.getDocument().identity, documentBytes); assert.equal(options.isBusy(), false);
+    await options.attach(files, dropSignal);
+    assert.equal(attachments.length, 1); assert.equal(attachments[0][0], files); assert.equal(attachments[0][1], dropSignal);
+    assert.equal(options.isEditing(), false, `${kind}: attaching in View leaves View active`);
+    await assert.rejects(options.insertImages(files, client, dropSignal), /Enter Edit mode/); assert.equal(images.length, 0);
+    editing = true; await options.insertImages(files, client, dropSignal);
+    assert.equal(images.length, 1); assert.equal(images[0][0], files); assert.equal(images[0][1], client); assert.equal(images[0][2], dropSignal);
+    if (kind === "three") {
+      host.readerDocumentIdentity = {}; host.currentPdfObject = { sourceLabel: "current.hep" };
+      const identity = options.getDocument().identity;
+      host.currentPdfObject = { sourceLabel: "current.hep" };
+      assert.equal(options.getDocument().identity, identity, "HEP document identity survives an editor/backend object replacement");
+    }
+    host.editorInitialization = new AbortController(); assert.equal(options.isBusy(), true);
+    await assert.rejects(host[ensureName](dropSignal), /Wait for the document or renderer change/);
+  }
 }
 
 async function testNativeWarmupLoads() {
@@ -1572,6 +1674,7 @@ async function testRoomDocumentReplacement() {
       return { id: file.name };
     }
   });
+  Object.assign(host, { pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true });
   vm.createContext(host);
   for (const name of ["loadSceneSource", "clearCurrentPdfObject"]) vm.runInContext(sourceFunction(source, name), host);
   assert.equal(await host.loadSceneSource({ name: "B" }), false);
@@ -1597,6 +1700,7 @@ async function testThreeBackendReplacement() {
     const failed = ["renderer", "layers", "compile", "cancel", "reader-layout"].includes(failure);
     const layout = failure === "reader-layout" ? "reader" : "sphere";
     const host = demoHost();
+    host.editorSceneApplicationActive = false;
     const canonicalScene = scene("same artifact");
     const previous = host.currentPdfObject;
     previous.sourceBytes = Uint8Array.of(75);
@@ -1792,7 +1896,8 @@ async function testThreeBackendReplacement() {
         arrangedPages.push({ pages, targets });
       }
     });
-    vm.createContext(host);
+    Object.assign(host, { pdfEditor: null, discardNativeEditor: () => true, discardThreeEditor: () => true });
+  vm.createContext(host);
     for (const name of [
       "reloadSourceWithBackend", "replacePdfObject", "releasePdfObject", "disposeCurrentObject",
       "preparePageLayoutReplacement", "resetPageLayout", "syncPageLayoutControls"
@@ -1833,6 +1938,7 @@ async function testThreeBackendReplacement() {
 
 function demoHost() {
   return {
+    updateThreeBackendSelectDisabledState: noop,
     performance, AbortController, waitForLoad, URLSearchParams,
     window: { location: { search: "" } }, canvasElement: { width: 800, height: 600 },
     filenameFromUrl: (source) => source,
@@ -1840,6 +1946,8 @@ function demoHost() {
     loadedCompressScansPreference: false, compressScansCheckboxElement: { checked: false },
     annotationOverlay: { sceneChanged: noop }, annotationControls: { sceneChanged: noop }, annotationInteraction: null,
     currentPdfObject: demoObject("A"), loadToken: 0, sourceLoadController: null,
+    createdDocumentSource: null, pageLayoutView: null, activePageLayout: "grid", readerEditorThumbnailScene: null,
+    captureCameraSnapshot: () => ({}), restoreCameraSnapshot: noop,
     reader: threeReaderMock(), readerDocumentIdentity: "original", readerPageRects: new Float32Array(),
     readerNavigationSource: null, readerNavigationScene: null,
     setStatus: noop, clearLoadedStatus: noop, requestRender: noop,

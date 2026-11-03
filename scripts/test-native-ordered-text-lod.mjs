@@ -208,7 +208,7 @@ try {
   for (const file of ["webGlPdfRenderer.ts","webGpuPdfRenderer.ts"]) {
     const source = await readFile(new URL(`../src/${file}`, import.meta.url), "utf8");
     assert.doesNotMatch(source, /textLodBuildResult = scene.drawRuns \? null/, "ordered metadata alone must not disable LOD");
-    assert.match(source, /textLodBuildResult = (?:this.thumbnailMode \|\| )?this.scenePaintVisibility.requiresCompositing \? null/,
+    assert.match(source, /textLodBuildResult = (?:this.thumbnailMode \|\| )?this.scenePaintVisibility.requiresCompositing(?: \|\| getEditorSceneTranslationHint\(scene\))? \? null/,
       "compositor effects conservatively retain exact text");
     assert.match(source, /scene.drawRuns && textLodUploadData \? new OrderedTextLodSelection/,
       "ordered LOD is activated only after a successful combined texture upload");

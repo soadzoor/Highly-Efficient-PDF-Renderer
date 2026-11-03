@@ -48,6 +48,815 @@ Shader comments are removed only from build output; TypeScript sources keep thei
 comments and indentation. Shader code whitespace remains intact for exact source
 patches. Vite builds requesting source maps retain the original strings and mappings.
 
+## PDF composition
+
+`await createPdfDocument(options?)` creates a headless `PdfDocumentComposer` for
+ordinary PDF artwork. It is available from the main, `/bundler`, and `/node`
+entries. Paths and SVG artwork stay vector-based; supplied images stay raster.
+No editor session, canvas, Three.js renderer, or `pdf-lib` is required to compose
+pages. New objects have no HEPR editing models. Text remains searchable and links
+are standard invisible PDF annotations.
+
+```ts
+import { createPdfDocument } from "@soadzoor/hepr/bundler";
+
+const pdf = await createPdfDocument({
+  metadata: { title: "PDF composition", author: "My application" },
+  signal,
+  onDiagnostic: diagnostic => console.warn(diagnostic)
+});
+try {
+  const source = await pdf.importPdf(originalPdfBytes);
+  const page = pdf.addSourcePage(source, 0);
+  page.drawRectangle({ x: 20, y: 30, width: 120, height: 60,
+    fill: "#45a5bc", fillOpacity: .2, stroke: "#123456", strokeWidth: 1.5 });
+  page.drawText("Caption", { x: 28, y: 55, fontSize: 14, underline: true });
+  page.addLink({ x: 20, y: 30, width: 120, height: 60 },
+    { type: "url", url: "https://example.com/item" });
+  const blob = await pdf.save({ signal });
+} finally {
+  await pdf.dispose();
+}
+```
+
+Document options accept `metadata` (title, author, subject, keywords, creator,
+producer, and creation/modification `Date`s), `signal`, `onProgress`,
+`onDiagnostic`, and `loadFontAsset`. Producer defaults to HEPR. `save` can override
+its signal/progress/diagnostic callbacks, snapshots the page commands immediately,
+and returns an `application/pdf` Blob. Failed or cancelled saves leave the document
+usable. Restore every saved graphics state before saving. Dispose the composer
+when finished; it closes owned sources and releases assets. It does not fetch
+application model data, create downloads, or display notifications.
+
+| Method | Behavior |
+| --- | --- |
+| `addPage({ width, height })` | Append a blank custom-sized page in points. Use `resolvePdfPageSize` for presets. |
+| `importPdf(bytes, { password?, signal? }?)` | Open a reusable document-owned source and expose its displayed page dimensions. |
+| `addSourcePage(source, index, { background? }?)` | Append exactly one zero-based source page; false copies geometry without background resources or links. |
+| `importScene(scene, options?)` | Reconstruct reusable source pages with `writeScenePdf`; usable with a complete HEP scene. Do not mutate the scene during import. |
+| `fonts.register(bytes, metadata?)` | Register application TTF/OTF faces using the existing font registry. `fonts.loadBundled` loads Liberation faces. |
+| `registerImage({ encoding, bytes })` | Decode PNG/JPEG into a reusable image handle. Node decoding uses optional `@napi-rs/canvas`; browser decoding uses browser image APIs. |
+| `registerImage({ width, height, data })` | Register straight-alpha RGBA8 pixels without a canvas. Inputs are copied; identical pixels share an image handle. |
+| `measureText(text, style)` | Return shaped width, line-box height and font ascent/descent in points using the same fonts as drawing. |
+
+Each page exposes `drawPath`, `drawSvgPath`, `drawRectangle`, `drawEllipse`,
+`drawText`, `drawTextBox`, `drawImage`, and `addLink`. Paint follows drawing-call
+order across all content types. `saveState()`, `restoreState()`,
+`transform([a,b,c,d,e,f])`, `clipPath(commands, fillRule?)`, and
+`clipRectangle({ x,y,width,height })` provide nested affine groups and clipping.
+Images take their registered handle and `{ x,y,width,height,opacity?,transform? }`;
+rotation/reflection belongs in the transform. Handles belong to their composer.
+
+Path commands are tuples `['M',x,y]`, `['L',x,y]`, `['Q',cx,cy,x,y]`,
+`['C',c1x,c1y,c2x,c2y,x,y]`, and `['Z']`. A path starts with a move and may
+contain multiple contours. SVG input supports absolute/relative M/L/H/V/C/S/Q/T/A/Z
+commands and repeated coordinate groups. SVG Y points down by default: its path
+is reflected about local Y=0 before the supplied transform. Set `svgYAxis: 'up'`
+for PDF-style data. This accepts path data, not complete SVG DOM/CSS documents.
+
+Paint accepts `fill`/`stroke` colors or null (omission also means absent),
+`fillOpacity`/`strokeOpacity` (0–1, default 1), `strokeWidth` (default 1; zero is
+a hairline), `lineCap` (butt/round/square), `lineJoin` (miter/round/bevel),
+`miterLimit` (default 10), `dashArray`, `dashPhase`, `fillRule` (nonzero/evenodd),
+and `transform`. Rectangle/ellipse/image x/y denote the lower-left bounds.
+
+`drawText(text, { x,y,fontSize,...style })` uses a baseline origin, retains
+explicit newlines, and does not automatically wrap. `drawTextBox({ x,y,width,
+height,text,fontSize,...style })` wraps and clips text, with left/center/right
+`align` and top/middle/bottom `verticalAlignment`. Both accept registered `fontId`
+or `fontFamily`, weight/style, color, opacity, underline/strikethrough, lineHeight,
+and rich `runs`. Runs can change font/size/color/decorations and multiply overall
+opacity with their own `opacity`. `backgroundColor` highlights glyph/run areas;
+`backgroundOpacity` controls those highlights. Draw a preceding rectangle for a
+full textbox or caption background. Missing faces/characters emit diagnostics;
+register the exact application fonts for matching typography.
+
+Page coordinates are measured from the initial displayed lower-left crop, X right
+and Y up, in points. Source CropBox origin, rotation and UserUnit are applied once
+by the page writer. Native page boxes, rotation, resources, transparency groups,
+and layer defaults are retained. Visible source annotation/widget appearances
+are baked before overlays; source editable fields are not copied. Unsupported
+appearances are synthesized or diagnosed with a bounded visible approximation.
+Ordinary source links survive when their destinations exist in the output; repeated
+source targets resolve to the first matching output page. Unavailable targets are
+diagnosed and omitted. The output is a fresh document and does not retain source
+scripts, form semantics, bookmarks, or cryptographic signatures.
+
+`setViewport({ x,y,width,height })` changes Crop/Trim/Bleed/Art boxes without moving
+drawing coordinates or changing MediaBox. Rectangles may extend outside the
+initial visible crop; readers still intersect them with MediaBox. It does not
+create blank margins beyond MediaBox. `addLink(rect, { type:'url',url })` or
+`{ type:'page',pageIndex,x?,y? }` creates an independent hotspot transformed by the
+current state. Hotspots do not inherit artwork clip paths; keep their geometry
+inside the intended clickable area. Only ordinary web/contact URLs and local
+destinations are authored.
+
+HEP does not contain original PDF bytes. Scene reconstruction retains the content
+available to `writeScenePdf`, including existing raster fallback islands, and
+cannot recover discarded fonts or PDF authoring structures. Keep original PDF
+bytes for the native import route. See the [PDF composition guide](pdf-composition.md)
+and [runnable example](../examples/pdf-composition.mjs).
+
+## Editing APIs
+
+`openEditorSession(scene, options?)` opens an immutable compiled `VectorScene`
+for editing and returns `Promise<EditorSession>`. It does not start a renderer or
+change the supplied scene. The same compiled results work with the native and
+Three.js WebGL/WebGPU renderers. Editing/font/writer runtimes load on demand.
+
+```ts
+import { openEditorSession } from "@soadzoor/hepr/bundler";
+
+const editor = await openEditorSession(scene, { sourcePdf: originalPdfBytes });
+const id = editor.addObject({
+  kind: "text", pageIndex: 0, x: 24, y: 120, width: 240, height: 80,
+  text: "Hello PDF", fontSize: 18,
+  runs: [{ text: "Hello ", fontFamily: "Liberation Sans" },
+    { text: "PDF", fontWeight: "bold", color: "#cc0000" }]
+});
+editor.select([id]);
+editor.transformSelection([1, 0, 0, 1, 12, 0]);
+const modifiedScene = await editor.getScene({ signal });
+const pdf = await editor.savePdf({ signal });
+const hep = await editor.saveHep({ signal });
+editor.dispose();
+```
+
+Objects use displayed page-local coordinates, X right/Y up, with the lower-left
+page corner at `(0, 0)`. Their six-component affine `transform` defaults to the
+identity. `transformSelection(matrix)` takes a delta in composed scene coordinates
+so a shared gesture can transform a multi-object selection about one pivot.
+Reader/Grid and camera presentation must be converted by the host adapter.
+
+Add editable form widgets through `addObject({ kind: "field", ... })`:
+
+```ts
+const amount = editor.addObject({
+  kind: "field", fieldType: "number", name: "Amount", pageIndex: 0,
+  x: 24, y: 80, width: 160, height: 24, value: "", defaultValue: "",
+  tooltip: "Invoice amount", required: true, fontSize: 12,
+  color: "#111111", fill: "#ffffff", borderColor: "#707070", strokeWidth: 1
+});
+editor.setFieldValue("Amount", "123.45");
+editor.select([amount]); // The normal transforms, locks, clipboard and undo APIs apply.
+```
+
+`EditorFieldObject.fieldType` supports `text`, `number`, `date`, `email`, `tel`,
+`url`, `checkbox`, `radio`, `dropdown` and `list`. Fields accept current/default
+values, tooltips, `readOnly`, `required`, `multiline` (text), `maxLength`, font/style,
+alignment, text/checkmark color, background fill, border color and width.
+`fontSize: 0` requests automatic fitting. Choice `options` contain `{ value, label }`;
+lists can set `multiSelect`. Checkbox/radio `onValue` defaults to `Yes`; radio
+widgets share a name and use distinct `onValue` values. Other authored names
+must be unique, including against existing source fields; new names cannot contain
+periods (reserved for PDF field hierarchies). Required fields may
+remain empty while authoring; `readOnly` restricts filling, independently of the
+object's editing lock. Number values must be finite; dates use `YYYY-MM-DD`.
+
+PDF saves create standard AcroForm field trees and widget appearances, embedding
+the actual font programs for later typing. Text-like fields retain an inert
+`/HEPRInputType` hint for HEPR's native controls; other PDF readers can edit the
+standard text field but need not enforce its specialized input format. No PDF
+scripts are generated or executed. HEP and flattened PDFs bake the appearance;
+HEP does not preserve these authored field models or font programs.
+
+Shapes, ink and signatures accept `fillOpacity` from 0 to 1 independently of
+stroke `opacity`. When omitted, fills retain the legacy `opacity` fallback;
+explicit values also work with fully transparent strokes or fills. Arrowheads
+follow stroke opacity. Both values compile into ordinary PDF/HEP paint data,
+without adding renderer frame work. Text and images continue using `opacity`.
+
+`getSelectionFrame()` returns committed `{ bounds, transform, pageIndex? }` data
+for drawing transform handles. The bounds use the frame's local axes; transform
+its four corners with the supplied matrix to obtain composed scene coordinates.
+The frame follows rotation, shear and reflection; `pageIndex` is available when
+the selection belongs to one page. Apply the preview delta captured for the
+displayed scene once when drawing a gesture. `getSelectionBounds()` continues to
+return axis-aligned scene
+bounds for spatial queries. Frame data is detached from the session and does not
+add authoring metadata to PDF or HEP output.
+Groups contain independently transformed children. A group's `transform`
+records its selection axes; its children already include group operations, so
+do not apply the group's matrix a second time when rendering those children.
+For page-plane picking in a Three.js Reader layout,
+`clientToScenePoint(camera, x, y, element, pageIndex?)` can target the frame's
+page explicitly, keeping handle drags usable outside that page's border.
+
+The session exposes `getObjects`, `getObjectBounds`, `getSelectionBounds`, `getSelectionFrame`,
+`select`, `selectPrimitives`, `selectAnnotations`, `selectArea`, `addObject`, `updateObject`,
+`transformSelection`, `cloneSelection`, `deleteSelection`, `groupSelection`,
+`ungroupSelection`, `setFieldValue`, `transaction`, `undo`, `redo`, `subscribe`,
+`getScene`, `savePdf`, and `saveHep`. Transactions roll back on failure.
+`getState()` reports revision, selection, undo/redo availability and dirty state.
+`getObjectPaintColors(id)` returns detached `color` and `fill` RGB lists, including
+mixed paint on original content and source copies. Empty lists identify channels
+without editable vector paint. `updateObject(sourceId, { color })` changes existing
+vector RGB; `{ fill }` targets existing filled paths only. Original opacity, masks,
+clipping, fonts and geometry are retained. Recoloring a gradient replaces its RGB
+colors while retaining its alpha and spatial coverage. Raster pixels and mask-only
+paint are excluded. Source color patches do not create or remove fill geometry;
+other source geometry changes continue through selection transforms. Color changes
+participate in transactions, Undo/Redo, copying, recovery and PDF/HEP output.
+Source text also accepts `{ fontWeight: "bold" | "normal", fontStyle: "italic" |
+"normal" }` patches. These add a synthetic outline pen/shear without replacing
+the original font or moving adjacent glyphs; normal restores the original source
+appearance, including any intrinsic bold/italic in that font. Local recovery
+retains the toggles; PDF/HEP retain their rendered appearance without editable
+source style metadata. Authored textboxes retain their ordinary font/run styles.
+Textbox objects and runs accept `backgroundColor?: EditorColor | null` for text
+highlighting. Runs inherit an omitted background; `null` explicitly clears it.
+Backgrounds follow text wrapping and transforms, remain behind glyphs, and retain
+their style in editable PDF models and their visible vector appearance in HEP.
+Compilation and saving accept `signal` cancellation and `onProgress` callbacks
+with normalized `value` and `stage`; failed saves do not clear dirty state.
+`setPreviewTransform(matrix | null)` previews a gesture without adding history or
+dirty state; saves exclude previews. `getScene({ includeObjects: false, preview:
+false })` returns only the edited original content and filled fields.
+
+Translation previews prepare the current compiled scene and selection once, then
+update selected text, fills and strokes without recompiling fields, fonts, layers
+or authored objects on each pointer move. Geometry, annotation frames and search
+references remain current; paint order and compatible clipping are preserved.
+Prepared geometry is immutable, selection/document changes invalidate it, and
+preview hints stay in memory only. Rotation/resizing, selected raster/gradient
+content, compositing effects, shared paths and legacy text/hard-clip metadata use
+the general compilation path. Saving still excludes every transient pose.
+
+Layer authoring uses the existing PDF optional-content model. `getLayers()` lists
+user OCGs (`id`, `name`, `defaultVisible`, `locked`, `usedInView`), excluding internal
+annotation groups; `getLayerOrder()` returns its nested group/label hierarchy.
+`createLayer({ name, defaultVisible?, locked?, parentId?, index? })` returns an ID.
+`updateLayer(id, { name?, defaultVisible?, locked? })` changes properties;
+visibility changes respect locked layers, source View intent and radio groups.
+`moveLayer(id, { parentId?, index })` and `setLayerOrder(tree)` change both list
+order and stacking: top listed layers paint in front, compound memberships use
+their frontmost layer, and unlayered paint slots remain fixed. Compositing units
+move together. Creation and renaming alone retain original paint order.
+
+```ts
+const notes = editor.createLayer({ name: "Review notes" });
+editor.setActiveLayer(notes);
+editor.assignSelectionToLayer(notes);
+editor.updateLayer(notes, { name: "Approved notes", defaultVisible: true });
+editor.moveLayer(notes, { parentId: null, index: 0 });
+```
+
+`setActiveLayer(id | null)` controls new and pasted objects, without dirtying the document.
+An explicit `layerId` on `addObject` overrides it; null means unlayered. The UI
+rejects placement on a hidden active layer. `getObjectLayerIds(id)`,
+`assignObjectsToLayer(ids, layerId | null)`, `assignSelectionToLayer(layerId | null)`,
+`getLayerObjects(id)` and `selectLayerContents(id)` support custom controls.
+The stock panel highlights one active row for creation and paste, including an
+Unlayered row for null; no separate active-layer selector is needed. It provides
+inline naming and default-visibility/lock controls. Grip dragging uses Pointer
+Events for mouse, touch and pen, with capture, insertion markers, edge scrolling
+and cancellation; ordinary list swipes still scroll. A completed drag updates
+`setLayerOrder`, including artwork stacking. Heading nodes and subtrees survive,
+and gesture listeners/frame work detach when the drag ends or controls close.
+
+`await copySelection({ signal? })` and `await cutSelection({ signal? })` capture
+the selected roots into a private in-memory clipboard and return their count.
+Copy leaves history and dirty state unchanged; cut deletes only after successful
+capture and rejects a changed document/selection rather than cutting newer work.
+`canPaste()` reports whether the clipboard has content.
+`pasteSelection({ offset?: [dx, dy] })` returns independent new root IDs, assigns
+the current active layer (null means unlayered), retains page indexes and selects
+visible copies. Each paste is one undoable transaction. Copy pastes use successive
+`[12, -12]` offsets; cut pastes default to `[0, 0]`. Supply `[0, 0]` for an explicit
+paste in place. Hidden destinations stay hidden. Added author models retain rich
+text, geometry, images and groups; source objects/widgets capture their current
+rendered appearance as independent artwork, without linked field semantics.
+Clipboard state survives selection, layer and Undo/Redo changes, is never saved,
+and requires recopy or undo before pasting across a page-structure change.
+
+```ts
+await editor.cutSelection({ signal });
+editor.setActiveLayer(notes);
+const pasted = editor.pasteSelection();
+```
+
+`copyObjectLayerMembership(sourceId, targetId)` copies the exact current
+visibility expression when replacing an object, including compound/negated
+OCMD membership, without coupling it to the original annotation's ownership.
+The source must be one annotation or one authored object; heterogeneous source
+collections and temporary groups retain their per-primitive scopes and cannot
+be reduced to a single copied condition.
+`getObjectLayerCondition(id)` returns `{ catalog, condition? }` for custom writers.
+Advanced authored objects can use `layerCondition` as an index into the session's
+current catalog instead of `layerId`; it is session-local and must be remapped
+when moving objects between documents. Use the copy operation for replacements.
+`removeLayer(id, { targetLayerId? })` keeps artwork: omission/null forgets the
+removed visibility variable, retaining other memberships; a destination retargets
+it. Negated and compound visibility expressions are projected together so removal
+cannot reveal previously impossible content. Layer document changes are undoable.
+
+`canReorderSelection(action)` and `reorderSelection(action)` expose object
+arrangement within each layer and page. `EditorStackingAction` is
+`"bring-to-front"`, `"bring-forward"`, `"send-backward"` or `"send-to-back"`.
+They preserve selected objects' relative order, leave other layers' paint slots
+fixed, and treat inseparable compositing scopes as units. Compound memberships
+use the same frontmost-layer ownership as layer reordering; unlayered content
+arranges within its own page scope. Boundary operations are no-ops and do not
+add undo history. Reordering updates compiled drawing order and picking ranks.
+PDF/HEP save the resulting ordinary paint data, without editor order/history
+sections. Editable PDF still obeys its separate page/annotation/widget paint
+passes; flattened PDF reproduces the compiled order across those passes.
+
+`isObjectVisible`, `isPrimitiveVisible` and `isAnnotationVisible` use current
+editor visibility. `getPrimitivePaintRank(ref)` and `getObjectPaintRank(id)` supply
+matching source and authored-object picking order;
+pass it as `ScenePrimitivePickOptions.resolvePaintRank` after reordering layers.
+`getLayerRevision()` changes for layer/membership edits, allowing controls to skip
+work during transform previews. `getLayerEdits()` returns a detached persistence
+snapshot for writers. Compiled scenes and HEP use ordinary optional-content data.
+PDF saves preserve OCG identities and visibility configuration. Metadata-only
+edits retain original drawing streams. Source paint transforms, deletion,
+membership changes and independent graphics-state scope reordering rewrite
+owned operations at their original paint positions. A modified shared Form
+invocation receives its own resource without changing other instances. When an
+operation or a reordered range cannot be separated safely, the writer replaces
+that bounded region with its compiled vector appearance and reports
+`editor.pdf-source-operation-appearance`. Unsupported ancestor clipping or
+semantic replacement scopes can require a page-vector fallback, reported as
+`editor.pdf-source-operation-fallback` and through `onWarning`.
+`savePdf({ onDiagnostic })` also reports
+the `editor.pdf-layer-stacking` warning for separate annotation paint passes.
+Editable PDF
+annotations and widgets still obey independent readers' separate paint passes;
+use `savePdf({ flatten: true })` for exact displayed order across those passes.
+
+`await createEditorLayoutController(editor)` returns `align(alignment,
+reference?)`, `distribute(direction)` and `createAlignmentSnap(candidates?)`.
+Alignments are `left`, `center`, `right`, `top`, `middle` and `bottom`; the reference
+is `selection` (default) or `page`. Distribution accepts `horizontal` or `vertical`
+and equalizes gaps while keeping the outer objects fixed. Each operation arranges
+selection roots independently per page, preserves rotations and grouping, and
+creates one undoable transaction. Locked selections reject layout changes.
+The return value is the number of moved roots.
+
+For custom direct manipulation, prepare `createAlignmentSnap()` once at gesture
+start. Its `snap(translation, tolerance, disabled?)` returns `{ matrix, guides }`;
+tolerance uses scene units. Targets include page edges/centers and visible objects
+on that page. Supplying `candidates` replaces object targets with those bounds.
+The prepared object keeps target lookup out of pointer-movement document scans.
+Recreate it after selection or scene changes. Stock controls use a six-pixel
+threshold, render guides with the acknowledged document pose and bypass snapping
+while Alt/Option is held.
+
+`await createEditorReviewTools(editor)` returns `textQuads(scene, spans)`,
+`addTextMarkup(scene, spans, type, style?)` and `addComment(page, x, y, contents,
+author?, style?)`. Spans use `{ pageIndex, start, length }` offsets in the current
+scene's text index. Text markup types are `highlight`, `underline` and `strikeout`;
+style accepts `color`, `opacity`, `contents` and `author`. Glyph positions determine
+oriented line quadrilaterals, including rotated text. Text that lacks searchable
+character geometry cannot supply text-markup spans. Comments use page-local
+coordinates and nonempty text, with optional color and opacity. Returned IDs are
+ordinary editor objects, with `review` metadata on their shape model.
+
+```ts
+const layout = await createEditorLayoutController(editor);
+layout.align("left");
+layout.distribute("horizontal");
+const review = await createEditorReviewTools(editor);
+review.addTextMarkup(await editor.getScene(), [{ pageIndex: 0, start: 0, length: 12 }],
+  "highlight", { color: "#ffdd00", opacity: 0.35, contents: "Check this passage" });
+review.addComment(0, 24, 80, "Confirm this value", "Reviewer");
+```
+
+Editable PDFs store standard Highlight, Underline, StrikeOut and Text annotations,
+with explicit appearances, quadrilaterals and comment metadata. Source annotation
+notes can be changed through `updateAnnotation(id, { contents?, author? })`.
+Widget author changes are rejected because PDF `/T` names the form field there.
+HEP bakes their appearance into ordinary geometry and existing annotation metadata;
+it carries no editor history or font programs. Removing or restyling a note follows
+the same selection, locking and undo rules as other objects.
+
+`getObjectLink(id)` returns an `EditorLink` or `null`;
+`setObjectLink(id, linkOrNull)` adds, replaces or removes that object's link.
+The object may be an added textbox, image, shape, review highlight, handwriting,
+group, or selectable source content. Link changes support transactions and
+Undo/Redo, and respect editing locks. Use one transaction to assign a link to
+several selected objects.
+
+Internal targets follow current transforms. Copying both ends retargets the
+copied owner to the copied target; copying only the owner retains its original
+target. Duplicating both pages also pairs their copied objects, including
+references across those pages. Removing a target omits the broken hotspot with
+a diagnostic/export warning; Undo can restore the original reference. An old
+primitive index is never substituted with unrelated source content.
+
+```ts
+editor.setObjectLink(highlightId, { type: "url", url: "https://example.com/reference" });
+editor.setObjectLink(anotherHighlightId, { type: "object", objectId: diagramId });
+const previousLink = editor.getObjectLink(highlightId);
+editor.setObjectLink(highlightId, null); // The highlight itself is retained.
+```
+
+`EditorLink` is `{ type: "url", url: string }`, `{ type: "object", objectId:
+string }`, or `{ type: "destination", destination: AnnotationDestination }`.
+New URLs must use HTTP, HTTPS, `mailto` or `tel`; script, data and file schemes
+are not activated. Object destinations belong to the same session and resolve
+to the target's current transformed bounds, including targets on another page.
+The destination variant retains an existing standard PDF destination when no
+reliable authoring-object identity is available.
+
+Compiled scenes and PDF exports represent the hotspot as an invisible standard
+Link annotation, leaving a highlight's visual annotation and its note intact.
+Highlighted text uses its individual quadrilaterals, so gaps between lines are
+not clickable. URLs use URI actions; internal references use standard local
+GoTo destinations. Identifiable authored-annotation targets retain their object
+binding when a saved PDF is reopened. Anonymous source primitives become
+standard page destinations across save/reopen, rather than binding an old
+primitive index to unrelated content. HEP retains links in existing annotation
+and page-mapping metadata, without a new editor-persistence section.
+
+### New PDFs and automatic page numbers
+
+`createPdf(options?)` creates a PDF Blob without an existing document. It is
+exported from the root, bundler and Node entries. Defaults are one A4 portrait
+page with numbering disabled. Options include `title`, `pageSize`, `orientation`,
+`pageCount`, partial `pageNumbering` settings, `signal`, and `onProgress`.
+
+```ts
+import { createPdf, resolvePdfPageSize } from "@soadzoor/hepr";
+
+const pdf = await createPdf({ title: "My document", pageSize: "A4", pageCount: 3 });
+const landscapeLetter = resolvePdfPageSize("Letter", "landscape");
+const custom = await createPdf({ pageSize: { width: 360, height: 540 } });
+```
+
+`PdfPageSize` accepts ISO A0–A6, `Letter`, `Legal`, `Tabloid`, `Executive`, or
+`{ width, height }` in PDF points (72 per inch). `PDF_PAGE_SIZE_PRESETS` exposes
+the dimensions. Custom dimensions keep their supplied orientation unless an
+explicit `portrait` or `landscape` option sorts the dimensions. Dimensions must
+remain positive finite scene coordinates; there is no application-defined
+paper-size or page-count cap.
+
+`editor.insertBlankPages({ at?, pageSize?, orientation?, pageCount?, signal?,
+onProgress?, onDiagnostic? })` inserts before `at` or appends by default. Omitted
+size inherits the adjacent page. `editor.resizePages(indexes, size, options?)`
+changes paper size, preserving actual content scale and the current visible
+top-left offset. Shrinking clips without deleting content; enlargement may reveal
+hidden paint. Rotation and `UserUnit` are retained. These changes share ordinary
+page-operation history, cancellation, and author-model preservation.
+
+`editor.getPageNumbering()` returns detached settings;
+`editor.setPageNumbering(partialSettings)` updates them in one undoable step.
+Controls include `enabled`, `skipFirstPage`, `startNumber`, `format` (`number`,
+`page`, `page-of-total`), `position` (`header`/`footer`), `align`, `marginX`,
+`marginY`, `fontFamily`, `fontSize`, and `color`. Margins/font size use points.
+Fonts are Liberation Sans, Serif, or Mono. Enabled defaults are centered footer,
+10-point black Sans, 10 mm margins, starting at 1. A skipped cover consumes no
+number; the total is the last logical number in the series. Mixed-size pages
+anchor numbers to their displayed bounds, with margins reduced to fit small pages.
+
+Managed numbers update with page operations and stay locked against ordinary
+object editing. Use their settings, or double-click a number in the stock editor.
+Copying a number produces ordinary unlocked text. Editable PDF and HEP saves
+retain the policy and appearance ownership; flattened copies retain visible text.
+Extraction keeps original numbers as ordinary text, and foreign imports retain
+their displayed numbers without replacing the destination's policy. Optional
+metadata is inert, versioned, and ignored with diagnostics when unsupported.
+
+Both viewers expose New PDF, page-size controls under Pages, and Page Numbers.
+New viewer documents remain unsaved until downloaded as PDF/HEP. API hosts can
+pass `initiallyDirty: true` to `openEditorSession` for the same saved-marker behavior.
+
+`getPages()` returns current page indexes, displayed dimensions and
+rotation. Page indexes are zero-based. `rotatePages(indexes, degrees, options?)`
+accepts clockwise multiples of 90 degrees; `removePages(indexes, options?)`
+keeps at least one page. `insertPdf(bytes, { at?, pages?, password?, signal?,
+onProgress?, onDiagnostic? })` inserts selected pages from another PDF before
+`at`, or appends when `at` is omitted. Omit `pages` to import the whole PDF.
+The inserted page indexes follow their supplied order. The foreign password is
+independent of the primary document's password. `reorderPages(order, options?)`
+accepts a complete permutation of current indexes. `duplicatePages(indexes,
+{ at?, signal?, onProgress?, onDiagnostic? })` inserts independent copies in the
+supplied order before `at` (default: append), retaining the original layer
+identities and separating copied form-field owners from their originals.
+`cropPages(indexes, box, options?)` changes the visible page box. A
+`PdfPageCropBox` is `{ x, y, width, height }` in displayed points from the current
+lower-left corner, accounting for rotation and PDF `UserUnit`; the box must fit
+every selected page. Pass `null` to reset to the media box. Cropping retains hidden
+content and is not redaction. `extractPages(indexes, options?)` returns a PDF Blob
+in the supplied order, including current edits and source protection, without
+changing the active document, selection, history or saved marker.
+Source-backed sessions require all source pages in their original order for page
+management; partial or reordered source scenes reject the operation before
+changing the document. Open the complete PDF, or use the direct native API for
+physical source-page operations.
+
+```ts
+await editor.rotatePages([0, 1], 90, { signal });
+await editor.removePages([2], { signal });
+await editor.insertPdf(otherPdfBytes, { at: 1, password: otherPassword, signal });
+// Repeat insertion to merge additional PDFs.
+await editor.reorderPages([1, 0, 2], { signal });
+await editor.duplicatePages([0, 2], { at: 1, signal });
+await editor.cropPages([0], { x: 12, y: 12, width: 300, height: 400 }, { signal });
+await editor.cropPages([0], null, { signal });
+const extractedPdf = await editor.extractPages([2, 0], { signal });
+```
+
+Page changes share undo/redo with object and field edits. They retain the current
+authoring state in memory, including independent copied author objects/groups,
+and commit only after the new document is ready;
+cancelled, failed or stale operations leave the active document unchanged.
+Explicit drawing order is retained in the canonical scene during page changes,
+including source content interleaved with authored annotations; editable PDF
+materialization alone cannot represent all such interleaving. Source-copy
+appearances become ordinary editable source annotations after materialization.
+`sourceScene` and `sourcePdf` can change after page operations and undo/redo.
+Hosts must refresh picking and page-coordinate adapters when `sourceScene`
+changes. The stock UI calls `EditorUiHost.documentChanged(scene, source)` before
+installing the replacement scene. Source-specific field/font services can be
+recreated with `EditorSessionOptions.createSourceOptions`; its `disposeSource`
+hook releases source-owned resources while retained history keeps them usable.
+
+`createEditorAppServices({ sourcePdf?, password?, loadFontAsset?, onDiagnostic? })`
+returns `{ sessionOptions, fonts, dispose }`. Pass its `sessionOptions` to
+`openEditorSession` when sharing a font registry with a custom interface.
+`fonts.loadBundled`, `fonts.register`, `fonts.requestLocalFonts`, `fonts.resolve`
+and `fonts.list` manage portable font bytes. `register` accepts complete TTF/OTF
+data. Font records are read-only and their byte buffers must not be modified.
+Default services support Node font loading; `loadFontAsset` can override it.
+The optional `prepareScene` hook enriches form controls only during editor setup.
+`AnnotationField.textStyle` then supplies the typing font family, point size
+(zero means automatic), weight/style, RGB color, em-based ascent/descent and
+the field's content inset when available.
+Source font bytes remain in the editor registry; typing styles are omitted from HEP.
+`readTextAnnotation(id, scene, signal?, source?)` restores HEPR-authored PDF textboxes and
+their embedded fonts for a custom text-editing interface.
+Pass `{ pdf: editor.sourcePdf, password }` as `source` after page operations.
+
+`createEditorUi(host, signal?)` supplies optional shared browser controls. Its
+`EditorUiHost` supplies the current scene/source, full-quality preparation,
+scene installation, canvas and bidirectional client/scene coordinate conversion,
+plus edit-mode notifications. Instantiate it when editing or attachment is requested;
+`setEditing(false)` removes editor frame work while retaining the session.
+`runPresentationChange(change, signal?)` synchronizes a host's viewing-layout
+change with the committed editor frame. It cancels transient pointer gestures,
+blocks editing while the callback runs, then republishes and repositions the
+same editor content. It retains unfinished text/form/color drafts, selection,
+dirty state and document history. Both stock viewers use it to switch between
+Reader and Grid while staying in Edit mode; layout controls are disabled only
+while another document, renderer or editor operation is running.
+The shared UI previews Color/Fill input without mutating the session. A host may
+provide `previewColors(updates | null): boolean` on `EditorUiHost`: apply the
+`PrimitiveColorUpdate` RGB values to the most recently published canonical scene,
+or restore preview-owned refs for `null`, returning whether the update was applied.
+The native and Three.js examples use their sparse primitive overrides, retaining
+geometry/resources and clearing previews only when the committed scene replaces
+them. Hosts without this callback use coalesced temporary compiled scenes. Final
+picker submission remains a normal transaction; previews never enter exports,
+recovery snapshots or Undo history.
+`applyScene(scene, signal, onPresented?, { preview?, affectedPages? }?)` receives an
+optional fourth argument identifying gesture previews and changed page pixels.
+`affectedPages` contains zero-based page indexes since the last acknowledged
+committed scene: `[]` means no thumbnail changes; `undefined` requests a full
+refresh, including structural source/page changes. Shared form fields include
+every associated widget page, and undo/redo includes both old and new placement.
+Transient previews do not advance this baseline. Hosts can retain unaffected
+thumbnail images and in-flight work; document-wide appearance settings still
+require a full refresh. Existing three-argument hosts remain compatible.
+A host may try its native renderer's optional
+`updateEditorPreviewScene(scene): boolean`, or the matching Three object method,
+before using its normal scene replacement. These methods accept only compatible,
+privately hinted editor scenes; `false` requests the normal path. The first pose
+of a prepared generation also requires normal installation. For example:
+
+```ts
+async applyScene(scene, signal, onPresented, options) {
+  signal.throwIfAborted();
+  if (!(options?.preview && display.updateEditorPreviewScene?.(scene))) {
+    await replaceScene(scene, signal);
+  }
+  await drawMatchingFrame(signal);
+  signal.throwIfAborted();
+  onPresented?.();
+}
+```
+
+Here `replaceScene` and `drawMatchingFrame` are the host's upload and presentation
+routines. Returning `true` from the preview update means resources were updated,
+not that the frame was drawn. Call `onPresented` only for that scene's actual
+draw/submission, or resolve `applyScene` after it, so selection frames and field
+controls cannot advance ahead of their content. Native WebGL/WebGPU patch only
+changed geometry/clip texels when compatible; unsupported content, active LOD or
+renderer state retains ordinary installation and its existing fidelity.
+The stock UI coalesces pointer poses before the upcoming frame and skips unchanged
+toolbar/hidden-form work. Stock hosts avoid rebuilding page, search and thumbnail
+UI for transient poses. Commit, cancellation and View use the normal document
+update path; preview caches and hints are absent from PDF/HEP output.
+`EditorUiHost.onSetupProgress` receives `EditorSetupProgress` with a `stage`
+(`loading`, `document`, `fields`, `session`, or `display`) and an optional
+0–1 `value` for that stage. Omitted values indicate indeterminate work.
+Forward the optional progress callback from `prepareScene(signal, onProgress)`
+to your document loader. `EditorAppServicesOptions.onPrepareProgress` reports
+form preparation separately. `setEditing(true, signal?)` observes cancellation
+through the first editable frame and returns to View if activation fails;
+the existing session and its edits remain available for retry.
+For frame-aligned form controls, supply `subscribeToFrames(listener)` and return
+an unsubscribe function. Invoke the listener synchronously after drawing or
+submitting each document frame, including camera-only frames, while coordinate
+conversion still uses that frame's camera. `requestFrame()` schedules an initial
+draw when the Fill tool creates controls; provide it with frame notifications
+unless the host already guarantees that draw. These hooks are optional; hosts
+without frame notifications retain animation-frame positioning. The UI subscribes
+only in Edit mode and unsubscribes on returning to View or disposing.
+Supply optional `layerControlsContainer` and `showLayerControls()` to mount the
+layer editor in a host dock beside the canvas and open that dock from the toolbar.
+Without a container, the shared UI uses an accessible layer dialog. Layer controls
+unsubscribe when returning to View.
+`save("print")` also works while those controls are hidden and does not mark the
+document saved. Optional host `onStatus` and `onBusyChange` callbacks let a View
+toolbar expose inactive-editor progress/errors and coordinate its controls;
+the stock UI also exposes `isBusy()`.
+`attachDocuments(files, signal?)` appends PDF or HEP files in order using the same
+page history as the Pages dialog. It flushes active text/form drafts and works
+while the UI is in View; it does not enable editing controls or mark changes saved.
+Each file commits atomically, so earlier attachments remain if a later one fails
+or is cancelled. HEP files (including legacy ZIPs) are rebuilt as PDF pages from
+their retained scene content; missing original authoring semantics are not recovered.
+`dropImages(files, { x, y }, signal?)` accepts client coordinates and PNG/JPEG/WebP
+files in active Edit mode. It captures the page position before decoding and
+inserts each full-resolution image with undo support. Tool, mode or document
+changes cancel stale placement. Drops outside a document page are rejected.
+Hosts can instead build their own interface around `EditorSession`.
+
+`await createEditorInteractionController(editor)` supplies the same DOM-free
+selection and affine-transform gestures used by the stock toolbar. Feed picked
+object IDs to `selectHit(id, { ctrlKey?, metaKey?, shiftKey? })`; Ctrl/Cmd toggles
+and Shift adds. `selectArea(bounds, modifiers?)` selects only fully contained
+objects. `previewTransform(matrix)`, `applyTransform(matrix?)`,
+`cancelTransform()` and `nudge(x, y)` share the session's preview and undo model.
+Hosts render `editor.getScene()` themselves. Dispose the controller before its
+caller-owned session. The factory and its types are also available from `/node`.
+
+`writeScenePdf(scene, options?)` rebuilds a PDF from rendering data alone. It
+supports HEP-only input, source-order vector paths and outline glyphs, searchable
+Unicode text where mappings exist, images, clips, gradients and transparency.
+PDF layer conditions, defaults and shared identities are retained; `flatten:
+true` bakes their default visibility into the output.
+Existing raster fallback islands remain images. It cannot recover discarded
+source fonts, original text-authoring structure or form semantics.
+
+Newly authored objects remain editable PDF annotations even with HEP-only input.
+When `sourcePdf` is supplied, `savePdf` preserves the source document and writes
+editable annotations/forms with explicit appearances. Source-operation provenance
+is prepared lazily from the original PDF when saving changed source paint; it is
+transient and adds no View-mode frame work or HEP persistence data. Native text
+operations retain their encoded character strings and original font resources,
+including per-glyph transforms and deletion with the original subsequent text
+advances. Source wording is not rewritten. Inseparable source operations use
+diagnosed vector appearances; a page fallback is reserved for cases that cannot
+be isolated safely. Original annotation discussion metadata and lock-only edits
+update their dictionaries without regenerating their appearances.
+`{ flatten: true }` requests a
+rendering-data PDF. Existing supported password encryption is preserved by
+default, including flattened copies. No cryptographic signing or PDF script
+execution occurs.
+
+For editable PDF exports, `onWarning` also reports artwork that may overlap
+visible form widgets. Chrome and some other readers draw widgets after ordinary
+annotations regardless of their array order. The standalone viewers offer an
+editable/flattened copy choice for these overlaps. API callers can request
+`flatten: true` to keep the compiled visual stacking; the resulting copy has no
+interactive form fields or annotations. Detection uses committed geometry and
+conservative bounds, respects moved/deleted/hidden fields, and runs only during
+export. It adds no View-mode rendering work and never silently flattens output.
+
+PDF saves accept `protection: { mode: "preserve" }` (the default), `{ mode:
+"remove" }`, or `{ mode: "password", password, ownerPassword? }`. Set the existing
+source `password` when opening the editor; the output password is separate.
+New protection uses AES-256 with the Standard revision-6 handler. Opening and
+explicit owner passwords must be nonempty and fit 127 UTF-8 bytes after SASLprep
+Unicode preparation; prohibited characters and invalid bidirectional combinations
+are rejected. The owner password defaults to the opening password. Password
+changes rewrite the final object graph, discarding previous revisions and old
+encryption data. They retain document objects and resources without rendering.
+Creating new protection requires WebCrypto (HTTPS or localhost in browsers).
+
+```ts
+const unlocked = await editor.savePdf({ protection: { mode: "remove" } });
+const protectedCopy = await editor.savePdf({
+  protection: { mode: "password", password: newPassword }
+});
+```
+
+`changePdfProtection(bytes, protection, { password?, signal?, onProgress?,
+onDiagnostic? })` changes protection directly without creating an editor or
+compiling page geometry. It is exported from the root, bundler and Node entries:
+
+```ts
+import { changePdfProtection } from "@soadzoor/hepr/node";
+
+const unlocked = await changePdfProtection(pdfBytes, { mode: "remove" }, {
+  password: existingPassword
+});
+```
+
+Password settings remain in memory. HEP has no encryption or password field;
+HEP exports contain the decrypted rendering data.
+
+`manipulatePdfPages(bytes, operation, options?)` provides native page operations
+without an editor or page rendering. Operations are `{ kind: "rotate", pages,
+degrees }`, `{ kind: "remove", pages }`, `{ kind: "insert", at, bytes,
+pages?, password? }`, `{ kind: "reorder", pages }` (complete permutation),
+`{ kind: "duplicate", pages, at }`, `{ kind: "extract", pages }`, and
+`{ kind: "crop", pages, box }` (`PdfPageCropBox | null`, as above), and
+`{ kind: "resize", pages, width, height }` (displayed points, keeping content at
+its actual size and top-left offset). All return a
+new PDF Blob and leave caller bytes untouched. Options accept the primary `password`, `signal`,
+`onProgress`, and `onDiagnostic`. The root, bundler and Node entries export it.
+It preserves primary encryption, native page resources and editable fields and
+annotations. Imported field names receive a namespace when they collide with
+existing names. Imported document bookmarks are not merged. Diagnostics identify
+omitted bookmarks and navigation or structure that cannot refer to retained
+pages; the stock Pages dialog displays these warnings.
+
+```ts
+const merged = await manipulatePdfPages(primaryBytes, {
+  kind: "insert", at: 1, bytes: otherPdfBytes, pages: [0, 2],
+  password: otherPassword
+}, { password: primaryPassword, signal });
+```
+
+HEP saves bake current geometry and update searchable text, annotations, clipping
+and LOD. Optional document identity/numbering hints accompany managed number
+appearance ownership. They contain no source PDF/font/editor-history sections
+or application-defined object count limit.
+
+`createEditorSignatureLibrary(storage)` accepts a `getItem`/`setItem` storage
+adapter and exposes `list`, `save`, and `remove`. `normalizeEditorSignature`
+normalizes flat handwriting coordinate paths without rasterization. Browser
+storage errors propagate, leaving the existing stored library intact.
+`normalizeEditorSignature(paths, name, id, smoothing = 0)` accepts a total error
+budget in template coordinates. A positive budget uses one quarter to compact
+redundant captured points and reserves three quarters in the returned `smoothing`
+for curve fitting. Zero retains raw polyline samples. Existing stored templates remain
+compatible and are not rewritten when listed or reused.
+The optional `smoothing` on ink/signature objects uses local page units; zero
+retains the original polylines. SVG previews, compiled curves and explicit PDF
+appearances share the fitted geometry; PDF `InkList` samples follow those curves.
+HEP stores ordinary line/quadratic geometry without the capture or smoothing model.
+
+## Local editor recovery
+
+`await createEditorRecovery(options)` lazily loads a browser-only recovery
+controller; renderer imports and HEP encoding do not load or persist recovery
+state. `await editorRecoveryDocumentKey({ bytes?, scene? }, signal?)` computes a
+SHA-256 source key. Prefer original PDF/HEP bytes so identity is independent of
+viewer layout and filenames; a complete scene can be used when bytes are absent.
+
+Supply `session`, `key`, `label`, optional `password` and `protected`, plus
+`getDraft()`/`applyDraft(value)` for serializable unfinished text/form models.
+Never store DOM nodes, executable HTML or output-password settings as draft data.
+`await services.isSourceProtected(signal?)` probes source encryption when needed,
+including PDFs that open with an empty password and PDFs without form fields.
+Set `protected: true` for protected sources; missing passwords fail safely instead
+of writing a plaintext recovery snapshot.
+
+The controller subscribes only to committed revisions and debounces writes.
+Call `draftChanged()` for uncommitted typing, and provide `isInteracting()` to
+defer automatic work during gestures. `probe()` offers a matching old checkpoint;
+`restore()` and `discard()` resolve it. Until that decision, older matching data
+is preserved, including when the UI is closed with Later. `flush()` requests a
+current checkpoint, `hasPendingDecision()` reports whether the old-draft choice
+still blocks checkpoints, `list()` returns small management metadata, and
+`discard(key?)` deletes the current or another local draft. `dispose()` cancels
+queued work, detaches its session subscription and closes owned storage.
+An injected `EditorRecoveryStore` can replace IndexedDB for custom hosts/tests.
+
+The New PDF dialog lists locally created drafts with Resume draft actions, so
+never-saved documents do not require an external source file. Each new document
+has a unique identity. Resume validates stored authoring state before replacement
+and retains the original record key even after page operations changed source
+bytes. Custom UI hosts can supply `getSource().createdDocument`, `initialUnsaved`,
+`recoveryKey`, and `resumeRecovery` for this workflow. Deferred replacement can
+use `confirmDocumentChange({ deferRecoveryDiscard: true })`, then
+`dispose({ discardRecovery: true, preserveRecoveryKey?, preserveHostMode? })`
+only at successful commit; preserve the host mode when retiring a previous editor
+after its replacement is already active; cancellation leaves the existing editor and draft intact.
+
+`session.captureRecovery({ signal? })` returns a detached, versioned
+`EditorRecoverySnapshot`. `session.restoreRecovery(snapshot, { signal? })`
+validates and restores it atomically as an undoable operation. The snapshot keeps
+actual font programs, editable author models, current source/page resources,
+field values, annotation metadata/frames, layers and editing locks. It excludes
+passwords, undo/redo history, clipboard contents and transient previews. The
+opaque `data` field is a private recovery schema, not a PDF/HEP extension.
+Protected checkpoints use PBKDF2-SHA256 and AES-256-GCM with fresh nonces; password
+and derived keys remain in memory. Normal PDF opening/password verification is
+performed again before stored source state replaces the current document.
+
+`savePdf({ markSaved: false })` and `saveHep({ markSaved: false })` serialize a
+snapshot without clearing dirty state. The default remains true for API
+compatibility. Custom hosts should distinguish serialized/exported output from
+a confirmed file write before calling `markSaved()`; a browser anchor download
+does not acknowledge filesystem persistence. Recovery status `saved` means the
+local checkpoint transaction completed, not that the source file was saved.
+
 ## `renderPdfThumbnail(source, options?)`
 
 Returns `Promise<{ blob, width, height }>` for a fast, single-page overview.
@@ -519,6 +1328,15 @@ reuses the active PDF session and cached full pages, then extracts the remaining
 complete content for analysis or export. `sourceLabel`, `sourceKind`, and
 `rendererType` describe the loaded source and backend.
 
+`updateEditorPreviewScene(scene): boolean` reuses compatible prepared editor
+translation scenes and patches existing material textures. It supports an
+ordinary document object, including Grid and single-page Reader viewing, on both
+backends. Independently prepared page views, including multi-page Reader views
+retained after returning to Grid, use normal replacement. Compositing, active LOD,
+highlights and other incompatible material state also return `false`. Hosts must
+fall back to their existing scene-replacement flow and still schedule a draw;
+this method does not acknowledge presentation or change saved document state.
+
 Transforms apply to the **whole loaded object**, including all pages, backgrounds
 and content:
 
@@ -869,7 +1687,8 @@ room-detection enable **Annotation bubbles** by default, with no permanent
 hotspot markers. `pickSceneAnnotation` is also exported for custom UIs; it tests
 individual markup quads, ink proximity and other annotation bounds.
 
-All three examples opt into opening HTTP(S) links in a new tab and navigating
+All three examples opt into opening HTTP(S) links in a new tab, activating
+`mailto` and `tel` links through the browser's contact handlers, and navigating
 local `/GoTo` or `/Dest` links with a distance-aware camera animation: nearby
 jumps have a subtle zoom arc, while longer jumps pull back as they move and
 zoom in on arrival. Travel takes 450–1200 ms with a smooth departure and

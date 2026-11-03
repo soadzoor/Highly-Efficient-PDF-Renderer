@@ -38,12 +38,41 @@ export interface AnnotationBorder {
   verticalRadius?: number;
 }
 
+/** Detached display style in PDF user-space units; metrics are fractions of one em. */
+export interface AnnotationFieldTextStyle {
+  fontFamily: string;
+  /** A zero point size requests automatic field text fitting. */
+  fontSize: number;
+  fontWeight: number;
+  fontStyle: "normal" | "italic";
+  color: readonly number[];
+  ascent: number;
+  descent: number;
+  /** Effective appearance inset in PDF user-space units. */
+  contentInset?: number;
+}
+
+/** Typed text entry is an inert hint; standard PDF text fields remain /Tx. */
+export const ANNOTATION_FIELD_INPUT_TYPES = Object.freeze(["text", "number", "date", "email", "tel", "url"] as const);
+export type AnnotationFieldInputType = typeof ANNOTATION_FIELD_INPUT_TYPES[number];
+
 export interface AnnotationField {
   type?: string;
   name?: string;
   flags: number;
   value?: string | number | boolean | null | readonly string[];
   defaultValue?: string | number | boolean | null | readonly string[];
+  inputType?: AnnotationFieldInputType;
+  /** Detached AcroForm editing metadata. Older HEP files may omit these. */
+  maxLength?: number;
+  options?: readonly { value: string; label: string }[];
+  selectedIndices?: readonly number[];
+  alignment?: 0 | 1 | 2;
+  textStyle?: AnnotationFieldTextStyle;
+  /** Editor-only preview hint from a standard Widget /MK /CA mark caption. */
+  buttonMark?: "check" | "circle" | "cross" | "diamond" | "square" | "star";
+  onValue?: string;
+  appearanceState?: string;
 }
 
 /** A detached, clone-safe annotation; no live PDF dictionaries or appearance bytes. */
@@ -72,6 +101,8 @@ export interface PdfAnnotation {
   subject?: string;
   name?: string;
   creationDate?: string;
+  /** Managed page-number appearance; only matching document authoring IDs are regenerated. */
+  pageNumberingId?: string;
   modificationDate?: string;
   iconName?: string;
   open?: boolean;
@@ -243,7 +274,7 @@ export function validateAnnotations(value: unknown, options: {
     if ((pdf.rect as number[]).length !== 4) fail();
     geometry(pdf); geometry(a);
     for (const key of ["contents", "tooltip", "author", "subject", "name", "creationDate", "modificationDate",
-      "iconName", "popupId", "parentId", "replyToId", "replyType", "state", "stateModel"]) if (a[key] !== undefined) string(a[key]);
+      "iconName", "popupId", "parentId", "replyToId", "replyType", "state", "stateModel", "pageNumberingId"]) if (a[key] !== undefined) string(a[key]);
     if (a.open !== undefined && typeof a.open !== "boolean") fail();
     if (a.opacity !== undefined && (typeof a.opacity !== "number" || !Number.isFinite(a.opacity) || a.opacity < 0 || a.opacity > 1)) fail();
     if (a.color !== undefined) {
@@ -262,6 +293,28 @@ export function validateAnnotations(value: unknown, options: {
       const field = record(a.field);
       if (!integer(field.flags) || field.flags > 0xffff_ffff) fail();
       for (const key of ["type", "name"]) if (field[key] !== undefined) string(field[key]);
+      if (field.inputType !== undefined && !ANNOTATION_FIELD_INPUT_TYPES.includes(field.inputType as AnnotationFieldInputType)) fail();
+      for (const key of ["onValue", "appearanceState"]) if (field[key] !== undefined) string(field[key]);
+      if (field.maxLength !== undefined && (!integer(field.maxLength) || field.maxLength === 0)) fail();
+      if (field.alignment !== undefined && ![0, 1, 2].includes(field.alignment as number)) fail();
+      if (field.buttonMark !== undefined && !["check", "circle", "cross", "diamond", "square", "star"].includes(field.buttonMark as string)) fail();
+      if (field.textStyle !== undefined) {
+        const style = record(field.textStyle); string(style.fontFamily);
+        if (!style.fontFamily || typeof style.fontSize !== "number" || !Number.isFinite(style.fontSize) || style.fontSize < 0 ||
+          typeof style.fontWeight !== "number" || !Number.isFinite(style.fontWeight) || style.fontWeight < 1 || style.fontWeight > 1000 ||
+          !["normal", "italic"].includes(style.fontStyle as string) ||
+          typeof style.ascent !== "number" || !Number.isFinite(style.ascent) ||
+          typeof style.descent !== "number" || !Number.isFinite(style.descent) || style.ascent <= style.descent) fail();
+        array(style.color, 3);
+        if ((style.color as number[]).length !== 3 || (style.color as number[]).some(n => n < 0 || n > 1)) fail();
+        if (style.contentInset !== undefined && (typeof style.contentInset !== "number" || !Number.isFinite(style.contentInset) || style.contentInset < 0)) fail();
+      }
+      if (field.options !== undefined) {
+        if (!Array.isArray(field.options)) fail();
+        for (const option of field.options as unknown[]) { const o = record(option); string(o.value); string(o.label); }
+      }
+      if (field.selectedIndices !== undefined && (!Array.isArray(field.selectedIndices) ||
+        field.selectedIndices.some(index => !integer(index)))) fail();
       for (const key of ["value", "defaultValue"]) {
         const v = field[key];
         if (typeof v === "string") string(v);

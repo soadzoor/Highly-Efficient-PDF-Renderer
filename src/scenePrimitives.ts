@@ -78,6 +78,8 @@ export interface PrimitiveHit {
   triangleIndex?: number;
 }
 export interface ScenePrimitivePickOptions {
+  /** Editor-owned paint order; the spatial index remains valid when layers move. */
+  resolvePaintRank?(ref: PrimitiveRef): number;
   isConditionVisible?(condition?: number): boolean;
   /** Display RGB after per-primitive overrides and the existing global vector tint. */
   resolveColor?(ref: PrimitiveRef, original: readonly [number, number, number]): readonly [number, number, number];
@@ -228,6 +230,13 @@ function getPrimitiveConditionFields(scene: VectorScene, ref: PrimitiveRef): {
 /** Lookup costs depend on paint runs, rather than the number of stored primitives. */
 export function getPrimitiveOptionalContentCondition(scene: VectorScene, ref: PrimitiveRef): number | undefined {
   return primitiveRun(scene, ref)?.optionalContent;
+}
+
+/** Exact layer predicates for visible page paint, including ancestor scopes.
+ * Null excludes mask-only and statically hidden paint; an empty list is unconditional. */
+export function getPrimitiveVisibilityConditions(scene: VectorScene, ref: PrimitiveRef): readonly number[] | null {
+  const run = primitiveRun(scene, ref);
+  return isScenePaintRunVisible(scene, run, () => true) ? scenePaintRunConditions(scene, run, false) : null;
 }
 
 /** Includes static paint-graph eligibility and ancestor visibility conditions. */
@@ -907,13 +916,13 @@ export class ScenePrimitivePicker {
       const stack: number[] = [index.levels.length - 1, index.levels[index.levels.length - 1]];
       while (stack.length) {
         const node = stack.pop()!, level = stack.pop()!;
-        if (index.maxRanks[node] <= bestRank || !intersects(index.bounds, node, query)) continue;
+        if ((!options.resolvePaintRank && index.maxRanks[node] <= bestRank) || !intersects(index.bounds, node, query)) continue;
         if (level === 0) {
           const group = index.ids[node], first = group * index.groupSize;
           for (let id = Math.min(first + index.groupSize, index.total) - 1; id >= first; id--) {
             const ref = refFromId(id, index.offsets);
             if (!allowed || allowed.has(ref.kind)) {
-              const rank = index.groupSize === 1 ? index.ranks[group] : paintRank(this.scene, ref, index.runRanks);
+              const rank = options.resolvePaintRank?.(ref) ?? (index.groupSize === 1 ? index.ranks[group] : paintRank(this.scene, ref, index.runRanks));
               // A coarse leaf can cover empty space between its members. Reject
               // those members before doing projected curves and stroke caps.
               // Gradient runs may contain many segments; their member tests yield.

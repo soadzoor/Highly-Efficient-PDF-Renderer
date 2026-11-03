@@ -1,0 +1,224 @@
+import assert from "node:assert/strict";
+import { createEditorContextMenu } from "../src/editorContextMenu.ts";
+
+class Target extends EventTarget {
+  listeners = new Map();
+  addEventListener(type, listener, options = {}) {
+    if (options.signal?.aborted) return;
+    const own = { ...options }; delete own.signal;
+    super.addEventListener(type, listener, own);
+    if (!this.listeners.has(type)) this.listeners.set(type, new Set()); this.listeners.get(type).add(listener);
+    options.signal?.addEventListener("abort", () => this.removeEventListener(type, listener, own), { once: true });
+  }
+  removeEventListener(type, listener, options) {
+    super.removeEventListener(type, listener, options); this.listeners.get(type)?.delete(listener);
+  }
+  get listenerCount() { return [...this.listeners.values()].reduce((count, items) => count + items.size, 0); }
+}
+class Element extends Target {
+  childNodes = []; dataset = {}; style = {}; attributes = new Map(); disabled = false; hidden = false; textContent = ""; focusCount = 0;
+  constructor(tag, document) { super(); this.tagName = tag; this.ownerDocument = document; }
+  append(...nodes) { for (const node of nodes) { node.remove(); this.childNodes.push(node); node.parent = this; } }
+  remove() {
+    if (!this.parent) return;
+    this.parent.childNodes = this.parent.childNodes.filter(node => node !== this); this.parent = null;
+    if (this.contains(this.ownerDocument.activeElement)) this.ownerDocument.activeElement = this.ownerDocument.body;
+  }
+  get isConnected() { return this === this.ownerDocument.body || Boolean(this.parent?.isConnected); }
+  setAttribute(name, value) { this.attributes.set(name, value); }
+  contains(node) { return node === this || this.childNodes.some(child => child.contains(node)); }
+  closest(selector) {
+    return (selector === "[data-stack-action]" && this.dataset.stackAction || selector === "[data-clipboard-action]" && this.dataset.clipboardAction || selector === "[data-custom-action]" && this.dataset.customAction)
+      ? this : this.parent?.closest(selector) ?? null;
+  }
+  focus(options) { if (this.disabled) return; this.ownerDocument.activeElement = this; this.focusCount++; this.focusOptions = options; }
+  getBoundingClientRect() { return { width: Math.min(180, parseFloat(this.style.maxWidth) || 0), height: Math.min(128, parseFloat(this.style.maxHeight) || 0) }; }
+}
+const window = new Target(); window.innerWidth = 320; window.innerHeight = 180;
+const document = { defaultView: window, documentElement: { clientWidth: 320, clientHeight: 180 }, createElement: tag => new Element(tag, document) };
+document.body = document.createElement("body");
+const anchor = document.createElement("canvas"), outside = document.createElement("input"); document.body.append(anchor, outside); anchor.focus();
+const actions = ["bring-to-front", "bring-forward", "send-backward", "send-to-back"];
+const enabled = new Set(["bring-forward", "send-backward"]), calls = [], errors = [];
+let throwCanRun = false, runError, asyncError;
+const widget = createEditorContextMenu(document, {
+  canRun(action) { if (throwCanRun) throw new Error("Eligibility failed"); return enabled.has(action); },
+  run(action) {
+    calls.push(action); assert.equal(document.body.childNodes.length, 2, "the popup closes before the document mutation");
+    if (runError) throw runError; if (asyncError) return Promise.reject(asyncError);
+  },
+  onError: error => errors.push(error.message)
+});
+const menu = () => document.body.childNodes.find(node => node.className === "hepr-editor-context-menu");
+const event = (target, type, origin = target, details = {}) => {
+  const value = new Event(type, { cancelable: true });
+  Object.defineProperty(value, "target", { value: origin });
+  for (const [key, item] of Object.entries(details)) Object.defineProperty(value, key, { value: item });
+  let stopped = false; const stop = value.stopPropagation.bind(value); value.stopPropagation = () => { stopped = true; stop(); };
+  target.dispatchEvent(value); return { value, get stopped() { return stopped; } };
+};
+const click = action => { const panel = menu(); return event(panel, "click", panel.childNodes.find(button => button.dataset.stackAction === action)); };
+const key = (name, viaWindow = false) => event(viaWindow ? window : menu(), "keydown", document.activeElement, { key: name });
+
+assert.equal(window.listenerCount, 0); assert.equal(menu(), undefined, "idle View has no popup node or document listeners");
+widget.show({ x: 315, y: 175 });
+let panel = menu(); assert(panel); assert.equal(panel.attributes.get("role"), "menu");
+assert.equal(panel.attributes.get("aria-label"), "Drawing order within layer");
+assert.deepEqual(panel.childNodes.map(button => button.textContent), ["Bring to front", "Bring forward", "Send backward", "Send to back"]);
+assert(panel.childNodes.every(button => button.attributes.get("role") === "menuitem"));
+assert.deepEqual(panel.childNodes.map(button => button.disabled), [true, false, false, true]);
+assert.equal(document.activeElement.dataset.stackAction, "bring-forward");
+assert.equal(panel.style.left, "136px"); assert.equal(panel.style.top, "47px", "bottom-edge menus open above the anchor and remain in the viewport");
+assert.equal(window.listenerCount, 8);
+assert(key("ArrowDown", true).value.defaultPrevented); assert.equal(document.activeElement.dataset.stackAction, "send-backward");
+key("ArrowDown"); assert.equal(document.activeElement.dataset.stackAction, "bring-forward", "navigation wraps and skips disabled commands");
+key("End"); assert.equal(document.activeElement.dataset.stackAction, "send-backward");
+key("Home"); assert.equal(document.activeElement.dataset.stackAction, "bring-forward");
+assert(key("Delete", true).stopped, "menu keystrokes cannot delete or nudge the underlying editor selection");
+assert(key("Backspace", true).value.defaultPrevented);
+click("bring-to-front"); assert.equal(calls.length, 0); assert(menu(), "disabled commands do not close or execute");
+click("bring-forward"); assert.deepEqual(calls, ["bring-forward"]); assert.equal(document.activeElement, anchor); assert.equal(window.listenerCount, 0);
+assert.equal(menu(), undefined); assert.deepEqual(anchor.focusOptions, { preventScroll: true });
+
+enabled.clear(); actions.forEach(action => enabled.add(action));
+for (const action of actions) { widget.show({ x: 20, y: 30 }); click(action); assert.equal(calls.at(-1), action); assert.equal(window.listenerCount, 0); }
+widget.show({ x: 10, y: 10 }); enabled.delete("send-to-back");
+const beforeStale = calls.length; click("send-to-back");
+assert.equal(calls.length, beforeStale, "eligibility is checked again after selection/history changes"); assert(!menu());
+enabled.clear(); widget.show({ x: 0, y: 0 }); assert.equal(document.activeElement, menu(), "an all-disabled menu remains keyboard dismissible");
+key("ArrowUp"); key("Escape", true); assert.equal(document.activeElement, anchor); assert.equal(window.listenerCount, 0);
+actions.forEach(action => enabled.add(action));
+
+for (const type of ["pointerdown", "contextmenu", "wheel", "scroll", "focusin", "resize", "blur"]) {
+  anchor.focus(); widget.show({ x: 30, y: 30 }); panel = menu();
+  if (["wheel", "scroll", "pointerdown", "contextmenu", "focusin"].includes(type)) {
+    event(window, type, panel.childNodes[0]); assert(menu(), `${type} inside the popup remains available`);
+  }
+  if (type === "focusin") outside.focus();
+  const dismissal = event(window, type, outside);
+  assert(!menu(), `${type} dismisses the popup`); assert.equal(window.listenerCount, 0, `${type} removes every document listener`);
+  if (type === "contextmenu") assert(!dismissal.value.defaultPrevented, "other context menus retain their default behavior");
+  if (type === "focusin") assert.equal(document.activeElement, outside, "outside focus is not stolen back");
+}
+
+anchor.focus(); widget.show({ x: 10, y: 10 }); panel = menu();
+assert(event(panel, "contextmenu").value.defaultPrevented, "the popup suppresses the browser menu over itself");
+widget.show({ x: 40, y: 50 }); assert.equal(window.listenerCount, 8, "reopening does not accumulate document listeners");
+assert(key("Tab").stopped); assert(!menu()); assert.equal(document.activeElement, anchor);
+widget.show({ x: 10, y: 10 });
+const saveShortcut = event(window, "keydown", document.activeElement, { key: "s", ctrlKey: true });
+assert(!saveShortcut.stopped && !saveShortcut.value.defaultPrevented, "save shortcuts close the menu and remain available to the host");
+assert(!menu()); assert.equal(window.listenerCount, 0); assert.equal(document.activeElement, anchor);
+window.visualViewport = { offsetLeft: 50, offsetTop: 30, width: 100, height: 70 };
+widget.show({ x: 500, y: 500 }); panel = menu();
+assert.equal(panel.style.maxWidth, "92px"); assert.equal(panel.style.maxHeight, "62px");
+assert.equal(panel.style.left, "54px"); assert.equal(panel.style.top, "34px"); widget.close();
+window.visualViewport = null; window.innerWidth = window.innerHeight = 4;
+widget.show({ x: NaN, y: Infinity }); panel = menu(); assert.equal(panel.style.maxWidth, "0px"); assert.equal(panel.style.left, "2px"); widget.close();
+window.innerWidth = 320; window.innerHeight = 180;
+
+throwCanRun = true; widget.show({ x: 0, y: 0 }); assert(!menu()); assert.equal(window.listenerCount, 0); assert.equal(errors.at(-1), "Eligibility failed"); throwCanRun = false;
+anchor.focus(); widget.show({ x: 0, y: 0 }); throwCanRun = true; widget.show({ x: 20, y: 20 });
+assert(!menu()); assert.equal(document.activeElement, anchor, "failed repositioning restores the original focus target"); assert.equal(window.listenerCount, 0); throwCanRun = false;
+runError = new Error("Action failed"); widget.show({ x: 0, y: 0 }); click("bring-forward"); assert.equal(errors.at(-1), "Action failed"); runError = null;
+asyncError = new Error("Async action failed"); widget.show({ x: 0, y: 0 }); click("bring-forward"); await new Promise(resolve => setImmediate(resolve));
+assert.equal(errors.at(-1), "Async action failed"); asyncError = null;
+anchor.focus(); widget.show({ x: 0, y: 0 }); widget.dispose();
+assert(!menu()); assert.equal(window.listenerCount, 0); assert.equal(document.activeElement, anchor);
+widget.show({ x: 10, y: 10 }); widget.close(); widget.dispose(); assert(!menu()); assert.equal(window.listenerCount, 0);
+
+const clipboardEnabled = new Set(["copy", "cut"]), clipboardCalls = [];
+let clipboardFailure;
+const clipboardWidget = createEditorContextMenu(document, {
+  canRun: action => enabled.has(action), run: action => calls.push(action),
+  clipboard: {
+    canRun: action => clipboardEnabled.has(action),
+    run(action) {
+      assert(!menu(), "clipboard commands close before mutating the document or selection");
+      clipboardCalls.push(action); if (clipboardFailure) return Promise.reject(clipboardFailure);
+    }
+  },
+  onError: error => errors.push(error.message)
+});
+const clipboardButton = action => menu().childNodes.find(button => button.dataset.clipboardAction === action);
+const clickClipboard = (action, shortcut = false) => {
+  const button = clipboardButton(action); return event(menu(), "click", shortcut ? button.childNodes[0] : button);
+};
+anchor.focus(); clipboardWidget.show({ x: 20, y: 30 }); panel = menu();
+assert.equal(panel.attributes.get("aria-label"), "Selected objects and layer drawing order");
+assert.deepEqual(panel.childNodes.filter(node => node.attributes.get("role") === "menuitem").map(button => button.textContent),
+  ["Copy", "Cut", "Paste", "Bring to front", "Bring forward", "Send backward", "Send to back"]);
+assert.equal(panel.childNodes[3].attributes.get("role"), "separator");
+assert.equal(clipboardButton("copy").attributes.get("aria-keyshortcuts"), "Control+C Meta+C");
+assert.equal(clipboardButton("cut").childNodes[0].textContent, "Ctrl/Cmd+X");
+assert.equal(clipboardButton("cut").childNodes[0].attributes.get("aria-hidden"), "true");
+assert(clipboardButton("paste").disabled); assert.match(clipboardButton("paste").title, /active layer/);
+assert.equal(document.activeElement.dataset.clipboardAction, "copy");
+key("ArrowDown", true); assert.equal(document.activeElement.dataset.clipboardAction, "cut");
+key("ArrowDown", true); assert.equal(document.activeElement.dataset.stackAction, "bring-to-front", "navigation skips a disabled paste command and the separator");
+clickClipboard("paste"); assert.deepEqual(clipboardCalls, []); assert(menu(), "disabled paste cannot execute");
+clickClipboard("copy", true); assert.deepEqual(clipboardCalls, ["copy"], "clicking a visible shortcut label invokes its command");
+assert.equal(document.activeElement, anchor); assert.equal(window.listenerCount, 0);
+
+clipboardWidget.show({ x: 30, y: 40 }); clickClipboard("cut"); assert.equal(clipboardCalls.at(-1), "cut");
+clipboardEnabled.clear(); clipboardEnabled.add("paste");
+clipboardWidget.show({ x: 30, y: 40 });
+assert(clipboardButton("copy").disabled && clipboardButton("cut").disabled);
+assert.equal(document.activeElement.dataset.clipboardAction, "paste", "an empty canvas can present an enabled Paste command");
+clipboardEnabled.delete("paste"); clickClipboard("paste");
+assert.deepEqual(clipboardCalls, ["copy", "cut"], "clipboard eligibility is rechecked at execution"); assert(!menu());
+clipboardEnabled.add("paste"); clipboardWidget.show({ x: 30, y: 40 }); clickClipboard("paste"); assert.equal(clipboardCalls.at(-1), "paste");
+
+clipboardWidget.show({ x: 30, y: 40 });
+const pasteShortcut = event(window, "keydown", document.activeElement, { key: "v", ctrlKey: true });
+assert(!pasteShortcut.stopped && !pasteShortcut.value.defaultPrevented, "the host receives object clipboard shortcuts after the popup closes");
+assert(!menu()); assert.equal(document.activeElement, anchor);
+clipboardFailure = new Error("Clipboard failed"); clipboardWidget.show({ x: 30, y: 40 }); clickClipboard("paste");
+await new Promise(resolve => setImmediate(resolve)); assert.equal(errors.at(-1), "Clipboard failed"); clipboardFailure = null;
+clipboardWidget.show({ x: 30, y: 40 }); clipboardWidget.dispose();
+assert(!menu()); assert.equal(window.listenerCount, 0); assert.equal(document.activeElement, anchor);
+const objectCalls = [], objectEnabled = new Set(["duplicate", "copy", "cut", "paste"]);
+const objectWidget = createEditorContextMenu(document, {
+  canRun: action => enabled.has(action), run: action => calls.push(action),
+  objects: { canRun: action => objectEnabled.has(action), run: action => objectCalls.push(action) }
+});
+objectWidget.show({ x: 30, y: 40 }); panel = menu();
+assert.deepEqual(panel.childNodes.filter(node => node.attributes.get("role") === "menuitem").map(button => button.textContent),
+  ["Duplicate", "Copy", "Cut", "Paste", "Bring to front", "Bring forward", "Send backward", "Send to back"], "stock object actions are present independently of stacking eligibility");
+assert.equal(panel.childNodes[4].attributes.get("role"), "separator");
+assert.equal(document.activeElement.dataset.clipboardAction, "duplicate");
+const duplicate = panel.childNodes[0]; assert.equal(duplicate.attributes.get("aria-keyshortcuts"), "Control+D Meta+D");
+event(panel, "click", duplicate); assert.deepEqual(objectCalls, ["duplicate"]); assert(!menu());
+for (const action of ["copy", "cut", "paste"]) {
+  objectWidget.show({ x: 30, y: 40 }); const button = menu().childNodes.find(node => node.dataset.clipboardAction === action);
+  assert(button && !button.disabled); event(menu(), "click", button); assert.equal(objectCalls.at(-1), action);
+}
+objectWidget.dispose(); assert.equal(window.listenerCount, 0);
+const customEnabled = new Set(["lock", "edit-comment"]), customCalls = [];
+let customEligibilityError = false, customRunError = null;
+const customWidget = createEditorContextMenu(document, {
+  canRun: () => false, run: () => assert.fail("no enabled stacking commands"),
+  objects: { canRun: () => false, run: () => assert.fail("no enabled object commands") },
+  extra: ["lock", "unlock", "edit-comment"].map(action => ({ action, label: action,
+    canRun() { if (customEligibilityError) throw new Error("Custom eligibility failed"); return customEnabled.has(action); },
+    run() { assert(!menu(), "custom commands close before mutation"); customCalls.push(action); if (customRunError) return Promise.reject(customRunError); }
+  })), onError: error => errors.push(error.message)
+});
+const customButton = action => menu().childNodes.find(button => button.dataset.customAction === action);
+anchor.focus(); customWidget.show({ x: 20, y: 20 });
+assert.deepEqual(menu().childNodes.filter(node => node.attributes.get("role") === "menuitem").map(button => button.textContent),
+  ["Duplicate", "Copy", "Cut", "Paste", "lock", "unlock", "edit-comment", "Bring to front", "Bring forward", "Send backward", "Send to back"]);
+assert(customButton("unlock").disabled); assert.equal(document.activeElement.dataset.customAction, "lock");
+key("ArrowDown", true); assert.equal(document.activeElement.dataset.customAction, "edit-comment", "keyboard navigation includes custom commands and skips disabled ones");
+key("ArrowDown"); assert.equal(document.activeElement.dataset.customAction, "lock"); key("End"); assert.equal(document.activeElement.dataset.customAction, "edit-comment");
+const child = document.createElement("span"); customButton("edit-comment").append(child); event(menu(), "click", child);
+assert.deepEqual(customCalls, ["edit-comment"]); assert.equal(document.activeElement, anchor); assert.equal(window.listenerCount, 0);
+customWidget.show({ x: 20, y: 20 }); event(menu(), "click", customButton("unlock")); assert(menu()); assert.equal(customCalls.length, 1);
+customEnabled.delete("lock"); event(menu(), "click", customButton("lock")); assert(!menu()); assert.equal(customCalls.length, 1, "custom eligibility is revalidated at execution");
+customEnabled.add("unlock"); customWidget.show({ x: 20, y: 20 }); assert.equal(document.activeElement.dataset.customAction, "unlock");
+event(menu(), "click", customButton("unlock")); assert.equal(customCalls.at(-1), "unlock");
+customRunError = new Error("Custom action failed"); customWidget.show({ x: 20, y: 20 }); event(menu(), "click", customButton("edit-comment"));
+await new Promise(resolve => setImmediate(resolve)); assert.equal(errors.at(-1), "Custom action failed"); customRunError = null;
+customEligibilityError = true; customWidget.show({ x: 20, y: 20 }); assert(!menu()); assert.equal(errors.at(-1), "Custom eligibility failed"); customEligibilityError = false;
+customWidget.show({ x: 20, y: 20 }); customWidget.dispose(); assert(!menu()); assert.equal(window.listenerCount, 0);
+console.log("Editor context menu: clipboard and stacking commands, eligibility, keyboard/focus, viewport, dismissal and idle cleanup passed.");

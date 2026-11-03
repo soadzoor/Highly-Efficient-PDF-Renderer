@@ -195,6 +195,7 @@ assert.equal(compoundOutline.commands[0].x, 50);
 await testEmbeddedObsoleteCompoundFlag();
 await testMissingFontResolution();
 await testEmbeddedMacintoshSymbolFont();
+await testEmbeddedMacintoshRomanFont();
 await testFixedPitchInferenceFromWidths();
 await testStandard14AdvanceMetrics();
 
@@ -342,6 +343,83 @@ async function testEmbeddedMacintoshSymbolFont() {
   assert.deepEqual([...compiled.glyphs.glyphIds], [2, 1, 2]);
   assert.equal(compiled.textIndex.text, "AΩfi");
   assert.deepEqual([...compiled.textIndex.charGlyphIndices], [0, 1, 2, 2]);
+}
+
+async function testEmbeddedMacintoshRomanFont() {
+  // Synthetic nonsymbolic subset with only a Macintosh format-6 cmap, as
+  // produced by PDF subsetters for separate space, digit and accent fonts.
+  const macCmap = buildMacintoshRomanCmap([
+    [0x20, 1], [0x31, 2], [0x41, 1], [0x8e, 2], [0xca, 2]
+  ]);
+  const dictionary = new Map([
+    ["Subtype", name("TrueType")],
+    ["BaseFont", name("ABCDEF+FixtureRoman")],
+    ["Encoding", name("MacRomanEncoding")],
+    ["FirstChar", 32],
+    ["Widths", [278]],
+    ["FontDescriptor", new Map([
+      ["Flags", 32],
+      ["MissingWidth", 510],
+      ["FontFile2", stream(buildTinySfnt(macCmap))]
+    ])],
+    ["ToUnicode", stream(`
+      1 begincodespacerange <00> <ff> endcodespacerange
+      1 beginbfchar <31> <03a9> endbfchar
+    `)]
+  ]);
+  const font = await parseNativePdfFont(dictionary, resolver, {
+    missingFontResolver() {
+      assert.fail("an embedded Macintosh Roman cmap must not require substitution");
+    }
+  });
+  for (const [code, glyphId, unicode, width] of [
+    [0x20, 1, " ", 278],
+    [0x31, 2, "Ω", 510],
+    [0x8e, 2, "é", 510],
+    [0xca, 1, " ", 510]
+  ]) {
+    const mapped = font.decode(Uint8Array.of(code));
+    assert.equal(mapped.glyphId, glyphId, `MacRoman byte ${code} selects its encoded glyph`);
+    assert.equal(mapped.unicode, unicode, "ToUnicode remains independent of Macintosh glyph selection");
+    assert.equal(mapped.width, width, "PDF widths remain independent of the selected Macintosh glyph");
+  }
+  assert.equal(font.decode(Uint8Array.of(0x32)).glyphId, 0, "unmapped Roman glyphs remain .notdef");
+
+  const winAnsi = new Map(dictionary);
+  winAnsi.set("Encoding", name("WinAnsiEncoding"));
+  const winAnsiFont = await parseNativePdfFont(winAnsi, resolver);
+  assert.equal(winAnsiFont.decode(Uint8Array.of(0xe9)).glyphId, 2,
+    "WinAnsi characters are translated to the Macintosh Roman cmap");
+  assert.equal(winAnsiFont.decode(Uint8Array.of(0xe9)).unicode, "é");
+
+  const differences = new Map(dictionary);
+  differences.set("Encoding", new Map([
+    ["BaseEncoding", name("WinAnsiEncoding")],
+    ["Differences", [65, name("eacute"), name(".notdef"), name("unrecognized")]]
+  ]));
+  differences.set("ToUnicode", stream(`
+    1 begincodespacerange <00> <ff> endcodespacerange
+    3 beginbfchar <41> <005a> <42> <00e9> <43> <00e9> endbfchar
+  `));
+  const differencesFont = await parseNativePdfFont(differences, resolver);
+  assert.equal(differencesFont.decode(Uint8Array.of(65)).glyphId, 2,
+    "Differences glyph names select Macintosh Roman codes instead of raw PDF bytes");
+  assert.equal(differencesFont.decode(Uint8Array.of(65)).unicode, "Z");
+  assert.equal(differencesFont.decode(Uint8Array.of(66)).glyphId, 0,
+    "ToUnicode cannot redirect explicit .notdef geometry");
+  assert.equal(differencesFont.decode(Uint8Array.of(67)).glyphId, 0,
+    "ToUnicode cannot redirect unknown glyph names in an embedded font");
+
+  const unicodeCmap = new Map(dictionary);
+  unicodeCmap.set("FontDescriptor", new Map([
+    ["Flags", 32],
+    ["FontFile2", stream(buildTinySfnt(buildMacintoshRomanCmap([[0x8e, 2]], [[0xe9, 1]])))]
+  ]));
+  const unicodeFont = await parseNativePdfFont(unicodeCmap, resolver);
+  assert.equal(unicodeFont.decode(Uint8Array.of(0x8e)).glyphId, 1,
+    "a nonsymbolic font retains Unicode cmap precedence when both cmaps are available");
+  assert.equal(unicodeFont.sfnt.mapCodePoint(0x8e), 0,
+    "Macintosh Roman codes are not exposed as Unicode scalar mappings");
 }
 
 async function testStandard14AdvanceMetrics() {
@@ -753,6 +831,35 @@ function buildMacintoshSymbolCmap() {
   bytes[18 + 0x03] = 2;
   bytes[18 + 0x04] = 1;
   bytes[18 + 0xff] = 2;
+  return bytes;
+}
+
+function buildMacintoshRomanCmap(mappings, unicodeMappings = null) {
+  const records = [{ platform: 1, encoding: 0, mappings }];
+  if (unicodeMappings) records.push({ platform: 3, encoding: 1, mappings: unicodeMappings });
+  const subtables = records.map(({ mappings }) => {
+    const first = Math.min(...mappings.map(([code]) => code));
+    const count = Math.max(...mappings.map(([code]) => code)) - first + 1;
+    const bytes = new Uint8Array(10 + count * 2);
+    const view = new DataView(bytes.buffer);
+    view.setUint16(0, 6, false);
+    view.setUint16(2, bytes.length, false);
+    view.setUint16(6, first, false);
+    view.setUint16(8, count, false);
+    for (const [code, glyphId] of mappings) view.setUint16(10 + (code - first) * 2, glyphId, false);
+    return bytes;
+  });
+  let offset = 4 + records.length * 8;
+  const bytes = new Uint8Array(offset + subtables.reduce((sum, table) => sum + table.length, 0));
+  const view = new DataView(bytes.buffer);
+  view.setUint16(2, records.length, false);
+  records.forEach(({ platform, encoding }, index) => {
+    view.setUint16(4 + index * 8, platform, false);
+    view.setUint16(6 + index * 8, encoding, false);
+    view.setUint32(8 + index * 8, offset, false);
+    bytes.set(subtables[index], offset);
+    offset += subtables[index].length;
+  });
   return bytes;
 }
 

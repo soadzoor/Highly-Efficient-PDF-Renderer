@@ -1,0 +1,82 @@
+import type { VectorScene } from "./pdfVectorExtractor";
+import type { EditorAppServicesOptions } from "./editorAppServices";
+import type { EditorUiHost, EditorUi } from "./editorUi";
+import type { EditorPdfSaveOptions, EditorSession } from "./editorTypes";
+import type { PdfOutputProtection } from "./pdf/pdfProtection";
+import type { PdfProtectionChangeOptions } from "./editorPdfProtection";
+import type { PdfPageOperation, PdfPageOperationOptions } from "./editorPdfPages";
+import type { PdfCreateOptions } from "./pdfCreation";
+import type { PdfCompositionOptions, PdfDocumentComposer } from "./pdfCompositionTypes";
+
+/** Compose ordinary PDF page artwork with native backgrounds and reusable assets. */
+export async function createPdfDocument(options: PdfCompositionOptions = {}): Promise<PdfDocumentComposer> {
+  const settings = { ...options, metadata: options.metadata && structuredClone(options.metadata) };
+  settings.signal?.throwIfAborted();
+  return (await import("./pdfComposition")).createPdfDocument(settings);
+}
+
+/** Create a blank, editable PDF using a paper preset or custom point dimensions. */
+export async function createPdf(options: PdfCreateOptions = {}): Promise<Blob> {
+  const settings = { ...options, pageSize: typeof options.pageSize === "object" ? { ...options.pageSize } : options.pageSize,
+    pageNumbering: options.pageNumbering ? { ...options.pageNumbering, ...(Array.isArray(options.pageNumbering.color)
+      ? { color: [...options.pageNumbering.color] as [number, number, number] } : {}) } : undefined };
+  return (await import("./pdfCreation")).createPdf(settings);
+}
+
+/** Per-page visual alignment and prepared snapping for custom editor hosts. */
+export async function createEditorLayoutController(session: EditorSession) {
+  const layout = await import("./editorLayout");
+  return {
+    align: (alignment: import("./editorLayout").EditorAlignment, reference?: "selection" | "page") => layout.alignEditorSelection(session, alignment, reference),
+    distribute: (direction: import("./editorLayout").EditorDistribution) => layout.distributeEditorSelection(session, direction),
+    createAlignmentSnap: (candidates?: readonly import("./pdfVectorExtractor").Bounds[]) => layout.createEditorAlignmentSnap(session, candidates)
+  };
+}
+/** Glyph-bound PDF review annotations, sharing the same geometry as export. */
+export async function createEditorReviewTools(session: EditorSession) {
+  const review = await import("./editorReview");
+  return {
+    textQuads: review.editorTextMarkupQuads,
+    addTextMarkup: (scene: VectorScene, spans: readonly import("./textSelection").TextSelectionSpan[], type: "highlight" | "underline" | "strikeout", style?: Parameters<typeof review.addEditorTextMarkup>[4]) => review.addEditorTextMarkup(session, scene, spans, type, style),
+    addComment: (page: number, x: number, y: number, contents: string, author?: string, style?: Parameters<typeof review.addEditorComment>[6]) => review.addEditorComment(session, page, x, y, contents, author, style)
+  };
+}
+
+/** Complete font, form and preservation-first PDF services, loaded on demand. */
+export async function createEditorAppServices(options: EditorAppServicesOptions = {}) {
+  const settings = { ...options, sourcePdf: options.sourcePdf ? Uint8Array.from(options.sourcePdf) : undefined };
+  return (await import("./editorAppServices")).createEditorAppServicesFromSnapshot(settings);
+}
+/** Rebuild a vector-first PDF using only a compiled scene (including HEP input). */
+export async function writeScenePdf(scene: VectorScene, options: EditorPdfSaveOptions = {}): Promise<Blob> {
+  return (await import("./editorPdfWriter")).writeScenePdf(scene, options);
+}
+/** Change PDF password protection without compiling or rendering its pages. */
+export async function changePdfProtection(bytes: Uint8Array, protection: PdfOutputProtection, options: PdfProtectionChangeOptions = {}): Promise<Blob> {
+  const source = Uint8Array.from(bytes), policy = { ...protection }, settings = { ...options };
+  return (await import("./editorPdfProtection")).changePdfProtection(source, policy, settings);
+}
+/** Rotate, remove or import PDF pages while retaining native page resources. */
+export async function manipulatePdfPages(bytes: Uint8Array, operation: PdfPageOperation, options: PdfPageOperationOptions = {}): Promise<Blob> {
+  const primary = Uint8Array.from(bytes), settings = { ...options };
+  const request = operation.kind === "insert" ? { ...operation, bytes: Uint8Array.from(operation.bytes), pages: operation.pages?.slice() }
+    : operation.kind === "crop" ? { ...operation, pages: operation.pages.slice(), box: operation.box ? { ...operation.box } : null }
+    : { ...operation, pages: operation.pages.slice() };
+  return (await import("./editorPdfPages")).manipulatePdfPages(primary, request, settings);
+}
+/** Optional shared browser controls; hosts can use EditorSession without these. */
+export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): Promise<EditorUi> {
+  return (await import("./editorUi")).createEditorUi(host, signal);
+}
+/** DOM-free selection and transform gestures for custom hosts, loaded on demand. */
+export async function createEditorInteractionController(session: EditorSession) {
+  return (await import("./editorInteraction")).createEditorInteractionController(session);
+}
+/** Separate local browser recovery, loaded only when a host enables it. */
+export async function createEditorRecovery(options: Parameters<typeof import("./editorRecovery")["createEditorRecovery"]>[0]) {
+  return (await import("./editorRecovery")).createEditorRecovery(options);
+}
+export async function editorRecoveryDocumentKey(source: { bytes?: Uint8Array; scene?: VectorScene }, signal?: AbortSignal): Promise<string> {
+  const snapshot = { ...source, bytes: source.bytes ? Uint8Array.from(source.bytes) : undefined };
+  return (await import("./editorRecovery")).editorRecoveryDocumentKey(snapshot, signal);
+}

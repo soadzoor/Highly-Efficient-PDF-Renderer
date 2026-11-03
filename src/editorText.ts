@@ -1,0 +1,278 @@
+/// <reference path="./bidi-js.d.ts" />
+import type { EditorTextObject, EditorTextRun } from "./editorTypes";
+import type { EditorFont, EditorFontRegistry } from "./editorFonts";
+import { PdfByteWriter, pdfName, pdfNumber as n, pdfRef, pdfUtf16Hex } from "./editorPdfBytes";
+import { normalizePrimitiveColor } from "./primitiveAppearance";
+import createBidi from "bidi-js";
+import { allocateEditorTextCodes } from "./editorTextEncoding";
+import { editorTextGlyphOutline } from "./editorTextGlyphOutline";
+import { choosePdfFormAutoFontSize } from "./pdf/formAutoFontSize";
+import { waitForLoad } from "./loadCancellation";
+
+export interface EditorPositionedGlyph {
+  font: EditorFont; glyph: number; unicode: string; x: number; y: number;
+  size: number; color: readonly number[]; underline: boolean; strikethrough: boolean;
+  advance: number; italic: boolean; bold: boolean;
+  backgroundColor: readonly number[] | null; ascent: number; descent: number;
+  logicalIndex: number;
+  /** Optional per-run multipliers supplied by headless composition. */
+  opacity?: number; backgroundOpacity?: number;
+}
+export interface EditorTextLayout { glyphs: EditorPositionedGlyph[]; width: number; height: number; baselines?: number[] }
+/** Internal field layout; ordinary textbox layout keeps its existing defaults. */
+export interface EditorTextLayoutOptions {
+  wrap?: boolean;
+  verticalAlignment?: "top" | "middle";
+  autoFontSize?: boolean;
+  onFontMetrics?(metrics: { ascent: number; descent: number }): void;
+  /** Internal composition can reuse measured glyphs and omit textbox clipping. */
+  layout?: EditorTextLayout;
+  clip?: boolean;
+}
+const bidi = createBidi();
+
+/** Canonical layout used by appearance generation and the visible editor scene. */
+export async function layoutEditorText(object: EditorTextObject, fonts: EditorFontRegistry,
+  signal?: AbortSignal, options: EditorTextLayoutOptions = {}): Promise<EditorTextLayout> {
+  signal?.throwIfAborted();
+  if (!(object.width > 0 && object.height > 0 && object.fontSize > 0)) throw new RangeError("Textbox dimensions and font size must be positive.");
+  const hb = await import("harfbuzzjs");
+  if (options.autoFontSize) {
+    const probe = await layoutEditorText({ ...object, fontSize: 1 }, fonts, signal, { ...options, autoFontSize: false, wrap: false });
+    let ascent = 0, descent = 0;
+    for (const font of new Set(probe.glyphs.map(glyph => glyph.font))) {
+      const face = new hb.Face(new hb.Blob(font.bytes)), metrics = new hb.Font(face).hExtents();
+      ascent = Math.max(ascent, metrics.ascender / face.upem); descent = Math.min(descent, metrics.descender / face.upem);
+    }
+    const emHeight = Math.max(.01, ascent - descent || 1);
+    if (options.wrap === false) {
+      const size = choosePdfFormAutoFontSize(false, size => probe.width * size <= object.width + 1e-7 && emHeight * size <= object.height + 1e-7);
+      return layoutEditorText({ ...object, fontSize: size }, fonts, signal, { ...options, autoFontSize: false });
+    }
+    let maximum = 12;
+    for (;;) {
+      const size = choosePdfFormAutoFontSize(true, () => true, maximum);
+      const layout = await layoutEditorText({ ...object, fontSize: size }, fonts, signal, { ...options, autoFontSize: false });
+      const lines = Math.max(1, Math.round(layout.height / (size * (object.lineHeight ?? 1.2))));
+      if (size <= 4 || emHeight * size + Math.max(0, lines - 1) * size * (object.lineHeight ?? 1.2) <= object.height + 1e-7) return layout;
+      maximum = size - .001;
+    }
+  }
+  const runs = object.runs?.length ? object.runs : [{ text: object.text }];
+  const fullText = runs.map(run => run.text).join("");
+  const levels = bidi.getEmbeddingLevels(fullText);
+  const tokens: { text: string; start: number; font: EditorFont; style: EditorTextRun; size: number; level: number }[] = [];
+  let offset = 0;
+  for (const run of runs) {
+    const style = { ...object, ...run }; const font = await fonts.resolve(style);
+    const size = style.fontSize ?? object.fontSize;
+    if (!Number.isFinite(size) || size <= 0) throw new RangeError("Font sizes must be positive and finite.");
+    for (const match of run.text.matchAll(/\r\n|[\r\n]|[^\S\r\n]+|[^\s]+/gu)) {
+      const start = offset + match.index!;
+      // Direction boundaries are split before shaping; script properties are
+      // guessed by HarfBuzz per word, preserving joining and combining marks.
+      const text = match[0]; let first = 0;
+      for (let i = 1; i <= text.length; i++) if (i === text.length || levels.levels[start + i] !== levels.levels[start + first]) {
+        tokens.push({ text: text.slice(first, i), start: start + first, font, style, size, level: levels.levels[start + first] ?? 0 }); first = i;
+      }
+    }
+    offset += run.text.length;
+  }
+  interface Item { glyphs: EditorPositionedGlyph[]; width: number; height: number; start: number; end: number; level: number }
+  const lines: Item[][] = [[]]; let lineWidth = 0;
+  const fontCache = new Map<string, InstanceType<typeof hb.Font>>();
+  const shape = (token: typeof tokens[number]): Item => {
+    let font = fontCache.get(token.font.id);
+    if (!font) { font = new hb.Font(new hb.Face(new hb.Blob(token.font.bytes))); fontCache.set(token.font.id, font); }
+    const buffer = new hb.Buffer(); buffer.addText(token.text); buffer.guessSegmentProperties();
+    buffer.setDirection(token.level % 2 ? hb.Direction.RTL : hb.Direction.LTR); hb.shape(font, buffer);
+    const values = buffer.getGlyphInfosAndPositions();
+    const boundaries = [...new Set(values.map(glyph => glyph.cluster))].sort((a, b) => a - b);
+    const used = new Set<number>(); let x = 0;
+    const scale = token.size / font.face.upem;
+    const color = normalizePrimitiveColor(token.style.color ?? 0x000000);
+    const backgroundColor = token.style.backgroundColor == null ? null : normalizePrimitiveColor(token.style.backgroundColor), extents = font.hExtents();
+    const glyphs = values.map(glyph => {
+      const end = boundaries[boundaries.indexOf(glyph.cluster) + 1] ?? token.text.length;
+      const unicode = used.has(glyph.cluster) ? "" : token.text.slice(glyph.cluster, end); used.add(glyph.cluster);
+      const item: EditorPositionedGlyph = { font: token.font, glyph: glyph.codepoint, unicode,
+        x: x + (glyph.xOffset ?? 0) * scale, y: (glyph.yOffset ?? 0) * scale,
+        size: token.size, color, backgroundColor, ascent: extents.ascender * scale, descent: extents.descender * scale, logicalIndex: token.start + glyph.cluster,
+        underline: !!token.style.underline, strikethrough: !!token.style.strikethrough,
+        advance: (glyph.xAdvance ?? 0) * scale,
+        italic: (token.style.fontStyle === "italic" || token.style.fontStyle === "oblique") && token.font.fontStyle !== "italic",
+        bold: (token.style.fontWeight === "bold" || Number(token.style.fontWeight) >= 600) && token.font.fontWeight < 600 };
+      x += item.advance; return item;
+    });
+    return { glyphs, width: Math.abs(x), height: token.size * (object.lineHeight ?? 1.2), start: token.start,
+      end: token.start + token.text.length - 1, level: token.level };
+  };
+  for (const token of tokens) {
+    signal?.throwIfAborted();
+    if (/^[\r\n]+$/.test(token.text)) { lines.push([]); lineWidth = 0; continue; }
+    let item = shape(token);
+    if (options.wrap !== false && item.width > object.width && token.text.length > 1 && !/^\s+$/.test(token.text)) {
+      // Break oversized words on grapheme boundaries, then reshape each piece
+      // so contextual forms at the line boundaries remain correct.
+      let text = "", start = token.start;
+      for (const part of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(token.text)) {
+        const candidate = shape({ ...token, text: text + part.segment, start });
+        if (text && candidate.width > object.width) {
+          const ready = shape({ ...token, text, start });
+          if (lineWidth && lineWidth + ready.width > object.width) { lines.push([]); lineWidth = 0; }
+          lines.at(-1)!.push(ready); lines.push([]); lineWidth = 0; start += text.length; text = "";
+        }
+        text += part.segment;
+      }
+      item = shape({ ...token, text, start });
+    }
+    if (options.wrap !== false && lineWidth && lineWidth + item.width > object.width && !/^\s+$/.test(token.text)) { lines.push([]); lineWidth = 0; }
+    lines.at(-1)!.push(item); lineWidth += item.width;
+  }
+  const glyphs: EditorPositionedGlyph[] = [], baselines: number[] = [], metrics = new Map<string, { ascent: number; descent: number }>();
+  let y = object.y + object.height, widest = 0;
+  for (const line of lines) {
+    const width = line.reduce((sum, item) => sum + item.width, 0);
+    widest = Math.max(widest, width);
+    const height = Math.max(object.fontSize * (object.lineHeight ?? 1.2), ...line.map(item => item.height));
+    y -= height;
+    let baseline = y + height * .2;
+    if (options.verticalAlignment) {
+      let ascent = 0, descent = 0;
+      for (const item of line) for (const glyph of item.glyphs) {
+        let metric = metrics.get(glyph.font.id);
+        if (!metric) { const font = fontCache.get(glyph.font.id)!, extents = font.hExtents();
+          metric = { ascent: extents.ascender / font.face.upem, descent: extents.descender / font.face.upem }; metrics.set(glyph.font.id, metric); }
+        ascent = Math.max(ascent, metric.ascent * glyph.size); descent = Math.min(descent, metric.descent * glyph.size);
+      }
+      baseline = options.verticalAlignment === "middle" && lines.length === 1
+        ? object.y + (object.height - (ascent - descent)) / 2 - descent : y + height - ascent;
+    }
+    baselines.push(baseline);
+    const first = line[0]?.start ?? 0, end = line.at(-1)?.end ?? first;
+    const order = Array.from({ length: Math.max(0, end - first + 1) }, (_, i) => i + first);
+    for (const [a, b] of bidi.getReorderSegments(fullText, levels, first, end)) {
+      const slice = order.slice(a - first, b - first + 1).reverse(); order.splice(a - first, slice.length, ...slice);
+    }
+    const rank = new Map(order.map((index, i) => [index, i]));
+    const visual = [...line].sort((a, b) => Math.min(...order.filter(i => i >= a.start && i <= a.end).map(i => rank.get(i)!)) -
+      Math.min(...order.filter(i => i >= b.start && i <= b.end).map(i => rank.get(i)!)));
+    let x = object.x + (object.align === "right" ? object.width - width : object.align === "center" ? (object.width - width) / 2 : 0);
+    for (const item of visual) {
+      for (const glyph of item.glyphs) glyphs.push({ ...glyph, x: glyph.x + x, y: glyph.y + baseline });
+      x += item.width;
+    }
+  }
+  if (metrics.size) options.onFontMetrics?.({ ascent: Math.max(...[...metrics.values()].map(metric => metric.ascent)),
+    descent: Math.min(...[...metrics.values()].map(metric => metric.descent)) });
+  return { glyphs, width: widest, height: object.y + object.height - y, baselines };
+}
+
+/** A portable PDF appearance using embedded source fonts and positioned glyphs. */
+export async function editorTextPdf(object: EditorTextObject, fonts: EditorFontRegistry,
+  signal?: AbortSignal, options?: EditorTextLayoutOptions): Promise<Uint8Array> {
+  const layout = options?.layout ?? await layoutEditorText(object, fonts, signal, options);
+  const hb = await import("harfbuzzjs");
+  const writer = new PdfByteWriter({ signal }); const root = writer.reserve(), pages = writer.reserve();
+  const fontResources: string[] = []; const codes = new Map<EditorPositionedGlyph, { name: string; code: string }>();
+  const outlineFonts = new Map<string, InstanceType<typeof hb.Font>>();
+  const fontGroups = new Map<string, { asset: EditorFont; glyphs: EditorPositionedGlyph[] }>();
+  const retainFont = (asset: EditorFont) => {
+    if (!fontGroups.has(asset.id)) fontGroups.set(asset.id, { asset, glyphs: [] });
+    return fontGroups.get(asset.id)!;
+  };
+  for (const glyph of layout.glyphs) retainFont(glyph.font).glyphs.push(glyph);
+  // Preserve selected faces even for empty boxes/runs. Their editable PDF
+  // appearance can then recover the exact font when the user types later.
+  for (const run of [{ text: object.text }, ...(object.runs ?? [])]) {
+    const style = { ...object, ...run };
+    if (style.fontId) retainFont(fonts.get(style.fontId));
+    retainFont(await waitForLoad(fonts.resolve(style), signal));
+  }
+  for (const { asset, glyphs: group } of fontGroups.values()) {
+    const face = new hb.Face(new hb.Blob(asset.bytes)); const font = new hb.Font(face);
+    outlineFonts.set(asset.id, font);
+    const postscript = pdfName(face.getName(6, "en") || asset.family.replace(/\s/g, ""));
+    const cff = !!face.referenceTable("CFF ") || !!face.referenceTable("CFF2");
+    const file = await writer.stream(asset.bytes, cff ? "/Subtype /OpenType" : `/Length1 ${asset.bytes.length}`);
+    const extents = font.hExtents(); const factor = 1000 / face.upem;
+    const descriptor = writer.add(`<< /Type /FontDescriptor /FontName ${postscript} /FontFamily ${pdfUtf16Hex(asset.family)} /FontWeight ${n(asset.fontWeight)} /Flags 32 /FontBBox [-1000 -1000 3000 3000] /Ascent ${n(extents.ascender * factor)} /Descent ${n(extents.descender * factor)} /CapHeight ${n(extents.ascender * factor)} /ItalicAngle ${asset.fontStyle === "italic" ? -12 : 0} /StemV 80 /${cff ? "FontFile3" : "FontFile2"} ${pdfRef(file)} >>`);
+    const { partitions, codes: assigned } = allocateEditorTextCodes(group, signal), firstResource = fontResources.length;
+    for (let index = 0; index < group.length; index++) codes.set(group[index], {
+      name: `F${firstResource + assigned[index].partition}`, code: assigned[index].code.toString(16).padStart(4, "0")
+    });
+    const blocks = (rows: string[], op: string) => {
+      const output: string[] = []; for (let i = 0; i < rows.length; i += 100) { const part = rows.slice(i, i + 100); output.push(`${part.length} begin${op}\n${part.join("\n")}\nend${op}`); } return output.join("\n");
+    };
+    // PDFium treats a single four-byte codespace as one-byte text. Keep codes
+    // two bytes wide, with additional resources sharing the same embedded font
+    // when a textbox needs more distinct glyph/Unicode pairs than one can hold.
+    for (const entries of partitions) {
+      signal?.throwIfAborted();
+      const name = `F${fontResources.length}`, encodingName = `/HEPREncoding${name}`, unicodeName = `/HEPRUnicode${name}`;
+      const mappings = entries.map(entry => `<${entry.code.toString(16).padStart(4, "0")}> ${entry.glyph}`);
+      // Continuation glyphs still paint, but an empty UTF-16 destination is not
+      // a valid ToUnicode mapping. The cluster's first glyph owns its text.
+      const unicode = entries.filter(entry => entry.unicode.length).map(entry =>
+        `<${entry.code.toString(16).padStart(4, "0")}> <${Array.from({ length: entry.unicode.length }, (_, i) => entry.unicode.charCodeAt(i).toString(16).padStart(4, "0")).join("")}>`);
+      const cidSystemInfo = "<< /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>";
+      const cmap = await writer.stream(`/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo ${cidSystemInfo} def\n/CMapName ${encodingName} def\n/CMapType 1 def\n/WMode 0 def\n1 begincodespacerange\n<0000> <ffff>\nendcodespacerange\n${blocks(mappings, "cidchar")}\nendcmap\nCMapName currentdict /CMap defineresource pop\nend end`,
+        `/Type /CMap /CMapName ${encodingName} /CIDSystemInfo ${cidSystemInfo} /WMode 0`);
+      const unicodeSystemInfo = "<< /Registry (Adobe) /Ordering (UCS) /Supplement 0 >>";
+      const toUnicode = await writer.stream(`/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo ${unicodeSystemInfo} def\n/CMapName ${unicodeName} def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <ffff>\nendcodespacerange\n${blocks(unicode, "bfchar")}\nendcmap\nCMapName currentdict /CMap defineresource pop\nend end`,
+        `/Type /CMap /CMapName ${unicodeName} /CIDSystemInfo ${unicodeSystemInfo}`);
+      const glyphIds = [...new Set(entries.map(entry => entry.glyph))].sort((a, b) => a - b);
+      const widths = glyphIds.map(glyph => `${glyph} [${n(font.glyphHAdvance(glyph) * factor)}]`).join(" ");
+      const descendant = writer.add(`<< /Type /Font /Subtype /${cff ? "CIDFontType0" : "CIDFontType2"} /BaseFont ${postscript} /CIDSystemInfo ${cidSystemInfo} /FontDescriptor ${pdfRef(descriptor)} ${cff ? "" : "/CIDToGIDMap /Identity "}/DW 1000 /W [${widths}] >>`);
+      const type0 = writer.add(`<< /Type /Font /Subtype /Type0 /BaseFont ${postscript} /Encoding ${pdfRef(cmap)} /DescendantFonts [${pdfRef(descendant)}] /ToUnicode ${pdfRef(toUnicode)} >>`);
+      fontResources.push(`/${name} ${pdfRef(type0)}`);
+    }
+  }
+  const opacity = object.opacity ?? 1;
+  const alpha = writer.add(`<< /Type /ExtGState /ca ${n(opacity)} /CA ${n(opacity)} >>`);
+  const commands = ["q", "/HEPRTextAlpha gs"];
+  if (options?.clip !== false) commands.push(`${n(object.x)} ${n(object.y)} ${n(object.width)} ${n(object.height)} re W n`);
+  const alphas = new Map<number, string>([[opacity, "HEPRTextAlpha"]]);
+  const selectAlpha = (multiplier = 1): string => {
+    const value = opacity * multiplier;
+    let name = alphas.get(value);
+    if (!name) { name = `HEPRTextAlpha${alphas.size}`; alphas.set(value, name); }
+    return `/${name} gs`;
+  };
+  // All backgrounds precede glyph paint, so highlights never cover neighboring
+  // letters or combining marks and remain attached to textbox reflow/transforms.
+  for (const glyph of layout.glyphs) if (glyph.backgroundColor && glyph.advance !== 0) {
+    const x = Math.min(glyph.x, glyph.x + glyph.advance), height = Math.max(0, glyph.ascent - glyph.descent);
+    commands.push(selectAlpha(glyph.backgroundOpacity), `${glyph.backgroundColor.map(n).join(" ")} rg`, `${n(x)} ${n(glyph.y + glyph.descent)} ${n(Math.abs(glyph.advance))} ${n(height)} re f`);
+  }
+  // Absolute positions determine appearance. Emit clusters in logical order so
+  // searchable Unicode retains bidi semantics without collapsing a whole box
+  // into one ActualText selection quad.
+  for (const glyph of [...layout.glyphs].sort((a, b) => a.logicalIndex - b.logicalIndex)) {
+    commands.push(selectAlpha(glyph.opacity), `${glyph.color.map(n).join(" ")} rg ${glyph.color.map(n).join(" ")} RG`);
+    if (glyph.unicode) {
+      const code = codes.get(glyph)!;
+      commands.push("BT", `/${code.name} ${n(glyph.size)} Tf`, glyph.bold ? `${n(glyph.size * .025)} w 2 Tr` : "0 Tr",
+        `1 0 ${glyph.italic ? ".212556" : "0"} 1 ${n(glyph.x)} ${n(glyph.y)} Tm <${code.code}> Tj`, "ET");
+    } else {
+      // A shaped cluster can paint extra glyphs without owning extra Unicode.
+      // Some readers substitute character codes for missing/empty ToUnicode
+      // entries and ignore empty ActualText. Outline only these continuations;
+      // the cluster's first glyph remains searchable with the complete text.
+      const font = outlineFonts.get(glyph.font.id)!, path = editorTextGlyphOutline(font, glyph.glyph, signal);
+      if (path) {
+        const scale = glyph.size / font.face.upem;
+        commands.push("q", `${n(scale)} 0 ${n(glyph.italic ? scale * .212556 : 0)} ${n(scale)} ${n(glyph.x)} ${n(glyph.y)} cm`,
+          ...(glyph.bold ? [`${n(font.face.upem * .025)} w`] : []), path, glyph.bold ? "B" : "f", "Q");
+      }
+    }
+    for (const offset of [glyph.underline ? -.1 : null, glyph.strikethrough ? .3 : null]) if (offset !== null) {
+      commands.push(`${n(glyph.x)} ${n(glyph.y + offset * glyph.size)} ${n(glyph.advance)} ${n(glyph.size * .05)} re f`);
+    }
+  }
+  commands.push("Q"); const content = await writer.stream(commands.join("\n"));
+  const alphaResources = [...alphas].map(([value, name]) => `/${name} ${pdfRef(name === "HEPRTextAlpha" ? alpha : writer.add(`<< /Type /ExtGState /ca ${n(value)} /CA ${n(value)} >>`))}`).join(" ");
+  const page = writer.add(`<< /Type /Page /Parent ${pdfRef(pages)} /MediaBox [0 0 ${n(Math.max(1, object.x + object.width))} ${n(Math.max(1, object.y + object.height))}] /Resources << /Font << ${fontResources.join(" ")} >> /ExtGState << ${alphaResources} >> >> /Contents ${pdfRef(content)} >>`);
+  writer.set(pages, `<< /Type /Pages /Count 1 /Kids [${pdfRef(page)}] >>`); writer.set(root, `<< /Type /Catalog /Pages ${pdfRef(pages)} >>`);
+  return writer.build(root);
+}

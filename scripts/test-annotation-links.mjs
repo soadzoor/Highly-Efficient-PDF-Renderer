@@ -19,7 +19,7 @@ class Window extends EventTarget {
 }
 
 try {
-  const { resolveAnnotationUrl, resolveAnnotationView, createViewerLinkNavigation } = await import("../src/viewerLinkNavigation.ts");
+  const { resolvePdfLinkUrl, resolveAnnotationUrl, resolveAnnotationView, createViewerLinkNavigation } = await import("../src/viewerLinkNavigation.ts");
   const { createThreeLinkNavigation } = await import("../src/threeLinkNavigation.ts");
   const { computeNativePdfPageGeometry } = await import("../src/pdf/nativePageGeometry.ts");
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
@@ -30,6 +30,8 @@ try {
   assert.equal(resolveAnnotationUrl(uri("a"), "https://example.com/dir/doc.pdf"), "https://example.com/dir/a");
   assert.equal(resolveAnnotationUrl(uri("a", { uriBase: "../" }), "https://example.com/dir/doc.pdf"), "https://example.com/a");
   assert.equal(resolveAnnotationUrl(uri("https://example.com/", { uriBase: "broken" })), "https://example.com/");
+  assert.equal(resolvePdfLinkUrl("mailto:reviewer@example.com?subject=PDF%20review"), "mailto:reviewer@example.com?subject=PDF%20review");
+  assert.equal(resolveAnnotationUrl(uri("tel:+3615550100")), "tel:+3615550100");
   for (const url of ["javascript:alert(1)", "data:text/html,hello", "file:///tmp/file", "relative", "//example.com/"]) {
     assert.equal(resolveAnnotationUrl(uri(url)), null);
   }
@@ -85,6 +87,8 @@ try {
     getView: () => cameraView, setView: v => { cameraView = v; changes++; }, getIdentity: () => identity,
     getSourceUrl: () => "pdfs/doc.pdf", beforeNavigate: () => cancelledGesture++ });
   assert.equal(navigation.getActivationLabel(uri("/docs")), "Open link in new tab");
+  assert.equal(navigation.getActivationLabel(uri("mailto:reviewer@example.com")), "Compose email");
+  assert.equal(navigation.getActivationLabel(uri("tel:+3615550100")), "Call number");
   assert.equal(navigation.activate(uri("next.html")), true);
   assert.deepEqual(window.opened, [["https://viewer.example/app/pdfs/next.html", "_blank", "noopener,noreferrer"]]);
   assert.equal(changes, 0);

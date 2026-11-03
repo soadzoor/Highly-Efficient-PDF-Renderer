@@ -47,6 +47,8 @@ export interface RendererApi {
   getOptionalContentVisibility?(): OptionalContentSnapshot | null;
   /** Subscribe to per-frame draw diagnostics. */
   setFrameListener(listener: ((stats: DrawStats) => void) | null): void;
+  /** Schedule a native draw without changing its scene or camera. */
+  requestFrame?(): void;
 
   /** Switch native rendering to an externally driven frame loop. */
   setExternalFrameDriver?(enabled: boolean): void;
@@ -128,6 +130,8 @@ export interface RendererApi {
 
   /** Upload a parsed scene and return GPU/resource stats. */
   setScene(scene: VectorScene, options?: SceneUpdateOptions): SceneStats;
+  /** Apply a proven stable editor translation without reallocating scene resources. */
+  updateEditorPreviewScene?(scene: VectorScene): boolean;
 
   /** Return stats for the uploaded scene, if available. */
   getSceneStats(): SceneStats | null;

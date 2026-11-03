@@ -32,7 +32,9 @@ for (const name of files) {
       const specifier = reference.value.replace(/\.ts$/, ".js");
       const target = extname(specifier) ? specifier : `${specifier}.js`;
       if (target !== reference.value) edits.push({ start: reference.start, end: reference.end, value: target });
-      dependencies.push(fileURLToPath(new URL(target, pathToFileURL(file))));
+      const dependency = fileURLToPath(new URL(target, pathToFileURL(file)));
+      if (target.endsWith(".css")) assets.add(relative(outputDir, dependency));
+      else dependencies.push(dependency);
     }
     if (node.type !== "NewExpression" || node.callee.name !== "URL") return;
     const [url, base] = node.arguments;

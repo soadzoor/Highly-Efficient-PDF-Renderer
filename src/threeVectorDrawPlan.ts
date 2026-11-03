@@ -34,6 +34,7 @@ export class ThreeVectorDrawPlan {
   private minimumStrokeWidthPx = 0;
 
   private colorCommutationEnabled = true;
+  private geometryPreview = false;
   private blackPreserved = true;
   private strokeColorsMatchSource = true;
   private strokes: StrokeRecords;
@@ -81,8 +82,14 @@ export class ThreeVectorDrawPlan {
   /** Submission position of each canonical run, for `renderOrder` assignment. */
   get positions(): Int32Array { return this.positionOfRun; }
 
-  get colorBatchingEnabled(): boolean { return this.colorCommutationEnabled && this.strokeColorsMatchSource; }
+  get colorBatchingEnabled(): boolean { return !this.geometryPreview && this.colorCommutationEnabled && this.strokeColorsMatchSource; }
   get blackDarkenSourceOverEnabled(): boolean { return this.colorBatchingEnabled && this.blackPreserved; }
+
+  /** Moving geometry invalidates the source-bound overlap proofs for every run. */
+  setGeometryPreviewEnabled(enabled: boolean): void {
+    if (this.geometryPreview === enabled) return;
+    this.geometryPreview = enabled; this.rebuildScheduler();
+  }
 
   /** True while minification holds the scheduler's coverage margin. */
   get paintOrderApproximated(): boolean { return (!this.textLodEnabled || !!this.textLodData) && (this.scheduler?.paintOrderApproximated ?? false); }
@@ -164,7 +171,7 @@ export class ThreeVectorDrawPlan {
     // Arbitrary public graphs can visit canonical runs backwards. Such graphs
     // retain their source submissions rather than feeding a non-monotonic span
     // sequence to the scheduler.
-    if (!this.spanOrdered) return null;
+    if (this.geometryPreview || !this.spanOrdered) return null;
     return VectorPageDrawScheduler.create(this.scene, this.strokes, this.sourceRuns, this.segments, this.independentPageRuns);
   }
 

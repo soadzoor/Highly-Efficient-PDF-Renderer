@@ -57,10 +57,11 @@ export interface TextSelectionRange {
   start: TextSelectionCaret;
   end: TextSelectionCaret;
 }
+export interface TextSelectionSpan { pageIndex: number; start: number; length: number }
 
 export interface TextSelectionOptions {
   /** Canvas re-resolved per event so backend switches that swap the element keep working. */
-  getCanvas(): HTMLCanvasElement | null;
+  getCanvas(): HTMLElement | null;
   adapter: TextSelectionAdapter;
   /** Feature toggle. Defaults to true; also switchable via enable()/disable(). */
   enabled?: boolean;
@@ -69,10 +70,14 @@ export interface TextSelectionOptions {
   /** Finger movement allowed during the long-press. Defaults to 8 px. */
   longPressMoveTolerancePx?: number;
   onSelectionChange?(range: TextSelectionRange | null, selectedText: string): void;
+  /** Refresh a host's scene snapshot before a new canvas selection gesture. */
+  onSelectionStart?(): void;
   /** Plain mouse/pen click on text, in client CSS pixels; hosts can pick PDF links. */
   onTextClick?(point: TextSelectionPoint): void;
   /** Called after a successful clipboard write. */
   onCopy?(text: string): void;
+  /** A completed text-selection gesture, after pointer ownership is released. */
+  onSelectionCommit?(range: TextSelectionRange, selectedText: string): void;
 }
 
 export interface TextSelectionController {
@@ -83,6 +88,8 @@ export interface TextSelectionController {
   getSelectionRange(): TextSelectionRange | null;
   /** Page slices of the indexed text, joined with "\n" across pages. */
   getSelectedText(): string;
+  /** Raw text-index spans in visual line order, suitable for review annotations. */
+  getSelectedSpans(): readonly TextSelectionSpan[];
   copySelection(): Promise<boolean>;
   /** Re-push highlight rects through the adapter (e.g. after a backend swap). */
   refreshHighlights(): void;
@@ -340,7 +347,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
   let selectionIsTouch = false;
   let handleDragWhich: "start" | "end" | null = null;
 
-  let cursorCanvas: HTMLCanvasElement | null = null;
+  let cursorCanvas: HTMLElement | null = null;
   let cursorApplied = false;
 
   let lastClickTime = 0;
@@ -405,7 +412,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     onContextMenuCopy(): void {
       void copySelection();
     }
-  });
+  }, () => options.getCanvas()?.getBoundingClientRect() ?? null);
 
   function getSceneChecked(): VectorScene | null {
     const scene = adapter.getScene();
@@ -832,7 +839,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     }
   }
 
-  function applyCursor(canvas: HTMLCanvasElement | null, active: boolean): void {
+  function applyCursor(canvas: HTMLElement | null, active: boolean): void {
     if (active) {
       if (canvas && (!cursorApplied || cursorCanvas !== canvas)) {
         restoreCursor();
@@ -858,9 +865,9 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
    * long-press would otherwise start a native HTML selection anchored in
    * nearby DOM text (the canvas has none), alongside ours.
    */
-  let guardedCanvas: HTMLCanvasElement | null = null;
+  let guardedCanvas: HTMLElement | null = null;
 
-  function ensureCanvasSelectionGuards(canvas: HTMLCanvasElement): void {
+  function ensureCanvasSelectionGuards(canvas: HTMLElement): void {
     if (guardedCanvas === canvas) {
       return;
     }
@@ -1002,6 +1009,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     if (event.target !== canvas || state !== "idle") {
       return;
     }
+    if (event.button === 0) options.onSelectionStart?.();
 
     if (event.pointerType === "touch") {
       // Never block the touch start: panning must begin normally.
@@ -1180,6 +1188,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
       // Selection owns the DOM events to prevent camera panning. Forward only
       // stationary clicks to the host's annotation picker after releasing it.
       if (plainClick) options.onTextClick?.({ x: event.clientX, y: event.clientY });
+      if (event.type === "pointerup" && selectionRange && lastScene) options.onSelectionCommit?.(toPublicRange(selectionRange), selectedTextFor(lastScene, selectionRange));
       return;
     }
 
@@ -1190,6 +1199,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
       // the native controller's state was already cleared by the takeover).
       endTouchGesture();
       updateOverlay();
+      if (event.type === "pointerup" && selectionRange && lastScene) options.onSelectionCommit?.(toPublicRange(selectionRange), selectedTextFor(lastScene, selectionRange));
       return;
     }
 
@@ -1287,6 +1297,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
       overlay.hide();
       return;
     }
+    overlay.refreshViewport();
 
     const midGesture = state === "mouseSelecting" || state === "touchSelecting";
     if (!selectionIsTouch) {
@@ -1355,6 +1366,12 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
         return "";
       }
       return selectedTextFor(lastScene, selectionRange);
+    },
+    getSelectedSpans(): readonly TextSelectionSpan[] {
+      const spans: TextSelectionSpan[] = [];
+      if (lastScene && selectionRange) forEachSelectedLineSpan(lastScene, selectionRange,
+        (pageIndex, _layout, _line, from, to) => spans.push({ pageIndex, start: from, length: to - from }));
+      return spans;
     },
 
     copySelection,

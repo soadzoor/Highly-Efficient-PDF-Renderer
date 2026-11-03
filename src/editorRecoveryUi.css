@@ -1,0 +1,6 @@
+.hepr-editor-recovery-dialog{box-sizing:border-box;max-width:min(620px,94vw);max-height:85vh;overflow:auto;padding:18px;border:1px solid #b6c3d4;border-radius:10px;font:14px system-ui,sans-serif;color:#172333;background:#fff}
+.hepr-editor-recovery-dialog::backdrop{background:#17233366}
+.hepr-editor-recovery-dialog h2{margin-top:0}.hepr-editor-recovery-dialog p{line-height:1.5}
+.hepr-editor-recovery-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;border-top:1px solid #ccd7e5;padding:10px 0}.hepr-editor-recovery-row>span{flex:1 1 220px;min-width:0;overflow-wrap:anywhere}
+.hepr-editor-recovery-actions{display:flex;justify-content:flex-end;margin-top:14px;gap:8px}.hepr-editor-recovery-dialog button{font:inherit;padding:5px 10px;cursor:pointer}
+.hepr-editor-recovery-dialog [role=status]{margin-top:10px;overflow-wrap:anywhere}

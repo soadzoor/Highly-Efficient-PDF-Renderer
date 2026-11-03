@@ -18,6 +18,7 @@ Open the [standalone viewer](https://soadzoor.github.io/Highly-Efficient-PDF-Ren
 - **Multiple pages:** load a whole PDF or selected pages, arranged in a grid.
 - **Search and selection:** find text, highlight matches, and copy selections on desktop and touch devices.
 - **Drawing selection:** select drawing elements, inspect their geometry and layer membership, and temporarily recolor vectors.
+- **PDF editing:** switch from View to Edit to fill forms, add rich text, vector markups, handwritten signatures and images; manage PDF layers and their stacking, select and transform multiple objects, undo changes, and save PDF/HEP or print. Editing loads on demand. See [editing](docs/manual.md#editing-documents).
 - **PDF layers:** toggle optional content in the main viewer, inspect layer dependencies when picking geometry, or use the shared library APIs.
 - **Reusable documents:** export `.hep` files with geometry, images, and a searchable text index to skip PDF parsing on subsequent loads.
 - **Fast thumbnails:** prepare one PDF/HEP page for its requested pixel size, with cancellation, lossless WebP output, and reusable thumbnail-to-HEP sessions.
@@ -170,6 +171,28 @@ for matrix, ownership, coordinate and HEP compatibility details.
 The same loader accepts `.hep` files, `File`/`Blob` objects, bytes, and base64 data. Select PDF pages with `{ pages: "1-3, 5" }`; report loading progress with `{ onProgress: ({ stage, value }) => console.log(stage, value) }`.
 
 When removing a document, call `pdf.removeFromParent()` and `pdf.dispose()`. When closing the viewer, also stop its animation loop and dispose its controls and renderer. See the [examples](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/examples.md) to add search, text selection, and drawing selection.
+
+## Create a PDF
+
+Choose **New PDF** in either viewer to start editing blank pages. Select paper
+size, orientation and page count; add or resize pages under **Pages**, and enable
+adjustable automatic numbering under **Page Numbers**. New documents start with
+numbering off. PDF and HEP saves retain numbering settings, and locally created
+unsaved drafts can be resumed from the New PDF dialog.
+
+```js
+import { createPdf } from "@soadzoor/hepr";
+
+const pdf = await createPdf({ title: "My document", pageSize: "A4", pageCount: 3 });
+```
+
+See the [creation and numbering API](docs/api.md#new-pdfs-and-automatic-page-numbers)
+for custom dimensions, blank-page insertion, resizing and numbering controls.
+
+For ordered PDF drawing with original PDF pages, reusable raster images,
+SVG/vector paths, text and links, use [`createPdfDocument`](docs/api.md#pdf-composition).
+See the [PDF composition guide](docs/pdf-composition.md) and
+[runnable example](examples/pdf-composition.mjs).
 
 ## Render your own polylines
 

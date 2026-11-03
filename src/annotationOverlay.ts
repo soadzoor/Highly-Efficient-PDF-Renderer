@@ -163,8 +163,8 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
   panel.className = "hepr-annotation-bubble";
   panel.setAttribute("role", "dialog");
   panel.setAttribute("aria-label", "PDF annotation");
-  panel.style.cssText = "position:fixed;z-index:10001;box-sizing:border-box;max-width:min(360px,calc(100vw - 16px));" +
-    "max-height:min(320px,calc(100vh - 16px));overflow:auto;padding:12px 36px 12px 14px;" +
+  panel.style.cssText = "position:fixed;z-index:21;box-sizing:border-box;min-width:0;min-height:0;max-width:360px;" +
+    "max-height:320px;overflow:auto;padding:12px 36px 12px 14px;" +
     "border:1px solid #9ca3af;border-radius:8px;background:#fff;color:#111827;" +
     "box-shadow:0 4px 16px #0003;font:14px/1.4 system-ui,sans-serif;overflow-wrap:anywhere;" +
     "user-select:text;-webkit-user-select:text;pointer-events:auto;";
@@ -224,18 +224,34 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
     if (link && !pointer) { hide(); return; }
     const anchor = link ? pointer : adapter.sceneToClientPoint((minX + maxX) / 2, maxY);
     const viewport = options.getCanvas()?.getBoundingClientRect();
-    if (!anchor || !viewport || anchor.x < viewport.left || anchor.x > viewport.right || anchor.y < viewport.top || anchor.y > viewport.bottom) {
+    if (!anchor || !viewport || ![anchor.x, anchor.y, viewport.left, viewport.top, viewport.right, viewport.bottom,
+      window.innerWidth, window.innerHeight].every(Number.isFinite)) {
       panel.hidden = true; return;
     }
+    const left = Math.max(0, viewport.left), top = Math.max(0, viewport.top),
+      right = Math.min(window.innerWidth, viewport.right), bottom = Math.min(window.innerHeight, viewport.bottom);
+    if (left >= right || top >= bottom || anchor.x < left || anchor.x > right || anchor.y < top || anchor.y > bottom) {
+      panel.hidden = true; return;
+    }
+    const marginX = Math.min(8, (right - left) / 4), marginY = Math.min(8, (bottom - top) / 4);
+    const maxWidth = Math.min(360, right - left - marginX * 2), maxHeight = Math.min(320, bottom - top - marginY * 2);
+    // Border-box constraints also need fitting padding on very small viewports.
+    const border = Math.min(1, maxWidth / 2, maxHeight / 2), paddingRight = link ? 14 : 36;
+    const horizontal = Math.min(1, (maxWidth - border * 2) / (14 + paddingRight)),
+      vertical = Math.min(1, (maxHeight - border * 2) / 24);
+    const style = panel.style as unknown as Record<string, string>;
+    for (const [key, value] of Object.entries({ maxWidth: `${maxWidth}px`, maxHeight: `${maxHeight}px`, borderWidth: `${border}px`,
+      paddingLeft: `${14 * horizontal}px`, paddingRight: `${paddingRight * horizontal}px`,
+      paddingTop: `${12 * vertical}px`, paddingBottom: `${12 * vertical}px` })) if (style[key] !== value) style[key] = value;
     panel.hidden = false;
-    const width = panel.offsetWidth, height = panel.offsetHeight;
+    const width = Math.min(panel.offsetWidth, maxWidth), height = Math.min(panel.offsetHeight, maxHeight);
     let x = anchor.x + 12, y = anchor.y + 12;
     // Flip link previews near viewport edges so they keep an offset from the pointer.
-    if (link && x + width > window.innerWidth - 8) x = anchor.x - width - 12;
-    if (link && y + height > window.innerHeight - 8) y = anchor.y - height - 12;
-    x = Math.max(8, Math.min(x, window.innerWidth - width - 8));
-    y = Math.max(8, Math.min(y, window.innerHeight - height - 8));
-    panel.style.left = `${Math.round(x)}px`; panel.style.top = `${Math.round(y)}px`;
+    if (link && x + width > right - marginX) x = anchor.x - width - 12;
+    if (link && y + height > bottom - marginY) y = anchor.y - height - 12;
+    x = Math.max(left + marginX, Math.min(Math.round(x), right - width - marginX));
+    y = Math.max(top + marginY, Math.min(Math.round(y), bottom - height - marginY));
+    panel.style.left = `${x}px`; panel.style.top = `${y}px`;
   }
   function display(annotation: SceneAnnotation, pin: boolean): void {
     if (active !== annotation) {

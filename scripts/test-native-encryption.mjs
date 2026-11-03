@@ -24,6 +24,7 @@ const METADATA = "<?xpacket begin=''?><x:xmpmeta xmlns:x='adobe:ns:meta/'/><?xpa
 try {
   const { openNativePdfDocument } = await import("../src/pdf/nativeDocument.ts");
   const { isPdfStream } = await import("../src/pdf/nativeCos.ts");
+  const { NativePdfWriter, pdfAsciiValue, pdfStreamValue } = await import("../src/pdf/nativeWriter.ts");
 
   const { isPdfPasswordError, loadPdfSceneFromSource } = await import("../src/pdfObjectGenerator.ts");
 
@@ -70,8 +71,30 @@ try {
     identityStream: true
   }), "AES 128-bit");
   assert.equal(aes128[1], EXTRA_CONTENT, "a /Crypt /Identity stream is read without decryption");
+  const indirectCryptBytes = legacyPdf({ version: 4, revision: 4, keyBytes: 16, method: "aes128", encryptMetadata: false,
+    objectStream: true, identityStream: true, indirectCryptFilters: true });
+  const indirectCrypt = await expectPlaintext(indirectCryptBytes, "AES 128-bit");
+  assert.equal(indirectCrypt[1], EXTRA_CONTENT, "indirect Crypt selectors resolve before stream decryption");
+  const indirectDocument = await open(indirectCryptBytes);
+  let indirectRemoved;
+  try { indirectRemoved = await new NativePdfWriter(indirectDocument).save(undefined, { protection: { mode: "remove" } }); }
+  finally { await indirectDocument.close(); }
+  const indirectPlain = await open(indirectRemoved);
+  try {
+    assert.deepEqual((await indirectPlain.getDecodedPageContents(0)).map(part => Buffer.from(part).toString()), [CONTENT, EXTRA_CONTENT]);
+    const metadata = await indirectPlain.resolveValue(indirectPlain.catalog.get("Metadata"));
+    assert.equal(Buffer.from(await indirectPlain.decodeStream(metadata)).toString(), METADATA, "exempt metadata retains its plaintext after indirect Crypt removal");
+  } finally { await indirectPlain.close(); }
 
   await expectPlaintext(aes256Pdf({}), "AES 256-bit");
+  for (const [stored, supplied] of [["IXZ", "I\u00adX\u200cZ"], ["left right", "left\u00a0right"],
+    ["legacy\u00adpassword", "legacy\u00adpassword"], ["legacy\u0007password", "legacy\u0007password"]]) {
+    // The independent producer hashes the literal bytes supplied here. The
+    // reader accepts standards-prepared and older unprepared passwords.
+    const prepared = await open(aes256Pdf({ userPassword: stored }), supplied);
+    try { assert.equal(Buffer.from((await prepared.getDecodedPageContents(0))[0]).toString(), CONTENT); }
+    finally { await prepared.close(); }
+  }
 
   // Only the owner password is empty: Algorithm 7 recovers the user password.
   await expectPlaintext(
@@ -136,6 +159,46 @@ try {
     open(legacyPdf({ version: 2, revision: 3, keyBytes: 16, handler: "Adobe.PubSec" })),
     (error) => error?.code === "encrypted" && error.details?.reason === "security-handler"
   );
+  // Exercise writing against independently encrypted input, including old
+  // compressed objects, explicit Identity streams and inherited trailer IDs.
+  const addedContent = "0 0 1 rg 10 10 20 20 re f\n";
+  for (const [bytes, password] of [
+    [legacyPdf({ version: 1, revision: 2, keyBytes: 5 }), undefined],
+    [protectedRc4, "secret"],
+    [legacyPdf({ version: 4, revision: 4, keyBytes: 16, method: "aes128", objectStream: true,
+      identityStream: true, encryptMetadata: false }), undefined],
+    [protectedAes128, "secret"], [protectedAes256, "secret"],
+    [legacyPdf({ version: 2, revision: 3, keyBytes: 16, objectStream: true,
+      appendedId: "ffeeddccbbaa99887766554433221100" }), undefined]
+  ]) {
+    const before = Uint8Array.from(bytes), document = await open(bytes, password);
+    let saved;
+    try {
+      const writer = new NativePdfWriter(document), page = document.getPage(0);
+      const dictionary = new Map(page.dictionary), added = writer.add(pdfStreamValue(addedContent));
+      const contents = await document.resolveValue(page.contents);
+      dictionary.set("Contents", Array.isArray(contents) ? [...contents, added] : [page.contents, added]);
+      dictionary.set("HEPREdit", pdfAsciiValue("Edited secret"));
+      writer.set(page.ref, dictionary);
+      saved = await writer.save();
+      assert.equal(page.dictionary.has("HEPREdit"), false, "saving leaves the parser dictionaries unchanged");
+      assert.deepEqual(saved.subarray(0, before.length), before, "incremental saves retain the original encrypted revision");
+      assert.equal(Buffer.from(saved).includes(Buffer.from(addedContent)), false, "new stream bytes stay encrypted");
+      assert.equal(Buffer.from(saved).includes(Buffer.from("Edited secret").toString("hex")), false, "new strings stay encrypted");
+      assert.deepEqual(Uint8Array.from(bytes), before, "saving leaves caller bytes unchanged");
+    } finally { await document.close(); }
+    const reopened = await open(saved, password);
+    try {
+      assert.equal(Buffer.from(reopened.getPage(0).dictionary.get("HEPREdit").bytes).toString(), "Edited secret");
+      const contents = await reopened.getDecodedPageContents(0);
+      assert.equal(Buffer.from(contents[0]).toString(), CONTENT, "existing content remains decryptable");
+      assert.equal(Buffer.from(contents.at(-1)).toString(), addedContent, "new content decrypts with the existing password");
+      assert.equal(reopened.info.metadata.title, "Secret Title", "original Info strings survive appended saves");
+      const metadata = await reopened.resolveValue(reopened.catalog.get("Metadata"));
+      assert.equal(Buffer.from(await reopened.decodeStream(metadata)).toString(), METADATA);
+    } finally { await reopened.close(); }
+    if (password) await assert.rejects(open(saved, "wrong"), error => error?.code === "encrypted");
+  }
   console.log("Native PDF encryption tests passed.");
 } finally {
   hooks.deregister();
@@ -151,6 +214,7 @@ function legacyPdf({
   encryptMetadata = true,
   objectStream = false,
   identityStream = false,
+  indirectCryptFilters = false,
   appendedId = null,
   handler = "Standard"
 }) {
@@ -189,7 +253,7 @@ function legacyPdf({
     `/O <${owner.toString("hex")}> /U <${user.toString("hex")}> /P ${permissions}` +
     `${encryptMetadata ? "" : " /EncryptMetadata false"} >>`;
   const encryptor = (number, plain) => encryptLegacy(method, fileKey, number, plain);
-  return documentBytes({ encryptor, encrypt, encryptMetadata, objectStream, identityStream, appendedId });
+  return documentBytes({ encryptor, encrypt, encryptMetadata, objectStream, identityStream, indirectCryptFilters, appendedId });
 }
 
 function aes256Pdf({ userPassword = "", ownerPassword = "owner" }) {
@@ -225,6 +289,7 @@ function documentBytes({
   encryptMetadata,
   objectStream = false,
   identityStream = false,
+  indirectCryptFilters = false,
   compressContent = false,
   appendedId = null
 }) {
@@ -246,7 +311,7 @@ function documentBytes({
     : stream(4, "", Buffer.from(CONTENT));
   const metadata = encryptMetadata
     ? stream(6, "/Type /Metadata /Subtype /XML", Buffer.from(METADATA))
-    : Buffer.from(`<< /Type /Metadata /Subtype /XML /Length ${METADATA.length} >>\nstream\n${METADATA}\nendstream`);
+    : Buffer.from(`<< /Type /Metadata /Subtype /XML${indirectCryptFilters ? " /Filter 12 0 R /DecodeParms 13 0 R" : ""} /Length ${METADATA.length} >>\nstream\n${METADATA}\nendstream`);
 
   const objects = new Map([
     [1, Buffer.from("<< /Type /Catalog /Pages 2 0 R /Metadata 6 0 R >>")],
@@ -257,9 +322,14 @@ function documentBytes({
   ]);
   if (identityStream) {
     objects.set(8, Buffer.from(
-      `<< /Filter [/Crypt] /DecodeParms [<< /Name /Identity >>] /Length ${EXTRA_CONTENT.length} >>\n` +
+      `<< ${indirectCryptFilters ? "/Filter 12 0 R /DecodeParms 13 0 R" : "/Filter [/Crypt] /DecodeParms [<< /Name /Identity >>]"} /Length ${EXTRA_CONTENT.length} >>\n` +
       `stream\n${EXTRA_CONTENT}\nendstream`
     ));
+  }
+  if (indirectCryptFilters) {
+    objects.set(12, Buffer.from("[14 0 R]")); objects.set(13, Buffer.from("[15 0 R]")); objects.set(14, Buffer.from("/Crypt"));
+    objects.set(15, Buffer.from(`<< /Name 16 0 R /Private ${string(15, "already decrypted once")} >>`));
+    objects.set(16, Buffer.from("/Identity"));
   }
   const compressed = new Map();
   if (objectStream) {

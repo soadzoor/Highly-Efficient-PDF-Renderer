@@ -230,6 +230,15 @@ It preserves original PDF geometry alongside composed scene geometry, source
 identities, decoded strings, field metadata, relationships, inert actions and
 optional-content condition indexes. It contains no appearance streams.
 
+The same version-1 section may include optional `documentAuthoring` with a
+versioned document identity, title and automatic page-number policy. Managed
+number annotations carry a `pageNumberingId` matching that identity, and their
+compiled paint uses annotation appearance ownership so editors can replace it
+without duplicating visible digits. This metadata also persists when numbering
+is disabled. Older readers ignore these additions and display ordinary compiled
+paint; unsupported optional policies or ownership hints leave that paint usable.
+No source PDF, font programs, authoring history, or new container version is required.
+
 The reader validates the descriptor, version, count, geometry, scalar types,
 page slots, condition indexes and action cycles. Section lengths must fit the
 container's uint32 fields; records, coordinates, text and action nesting have

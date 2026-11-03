@@ -81,6 +81,8 @@
     "README.md",
     "CHANGELOG.md",
     "docs/HEP_CONTAINER.md",
+    "docs/pdf-composition.md",
+    "examples/pdf-composition.mjs",
     "LICENSE",
     "THIRD_PARTY_NOTICES"
   ],
@@ -120,7 +122,10 @@
     "prepublishOnly": "npm run changelog:check -- --released && npm test && npm run build:all",
     "clean:lib": "node scripts/clean-lib-output.mjs"
   },
-  "dependencies": {},
+  "dependencies": {
+    "bidi-js": "1.1.0",
+    "harfbuzzjs": "1.6.4"
+  },
   "optionalDependencies": {
     "@napi-rs/canvas": "1.0.9"
   },

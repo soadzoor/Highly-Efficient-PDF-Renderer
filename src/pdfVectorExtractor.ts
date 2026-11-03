@@ -1,4 +1,5 @@
 import { preparedRasterSection } from "./preparedRasterSections";
+import type { DocumentAuthoringData } from "./documentAuthoring";
 import type { SourceJpxRaster } from "./sourceJpxRaster";
 import { PAGE_PRIMITIVE_KINDS, PAGE_PRIMITIVE_RANGE_STRIDE, scenePrimitiveCounts, validatePagePrimitiveRanges } from "./scenePageViews";
 import { appendVectorDrawRun, defaultVectorDrawRuns, validateVectorDrawRuns } from "./vectorDrawOrder";
@@ -131,6 +132,8 @@ export interface VectorDrawRun {
 }
 
 export interface VectorScene {
+  /** Optional inert authoring settings; absent from ordinary and older documents. */
+  documentAuthoring?: DocumentAuthoringData;
   /** Original PDF size used to warn when an exported HEP is larger. */
   sourcePdfByteLength?: number;
   /** Internal one-page viewing policy; omitted from composed/exported document data. */
@@ -488,6 +491,7 @@ async function extractPdfPageScenesWithNative(
     sourcePageCount = vectorSession.info.pageCount;
     const pageNumbers = resolvePdfPageNumbers(sourcePageCount, options.pages);
     selectedPageCount = pageNumbers.length;
+    const completeDocument = selectedPageCount === sourcePageCount && pageNumbers.every((page, index) => page === index + 1);
     if (options.compressScans && !options.ocrTextOnly) {
       const { createPdfRasterCompressor } = await import("./pdfRasterCompression");
       scanCompressor = createPdfRasterCompressor(options.onDiagnostic);
@@ -526,6 +530,7 @@ async function extractPdfPageScenesWithNative(
         ...(options.annotationAppearances ? { annotationAppearances: options.annotationAppearances } : {}),
         onProgress: reportProgress
       });
+      if (!completeDocument) scene.documentAuthoring = undefined;
       signal?.throwIfAborted();
       if (options.extractTextContent === true) {
         scene.textContent = deriveSceneTextContentFromIndex(scene, 0);
@@ -896,6 +901,7 @@ function createNativeRasterOnlyPageScene(scene: VectorScene): VectorScene {
   const emptyRasterData = new Uint8Array(0);
   return {
     ...base,
+    documentAuthoring: scene.documentAuthoring,
     pdfPages: scene.pdfPages,
     annotations: scene.annotations?.map(a => { const { optionalContent: _condition, ...rest } = a; return { ...rest, pageIndex: 0 }; }),
     pageCount: 1,
@@ -1457,6 +1463,8 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     details: { pageCount: structureDroppedPages } });
   const composedScene: VectorScene = {
     annotations,
+    ...(pageScenes[0].documentAuthoring && pageScenes.every(scene => !scene.documentAuthoring || scene.documentAuthoring.id === pageScenes[0].documentAuthoring!.id)
+      ? { documentAuthoring: pageScenes[0].documentAuthoring } : {}),
     ...(pageScenes[0].annotationAppearances ? { annotationAppearances: pageScenes[0].annotationAppearances } : {}),
     ...structure,
     pdfPages,

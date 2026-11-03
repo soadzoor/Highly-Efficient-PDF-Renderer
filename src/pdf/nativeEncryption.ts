@@ -11,6 +11,7 @@ import {
 } from "./nativeCos";
 import { AesKey, concatBytes, md5, rc4, sha256, sha384, sha512 } from "./nativeCrypto";
 import { encodePdfDocEncoding } from "./nativePdfDocEncoding";
+import { preparePdfPassword } from "./pdfPasswordPrep";
 import { PdfError, type PdfDiagnostic } from "./nativeTypes";
 
 /** ISO 32000-2 Algorithm 2 password padding string. */
@@ -62,6 +63,8 @@ export class PdfSecurityHandler {
   private readonly filters: ReadonlyMap<string, CryptFilter>;
   private readonly encryptMetadata: boolean;
   private readonly encryptRefKey: string | null;
+  private readonly outputDictionary: PdfDictionary;
+  private readonly fileId: Uint8Array;
   private aesKeyCache: { readonly key: Uint8Array; readonly aes: AesKey } | null = null;
 
   private constructor(
@@ -71,7 +74,9 @@ export class PdfSecurityHandler {
     streamFilter: CryptFilter,
     encryptMetadata: boolean,
     encryptRef: PdfRef | null,
-    diagnostic: PdfDiagnostic
+    diagnostic: PdfDiagnostic,
+    outputDictionary: PdfDictionary,
+    fileId: Uint8Array
   ) {
     this.fileKey = fileKey;
     this.filters = filters;
@@ -80,6 +85,8 @@ export class PdfSecurityHandler {
     this.encryptMetadata = encryptMetadata;
     this.encryptRefKey = encryptRef ? pdfRefKey(encryptRef) : null;
     this.diagnostic = diagnostic;
+    this.outputDictionary = outputDictionary;
+    this.fileId = fileId;
   }
 
   static create(input: PdfEncryptionInput): PdfSecurityHandler {
@@ -187,8 +194,14 @@ export class PdfSecurityHandler {
           suppliedPassword: !authentication.empty,
           permissions
         }
-      }
+      }, dictionary, authentication.fileId ?? input.fileIds[0] ?? EMPTY
     );
+  }
+
+  /** @internal Preserve an authenticated handler on a freshly rebuilt PDF without exposing its file key. */
+  outputProtection(): { dictionary: PdfDictionary; fileId: Uint8Array; encrypt: (value: PdfValue, ref: PdfRef) => PdfValue } {
+    return { dictionary: this.outputDictionary, fileId: this.fileId,
+      encrypt: (value, ref) => this.encryptObject(value, ref, false) };
   }
 
   /**
@@ -196,7 +209,8 @@ export class PdfSecurityHandler {
    * source. Objects extracted from an object stream are already plain text
    * because the containing stream was decrypted.
    */
-  decryptObject(value: PdfValue, ref: PdfRef): PdfValue {
+  decryptObject(value: PdfValue, ref: PdfRef,
+    normalizeStreamDictionary?: (dictionary: PdfDictionary) => Promise<PdfDictionary>): PdfValue | Promise<PdfValue> {
     if (this.encryptRefKey !== null && pdfRefKey(ref) === this.encryptRefKey) return value;
     let objectKeys: Map<CryptMethod, Uint8Array> | null = null;
     const keyFor = (method: CryptMethod): Uint8Array => {
@@ -208,25 +222,54 @@ export class PdfSecurityHandler {
       }
       return key;
     };
-    if (isPdfStream(value)) return this.decryptStream(value, keyFor);
+    if (isPdfStream(value)) return this.decryptStream(value, keyFor, normalizeStreamDictionary);
     return this.decryptValue(value, keyFor);
   }
 
-  private decryptStream(stream: PdfStream, keyFor: (method: CryptMethod) => Uint8Array): PdfValue {
+  /** Encrypt newly serialized indirect objects using the authenticated source handler. */
+  encryptObject(value: PdfValue, ref: PdfRef, skipEncryptionDictionary = true): PdfValue {
+    if (skipEncryptionDictionary && this.encryptRefKey !== null && pdfRefKey(ref) === this.encryptRefKey) return value;
+    const encrypt = (filter: CryptFilter, bytes: Uint8Array): Uint8Array => {
+      if (filter.method === "identity") return bytes;
+      const key = this.objectKey(filter.method, ref);
+      if (filter.method === "rc4") return rc4(key, bytes);
+      const iv = crypto.getRandomValues(new Uint8Array(16));
+      const padding = 16 - bytes.length % 16;
+      const padded = new Uint8Array(bytes.length + padding);
+      padded.set(bytes); padded.fill(padding, bytes.length);
+      return concatBytes([iv, new AesKey(key).encryptCbc(padded, iv)]);
+    };
+    const visit = (entry: PdfValue): PdfValue => {
+      if (isPdfString(entry)) return { ...entry, bytes: encrypt(this.stringFilter, entry.bytes) };
+      if (Array.isArray(entry)) return entry.map(visit);
+      if (isPdfDictionary(entry)) return new Map([...entry].map(([key, item]) => [key, visit(item)]));
+      return entry;
+    };
+    if (!isPdfStream(value)) return visit(value);
+    const type = value.dictionary.get("Type");
+    if (isPdfName(type, "XRef")) return value;
+    const dictionary = visit(value.dictionary) as PdfDictionary;
+    // Source stream bytes are decrypted before reaching the writer. An explicit
+    // /Crypt filter is consumed by decode and is selected here if still present.
+    const explicit = takeCryptFilter(dictionary, this.filters);
+    const bytes = isPdfName(type, "Metadata") && !this.encryptMetadata ? value.bytes
+      : encrypt(explicit ?? this.streamFilter, value.bytes);
+    return { kind: "stream", dictionary, bytes };
+  }
+
+  private decryptStream(stream: PdfStream, keyFor: (method: CryptMethod) => Uint8Array,
+    normalizeDictionary?: (dictionary: PdfDictionary) => Promise<PdfDictionary>): PdfValue | Promise<PdfValue> {
     const type = stream.dictionary.get("Type");
     // Cross-reference streams are never encrypted; metadata may be exempt.
     if (isPdfName(type, "XRef")) return stream;
     const dictionary = this.decryptValue(stream.dictionary, keyFor) as PdfDictionary;
-    if (isPdfName(type, "Metadata") && !this.encryptMetadata) {
-      return { kind: "stream", dictionary, bytes: stream.bytes };
-    }
-    const explicit = takeCryptFilter(dictionary, this.filters);
-    const filter = explicit ?? this.streamFilter;
-    return {
-      kind: "stream",
-      dictionary,
-      bytes: this.decryptBytes(filter, stream.bytes, keyFor)
+    const finish = (dictionary: PdfDictionary): PdfValue => {
+      const explicit = takeCryptFilter(dictionary, this.filters);
+      return { kind: "stream", dictionary,
+        bytes: isPdfName(type, "Metadata") && !this.encryptMetadata ? stream.bytes
+          : this.decryptBytes(explicit ?? this.streamFilter, stream.bytes, keyFor) };
     };
+    return normalizeDictionary ? normalizeDictionary(dictionary).then(finish) : finish(dictionary);
   }
 
   private decryptValue(value: PdfValue, keyFor: (method: CryptMethod) => Uint8Array): PdfValue {
@@ -295,6 +338,7 @@ interface Authentication {
   readonly fileKey: Uint8Array;
   readonly password: "user" | "owner";
   readonly empty: boolean;
+  readonly fileId?: Uint8Array;
 }
 
 /**
@@ -314,12 +358,14 @@ function legacyPasswordCandidates(password: string): Uint8Array[] {
 
 /**
  * Revisions 5-6 hash the SASLprep-processed password as UTF-8, truncated to
- * 127 bytes. NFKC normalization is SASLprep's mapping step for practically
- * every password; the unnormalized text is tried as well.
+ * 127 bytes. Earlier writers sometimes omitted SASLprep's mapping or
+ * validation; NFKC-only and raw encodings remain compatibility candidates.
  */
 function aes256PasswordCandidates(password: string): Uint8Array[] {
   const encoder = new TextEncoder();
-  return uniquePasswords([password.normalize("NFKC"), password]
+  let prepared: string | null = null;
+  try { prepared = preparePdfPassword(password); } catch { /* Older nonconforming files can still use their original password. */ }
+  return uniquePasswords([prepared, password.normalize("NFKC"), password].filter((text): text is string => text !== null)
     .map((text) => encoder.encode(text).subarray(0, 127)));
 }
 
@@ -345,7 +391,7 @@ function authenticateLegacyWithIds(
     const authentication = authenticateLegacy(
       revision, keyLength, owner, user, permissions, fileId, encryptMetadata, password
     );
-    if (authentication) return authentication;
+    if (authentication) return { ...authentication, fileId };
   }
   return null;
 }

@@ -355,6 +355,7 @@ export class PdfPageDemandLoader {
             selectionIndex: index, selectedPageCount: this.pageCount, sourcePageCount: this.session.info.pages.length
           })
         });
+        if (this.sourcePages.length !== this.session.info.pages.length) scene.documentAuthoring = undefined;
         checkActive();
         if (!cached && this.options.extractTextContent === true) scene.textContent = deriveSceneTextContentFromIndex(scene, 0);
         pages.push(scene);
@@ -464,6 +465,7 @@ export class PdfPageDemandLoader {
             });
           }
         });
+        if (this.sourcePages.length !== this.session.info.pages.length) scene.documentAuthoring = undefined;
         try { this.onTiming?.(detail ? "pageSwap.decode" : "pageSwap.overview", performance.now() - started); }
         catch (error) { console.warn("[HEPR] Page timing listener failed.", error); }
         if (this.options.extractTextContent === true) scene.textContent = deriveSceneTextContentFromIndex(scene, 0);
@@ -506,6 +508,7 @@ export class PdfPageDemandLoader {
         enableInvisibleCull: this.options.enableInvisibleCull !== false,
         ...(this.options.annotationAppearances ? { annotationAppearances: this.options.annotationAppearances } : {})
       });
+      if (this.sourcePages.length !== this.session.info.pages.length) scene.documentAuthoring = undefined;
       // A higher-priority viewport request can interrupt and retry a thumbnail later.
       if (operation.signal.aborted || !this.pagePreviewRequests.has(request)) return;
       const preview = buildRasterScenePreview(scene, request.maximumDimension);

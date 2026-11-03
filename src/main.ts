@@ -16,6 +16,14 @@ import { createPdfAnnotationControls } from "./pdfAnnotationControls";
 import { waitForLoad, yieldAfterPaint, yieldForLoad } from "./loadCancellation";
 import { warmViewerRendering } from "./viewerRenderWarmup";
 import type { ThumbnailSceneRenderer } from "./thumbnailRenderer";
+import { createViewerPrintAction, type ViewerPrintAction, type ViewerPrintDocument } from "./viewerPrint";
+import { createViewerFileDropController } from "./viewerFileDrop";
+import { initializeToolbarIcons, setToolbarIconButton, toolbarIconMarkup } from "./toolbarIcons";
+import { createEditorSetupLoading, type EditorSetupLoadingHandle } from "./editorSetupLoading";
+import { panEditorReader } from "./editorHostPan";
+import type { CreatedDocumentSource, NewPdfRequest } from "./newPdfUi";
+import "./newPdfUi.css";
+import "./editorSetupLoading.css";
 
 import { WebGlPdfRenderer, type DrawStats, type SceneStats, type ViewState } from "./webGlPdfRenderer";
 import {
@@ -90,7 +98,6 @@ import { buildRasterScenePreview } from "./pageRasterPreview";
 const canvas = document.querySelector<HTMLCanvasElement>("#viewport");
 const hudElement = document.querySelector<HTMLDivElement>("#hud");
 const toggleHudButton = document.querySelector<HTMLButtonElement>("#toggle-hud");
-const toggleHudIcon = document.querySelector<HTMLSpanElement>("#toggle-hud-icon");
 const openButton = document.querySelector<HTMLButtonElement>("#open-file");
 const exampleDropdownContainer = document.querySelector<HTMLDivElement>("#example-dropdown");
 const exampleSelect = document.querySelector<HTMLButtonElement>("#example-select");
@@ -142,7 +149,6 @@ if (
   !canvas ||
   !hudElement ||
   !toggleHudButton ||
-  !toggleHudIcon ||
   !openButton ||
   !exampleDropdownContainer ||
   !exampleSelect ||
@@ -193,10 +199,12 @@ if (
   throw new Error("Required UI elements are missing from index.html.");
 }
 
+initializeToolbarIcons(document);
+exampleSelect.insertAdjacentHTML("afterbegin", toolbarIconMarkup("examples"));
+
 let canvasElement = canvas;
 const hudPanelElement = hudElement;
 const toggleHudButtonElement = toggleHudButton;
-const toggleHudIconElement = toggleHudIcon;
 const openButtonElement = openButton;
 const exampleDropdown = createExampleDropdown({
   containerElement: exampleDropdownContainer,
@@ -240,6 +248,17 @@ const vectorOpacityInputElement = vectorOpacityInput;
 let renderer: RendererApi;
 let webGpuRendererClass: typeof import("./webGpuPdfRenderer").WebGpuPdfRenderer | null = null;
 let lastParsedScene: VectorScene | null = null;
+let readerThumbnailScene: VectorScene | null = null;
+// Editing and document attachment load the editor, fonts and picking indexes on demand.
+let pdfEditor: import("./editorUi").EditorUi | null = null;
+let createdDocumentSource: CreatedDocumentSource | null = null;
+let editorFrameListener: (() => void) | null = null;
+let editorInitialization: AbortController | null = null;
+const editorSetupLoading = createEditorSetupLoading(() => canvasElement);
+let activeEditorSetup: EditorSetupLoadingHandle | null = null;
+const editorModeButton = document.querySelector<HTMLButtonElement>("#editor-mode")!;
+const printPdfButton = document.querySelector<HTMLButtonElement>("#print-pdf")!;
+let viewerPrintAction: ViewerPrintAction | null = null;
 // Reader transforms are presentation state. HEP exports keep the original grid.
 let lastCanonicalScene: VectorScene | null = null;
 let documentPageScenes: VectorScene[] | null = null;
@@ -263,6 +282,7 @@ let demandPdfUpdateTimer: number | null = null;
 let demandPdfUpdateRunning = false;
 let demandPdfUpdatePending = false;
 let backendSwitcher: ReturnType<typeof createBackendSwitcher> | null = null;
+let editorSceneApplicationActive = false;
 
 const uiControlManager = createUiControlManager(
   {
@@ -316,7 +336,8 @@ textSearchController = createTextSearchController({
   navigateToView: navigateNativeView
 });
 
-function applyTextSearchScene(scene: VectorScene): void {
+function applyTextSearchScene(scene: VectorScene, affectedPages?: readonly number[]): void {
+  readerThumbnailScene = scene;
   layerVisibility.sceneChanged();
   pdfLayerControls.refresh();
   annotationControls.sceneChanged();
@@ -327,6 +348,7 @@ function applyTextSearchScene(scene: VectorScene): void {
   textSearchController.setScene(scene);
   const hasText = scene.textIndex?.pages.some((page) => page.text.length > 0) ?? false;
   textSearchWidget.setAvailability(hasText ? "ready" : "no-text-index");
+  readerViewport?.invalidateThumbnails(affectedPages);
 }
 
 const textSelection = createTextSelectionController({
@@ -429,13 +451,15 @@ const layerVisibility = createLayerVisibilityController({
   getScene: () => lastParsedScene,
   getRenderer: () => renderer,
   onProgress: percentage => pdfLayerControls.setProgress(percentage),
-  onChange: () => {
+  onChange: snapshot => {
     textSearchController.refreshVisibility();
     textSelection.clearSelection();
     drawingSelection.onFrame();
     annotationInteraction?.onFrame();
     annotationOverlay.onFrame();
-    readerViewport?.invalidateThumbnails();
+    // Installing a scene publishes revision zero; its changed pages are
+    // invalidated by applyTextSearchScene. Later revisions are viewer toggles.
+    if (snapshot.revision > 0) readerViewport?.invalidateThumbnails();
   }
 });
 const pdfLayerControls = createPdfLayerControls({
@@ -499,6 +523,7 @@ function onRendererFrame(stats: DrawStats): void {
   drawingSelection.onFrame();
   annotationInteraction?.onFrame();
   annotationOverlay.onFrame();
+  editorFrameListener?.();
 
   // Camera/interaction work stays per frame; formatting and replacing the HUD
   // text hundreds of times per second adds unnecessary browser work.
@@ -575,8 +600,8 @@ function scheduleDemandPdfUpdate(): void {
       loader.bindDisplayScene(scene, pageScenes);
       await layerVisibility.sceneChanged(true);
       if (activePdfPageLoader !== loader || lastParsedScene !== scene) return;
-      applyTextSearchScene(scene);
-      readerViewport?.invalidateThumbnails();
+      // Display-page residency does not change the canonical thumbnail source.
+      applyTextSearchScene(scene, []);
       const initialUpdate = loader.getDisplayUpdate(scene);
       if (initialUpdate && renderer.prepareRasterLayerUpdates) {
         const staged = renderer.prepareRasterLayerUpdatesAsync
@@ -650,6 +675,7 @@ renderer = createWebGlRenderer(canvasElement);
 let readerThumbnailRenderer: ThumbnailSceneRenderer | undefined;
 readerViewport = createReaderViewport({
   getCanvas: () => canvasElement,
+  settingsPanel: hudPanelElement,
   layouts: [{ value: "reader", label: "Reader" }, { value: "grid", label: "Grid" }],
   onLayoutChange: changeNativeLayout,
   onViewChange: applyReaderView,
@@ -661,7 +687,7 @@ readerViewport = createReaderViewport({
         ? undefined : layerVisibility.getOptionalContentVisibility() ?? undefined };
     const pageLoader = nativeLoadPreparation ? nativeLoadPreparation.pageLoader : activePdfPageLoader;
     if (pageLoader) return pageLoader.getPageThumbnail(pageIndex, { ...appearance, signal: options.signal });
-    const scene = nativeLoadPreparation?.scene ?? lastParsedScene;
+    const scene = nativeLoadPreparation?.scene ?? readerThumbnailScene ?? lastParsedScene;
     if (!scene) throw new DOMException("No document is loaded.", "AbortError");
     let pages = thumbnailPartitions.get(scene);
     if (!pages) { pages = new ScenePageViews(scene); thumbnailPartitions.set(scene, pages); }
@@ -674,6 +700,199 @@ readerViewport = createReaderViewport({
   onFind: () => { setHudCollapsed(false); textSearchWidget.focusInput(); },
   onSettings: () => setHudCollapsed(!hudPanelElement.classList.contains("collapsed"))
 });
+document.querySelector(".reader-primary-controls")?.append(editorModeButton, printPdfButton);
+editorModeButton.addEventListener("click", () => { void togglePdfEditing(); });
+
+function setNativeEditing(active: boolean): void {
+  if (active) { drawingSelection.disable(); textSelection.disable(); annotationOverlay.hide(); }
+  else if (textSelectionCheckbox!.checked) textSelection.enable();
+  if (!active) activePdfPageLoader?.resume();
+  annotationInteraction?.setInteractionEnabled(!active);
+  textSelectionCheckbox!.disabled = active;
+  for (const control of [ocrTextCheckbox!, pageStreamingCheckbox!, compressScansCheckbox!]) control.disabled = active || Boolean(pdfEditor) || lastLoadedSource?.kind !== "pdf";
+  const layout = document.querySelector<HTMLSelectElement>(".reader-layout");
+  if (layout) layout.disabled = Boolean(editorInitialization) || pendingSourceLoadCount > 0 || activeSceneLoadToken !== null ||
+    activeHepExportController !== null || layoutChangeRunning || editorSceneApplicationActive || Boolean(pdfEditor?.isBusy?.()) || Boolean(backendSwitcher?.isSwitchInFlight());
+  setToolbarIconButton(editorModeButton, editorInitialization ? "cancel" : active ? "view" : "edit",
+    editorInitialization ? "Cancel editing setup" : active ? "View PDF" : "Edit PDF");
+  editorModeButton.setAttribute("aria-pressed", String(active));
+  viewerPrintAction?.refresh();
+}
+
+async function togglePdfEditing(): Promise<void> {
+  if (editorInitialization) { editorInitialization.abort(); return; }
+  let setup: EditorSetupLoadingHandle | undefined, controller: AbortController | undefined;
+  try {
+    if (!pdfEditor?.isEditing()) activeEditorSetup = setup = editorSetupLoading.begin({ stage: pdfEditor ? "display" : "loading" });
+    const editor = await ensureNativeEditor(undefined, setup);
+    controller = editorInitialization = new AbortController();
+    const layout = document.querySelector<HTMLSelectElement>(".reader-layout"); if (layout) layout.disabled = true;
+    setToolbarIconButton(editorModeButton, "cancel", "Cancel editing setup"); editorModeButton.setAttribute("aria-busy", "true");
+    if (setup) { setup.report({ stage: "display" }); await yieldAfterPaint(controller.signal); }
+    await editor.setEditing(!editor.isEditing(), controller.signal);
+    controller.signal.throwIfAborted(); clearLoadedStatus();
+  } catch (error) {
+    if (!(error instanceof DOMException && error.name === "AbortError")) setStatus(`Could not enter Edit mode: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    if (controller && editorInitialization === controller) {
+      editorInitialization = null; editorModeButton.removeAttribute("aria-busy");
+      setToolbarIconButton(editorModeButton, pdfEditor?.isEditing() ? "view" : "edit", pdfEditor?.isEditing() ? "View PDF" : "Edit PDF");
+      const layout = document.querySelector<HTMLSelectElement>(".reader-layout"); if (layout) layout.disabled = layoutChangeRunning || Boolean(pdfEditor?.isBusy?.());
+    }
+    setup?.finish(); if (activeEditorSetup === setup) activeEditorSetup = null;
+    viewerPrintAction?.refresh();
+  }
+}
+
+async function ensureNativeEditor(signal?: AbortSignal, setup?: EditorSetupLoadingHandle, preparingDocument = false): Promise<import("./editorUi").EditorUi> {
+  signal?.throwIfAborted();
+  if (editorInitialization || !preparingDocument && (pendingSourceLoadCount > 0 || activeSceneLoadToken !== null) || layoutChangeRunning || backendSwitcher?.isSwitchInFlight())
+    throw new Error("Wait for the document or renderer change to finish before editing the document.");
+  if (!lastParsedScene || !lastLoadedSource) throw new Error("Open a PDF or HEP before editing the document.");
+  if (pdfEditor) return pdfEditor;
+  const loading = setup ?? editorSetupLoading.begin({ stage: "loading" }); activeEditorSetup = loading;
+  setToolbarIconButton(editorModeButton, "cancel", "Cancel editing setup"); editorModeButton.setAttribute("aria-busy", "true");
+  const controller = editorInitialization = new AbortController();
+  const layout = document.querySelector<HTMLSelectElement>(".reader-layout"); if (layout) layout.disabled = true;
+  const abort = (): void => controller.abort(signal?.reason);
+  signal?.addEventListener("abort", abort, { once: true });
+  try {
+    if (!pdfEditor) {
+      setStatus("Preparing full-quality editing data…");
+      loading.report({ stage: "loading" }); await yieldAfterPaint(controller.signal);
+      const { createEditorUi } = await import("./editorUi");
+      const { remapEditorPagePoint } = await import("./editorCoordinates");
+      const { waitForEditorScenePresentation } = await import("./editorPresentation");
+      const { createEditorColorPreviewHost } = await import("./editorColorPreviewHost");
+      controller.signal.throwIfAborted();
+      const originalLayout = nativeLayout;
+      const originalSource = lastLoadedSource, originalPassword = lastLoadedPdfPassword;
+      const originalDownload = lastDownloadablePdf;
+      let editSourceScene: VectorScene | null = null, initialEditScene: VectorScene | null = null;
+      let editSourceLayout = originalLayout;
+      let pendingEditorSource: { pdf?: Uint8Array; password?: string; label: string } | null = null;
+      let editorPanRenderer: typeof renderer | undefined;
+      const sourcePlacementMatches = (): boolean => nativeLayout === editSourceLayout &&
+        (nativeLayout === "reader" || editSourceScene?.pagesPerRow === canonicalPagesPerRow);
+      const colorPreview = createEditorColorPreviewHost({ getTarget: () => renderer, getScene: () => lastParsedScene,
+        canApply: target => typeof target.setPrimitiveColorUpdates === "function",
+        apply: (target, updates) => target.setPrimitiveColorUpdates!(updates) });
+      pdfEditor = await createEditorUi({
+        layerControlsContainer: document.querySelector<HTMLDivElement>("#pdf-layers")!,
+        showLayerControls: () => setHudCollapsed(false),
+        getCanvas: () => canvasElement, getScene: () => lastParsedScene,
+        previewColors: updates => colorPreview.previewColors(updates),
+        beginCameraPan() { if (readerViewport?.isActive()) readerViewport.cancelActiveGesture(); else { editorPanRenderer = renderer; renderer.beginPanInteraction(); } },
+        panCameraByPixels(dx, dy) { if (!panEditorReader(readerViewport, dx, dy)) renderer.panByPixels(dx, dy); },
+        endCameraPan() { if (editorPanRenderer === renderer) editorPanRenderer.endPanInteraction(); editorPanRenderer = undefined; },
+        getSource: () => ({ bytes: lastLoadedSource?.bytes, pdf: lastLoadedSource?.kind === "pdf" ? lastLoadedSource.bytes : undefined,
+          password: lastLoadedPdfPassword, label: lastLoadedSource?.label ?? "document", ...createdDocumentSource }),
+        async prepareScene(signal, onProgress) {
+          const source = lastLoadedSource!;
+          activePdfPageLoader?.pause();
+          if (source.kind !== "pdf") return initialEditScene = editSourceScene = lastParsedScene!;
+          const pages = await extractPdfPageScenes(createParseBuffer(source.bytes), {
+            ...getExtractionOptions(), password: lastLoadedPdfPassword, compressScans: false, ocrTextOnly: false,
+            enableSegmentMerge: false, enableInvisibleCull: false,
+            onProgress: progress => { if (!signal.aborted && lastLoadedSource === source) {
+              onProgress?.(progress); setStatus(`Preparing editing data: ${Math.round(progress.value * 100)}%`);
+            } }
+          }, signal, "transfer");
+          signal.throwIfAborted();
+          return initialEditScene = editSourceScene = nativeLayout === "reader" ? composeVectorScenesInColumn(pages) : composeVectorScenesInGrid(pages, canonicalPagesPerRow);
+        },
+        documentChanged(scene, source) {
+          editSourceScene = scene;
+          // Structural sessions compose a canonical grid; undo can restore the
+          // exact initial Reader scene and its original page placement.
+          editSourceLayout = scene.pageRects === initialEditScene?.pageRects ? originalLayout : "grid";
+          pendingEditorSource = source;
+        },
+        async applyScene(scene, signal, onPresented, options) {
+          signal.throwIfAborted();
+          editorSceneApplicationActive = true; updateBackendSelectDisabledState();
+          try {
+            await waitForLoad(backendSwitcher!.runWhenIdle(() => undefined), signal); signal.throwIfAborted();
+            const transient = options?.preview && !pendingEditorSource && sourcePlacementMatches();
+            const partition = transient ? null : new ScenePageViews(scene), pageViews = partition
+              ? Array.from({ length: partition.pageCount }, (_, index) => partition.extract(index)) : null;
+            const pages = pageViews?.map(view => view.scene) ?? documentPageScenes ?? [];
+            const displayedScene = sourcePlacementMatches() ? scene : nativeLayout === "reader" ? composeVectorScenesInColumn(pages) : composeVectorScenesInGrid(pages, canonicalPagesPerRow);
+            const structural = pendingEditorSource, readerState = structural ? readerViewport?.snapshot() : undefined;
+            const view = renderer.getViewState();
+            colorPreview.beforeSceneChange();
+            if (!transient || !renderer.updateEditorPreviewScene?.(displayedScene)) {
+              renderer.setScene(displayedScene, { preserveRasterResolution: true }); renderer.setViewState(view);
+            }
+            lastParsedScene = displayedScene;
+            if (!transient) {
+              documentPageScenes = pages;
+              lastCanonicalScene = nativeLayout === "grid" ? displayedScene : composeVectorScenesInGrid(pages, canonicalPagesPerRow);
+              const previousLoader = activePdfPageLoader; activePdfPageLoader = null;
+              void previousLoader?.close(); parsedPdfPageCache = null;
+            }
+            if (structural) {
+              lastLoadedSource = structural.pdf ? { kind: "pdf", bytes: structural.pdf, label: structural.label } : originalSource;
+              lastLoadedPdfPassword = structural.pdf ? structural.password : originalPassword;
+              lastDownloadablePdf = structural.pdf ? { bytes: structural.pdf, label: structural.label, url: originalDownload?.url } : originalDownload;
+              pendingEditorSource = null;
+              updateNativePresentation(nativeLayout, pages, lastLoadedSource?.bytes);
+              if (readerState && nativeLayout === "reader") readerViewport?.restore(readerState);
+              else renderer.setViewState(view);
+              setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
+            }
+            if (options?.preview && !structural) textSearchController.setScene(displayedScene);
+            else applyTextSearchScene(displayedScene, options?.affectedPages);
+            if (onPresented) {
+              const target = renderer;
+              await waitForEditorScenePresentation({ signal, onPresented: () => { colorPreview.bind(scene, displayedScene, pageViews ?? undefined); onPresented(); },
+                isCurrent: () => renderer === target && lastParsedScene === displayedScene,
+                subscribe: notify => {
+                  target.setFrameListener(stats => { try { onRendererFrame(stats); } finally { notify(); } });
+                  return () => target.setFrameListener(onRendererFrame);
+                } });
+            } else colorPreview.bind(scene, displayedScene, pageViews ?? undefined);
+          } finally { editorSceneApplicationActive = false; updateBackendSelectDisabledState(); }
+        },
+        clientToScenePoint: (x, y, pageIndex) => {
+          const point = renderer.clientToScenePoint?.(x, y);
+          if (point && sourcePlacementMatches()) return point;
+          return point && lastParsedScene && editSourceScene ? remapEditorPagePoint(point, lastParsedScene.pageRects, editSourceScene.pageRects, pageIndex) : null;
+        },
+        sceneToClientPoint: (x, y, pageIndex) => {
+          if (sourcePlacementMatches()) return renderer.sceneToClientPoint?.(x, y) ?? null;
+          const point = lastParsedScene && editSourceScene ? remapEditorPagePoint({ x, y }, editSourceScene.pageRects, lastParsedScene.pageRects, pageIndex) : null;
+          return point ? renderer.sceneToClientPoint?.(point.x, point.y) ?? null : null;
+        },
+        subscribeToFrames(listener) {
+          editorFrameListener = listener;
+          return () => { if (editorFrameListener === listener) editorFrameListener = null; };
+        },
+        requestFrame: () => renderer.requestFrame?.(),
+        setEditing: setNativeEditing, onStatus: setStatus, onBusyChange: () => { updateBackendSelectDisabledState(); viewerPrintAction?.refresh(); },
+        onSetupProgress: progress => { if (!controller.signal.aborted) loading.report(progress); }
+      }, controller.signal);
+    }
+    controller.signal.throwIfAborted(); return pdfEditor;
+  } finally {
+    signal?.removeEventListener("abort", abort);
+    if (!setup) { loading.finish(); if (activeEditorSetup === loading) activeEditorSetup = null; }
+    if (editorInitialization === controller) {
+      editorInitialization = null; editorModeButton.removeAttribute("aria-busy");
+      setToolbarIconButton(editorModeButton, pdfEditor?.isEditing() ? "view" : "edit", pdfEditor?.isEditing() ? "View PDF" : "Edit PDF");
+      const layout = document.querySelector<HTMLSelectElement>(".reader-layout"); if (layout) layout.disabled = layoutChangeRunning || Boolean(pdfEditor?.isBusy?.());
+      if (!pdfEditor) activePdfPageLoader?.resume();
+    }
+    viewerPrintAction?.refresh();
+  }
+}
+
+function discardNativeEditor(): boolean {
+  if (pdfEditor && !pdfEditor.confirmDocumentChange()) return false;
+  editorInitialization?.abort(); editorInitialization = null;
+  activeEditorSetup?.finish(); activeEditorSetup = null;
+  pdfEditor?.dispose(); pdfEditor = null; setNativeEditing(false); return true;
+}
 
 function applyReaderView(view: ReaderView): void {
   if (!readerViewport?.isActive()) return;
@@ -708,77 +927,87 @@ function updateNativePresentation(layout: "reader" | "grid", pages: VectorScene[
 async function changeNativeLayout(value: string): Promise<void> {
   const nextLayout = value === "reader" ? "reader" : "grid";
   if (nextLayout === nativeLayout) return;
-  if (!lastParsedScene || !documentPageScenes || layoutChangeRunning || activeSceneLoadToken !== null ||
-      pendingSourceLoadCount > 0 || activeHepExportController !== null || backendSwitcher?.isSwitchInFlight()) {
-    readerViewport?.setLayout(nativeLayout);
-    return;
-  }
-  layoutChangeRunning = true;
-  updateBackendSelectDisabledState();
-  const source = lastLoadedSource;
-  const previousScene = lastParsedScene;
-  const previousPages = documentPageScenes;
-  const previousCanonicalScene = lastCanonicalScene;
-  const previousReaderState = readerViewport!.snapshot();
-  const previousGridView = gridViewState;
-  const previousSavedReaderView = readerViewState;
-  const previousView = renderer.getViewState();
-  const previousLayout = nativeLayout;
-  const ratio = canvasElement.width / Math.max(1, canvasElement.getBoundingClientRect().width);
-  const anchor = readerCaptureAnchor(previousScene.pageRects, { centerX: previousView.cameraCenterX,
-    centerY: previousView.cameraCenterY, zoom: previousView.zoom / ratio });
-  try {
-    const pages = activePdfPageLoader?.displayPageScenes ?? documentPageScenes;
-    const scene = nextLayout === "reader" ? composeVectorScenesInColumn(pages)
-      : activePdfPageLoader ? prepareSceneForHepRendering(composeVectorScenesInGrid(pages, canonicalPagesPerRow))
-        : lastCanonicalScene!;
-    if (!activePdfPageLoader) {
-      if (!reuseTextLodForPageTranslation(previousScene, scene) && lastCanonicalScene) {
-        reuseTextLodForPageTranslation(lastCanonicalScene, scene);
-      }
+  if (editorInitialization || pdfEditor?.isBusy?.()) { readerViewport?.setLayout(nativeLayout); return; }
+  const applyLayout = async (): Promise<void> => {
+    if (!lastParsedScene || !documentPageScenes || layoutChangeRunning || activeSceneLoadToken !== null ||
+        pendingSourceLoadCount > 0 || activeHepExportController !== null || backendSwitcher?.isSwitchInFlight()) {
+      readerViewport?.setLayout(nativeLayout);
+      return;
     }
-    await prebuildVectorStrokeLodRuntime(scene, uiControlManager.readVectorLodModeInput(),
-      backendSwitcher?.getActiveBackend() ?? "webgl", { shouldCancel: () => lastLoadedSource !== source || pendingSourceLoadCount > 0 });
-    await prebuildTextLod(scene);
-    if (lastLoadedSource !== source || lastParsedScene !== previousScene || pendingSourceLoadCount > 0) return;
-    const stats = uploadSceneWithRollback(renderer, scene, true);
-    if (previousLayout === "grid") gridViewState = previousView;
-    else readerViewState = previousReaderState;
-    lastParsedScene = scene;
-    documentPageScenes = pages;
-    if (nextLayout === "grid" && activePdfPageLoader) lastCanonicalScene = scene;
-    activePdfPageLoader?.bindDisplayScene(scene, pages);
-    updateNativePresentation(nextLayout, pages, source?.bytes);
-    if (nextLayout === "reader") {
-      if (readerViewState) readerViewport!.restore(readerViewState);
-      else readerViewport!.goToPage(anchor.pageIndex);
-    } else {
-      if (gridViewState) renderer.setViewState(gridViewState);
-      else renderer.fitToBounds(resolveSceneFitBounds(scene), 64);
-    }
-    await layerVisibility.sceneChanged(true);
-    if (lastLoadedSource !== source || lastParsedScene !== scene) return;
-    applyTextSearchScene(scene);
-    updateMetricsPanel(lastParsedSceneLabel ?? "Document", scene, stats, 0, 0, null, null);
-  } catch (error) {
-    if (lastLoadedSource === source) {
-      lastParsedScene = previousScene;
-      lastCanonicalScene = previousCanonicalScene;
-      documentPageScenes = previousPages;
-      gridViewState = previousGridView;
-      readerViewState = previousSavedReaderView;
-      renderer.setScene(previousScene);
-      activePdfPageLoader?.bindDisplayScene(previousScene, previousPages);
-      updateNativePresentation(previousLayout, previousPages, source?.bytes);
-      readerViewport!.restore(previousReaderState);
-      renderer.setViewState(previousView);
-      await layerVisibility.sceneChanged(true);
-      applyTextSearchScene(previousScene);
-      setStatus(`Failed to change layout: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  } finally {
-    layoutChangeRunning = false;
+    layoutChangeRunning = true;
     updateBackendSelectDisabledState();
+    const source = lastLoadedSource;
+    const previousScene = lastParsedScene;
+    const previousPages = documentPageScenes;
+    const previousCanonicalScene = lastCanonicalScene;
+    const previousReaderState = readerViewport!.snapshot();
+    const previousGridView = gridViewState;
+    const previousSavedReaderView = readerViewState;
+    const previousView = renderer.getViewState();
+    const previousLayout = nativeLayout;
+    const ratio = canvasElement.width / Math.max(1, canvasElement.getBoundingClientRect().width);
+    const anchor = readerCaptureAnchor(previousScene.pageRects, { centerX: previousView.cameraCenterX,
+      centerY: previousView.cameraCenterY, zoom: previousView.zoom / ratio });
+    try {
+      const pages = activePdfPageLoader?.displayPageScenes ?? documentPageScenes;
+      const scene = nextLayout === "reader" ? composeVectorScenesInColumn(pages)
+        : activePdfPageLoader ? prepareSceneForHepRendering(composeVectorScenesInGrid(pages, canonicalPagesPerRow))
+          : lastCanonicalScene!;
+      if (!activePdfPageLoader) {
+        if (!reuseTextLodForPageTranslation(previousScene, scene) && lastCanonicalScene) {
+          reuseTextLodForPageTranslation(lastCanonicalScene, scene);
+        }
+      }
+      await prebuildVectorStrokeLodRuntime(scene, uiControlManager.readVectorLodModeInput(),
+        backendSwitcher?.getActiveBackend() ?? "webgl", { shouldCancel: () => lastLoadedSource !== source || pendingSourceLoadCount > 0 });
+      await prebuildTextLod(scene);
+      if (lastLoadedSource !== source || lastParsedScene !== previousScene || pendingSourceLoadCount > 0) return;
+      const stats = uploadSceneWithRollback(renderer, scene, true);
+      if (previousLayout === "grid") gridViewState = previousView;
+      else readerViewState = previousReaderState;
+      lastParsedScene = scene;
+      documentPageScenes = pages;
+      if (nextLayout === "grid" && activePdfPageLoader) lastCanonicalScene = scene;
+      activePdfPageLoader?.bindDisplayScene(scene, pages);
+      updateNativePresentation(nextLayout, pages, source?.bytes);
+      if (nextLayout === "reader") {
+        if (readerViewState) readerViewport!.restore(readerViewState);
+        else readerViewport!.goToPage(anchor.pageIndex);
+      } else {
+        if (gridViewState) renderer.setViewState(gridViewState);
+        else renderer.fitToBounds(resolveSceneFitBounds(scene), 64);
+      }
+      await layerVisibility.sceneChanged(true);
+      if (lastLoadedSource !== source || lastParsedScene !== scene) return;
+      applyTextSearchScene(scene);
+      updateMetricsPanel(lastParsedSceneLabel ?? "Document", scene, stats, 0, 0, null, null);
+    } catch (error) {
+      if (lastLoadedSource === source) {
+        lastParsedScene = previousScene;
+        lastCanonicalScene = previousCanonicalScene;
+        documentPageScenes = previousPages;
+        gridViewState = previousGridView;
+        readerViewState = previousSavedReaderView;
+        renderer.setScene(previousScene);
+        activePdfPageLoader?.bindDisplayScene(previousScene, previousPages);
+        updateNativePresentation(previousLayout, previousPages, source?.bytes);
+        readerViewport!.restore(previousReaderState);
+        renderer.setViewState(previousView);
+        await layerVisibility.sceneChanged(true);
+        applyTextSearchScene(previousScene);
+        setStatus(`Failed to change layout: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } finally {
+      layoutChangeRunning = false;
+      updateBackendSelectDisabledState();
+    }
+  };
+  try {
+    if (pdfEditor) await pdfEditor.runPresentationChange(applyLayout);
+    else await applyLayout();
+  } catch (error) {
+    readerViewport?.setLayout(nativeLayout);
+    setStatus(`Failed to change layout: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -893,6 +1122,9 @@ interface LoadPdfOptions {
   preserveView?: boolean;
   /** Password for a PDF that requires one; used only while parsing. */
   password?: string;
+  createdDocument?: CreatedDocumentSource;
+  beforeCommit?(): void;
+  prepareEditor?(): Promise<void>;
 }
 
 const LOAD_PROGRESS_PARSE_END = 0.34;
@@ -954,7 +1186,7 @@ backendSwitcher = createBackendSwitcher({
   isOperationActive: () =>
     pendingSourceLoadCount > 0 ||
     activeSceneLoadToken !== null ||
-    activeHepExportController !== null || layoutChangeRunning,
+    activeHepExportController !== null || layoutChangeRunning || editorSceneApplicationActive,
   getSceneSnapshot: () => ({
     scene: lastParsedScene,
     label: lastParsedSceneLabel,
@@ -980,6 +1212,12 @@ backendSwitcher.initializeToggleState();
 setMetricPlaceholder();
 setHudCollapsed(false);
 setDownloadDataButtonState(false);
+viewerPrintAction = createViewerPrintAction({ button: printPdfButton, document,
+  getDocument: getNativePrintDocument,
+  isBusy: () => pendingSourceLoadCount > 0 || activeSceneLoadToken !== null || layoutChangeRunning ||
+    editorInitialization !== null || editorSceneApplicationActive || Boolean(backendSwitcher?.isSwitchInFlight()) ||
+    activeHepExportController !== null || isBatchExampleExportRunning || fileInputElement.disabled || Boolean(pdfEditor?.isBusy?.()),
+  setStatus });
 setDownloadPdfButtonState(false);
 setDownloadAllDataButtonState(false);
 setStatus(baseStatus);
@@ -989,6 +1227,65 @@ void loadExampleManifest();
 openButtonElement.addEventListener("click", () => {
   fileInputElement.click();
 });
+document.querySelector<HTMLButtonElement>("#new-pdf")!.addEventListener("click", () => { void openNewPdfDialog(); });
+
+async function openNewPdfDialog(): Promise<void> {
+  const [{ showNewPdfDialog, readCreatedDocumentRecovery }, { createEditorRecoveryStore }] = await Promise.all([import("./newPdfUi"), import("./editorRecoveryStore")]);
+  showNewPdfDialog(document, {
+    async create(request: NewPdfRequest, signal) {
+      const { createPdf } = await import("./editorApi");
+      const bytes = new Uint8Array(await (await createPdf({ ...request, signal })).arrayBuffer()); signal.throwIfAborted();
+      return openCreatedNativePdf(bytes, request.title, { createdDocument: true, initialUnsaved: true }, signal);
+    },
+    async resume(entry, signal) {
+      const { snapshot } = await readCreatedDocumentRecovery(entry.key, signal);
+      const bytes = snapshot.sourcePdf ?? new Uint8Array(await (await (await import("./editorApi")).writeScenePdf(snapshot.sourceScene, { signal })).arrayBuffer());
+      signal.throwIfAborted();
+      return openCreatedNativePdf(bytes, snapshot.sourceLabel ?? entry.label, { createdDocument: true, initialUnsaved: true, recoveryKey: entry.key, resumeRecovery: true }, signal);
+    },
+    async listDrafts() { const store = createEditorRecoveryStore(); try { return await store.list(); } finally { store.close?.(); } },
+    onError: error => setStatus(`Could not create PDF: ${error instanceof Error ? error.message : String(error)}`)
+  });
+}
+
+/** Keep the old authoring session until its replacement has parsed and rendered. */
+async function openCreatedNativePdf(bytes: Uint8Array, title: string, created: CreatedDocumentSource, externalSignal: AbortSignal): Promise<boolean> {
+  externalSignal.throwIfAborted();
+  if (editorInitialization || pendingSourceLoadCount || activeSceneLoadToken !== null || layoutChangeRunning || pdfEditor?.isBusy?.()) throw new Error("Wait for the current document operation to finish.");
+  const previousEditor = pdfEditor, wasEditing = previousEditor?.isEditing() ?? false;
+  if (previousEditor && !previousEditor.confirmDocumentChange({ deferRecoveryDiscard: true })) return false;
+  if (wasEditing) { await previousEditor!.setEditing(false, externalSignal); if (previousEditor!.isEditing()) return false; }
+  const previous = { lastParsedScene, lastCanonicalScene, documentPageScenes, canonicalPagesPerRow, lastParsedSceneLabel, lastLoadedSource,
+    lastLoadedPdfPassword, lastDownloadablePdf, createdDocumentSource, nativeLayout, gridViewState, readerViewState, parsedPdfPageCache,
+    activePdfPageLoader, loadedOcrTextOnly, loadedPageStreaming, loadedCompressScans, loadedCompressScansPreference };
+  cancelActiveHepExport();
+  const token = beginSourceLoad(), signal = AbortSignal.any([externalSignal, sourceLoadController!.signal]);
+  const label = /\.pdf$/i.test(title) ? title : `${title}.pdf`;
+  let committed = false;
+  setPrimaryLoadControlsEnabled(false);
+  try {
+    await loadPdfBuffer(createParseBuffer(bytes), label, { source: { kind: "pdf", bytes, label }, downloadablePdf: { bytes, label },
+      signal, preserveView: false, createdDocument: created,
+      async prepareEditor() { pdfEditor = null; const editor = await ensureNativeEditor(signal, undefined, true); await editor.setEditing(true, signal); signal.throwIfAborted(); },
+      beforeCommit() { previousEditor?.dispose({ discardRecovery: true, preserveRecoveryKey: created.recoveryKey, preserveHostMode: true }); committed = true; }
+    });
+  } finally {
+    finishSourceLoad(token);
+    if (!committed) {
+      if (pdfEditor && pdfEditor !== previousEditor) pdfEditor.dispose(); pdfEditor = previousEditor;
+      const candidateLoader = activePdfPageLoader;
+      ({ lastParsedScene, lastCanonicalScene, documentPageScenes, canonicalPagesPerRow, lastParsedSceneLabel, lastLoadedSource,
+        lastLoadedPdfPassword, lastDownloadablePdf, createdDocumentSource, nativeLayout, gridViewState, readerViewState, parsedPdfPageCache,
+        activePdfPageLoader, loadedOcrTextOnly, loadedPageStreaming, loadedCompressScans, loadedCompressScansPreference } = previous);
+      if (candidateLoader !== activePdfPageLoader) void candidateLoader?.close();
+      if (lastParsedScene) applyTextSearchScene(lastParsedScene); else { readerThumbnailScene = null; textSearchController.setScene(null); }
+      refreshDropIndicator(); setDownloadDataButtonState(Boolean(lastParsedScene)); setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
+      if (previousEditor && wasEditing) await previousEditor.setEditing(true);
+    }
+    setPrimaryLoadControlsEnabled(true);
+  }
+  return committed;
+}
 
 downloadDataButtonElement.addEventListener("click", () => {
   void downloadHep();
@@ -1003,6 +1300,8 @@ downloadAllDataButtonElement.addEventListener("click", () => {
 });
 
 window.addEventListener("beforeunload", () => {
+  fileDropController.dispose();
+  viewerPrintAction?.cancel();
   readerViewport?.dispose();
   drawCallMeter.dispose();
   annotationInteraction?.dispose();
@@ -1037,7 +1336,9 @@ fileInputElement.addEventListener("change", async () => {
 
 backendSelectElement.addEventListener("change", () => {
   const targetBackend = backendSelectElement.value === "webgpu" ? "webgpu" : "webgl";
-  void backendSwitcher?.applyPreference(targetBackend);
+  const switching = backendSwitcher?.applyPreference(targetBackend);
+  viewerPrintAction?.refresh();
+  void switching?.finally(() => viewerPrintAction?.refresh());
 });
 
 uiControlManager.bindEventListeners({
@@ -1094,49 +1395,28 @@ window.addEventListener("keydown", (event) => {
   }
 });
 
-window.addEventListener("dragenter", (event) => {
-  event.preventDefault();
-  isDropDragActive = true;
-  refreshDropIndicator();
-});
-
-window.addEventListener("dragover", (event) => {
-  event.preventDefault();
-  if (!isDropDragActive) {
-    isDropDragActive = true;
-    refreshDropIndicator();
-  }
-});
-
-window.addEventListener("dragleave", (event) => {
-  if (event.target === document.documentElement || event.target === document.body) {
-    isDropDragActive = false;
-    refreshDropIndicator();
-  }
-});
-
-window.addEventListener("drop", async (event) => {
-  event.preventDefault();
-  isDropDragActive = false;
-  refreshDropIndicator();
-
-  const files = Array.from(event.dataTransfer?.files || []);
-  const supported = files.find((file) => isPdfFile(file) || isHepFile(file));
-
-  if (!supported) {
-    setStatus("Dropped file is not a supported PDF or HEP file.");
-    return;
-  }
-
-  if (isPdfFile(supported)) {
-    await loadPdfFile(supported);
-  } else {
-    await loadHepFile(supported);
-  }
+const fileDropController = createViewerFileDropController({
+  document,
+  getDocument: () => lastParsedScene && lastLoadedSource ? { identity: lastLoadedSource.bytes, label: lastLoadedSource.label } : null,
+  isEditing: () => pdfEditor?.isEditing() ?? false,
+  isBusy: () => pendingSourceLoadCount > 0 || activeSceneLoadToken !== null || layoutChangeRunning ||
+    editorInitialization !== null || editorSceneApplicationActive || Boolean(backendSwitcher?.isSwitchInFlight()) ||
+    activeHepExportController !== null || isBatchExampleExportRunning || fileInputElement.disabled || Boolean(pdfEditor?.isBusy?.()),
+  replace: (file, signal) => isPdfFile(file) ? loadPdfFile(file, signal) : loadHepFile(file, signal),
+  async attach(files, signal) { await (await ensureNativeEditor(signal)).attachDocuments(files, signal); },
+  async insertImages(files, client, signal) {
+    if (!pdfEditor?.isEditing()) throw new Error("Enter Edit mode before dropping images onto the document.");
+    await pdfEditor.dropImages(files, client, signal);
+  },
+  setDragging(active) { isDropDragActive = active; refreshDropIndicator(); },
+  setStatus
 });
 
 function refreshDropIndicator(): void {
   const shouldShow = isDropDragActive || !lastParsedScene;
+  dropIndicatorElement.textContent = pdfEditor?.isEditing()
+    ? "Drop PDF/HEP documents to replace or attach, or images onto a page"
+    : lastParsedScene ? "Drop PDF/HEP documents to replace or attach" : "Drop PDF or HEP files to open";
   dropIndicatorElement.classList.toggle("active", shouldShow);
   dropIndicatorElement.classList.toggle("dragging", isDropDragActive);
 }
@@ -1222,6 +1502,7 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
   if (!selection) {
     return;
   }
+  if (!discardNativeEditor()) return;
 
   cancelActiveHepExport();
   const sourceLoadToken = beginSourceLoad();
@@ -1284,15 +1565,17 @@ function isHepFile(file: File): boolean {
   );
 }
 
-async function loadPdfFile(file: File): Promise<void> {
+async function loadPdfFile(file: File, externalSignal?: AbortSignal): Promise<boolean> {
+  externalSignal?.throwIfAborted();
+  if (!discardNativeEditor()) return false;
   cancelActiveHepExport();
   const sourceLoadToken = beginSourceLoad();
-  const signal = sourceLoadController!.signal;
+  const signal = externalSignal ? AbortSignal.any([sourceLoadController!.signal, externalSignal]) : sourceLoadController!.signal;
   try {
     setStatus(`Reading ${file.name}...`);
     const buffer = await waitForLoad(file.arrayBuffer(), signal);
     if (!isCurrentSourceLoad(sourceLoadToken)) {
-      return;
+      return false;
     }
     const bytes = cloneSourceBytes(buffer);
     let password: string | undefined;
@@ -1316,11 +1599,13 @@ async function loadPdfFile(file: File): Promise<void> {
         });
         if (answer === null) {
           if (isCurrentSourceLoad(sourceLoadToken)) setStatus(`${file.name} was not opened: it needs a password.`);
-          return;
+          return false;
         }
         password = answer;
       }
     }
+    signal.throwIfAborted();
+    return isCurrentSourceLoad(sourceLoadToken) && lastLoadedSource?.bytes === bytes;
   } catch (error) {
     if (!signal.aborted && isCurrentSourceLoad(sourceLoadToken)) {
       setStatus(`Failed to read PDF: ${error instanceof Error ? error.message : String(error)}`);
@@ -1328,17 +1613,20 @@ async function loadPdfFile(file: File): Promise<void> {
   } finally {
     finishSourceLoad(sourceLoadToken);
   }
+  return false;
 }
 
-async function loadHepFile(file: File): Promise<void> {
+async function loadHepFile(file: File, externalSignal?: AbortSignal): Promise<boolean> {
+  externalSignal?.throwIfAborted();
+  if (!discardNativeEditor()) return false;
   cancelActiveHepExport();
   const sourceLoadToken = beginSourceLoad();
-  const signal = sourceLoadController!.signal;
+  const signal = externalSignal ? AbortSignal.any([sourceLoadController!.signal, externalSignal]) : sourceLoadController!.signal;
   try {
     setStatus(`Reading ${file.name}...`);
     const buffer = await waitForLoad(file.arrayBuffer(), signal);
     if (!isCurrentSourceLoad(sourceLoadToken)) {
-      return;
+      return false;
     }
     const bytes = cloneSourceBytes(buffer);
     await loadHepBuffer(createParseBuffer(bytes), file.name, {
@@ -1347,6 +1635,8 @@ async function loadHepFile(file: File): Promise<void> {
       signal,
       preserveView: false
     });
+    signal.throwIfAborted();
+    return isCurrentSourceLoad(sourceLoadToken) && lastLoadedSource?.bytes === bytes;
   } catch (error) {
     if (!signal.aborted && isCurrentSourceLoad(sourceLoadToken)) {
       setStatus(`Failed to read HEP file: ${error instanceof Error ? error.message : String(error)}`);
@@ -1354,6 +1644,7 @@ async function loadHepFile(file: File): Promise<void> {
   } finally {
     finishSourceLoad(sourceLoadToken);
   }
+  return false;
 }
 
 async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions): Promise<void> {
@@ -1450,11 +1741,6 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     demandLoader?.bindDisplayScene(scene, pageScenes);
     const rasterLayerCount = listSceneRasterLayers(scene).length;
     const hasRasterLayer = rasterLayerCount > 0;
-    if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer && !demandLoader && !extractionOptions.ocrTextOnly) {
-      setParsingLoader(false);
-      setStatus(`No visible geometry was extracted from ${label}.`);
-      return;
-    }
 
     setStatus(
       `Building LOD / GPU data for ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""}...`
@@ -1507,17 +1793,18 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     activePdfPageLoader = demandLoader;
     activePdfPageLoader?.setPerformanceListener((name, ms) => renderer.recordPerformanceTransition?.(name, ms));
     demandLoader = null;
-    void previousPageLoader?.close();
     if (activePdfPageLoader) parsedPdfPageCache = null;
     if (parsedPages) storeCachedPdfPageScenes(options.source, pageSceneOptionsKey, parsedPages);
     if (!options.preserveView) { gridViewState = null; readerViewState = null; }
-    preparation.commit();
     applyTextSearchScene(scene);
     if (activePdfPageLoader) textSearchWidget.setAvailability("ready");
     refreshDropIndicator();
     setDownloadDataButtonState(true);
 
     updateMetricsPanel(label, scene, sceneStats, parseMs, uploadMs, lodTiming, performance.now() - loadStart);
+    if (options.prepareEditor) await options.prepareEditor();
+    options.signal.throwIfAborted(); options.beforeCommit?.(); preparation.commit();
+    void previousPageLoader?.close();
     if (extractionOptions.ocrTextOnly) setStatus("Text-only view: pictures and diagrams are omitted. Pages without stored text are blank.");
     else clearLoadedStatus();
   } catch (error) {
@@ -1577,11 +1864,6 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
 
     const rasterLayerCount = listSceneRasterLayers(scene).length;
     const hasRasterLayer = rasterLayerCount > 0;
-    if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer) {
-      setParsingLoader(false);
-      setStatus(`No visible geometry was found in ${label}.`);
-      return;
-    }
 
     setStatus(
       `Preparing LOD / GPU data for ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""}...`
@@ -1657,6 +1939,7 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
 }
 
 function commitLoadedSource(options: LoadPdfOptions, ocrTextOnly = false, streaming = false, compressScans = false): void {
+  createdDocumentSource = options.createdDocument ?? null;
   lastLoadedSource = options.source;
   lastLoadedPdfPassword = options.source.kind === "pdf" ? options.password : undefined;
   loadedOcrTextOnly = options.source.kind === "pdf" && ocrTextOnly;
@@ -1940,6 +2223,7 @@ function beginSceneLoad(token: number): void {
 }
 
 function beginSourceLoad(): number {
+  viewerPrintAction?.cancel();
   sourceLoadController?.abort();
   sourceLoadController = new AbortController();
   // Invalidate parsing/LOD immediately, even while the next source is reading.
@@ -1976,20 +2260,23 @@ function finishSceneLoad(token: number): void {
 
 function updateBackendSelectDisabledState(): void {
   ocrTextCheckbox!.disabled = pendingSourceLoadCount > 0 || activeSceneLoadToken !== null ||
-    activeHepExportController !== null || lastLoadedSource?.kind === "hep";
+    activeHepExportController !== null || Boolean(pdfEditor) || lastLoadedSource?.kind === "hep";
   compressScansCheckbox!.disabled = ocrTextCheckbox!.disabled;
   pageStreamingCheckbox!.disabled = ocrTextCheckbox!.disabled;
   backendSelectElement.disabled =
     pendingSourceLoadCount > 0 ||
     activeSceneLoadToken !== null ||
-    activeHepExportController !== null || layoutChangeRunning;
+    activeHepExportController !== null || layoutChangeRunning || editorSceneApplicationActive;
+  const layout = backendSelectElement.ownerDocument?.querySelector<HTMLSelectElement>(".reader-layout");
+  if (layout) layout.disabled = backendSelectElement.disabled || Boolean(editorInitialization) || Boolean(pdfEditor?.isBusy?.()) || Boolean(backendSwitcher?.isSwitchInFlight());
   if (activePdfPageLoader) {
-    if (pendingSourceLoadCount > 0 || activeSceneLoadToken !== null || activeHepExportController !== null || layoutChangeRunning) activePdfPageLoader.pause();
+    if (pendingSourceLoadCount > 0 || activeSceneLoadToken !== null || activeHepExportController !== null || layoutChangeRunning || editorSceneApplicationActive) activePdfPageLoader.pause();
     else {
       activePdfPageLoader.resume();
       if (demandPdfUpdatePending) scheduleDemandPdfUpdate();
     }
   }
+  viewerPrintAction?.refresh();
 }
 
 function updateParsingLoaderProgress(progress: PDFLoadProgress): void {
@@ -2079,7 +2366,8 @@ function combineVectorLodTimings(
 function setDownloadDataButtonState(hasParsedData: boolean, isBusy = false): void {
   downloadDataButtonElement.hidden = !hasParsedData;
   downloadDataButtonElement.disabled = !hasParsedData || isBusy || isBatchExampleExportRunning;
-  downloadDataButtonElement.textContent = isBusy ? "Preparing HEP..." : "Download HEP";
+  setToolbarIconButton(downloadDataButtonElement, "download-hep", isBusy ? "Preparing HEP..." : "Download HEP");
+  viewerPrintAction?.refresh();
 }
 
 function setDownloadPdfButtonState(hasPdf: boolean, isBusy = false): void {
@@ -2090,28 +2378,31 @@ function setDownloadPdfButtonState(hasPdf: boolean, isBusy = false): void {
     isBusy ||
     isBatchExampleExportRunning ||
     activeHepExportController !== null;
-  downloadPdfButtonElement.textContent = isBusy ? "Preparing PDF..." : "Download PDF";
+  setToolbarIconButton(downloadPdfButtonElement, "download-pdf", isBusy ? "Preparing PDF..." : "Download PDF");
 }
 
 function setDownloadAllDataButtonState(hasExamples: boolean, isBusy = false, progressText?: string): void {
   downloadAllDataButtonElement.hidden = !bulkHepExportEnabled;
   downloadAllDataButtonElement.disabled = !bulkHepExportEnabled || !hasExamples || isBusy;
-  downloadAllDataButtonElement.textContent = isBusy
+  setToolbarIconButton(downloadAllDataButtonElement, "download-all", isBusy
     ? progressText ?? "Exporting Example HEP Files..."
-    : "Download All Example HEP Files";
+    : "Download All Example HEP Files");
 }
 
 function setPrimaryLoadControlsEnabled(isEnabled: boolean): void {
+  if (!isEnabled) viewerPrintAction?.cancel();
   openButtonElement.disabled = !isEnabled;
+  document.querySelector<HTMLButtonElement>("#new-pdf")!.disabled = !isEnabled;
   fileInputElement.disabled = !isEnabled;
   exampleDropdown.setDisabled(!isEnabled);
+  viewerPrintAction?.refresh();
 }
 
 function setHudCollapsed(collapsed: boolean): void {
   hudPanelElement.classList.toggle("collapsed", collapsed);
   toggleHudButtonElement.setAttribute("aria-expanded", String(!collapsed));
-  toggleHudButtonElement.title = "Close settings";
-  toggleHudIconElement.textContent = "×";
+  setToolbarIconButton(toggleHudButtonElement, "close", "Close settings");
+  readerViewport?.settingsChanged();
 }
 
 async function downloadAllExampleHeps(): Promise<void> {
@@ -2211,6 +2502,7 @@ async function downloadAllExampleHeps(): Promise<void> {
 }
 
 async function downloadHep(): Promise<boolean> {
+  if (pdfEditor) { await pdfEditor.save("hep"); return true; }
   if (layoutChangeRunning) {
     setStatus("Wait for the layout change to finish before exporting parsed data.");
     return false;
@@ -2343,7 +2635,18 @@ async function downloadHep(): Promise<boolean> {
   }
 }
 
+function getNativePrintDocument(): ViewerPrintDocument | null {
+  const source = lastLoadedSource, scene = lastCanonicalScene ?? lastParsedScene;
+  const label = lastParsedSceneLabel ?? source?.label ?? "document";
+  if (pdfEditor) return { identity: pdfEditor, label, editor: pdfEditor };
+  if (!source || !scene) return null;
+  // The native app opens the complete PDF; resident scene pages can be partial.
+  return source.kind === "pdf" ? { identity: source, label, sourcePdf: { bytes: source.bytes, label }, password: lastLoadedPdfPassword }
+    : { identity: source, label, scene };
+}
+
 async function downloadSourcePdf(): Promise<boolean> {
+  if (pdfEditor) { await pdfEditor.save("pdf"); return true; }
   if (!lastDownloadablePdf) {
     setStatus("No source PDF is available for the current file.");
     return false;

@@ -187,6 +187,7 @@ import { buildNativeVectorPage } from "./pdf/nativeVectorPage";
 import { bindNativeSourceJpxStore } from "./pdf/nativeSourceJpx";
 
 import { placeSceneAnnotation, validateAnnotationAppearanceMode, type PdfAnnotation } from "./annotationData";
+import { AnnotationLayerBuilder } from "./annotationLayers";
 import { NativePdfAnnotationMetadataRegistry } from "./pdf/nativeAnnotations";
 import { NativePdfStructureTree } from "./pdf/nativeStructure";
 
@@ -237,6 +238,11 @@ export interface NativeVectorPdfSession extends PdfSession {
 
 /** @internal Established-renderer controls which are intentionally absent from the page-native API. */
 export interface NativeVectorCompileOptions extends PdfCompileOptions {
+  /** Internal temporary-PDF editor provenance; never enabled by ordinary loading/HEP. */
+  readonly editorSourceProvenance?: boolean;
+  /** Temporary compiler snapshots, addressed by private paint MCIDs. @internal */
+  readonly onEditorSourceText?: (mcid: number, before: import("./pdf/nativeText").NativeEditorTextState,
+    after: import("./pdf/nativeText").NativeEditorTextState, glyphs: readonly import("./pdf/nativeText").NativeEditorSourceGlyph[]) => void;
   /** Internal, operation-local snapshot preparation. Never used for HEP compilation. */
   readonly thumbnailScale?: number;
   readonly thumbnailPixelSize?: ThumbnailStrokePixelSize;
@@ -573,6 +579,7 @@ class NativePdfSession implements NativeVectorPdfSession {
         const { compileNativeOcrTextPage } = await import("./pdf/nativeOcrText");
         const scene = await compileNativeOcrTextPage(this.document, sourcePageIndex, options, signal,
           this.missingFontResolver, this.optionalContent, diagnostic => this.appendDiagnostics([diagnostic]));
+        if (this.document.info.documentAuthoring) scene.documentAuthoring = structuredClone(this.document.info.documentAuthoring);
         scene.pdfOverviewKind = "vector";
         return scene;
       }
@@ -596,6 +603,7 @@ class NativePdfSession implements NativeVectorPdfSession {
             const overview = await compileNativeOcrTextPage(this.document, sourcePageIndex, options, signal,
               this.missingFontResolver, this.optionalContent, diagnostic => this.appendDiagnostics([diagnostic]));
             if (overview.textInstanceCount > 0 && overview.textIndex?.pages.some(page => /[^\s\ufffd]/u.test(page.text))) {
+              if (this.document.info.documentAuthoring) overview.documentAuthoring = structuredClone(this.document.info.documentAuthoring);
               overview.pdfOverviewKind = "ocr";
               return overview;
             }
@@ -612,6 +620,7 @@ class NativePdfSession implements NativeVectorPdfSession {
         }
       }
       const scene = await this.compileVectorPageWithLayerFallback(sourcePageIndex, options, signal);
+      if (this.document.info.documentAuthoring) scene.documentAuthoring = structuredClone(this.document.info.documentAuthoring);
       if (options.previewMaxDimension === undefined) return scene;
       scene.pdfOverviewKind = overviewKind;
       if (overviewKind === "raster") {
@@ -692,8 +701,18 @@ class NativePdfSession implements NativeVectorPdfSession {
       const canvasLimits = { maxImagePixels: this.document.limits.maxImagePixels,
         maxDecodedStreamBytes: this.document.limits.maxDecodedStreamBytes };
       if (options.optionalContent) {
-        const hiddenAnnotations = new Set(options.optionalContent.layers
-          .filter(layer => !layer.visible && layer.id.startsWith("annotation:")).map(layer => layer.id.slice("annotation:".length)));
+        const data = await this.optionalContent.sceneData(signal);
+        const values = new Map(options.optionalContent.layers.map(layer => [layer.id, layer.visible]));
+        // Recreate the page's collision-safe appearance IDs. A PDF layer can
+        // legitimately use the annotation: prefix, so its name is not ownership.
+        const annotationLayers = new AnnotationLayerBuilder(data, [...(data?.conditions ?? [])]);
+        for (let index = 0; index < page.stores.markedContent.tags.length; index++) {
+          if (page.stores.markedContent.tags[index] !== HEPR_ANNOTATION_MARKED_CONTENT_TAG) continue;
+          const id = page.stores.markedContent.propertyNames[index];
+          if (id) annotationLayers.condition(undefined, id);
+        }
+        const hiddenAnnotations = new Set((annotationLayers.build()?.groups ?? [])
+          .filter(group => group.annotationId !== undefined && values.get(group.id) === false).map(group => group.annotationId!));
         if (hiddenAnnotations.size) {
           const keep = (command: HeprDisplayCommand) => page.stores.markedContent.tags[command.markedContentIndex] !== HEPR_ANNOTATION_MARKED_CONTENT_TAG ||
             !hiddenAnnotations.has(page.stores.markedContent.propertyNames[command.markedContentIndex] ?? "");
@@ -701,9 +720,7 @@ class NativePdfSession implements NativeVectorPdfSession {
             groups: page.displayProgram.groups.map(group => ({ ...group, commands: group.commands.filter(keep) })),
             programs: page.displayProgram.programs.map(program => ({ ...program, commands: program.commands.filter(keep) })) } };
         }
-        const data = await this.optionalContent.sceneData(signal);
         if (data) {
-          const values = new Map(options.optionalContent.layers.map(layer => [layer.id, layer.visible]));
           const visibility = createDefaultOptionalContentSnapshot({ ...createEmptyVectorScene(), optionalContent: { ...data,
             groups: data.groups.map(group => ({ ...group, defaultVisible: values.get(group.id) ?? group.defaultVisible })) } });
           page = { ...page, stores: { ...page.stores, optionalContent: { ...page.stores.optionalContent,
@@ -1186,6 +1203,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       scene.annotationAppearances = options.annotationAppearances;
     }
     if (scene.markedContent?.items.length) await this.attachStructureElements(scene, sourcePageIndex, signal);
+    if (this.document.info.documentAuthoring) scene.documentAuthoring = structuredClone(this.document.info.documentAuthoring);
     return scene;
   }
 
@@ -1976,7 +1994,10 @@ class NativePdfSession implements NativeVectorPdfSession {
         if (context.font) {
           textCompiler.setFontResource(fontRegistry.resources[context.font.fontIndex], context.font.size);
         }
+        const capture = (options as NativeVectorCompileOptions).onEditorSourceText;
+        const before = capture && ["Tj", "TJ", "'", '"'].includes(operator) ? textCompiler.editorSourceState() : undefined;
         textCompiler.applyOperator(operator, operands, context.graphicsTransform);
+        if (before) capture!(context.editorSourceMcid ?? -1, before, textCompiler.editorSourceState(), textCompiler.editorSourceGlyphs(before.glyphCount));
         return emittedTextRuns;
       }
     };
@@ -2002,7 +2023,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       pageBounds,
       enableSegmentMerge: nativeVectorSegmentMergeEnabled(options),
       enableInvisibleCull: nativeVectorInvisibleCullEnabled(options),
-      ...(output === "display-program" && capturePaintSourceIdentities
+      ...((output === "display-program" && capturePaintSourceIdentities) || (options as NativeVectorCompileOptions).editorSourceProvenance
         ? { capturePaintSourceIdentities: true }
         : {}),
       textOperatorSink,
@@ -3251,7 +3272,10 @@ async function flattenNativeVectorFormOccurrences(
         if (context.font) {
           textCompiler.setFontResource(fontRegistry.resources[context.font.fontIndex], context.font.size);
         }
+        const capture = options.onEditorSourceText;
+        const before = capture && ["Tj", "TJ", "'", '"'].includes(operator) ? textCompiler.editorSourceState() : undefined;
         textCompiler.applyOperator(operator, operands, context.graphicsTransform);
+        if (before) capture!(context.editorSourceMcid ?? -1, before, textCompiler.editorSourceState(), textCompiler.editorSourceGlyphs(before.glyphCount));
         return emittedTextRuns;
       }
     };
@@ -3261,6 +3285,7 @@ async function flattenNativeVectorFormOccurrences(
     }
     const compiled = await compileVectorFormContent(await scopedContent(definition), {
       onDiagnostic: imageResources.onDiagnostic,
+      ...(options.editorSourceProvenance ? { capturePaintSourceIdentities: true } : {}),
       ...denseSourcePaintOptions(imageResources),
       pageMatrix: transform,
       pageBounds: clipBounds,
@@ -3391,6 +3416,8 @@ async function flattenNativeVectorFormOccurrences(
   const sourceOptionalContentIndices: number[] = [];
   const sourceAnnotationIndices: number[] = [];
   const sourceContentItems: number[] = [];
+  const editorItems = options.editorSourceProvenance ? [...(rootCompiled.vectorSceneData?.contentItems ?? [])] : undefined;
+  const editorItemIndexes = editorItems ? new Map(editorItems.map((item, index) => [item.mcid, index])) : undefined;
   // Form content's own MCIDs resolve through the Form's /StructParents, which
   // no compiled page carries; that paint keeps its caller's item instead.
   let ignoredFormContentItems = 0;
@@ -3484,8 +3511,13 @@ async function flattenNativeVectorFormOccurrences(
       const condition = optionalContent.combineMemberships(inheritedOptionalContent, sidecar.sourceOptionalContentIndices?.[offset / 2] ?? -1);
       const annotation = inheritedAnnotation >= 0 ? inheritedAnnotation : sidecar.sourceAnnotationIndices?.[offset / 2] ?? -1;
       const ownItem = sidecar.sourceContentItems?.[offset / 2] ?? -1;
-      if (occurrence.formDefinitionIndex !== -1 && ownItem >= 0 && kind !== DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT) ignoredFormContentItems += 1;
-      const item = occurrence.formDefinitionIndex === -1 ? ownItem : inheritedItem;
+      if (!options.editorSourceProvenance && occurrence.formDefinitionIndex !== -1 && ownItem >= 0 && kind !== DENSE_PDF_VECTOR_SCENE_EVENT_ORDINARY_PAINT) ignoredFormContentItems += 1;
+      let item = occurrence.formDefinitionIndex === -1 ? ownItem : inheritedItem;
+      const editorItem = options.editorSourceProvenance && ownItem >= 0 ? sidecar.contentItems?.[ownItem] : undefined;
+      if (editorItems && editorItemIndexes && editorItem?.tag === "HEPRSourceOperation") {
+        if (!editorItemIndexes.has(editorItem.mcid)) { editorItemIndexes.set(editorItem.mcid, editorItems.length); editorItems.push(editorItem); }
+        item = editorItemIndexes.get(editorItem.mcid)!;
+      }
       if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH) {
         if (localIndex >= seenGlyphRuns.length || seenGlyphRuns[localIndex] !== 0) {
           throw invalidVectorFormEvent(pageIndex, "glyph", localIndex);
@@ -3726,7 +3758,7 @@ async function flattenNativeVectorFormOccurrences(
   await walkOccurrence(rootOccurrence);
   const accumulatedText = textAccumulator.build().compilation;
   const annotationIds = rootCompiled.vectorSceneData?.annotationIds;
-  const contentItems = rootCompiled.vectorSceneData?.contentItems;
+  const contentItems = editorItems ?? rootCompiled.vectorSceneData?.contentItems;
   const vectorSceneData: DensePdfVectorSceneData = Object.freeze({
     sourceEvents: Uint32Array.from(sourceEvents),
     ...(optionalContent.groupCount > 0 ? { sourceOptionalContentIndices: Int32Array.from(sourceOptionalContentIndices) } : {}),
@@ -6244,6 +6276,7 @@ function buildInvocationOrderedTextIndex(
   const charOccurrences: number[] = [];
   const pens: number[] = [];
   const gapBefore: number[] = [];
+  const textScopes: { first: number; count: number; annotationId?: string; optionalContent: readonly number[] }[] = [];
   const activePrograms = new Set<number>();
   const compilation = accumulated.compilation;
   const maxTextCodeUnits = Math.min(
@@ -6259,8 +6292,15 @@ function buildInvocationOrderedTextIndex(
   const gaps = compilation.glyphGapBefore?.length === glyphCount ? compilation.glyphGapBefore : undefined;
 
   // The same pen geometry an ordinary vector page derives its word breaks from.
-  const appendPen = (glyphIndex: number, outerTransform: PdfMatrix): number => {
+  type TextScope = { annotationId?: string; optionalContent: readonly number[] };
+  const appendPen = (glyphIndex: number, outerTransform: PdfMatrix, scope?: TextScope): number => {
     const occurrence = gapBefore.length;
+    if (scope) {
+      const previous = textScopes[textScopes.length - 1];
+      if (previous && previous.first + previous.count === occurrence && previous.annotationId === scope.annotationId &&
+          previous.optionalContent.length === scope.optionalContent.length && previous.optionalContent.every((value, index) => value === scope.optionalContent[index])) previous.count++;
+      else textScopes.push({ first: occurrence, count: 1, ...scope });
+    }
     const offset = compilation.glyphs.transformIndices[glyphIndex] * 6, values = compilation.transforms.values;
     const matrix = multiplyPdfMatrices(outerTransform, [values[offset], values[offset + 1], values[offset + 2],
       values[offset + 3], values[offset + 4], values[offset + 5]]);
@@ -6306,7 +6346,8 @@ function buildInvocationOrderedTextIndex(
   const appendGlyph = (
     glyphIndex: number,
     outerTransform: PdfMatrix,
-    directReference: boolean
+    directReference: boolean,
+    scope?: TextScope
   ): boolean => {
     signal.throwIfAborted();
     const prefix = accumulated.glyphPrefixes[glyphIndex] ?? "";
@@ -6322,7 +6363,7 @@ function buildInvocationOrderedTextIndex(
       });
     }
     const invisible = (compilation.glyphs.flags[glyphIndex] & HEPR_GLYPH_FLAG.Invisible) !== 0;
-    const occurrence = appendPen(glyphIndex, outerTransform);
+    const occurrence = appendPen(glyphIndex, outerTransform, scope);
     if (directReference && !invisible) {
       appendCodeUnits(text, glyphIndex, occurrence);
       return true;
@@ -6348,7 +6389,8 @@ function buildInvocationOrderedTextIndex(
     glyphOffset: number,
     outerTransform: PdfMatrix,
     invocationProgramIndices: Uint32Array,
-    directReferences: boolean
+    directReferences: boolean,
+    inherited?: TextScope
   ): boolean => {
     let appended = false;
     for (let offset = 0; offset < source.paintRuns.length; offset += 3) {
@@ -6356,12 +6398,16 @@ function buildInvocationOrderedTextIndex(
       const kind = source.paintRuns[offset];
       const first = source.paintRuns[offset + 1];
       const count = source.paintRuns[offset + 2];
+      const condition = source.paintRunOptionalContentIndices[offset / 3] ?? -1;
+      const scope = condition < 0 || inherited?.optionalContent.includes(condition) ? inherited
+        : { annotationId: inherited?.annotationId, optionalContent: [...(inherited?.optionalContent ?? []), condition] };
       if (kind === DENSE_PDF_PAINT_RUN_GLYPH) {
         for (let index = 0; index < count; index += 1) {
           appended = appendGlyph(
             glyphOffset + first + index,
             outerTransform,
-            directReferences
+            directReferences,
+            scope
           ) || appended;
         }
       } else if (kind === DENSE_PDF_PAINT_RUN_FORM) {
@@ -6376,7 +6422,8 @@ function buildInvocationOrderedTextIndex(
         boundaryPending = true;
         const childAppended = walkProgram(
           programIndex,
-          multiplyPdfMatrices(outerTransform, paint.transform)
+          multiplyPdfMatrices(outerTransform, paint.transform),
+          scope
         );
         if (childAppended) {
           appended = true;
@@ -6389,7 +6436,7 @@ function buildInvocationOrderedTextIndex(
     return appended;
   };
 
-  const walkProgram = (programIndex: number, invocationTransform: PdfMatrix): boolean => {
+  const walkProgram = (programIndex: number, invocationTransform: PdfMatrix, scope?: TextScope): boolean => {
     if (activePrograms.has(programIndex)) {
       throw new PdfError("unsupported-content", "The reusable text program graph is cyclic.", {
         details: { reason: "text-index-program-cycle", programIndex }
@@ -6408,7 +6455,8 @@ function buildInvocationOrderedTextIndex(
         program.glyphOffset,
         multiplyPdfMatrices(invocationTransform, program.matrix),
         program.invocationProgramIndices,
-        false
+        false,
+        scope
       );
     } finally {
       activePrograms.delete(programIndex);
@@ -6431,7 +6479,8 @@ function buildInvocationOrderedTextIndex(
   for (const annotation of forms.annotations) {
     const previousBoundary: boolean = boundaryPending;
     boundaryPending = true;
-    const appended = walkProgram(annotation.programIndex, annotation.transform);
+    const appended = walkProgram(annotation.programIndex, annotation.transform, annotation.annotationId !== undefined || annotation.optionalContentIndex >= 0
+      ? { annotationId: annotation.annotationId, optionalContent: annotation.optionalContentIndex >= 0 ? [annotation.optionalContentIndex] : [] } : undefined);
     boundaryPending = appended ? true : previousBoundary;
   }
   return {
@@ -6444,7 +6493,8 @@ function buildInvocationOrderedTextIndex(
     positions: widthEms ? {
       charOccurrences: Int32Array.from(charOccurrences),
       pens: Float32Array.from(pens),
-      gapBefore: Uint8Array.from(gapBefore)
+      gapBefore: Uint8Array.from(gapBefore),
+      ...(textScopes.length ? { scopes: textScopes } : {})
     } : undefined
   };
 }

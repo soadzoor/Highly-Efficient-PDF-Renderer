@@ -1,4 +1,5 @@
 import { buildNativeMarkupAppearance } from "./nativeMarkupAppearance";
+import { choosePdfFormAutoFontSize } from "./formAutoFontSize";
 import {
   isPdfDictionary,
   isPdfName,
@@ -39,7 +40,7 @@ export interface NativePdfAppearanceSynthesisOptions {
   readonly embeddedFontPaint?: NativeEmbeddedFontPaint;
   /** Required when synthesized annotations carry an /OC association. */
   readonly optionalContent?: NativeOptionalContentRegistry;
-  /** Maximum automatically selected text size in default user-space units. @default 72 */
+  /** Maximum automatically selected text size in default user-space units. @default 144 */
   readonly maxAutoFontSize?: number;
   readonly onDiagnostic?: (diagnostic: Readonly<PdfDiagnostic>) => void;
 }
@@ -163,7 +164,7 @@ export class NativePdfAppearanceSynthesizer {
     this.missingFontResolver = options.missingFontResolver;
     this.embeddedFontPaint = options.embeddedFontPaint;
     this.optionalContent = options.optionalContent;
-    const maxAutoFontSize = options.maxAutoFontSize ?? 72;
+    const maxAutoFontSize = options.maxAutoFontSize ?? 144;
     if (!Number.isFinite(maxAutoFontSize) || maxAutoFontSize <= 0) {
       throw new RangeError("maxAutoFontSize must be a positive finite number.");
     }
@@ -1921,30 +1922,10 @@ function layoutText(
       line.width / 1000 * layout.fontSize <= width + 1e-7
     );
   };
-  if (requestedSize > 0) {
-    const layout = make(requestedSize);
-    if (!fits(layout)) {
-      throw synthesisError(annotation, "Field text does not fit its static appearance at the declared font size.", {
-        reason: "appearance-text-overflow",
-        fontSize: requestedSize
-      });
-    }
-    return layout;
-  }
-  let low = 0.25;
-  let high = maxAutoFontSize;
-  if (!fits(make(low))) {
-    throw synthesisError(annotation, "Field text cannot fit within its appearance bounds.", {
-      reason: "appearance-text-overflow"
-    });
-  }
-  for (let iteration = 0; iteration < 20; iteration += 1) {
-    const middle = (low + high) / 2;
-    if (fits(make(middle))) low = middle;
-    else high = middle;
-  }
-  const selected = Math.floor(low * 1000) / 1000;
-  return make(Math.max(0.25, selected));
+  // Explicit sizes remain authoritative even when the content overflows; the
+  // generated appearance clips to its field rectangle instead of changing font.
+  if (requestedSize > 0) return make(requestedSize);
+  return make(choosePdfFormAutoFontSize(multiline, size => fits(make(size)), maxAutoFontSize));
 }
 
 function wrapGlyphs(glyphs: readonly EncodedGlyph[], maximumWidth: number): EncodedLine[] {
@@ -2051,7 +2032,7 @@ function makeEncodedLine(glyphs: readonly EncodedGlyph[]): EncodedLine {
   return Object.freeze({ glyphs: Object.freeze([...glyphs]), bytes, width });
 }
 
-function parseDefaultAppearance(bytes: Uint8Array, annotation: NativePdfAnnotationAppearance): DefaultAppearance {
+export function parseDefaultAppearance(bytes: Uint8Array, annotation: NativePdfAnnotationAppearance): DefaultAppearance {
   const scanner = new DefaultAppearanceScanner(bytes, annotation);
   let fontResourceName: string | null = null;
   let fontSize = 0;

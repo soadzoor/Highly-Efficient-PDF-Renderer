@@ -1,0 +1,15 @@
+.hepr-editor-field-dialog{box-sizing:border-box;border:1px solid #b6c3d4;border-radius:10px;padding:18px;width:min(620px,92vw);max-height:85vh;overflow:auto;font:14px system-ui,sans-serif;color:#172333;background:#fff}
+.hepr-editor-field-dialog::backdrop{background:#17233366}
+.hepr-editor-field-dialog h2{margin:0 0 14px;font-size:20px}
+.hepr-editor-field-settings{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 14px}
+.hepr-editor-field-settings label{min-width:0;display:flex;flex-direction:column;gap:4px}
+.hepr-editor-field-settings input,.hepr-editor-field-settings select,.hepr-editor-field-settings textarea{box-sizing:border-box;width:100%;min-width:0;padding:5px;font:inherit}
+.hepr-editor-field-settings .hepr-editor-field-checkbox{flex-direction:row;align-items:center;gap:8px}
+.hepr-editor-field-settings input[type=checkbox]{width:auto;order:-1}
+.hepr-editor-field-settings input[type=color]{height:32px;padding:2px}
+.hepr-editor-field-settings [hidden]{display:none}
+.hepr-editor-field-dialog [role=alert]{color:#a21b1b}
+.hepr-editor-field-hint{font-size:12px;line-height:1.5;color:#48586b}
+.hepr-editor-field-actions{display:flex;justify-content:flex-end;gap:8px}
+.hepr-editor-field-actions button{padding:6px 10px;font:inherit;cursor:pointer}
+@media(max-width:480px){.hepr-editor-field-settings{grid-template-columns:minmax(0,1fr)}}

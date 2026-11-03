@@ -6,6 +6,338 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Added
+
+- Add headless `createPdfDocument()` composition with native PDF or HEP-scene
+  backgrounds, mixed-size pages, ordered vector/SVG paths, clipping/transforms,
+  reusable transparent images, measured rich/baseline text and PDF links.
+  Preserve source page geometry, layer defaults and visible annotation appearances
+  below new artwork; support hidden backgrounds and viewport crops without
+  changing MediaBox. Include a general PDF composition guide and runnable
+  example for images, SVG artwork, text and annotations. Composed artwork has
+  no editable HEPR author models.
+- Add a Select text workflow with selection-based bold, italic, underline,
+  strikethrough and highlight toggles, mixed-state controls and undoable partial
+  text changes. Also apply and remove underline/strikethrough/highlight on
+  original PDF text selected with the normal Select tool, retaining object
+  selection and mixed text edits. Replace persistent underline/strikeout/highlight
+  tools; retain the selection while combining or removing styles. Remove only
+  selected portions of saved review marks and retain review metadata in HEP.
+  Existing PDF fonts use reversible
+  synthetic emphasis in the session; saved source emphasis retains its visible
+  appearance rather than editable font-style metadata.
+  Textbox highlights follow their text through edits and wrapping, retain
+  per-run background colors in editable PDFs and keep visible backgrounds in HEP.
+- Create PDFs from scratch in both viewers and through `createPdf()`, with
+  preset/custom paper sizes, orientation, page count, blank-page insertion and
+  undoable resizing that preserves actual content size and top-left placement.
+  Open valid blank PDF/HEP pages, retain the previous document when replacement
+  fails or is cancelled, and resume never-saved new-document drafts locally.
+  Keep New PDF beside Open in the shared toolbar after initialization, with
+  primary controls wrapping within narrow screens.
+- Add optional automatic page numbers with header/footer placement, margins,
+  fonts, color, starting numbers, cover exclusion and page-total formats.
+  Renumber with page operations and Undo/Redo; retain adjustable settings in
+  editable PDF and HEP, including direct PDF-to-HEP export. Flattened copies
+  retain visible numbers; extracted/imported numbers become ordinary content.
+- Add form-field authoring with text, number, date, email, telephone, URL,
+  checkbox, radio, dropdown and list inputs. Draw field areas, edit properties,
+  fill values, transform, duplicate and undo changes; save real AcroForm widgets
+  with embedded fonts and explicit appearances. Typed text hints round-trip in
+  HEPR without PDF scripts; other readers retain standard editable text fields.
+  Flattened PDF and HEP keep ordinary rendered appearances. Keep copied radio
+  groups independent and remove obsolete field search geometry during page edits.
+- Add URL and same-document object links to selected content, including precise
+  multi-line highlighted text. Provide toolbar/context actions, Ctrl/Cmd+K and
+  destination picking, with undo, locks, copy/page-duplication rebinding and local
+  draft recovery. Save invisible standard PDF Link annotations and named
+  destinations without altering artwork; retain links in flattened PDFs and HEP.
+  References follow identifiable targets while editing; anonymous source targets
+  reopen as ordinary PDF destinations when their identity cannot be retained.
+- Add per-page alignment, equal-gap distribution and cached movement snapping
+  guides, with Alt/Option bypass and one-step Undo. Add glyph-bound highlights,
+  underlines, strikeouts and comments with standard PDF annotations and explicit
+  appearances, plus separate object/group editing locks and reusable host APIs.
+- Add local IndexedDB recovery for committed authoring state and pending text,
+  form and comment drafts. Offer Restore/Discard/Later without overwriting older
+  drafts; encrypt protected-source drafts without storing passwords. Keep
+  recovery separate from PDF/HEP persistence, history and the clipboard.
+- Add independent fill opacity for editor shapes, ink and signatures, with
+  linked sliders and numeric inputs for color/fill opacity in 0.1 steps from
+  0 to 1. Preserve separate paint alpha in PDF/HEP output and retain the fill
+  when changing stroke opacity; slider drags commit one undoable change.
+- Add undoable PDF layer (OCG) management in the native and Three.js editor
+  Settings docks: create, rename, nest, reorder, remove while retaining artwork,
+  set saved visibility/locks, choose an active layer and assign selected content.
+  Put inline naming, default visibility and visibility lock in compact rows;
+  mouse/touch/pen drag grips reorder whole layer subtrees with insertion markers,
+  edge scrolling, cancellation and keyboard alternatives. Keep normal touch
+  scrolling outside grips. The blue active row chooses the creation/paste
+  destination without disturbing artwork selection; remove the redundant
+  active-layer dropdown and retain an Unlayered row. Add toolbar/context-menu and Ctrl/Cmd copy,
+  cut and paste, including paste-in-place, independent current source appearances,
+  authored groups, destination-layer assignment and Undo/Redo. Keep clipboard
+  data in memory and retain originals when capture fails or is cancelled.
+  Retain compound memberships and portable fonts when editing or reassigning
+  reopened textboxes; hide text drafts and form controls with their layers
+  without discarding their contents.
+  Reordering also changes visual stacking while retaining unlayered paint slots
+  and atomic compositing groups. Add a Select-tool context menu to bring objects
+  to front/forward or send them backward/to back within each layer, with
+  multi-selection, undo/redo, matching picking and PDF/HEP persistence. Keep
+  drawing order and author models through page rotation, insertion and removal.
+  Preserve edited layers in PDF and HEP; offer a
+  flattened PDF copy for exact stacking across page graphics and editable
+  annotations/form widgets, whose paint passes differ in standard PDF readers.
+- Ask whether dropped PDF/HEP documents should replace the loaded document or
+  attach their pages at the end, in View or Edit in both viewers. Support ordered
+  multi-file drops, password-protected PDF imports and legacy HEP ZIP files;
+  attachment keeps current edits and supports Undo without leaving View.
+- Insert PNG, JPEG and WebP files dropped onto document pages in Edit, retaining
+  full image resolution and transparency with cancellation and stale-drop guards.
+- Double-click an editable form field with Select to activate Fill and focus the
+  clicked widget, including empty and transformed fields. Recognize click pairs
+  across redrawn selection handles and pending object picks; ignore click jitter
+  before starting transform previews so it cannot delay or block field activation.
+- Show reusable signatures as selectable vector previews beside their names.
+  Fit compact quadratic curves for signatures and pencil drawings, straightening
+  sampling jitter while retaining endpoints, corners, pen lifts and loops.
+  Simplify stored points in new smoothed captures; retain raw template
+  compatibility and share curves between previews, rendering and PDF/HEP output.
+  Highlight the active signature tool and show a translucent placement preview
+  centered on the cursor, matching the placed copy's size, color and stroke.
+- Add an on-demand Edit mode to the native and Three.js viewers, with AcroForm
+  filling, mixed-format textboxes and portable fonts, vector shapes and ink,
+  reusable local handwritten signatures, image import, multi-selection,
+  transforms, undo/redo, PDF/HEP saving and PDF printing. View remains the default.
+  Show a canvas-bounded loading card before tools load and through the first
+  editable frame, including re-entry and with Settings closed. Report setup
+  stages with a spinner, measured page/field progress or an indeterminate bar.
+  Cancel from the mode button; failed or cancelled setup restores View, retains
+  earlier edits and removes setup UI and listeners without stale updates.
+- Expose reusable editor sessions, shared interaction controls, font/form
+  services and a vector-first scene-to-PDF writer with cancellation and progress
+  reporting. PDF saves preserve source forms, annotations and supported
+  encryption. Prepare source-operation provenance only on demand for saving;
+  rewrite affected paths, text glyphs, images and individual shared Form
+  invocations while retaining unrelated operations and resources. Diagnose
+  bounded vector fallback for operations that cannot be rewritten independently.
+- Bake edits into ordinary HEP rendering data without embedding the original
+  PDF, source font files or editor history. HEP-only documents can be transformed
+  and rebuilt as PDFs with searchable outline text and layers; original
+  authoring semantics are not reconstructed.
+- Add PDF output password controls and a direct `changePdfProtection` API to
+  preserve, remove or replace protection. New passwords use AES-256; changing
+  protection rewrites the final object graph without retaining old revisions.
+  Editable and flattened PDF copies support the same settings; HEP remains
+  unencrypted and passwords are kept in memory only.
+- Add undoable page management: rotate pages in 90-degree increments, remove,
+  reorder, duplicate, extract and crop pages, and insert or merge PDFs with
+  independent input passwords. Support mouse/touch/pen page reordering and
+  keyboard alternatives; cropping retains hidden content. Expose
+  matching editor methods and native `manipulatePdfPages` APIs; preserve page
+  resources, editable fields/annotations and destination protection, and
+  namespace colliding imported fields. Retain authored object models through
+  page changes and refresh viewer layouts, picking, thumbnails and search.
+
+### Changed
+
+- Allow Reader/Grid switching during Edit in both viewers, preserving edits,
+  selection, unfinished text/form/color drafts and Undo/Redo. Synchronize layout
+  changes with committed frames and remap editor controls to displayed pages;
+  pause layout controls only while another operation is running.
+- Pan the camera with the held middle mouse button in any editing tool across
+  native/Three.js Reader and Grid layouts. Restore the complete object context
+  menu, including Duplicate, Copy, Cut, Paste and undoable Delete alongside drawing
+  order. Disable Delete for empty or locked selections and during document operations.
+- Show mixed/contextual appearance properties and apply supported group changes
+  to descendants. Keep drawing defaults independent of the selected objects.
+  Report browser downloads separately from confirmed file writes, retaining
+  local edits and recovery when a browser save or print dialog may be cancelled.
+- Dock Settings to the right of the document in the native, Three.js and room
+  detection demos, reserving canvas space instead of covering it. Closing
+  Settings restores document width; editing tools stay within the canvas column.
+  Keep opacity sliders compact and let their control rows shrink or wrap inside
+  the dock, preventing horizontal overflow in the native and Three.js viewers.
+- Share compact vector icons across View and Edit controls, including page and
+  password actions, PDF/HEP saves, flattening, printing, navigation, zoom, search
+  and downloads. Retain descriptive hover titles, accessible labels and keyboard
+  focus; mode and busy-state updates preserve icons without rebuilding unchanged
+  button contents. View icons do not load editing or font services.
+- Expose Print in the main native and Three.js toolbars in View as well as Edit.
+  Preserve retained edits and loaded page selections; print unedited PDFs from
+  their original resources and HEPs through the vector PDF writer. Reuse supplied
+  passwords for temporary printable copies, with a PDF-download fallback.
+- Preserve proportions during corner resizing by default; hold Shift for free
+  resizing, including while dragging. Textbox frames retain wrapping and their
+  proportions; Alt scales their appearance, with Alt+Shift allowing free scaling.
+  Snap rotation drags to the nearest absolute multiple of 45 degrees, including
+  zero, only within 5 degrees (inclusive); other angles rotate freely. Hold
+  Alt/Option to bypass snapping, including modifier changes without pointer
+  movement and on release.
+  Display the current angle with the rendered frame and make numeric Rotate set
+  its absolute signed angle, so repeating a value does not rotate it again.
+- Discover choice options, button states, alignment and text limits on entering
+  Edit mode so fields can be validated and displayed consistently.
+
+### Fixed
+
+- Preserve indirect font-stream lengths, filters and decode parameters when
+  importing PDF resources, while retaining shared font programs and cyclic metadata.
+  Retain one output identity for repeated references in imported resource arrays.
+- Snapshot caller PDF/image/font bytes, including Node Buffer offset views,
+  before lazy composition, editor, page and protection APIs begin their work.
+  Keep later form edits and recovery keys independent of reused input buffers,
+  while sharing owned editor source bytes to avoid redundant full-PDF copies.
+  Decode Buffer-backed recovery records into independent resource buffers with
+  the correct offsets and no unrelated backing bytes.
+- Extract displayed pages correctly from HEP scenes that retain subset or
+  reordered source-PDF page indexes.
+- Finish textbox drafts when clicking outside and reopen their content through
+  double-click, the Text tool or the explicit Edit text button. Recognize click
+  pairs across replaced selection overlays, retain font styles and saved HEPR
+  textbox models, and keep locked content protected.
+  Align typing baselines and usable text width with committed text, including
+  mixed fonts/sizes and custom line spacing, without moving existing textboxes.
+  Match editing font registration to CSS family names so fallback fonts do not
+  change text size or width while typing, including in new default-font boxes.
+  Apply selected font sizes across mixed rich-text runs and retain ancestor
+  underline/strikethrough decorations through nested formatting and Apply.
+  Resize textbox bounds while editing through edge/corner handles or numeric
+  W/H without scaling characters. Retain chosen dimensions through Apply,
+  reopening and Undo/Redo; track geometry-only drafts for local recovery and
+  navigation guards. Outside content editing, retain proportional scaling of the
+  box and its characters on release to match the preview; numeric W/H also scales
+  the complete textbox appearance.
+  Keep the applied textbox appearance visible until its committed frame is drawn
+  and defer Select outlines and handles until the resized bounds are presented,
+  preventing the old blue outline from flashing when clicking outside.
+  Retain editing line-break rules during this handoff so long words and whitespace
+  do not briefly rewrap before the committed text appears.
+  Preserve the active handle's resize cursor throughout captured textbox drags,
+  including rotated boxes, and restore the normal cursor on release or cancellation.
+  Keep content-edit resize handles white when hovered or pressed, matching Select
+  handles instead of inheriting the viewer's dark button hover background.
+  Allow document wheel scrolling and zooming while editing textbox content,
+  preserving its draft, focus and text selection as the editor follows the viewport.
+- Refresh Reader thumbnails only for affected edit pages in the native and
+  Three.js viewers, including shared form widgets and undo/redo. Retain unaffected
+  sidebar images and pending jobs, keep changed thumbnails until replacements
+  arrive, and skip refreshes for metadata, gesture previews and display residency.
+- Enable Color and Fill color changes on existing PDF/HEP vector artwork and
+  text, including groups, gradients and source copies. Retain opacity, clipping,
+  masks and unrelated shared resources; preserve colors through transforms,
+  Undo/Redo, copying, local recovery and editable PDF/HEP saves. Retain complete
+  form-text recolors when typing regenerates appearances. Keep image pixels
+  and mask-only paint excluded from vector color controls.
+  Bind pending Color/Fill picker changes to their original selection and chosen
+  RGB so selecting another object cannot discard or redirect the change. Preview
+  picker changes live through temporary native/Three RGB overrides, retaining
+  stroke/fill roles through outlined strokes and arrowheads. Coalesce input bursts
+  without changing document state or history; commit the final choice in one Undo
+  step, including saving and mode/tool changes. Escape restores the original paint;
+  returning to the original color adds no Undo step. Custom UI hosts can supply a
+  preview callback or use the coalesced compiled-scene fallback.
+- Render nonsymbolic embedded TrueType subsets with Macintosh Roman character
+  maps, restoring spaces, digits and letters that appeared as rectangles.
+  Translate PDF encodings and glyph-name differences without changing text
+  extraction, PDF spacing or existing Unicode/symbol character-map selection.
+- Compile links attached to original page primitives and groups with their exact
+  layer visibility, keeping same-document destinations usable in Read mode and
+  preventing failed Edit re-entry. Wait for the current committed frame before
+  leaving Edit, including link changes that do not add visible drawing geometry.
+- Keep shared ancestor clips fixed when transforming only some of their content,
+  while moving clips owned by the transformed objects. Use the same ownership
+  rules for cached drag previews and compiled output.
+- Restore hidden and partially cropped artwork when resetting page crops after
+  restacking, without doubling translucent paint. Move page-owned clips and
+  transparency/mask bounds together during whole-page placement.
+- Render explicit device-RGB transparency groups in Canvas2D, including saved
+  highlight appearances, while retaining checks for other managed blend spaces.
+- Keep export preparation and serialization isolated from editing commands;
+  retain drafts on cancellation and reject stale picks after camera changes.
+- Open saved PDFs whose layer identifiers collide with internal form/annotation
+  visibility controls. Allocate distinct controls without changing PDF layers,
+  and keep field visibility independent in document rendering and thumbnails.
+- Detect artwork that may overlap PDF form fields and offer editable or flattened
+  copies at save time. Explain Chrome's separate form-field rendering pass;
+  flattened copies keep artwork above fields, while editable copies retain fields
+  and annotations. Warn API callers without silently flattening their output.
+- Preserve stored butt and round stroke caps in rebuilt and flattened PDFs,
+  including dash gaps and zero-length strokes, instead of rounding every line.
+- Save added textboxes with PDFium-compatible font encodings, fixing rectangles
+  and displaced letters in Chrome. Retain embedded font bytes, Unicode mappings
+  and editable appearances; large textboxes share font programs across additional
+  encoding resources instead of truncating text or duplicating font data.
+  Paint combining-mark continuations as vector outlines while their cluster text
+  remains searchable, avoiding fallback control characters in independent readers.
+- Keep document selections, handles and editing controls inside the canvas and
+  below toolbars, Settings, thumbnails and menus in both viewers. Constrain
+  text-selection popups and annotation bubbles to the visible document viewport
+  while retaining captured drags beyond its edges.
+- Restore Reader wheel scrolling over the editor's Select and drawing overlays
+  in both viewers, retaining normal scroll distances and Ctrl/Cmd-wheel zoom.
+- Preserve form fields' local dimensions, rotation and scaling while typing and
+  regenerating appearances, including HEP-only editing. Retain transformed field
+  planes when reopening and filling PDFs saved by HEPR, without adding HEP data.
+- Align editable form controls with each document draw in native and Three.js
+  viewers so borders stay synchronized during zoom and pan. Preserve focused
+  inputs and drafts, and detach frame notifications in View mode.
+  Keep current field values visible after blur until their matching regenerated
+  appearances are drawn, avoiding stale-value flashes for shared widgets, rapid
+  edits and cleared fields. Retain drafts when regeneration fails or is superseded.
+- Retain the final pen position, empty-coalesced-event samples, closed pencil
+  loops and taps. Keep signature capture proportions consistent with its preview.
+  Match pencil and shape previews to committed curves/outlines, document-scaled
+  widths, colors, fills, arrowheads and separate opacities. Preview rectangles,
+  ellipses, lines, arrows, polygons and polylines; follow the next polygon segment
+  on its original page, retain first-click styles and finish only clicked vertices.
+  Keep pending drawings and signature copies independently until their matching
+  rendered frames take over. Allow another drawing on the same document during
+  compilation and wait for preview handoff before returning to View.
+- Match form input fonts to their PDF family, weight, color and point size,
+  retaining document zoom and using PDFium-style automatic text sizes. Preserve
+  original check/radio appearances without duplicate browser marks or doubled
+  text; keep declared text sizes when saved field content overflows. Share font
+  loading between widgets and omit typing styles from compact HEP exports.
+  Use black vector marks following standard PDF button captions during pending
+  updates, preserving check-styled radio fields and native keyboard/group behavior.
+- Reuse deterministic substitute fonts when recompiling edited form appearances,
+  so PDFs with nonembedded Type1 fonts can be saved and printed after filling.
+  Preserve source font resources and honor custom font-asset loaders.
+  Reuse canonical PDF field appearances across transforms when source, values
+  and target widgets match, retaining current geometry, clips and paint slots.
+  Cancel obsolete preparation without consumers while preserving reusable work
+  and active save snapshots; retain only the current cache per source session.
+- Synchronize transform selection frames with the matching rendered preview in
+  native and Three.js viewers, including release and cancellation. Coalesce new
+  pointer positions and serialize scene publication so older asynchronous updates
+  cannot overtake newer content or leave the frame ahead of the objects.
+  Reuse identical glyph-store resources across authored moves so the existing
+  text-atlas cache survives, while instance and search geometry remain current.
+  Prepare supported translations once and update selected text/path/field geometry
+  without repeating field, layer or page compilation. Reuse native WebGL/WebGPU
+  buffers and Three.js material textures for compatible poses, preserving private
+  antialiased clips and paint order; independent Reader page views and unsupported
+  transforms/content keep the regular path. Coalesce poses before the next frame,
+  avoid redundant toolbar/hidden-field and page/search/thumbnail work, and retain
+  normal LOD, commit/cancel/View updates and matching-frame acknowledgments.
+- Keep selection frames and handles aligned with rotated or transformed content,
+  including rotated corner squares after committing, reselecting and undo/redo.
+  Keep corner squares at a constant screen size as the viewport zooms. Resize and
+  numeric W/H controls follow the frame's axes, and corner cursors follow its angle.
+  Keep handle drags on their page plane across Reader margins. Expose committed
+  frame geometry through `EditorSession.getSelectionFrame()`.
+- Keep editor cursors and handles aligned with the active tool: show transforms
+  only in Select, use rotation, diagonal resize, text and pencil cursors, and
+  show a move cursor throughout the selected frame before dragging. Dragging its
+  interior moves the entire selection, while modifier clicks retain selection
+  behavior. Retain gesture cursors while dragging. Cancel stale gestures and
+  pending picks on tool changes so later clicks cannot trigger the previous action.
+- Resolve indirect crypt-filter selectors before decrypting PDF streams,
+  including encrypted object streams and exempt metadata, so supported protected
+  PDFs can be opened and have their protection changed consistently.
+
 ## [0.1.71] - 2026-10-22
 
 ### Changed

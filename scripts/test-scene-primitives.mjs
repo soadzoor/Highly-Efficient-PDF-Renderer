@@ -43,6 +43,17 @@ try {
 
   {
     const s = scene();
+    appendStroke(s, [0, 0], [10, 0]); appendStroke(s, [0, 0], [10, 0]);
+    const picker = new ScenePrimitivePicker(s);
+    assert.deepEqual(await hitRef(picker, query(5, 0)), ref("stroke", 1));
+    assert.deepEqual(await hitRef(picker, query(5, 0, { resolvePaintRank: primitive => primitive.index === 0 ? 100 : 0 })), ref("stroke", 0),
+      "layer-reordered picking uses current ranks without stale spatial-index rank pruning");
+    assert.deepEqual(await hitRef(picker, query(5, 0)), ref("stroke", 1), "custom ranks do not mutate the reusable source index");
+    picker.dispose();
+  }
+
+  {
+    const s = scene();
     appendStroke(s, [0, 0], [10, 0]);
     appendStroke(s, [0, 10], [10, 10], { control: [5, 20], halfWidth: 0 });
     const original = s.endpoints.slice();

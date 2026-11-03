@@ -97,6 +97,50 @@ try {
   assert.deepEqual(builder.build().conditions, [{ kind: "constant", value: true }, { kind: "group", groupId: "annotation:ref:5:0" },
     { kind: "and", operands: [0, 1] }]);
   assert.equal(new AnnotationLayerBuilder(undefined, []).build(), undefined, "pages without layers stay without optional content");
+  {
+    const id = "ref:5:0", preferred = annotationLayerId(id), occupiedFallback = `hepr-annotation:${JSON.stringify([id, 0])}`;
+    const real = layerId => ({ id: layerId, name: "Real PDF layer", defaultVisible: true, locked: false, usedInView: true });
+    const base = { groups: [real(preferred), real(occupiedFallback)], conditions: [{ kind: "group", groupId: preferred }, { kind: "group", groupId: occupiedFallback }],
+      order: [{ kind: "group", groupId: preferred }, { kind: "group", groupId: occupiedFallback }], radioGroups: [] };
+    const collision = new AnnotationLayerBuilder(base, [...base.conditions]);
+    const combined = collision.condition(0, id), own = collision.condition(undefined, id), built = collision.build();
+    validateSceneOptionalContent(built);
+    const internal = built.groups.find(group => group.annotationId === id);
+    assert.equal(internal.id, `hepr-annotation:${JSON.stringify([id, 1])}`, "real PDF ids reserve both preferred and alternate annotation gate ids");
+    assert.equal(new Set(built.groups.map(group => group.id)).size, 3);
+    assert.equal(base.groups.length, 2, "allocation leaves the source PDF catalog unchanged");
+    const collisionScene = { ...scene, optionalContent: built, annotations: [annotation(id, 0)],
+      drawRuns: scene.drawRuns.map((run, index) => ({ ...run, optionalContent: index === 0 ? 0 : index === 1 ? own : combined })) };
+    const independent = new OptionalContentController(collisionScene);
+    assert.deepEqual(independent.getLayers().map(group => group.id), [preferred, occupiedFallback], "prefix-shaped real PDF layers remain actual PDF layers");
+    await independent.setAnnotationVisibility([id], false);
+    assert.equal(independent.isVisible(0), true); assert.equal(independent.isVisible(own), false); assert.equal(independent.isVisible(combined), false);
+    await independent.setAnnotationVisibility([id], true); await independent.setLayerVisibility(preferred, false);
+    assert.equal(independent.isVisible(own), true); assert.equal(independent.isVisible(0), false); assert.equal(independent.isVisible(combined), false,
+      "the real OCG and annotation visibility gate retain independent state");
+    independent.dispose();
+
+    const existingGroup = { ...annotationLayer(id), id: "custom-existing-gate", defaultVisible: false };
+    const reusable = { groups: [real(preferred), existingGroup], conditions: [{ kind: "group", groupId: preferred }, { kind: "group", groupId: existingGroup.id },
+      { kind: "and", operands: [0, 1] }], order: [{ kind: "group", groupId: preferred }], radioGroups: [] };
+    const reused = new AnnotationLayerBuilder(reusable, [...reusable.conditions]);
+    assert.equal(reused.condition(undefined, id), 1); assert.equal(reused.condition(1, id), 1);
+    assert.equal(reused.condition(0, id), 2, "rewrapping an existing conjunction reuses its condition");
+    assert.equal(reused.build().groups.length, 2); assert.equal(reused.build().conditions.length, 3);
+    assert.equal(reused.build().groups.find(group => group.annotationId === id).defaultVisible, false, "explicit metadata preserves existing gate visibility");
+    const missingCondition = new AnnotationLayerBuilder({ ...reusable, conditions: [{ kind: "constant", value: true }] }, [{ kind: "constant", value: true }]);
+    assert.equal(missingCondition.condition(undefined, id), 1); assert.equal(missingCondition.build().groups.length, 2,
+      "an existing annotation group without a condition gains one without duplicating its group");
+
+    const aliases = ["a", "a:1"], deterministic = { groups: aliases.map(value => real(annotationLayerId(value))), conditions: [], order: [], radioGroups: [] };
+    const all = new AnnotationLayerBuilder(deterministic, []); aliases.forEach(value => all.condition(undefined, value));
+    const reversed = new AnnotationLayerBuilder(deterministic, []); [...aliases].reverse().forEach(value => reversed.condition(undefined, value));
+    const subset = new AnnotationLayerBuilder(deterministic, []); subset.condition(undefined, aliases[1]);
+    const allocated = data => new Map(data.groups.filter(group => group.annotationId !== undefined).map(group => [group.annotationId, group.id]));
+    for (const [annotationId, layerId] of allocated(all.build())) assert.equal(allocated(reversed.build()).get(annotationId), layerId);
+    assert.equal(allocated(subset.build()).get(aliases[1]), allocated(all.build()).get(aliases[1]), "gate ids do not depend on painting subset or order");
+    validateSceneOptionalContent(all.build()); validateSceneOptionalContent(reversed.build()); validateSceneOptionalContent(subset.build());
+  }
   const formerGroupLimit = 100_000;
   const full = new AnnotationLayerBuilder({ groups: Array.from({ length: formerGroupLimit },
     (_, index) => ({ id: `g${index}`, name: "", defaultVisible: true, locked: false, usedInView: true })), conditions: [], order: [], radioGroups: [] }, []);

@@ -162,6 +162,37 @@ try {
   }
   assert.deepEqual(scene, original, "interaction never mutates scene data");
 
+  // A hyperlink attached to highlighted text is a separate invisible Link
+  // annotation above the Highlight. Its disjoint quads must remain the hit area.
+  const linked = structuredClone(scene);
+  linked.optionalContent = undefined;
+  linked.drawRuns = linked.drawRuns.map(run => ({ ...run, optionalContent: undefined }));
+  const linkedQuads = [1010,-405,1040,-405,1010,-415,1040,-415, 1010,-430,1040,-430,1010,-440,1040,-440];
+  linked.annotations = [annotation("linked-highlight", 0, [1010,-440,1040,-405], { subtype: "Highlight", quadPoints: linkedQuads }),
+    annotation("highlight-link", 1, [1010,-440,1040,-405], { subtype: "Link", quadPoints: linkedQuads,
+      action: { type: "URI", uri: "https://example.com/reference" } })];
+  const { createNativeAnnotationInteractionAdapter } = await import("../src/nativeAnnotationInteraction.ts");
+  const nativeRenderer = { getViewState: () => ({ zoom: 1, cameraCenterX: 1050, cameraCenterY: -450 }),
+    sceneToClientPoint: (x, y) => ({ x: 75 + (x - 1000) * 8, y: 30 + (-y - 400) * 6 }),
+    clientToScenePoint: (x, y) => ({ x: 1000 + (x - 75) / 8, y: -400 - (y - 30) / 6 }),
+    setPrimitiveHighlights() {} };
+  const native = createNativeAnnotationInteractionAdapter({ getCanvas: () => element, getScene: () => linked, getRenderer: () => nativeRenderer });
+  try {
+    for (const y of [-410, -435]) assert.equal((await native.pick(nativeRenderer.sceneToClientPoint(1020, y), new AbortController().signal)).annotationId, "highlight-link");
+    assert.equal(await native.pick(nativeRenderer.sceneToClientPoint(1020, -422), new AbortController().signal), null, "the gap between linked text lines remains unclickable");
+  } finally { native.dispose(); }
+  for (const backend of ["webgl", "webgpu"]) {
+    const object = makeObject(linked, backend), camera = new THREE.OrthographicCamera(-100,100,75,-75,.1,1000);
+    camera.position.set(0, 0, 200); camera.updateMatrixWorld(true);
+    const pick = async y => { const client = object.sceneToClientPoint(camera, 1020, y, element);
+      return object.pickAnnotation({ camera, element, clientX: client.x, clientY: client.y, tolerancePx: 0 }); };
+    try {
+      for (const y of [-410, -435]) assert.equal((await pick(y)).annotationId, "highlight-link", `${backend}: link above a highlight activates on each text line`);
+      assert.equal(await pick(-422), null);
+      assert.equal(object.primitivePicker.index, null, "linked markup does not index unrelated document primitives");
+    } finally { object.dispose(); }
+  }
+
   // Parent paint-graph conditions supply ownership; soft-mask-only paint must not become a trace.
   const graph = structuredClone(scene);
   graph.drawRuns = [{ kind: "stroke", first: 0, count: 1 }, { kind: "stroke", first: 1, count: 1 }];

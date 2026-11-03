@@ -4,6 +4,8 @@ import type { OrderedTextLodSelection } from "./orderedTextLod";
 import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
+import { patchThreeEditorPreviewTexture } from "./threeEditorPreview";
+import type { EditorPreviewSceneUpdate, EditorPreviewTexel } from "./editorPreviewSceneUpdate";
 import { acquireThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
 import type { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
@@ -105,6 +107,7 @@ export class ThreeMaterialTextLayer {
   private readonly previousRangeStarts: Uint32Array;
   private readonly previousRangeCounts: Uint32Array;
   private previousRangeCount = -1;
+  private editorMovedText: readonly number[] = [];
   private usingAllTextInstances = true;
   private usingExternalSelection = false;
   private externalSelectionCount = -1;
@@ -445,6 +448,14 @@ export class ThreeMaterialTextLayer {
     this.usingExternalSelection = true;
   }
 
+  updateEditorPreview(update: EditorPreviewSceneUpdate, patches: readonly EditorPreviewTexel[]): void {
+    if (this.editorMovedText.length !== update.texts.length || this.editorMovedText.some((id, i) => id !== update.texts[i])) {
+      this.editorMovedText = [...update.texts].sort((a, b) => a - b); this.previousRangeCount = -1;
+    }
+    patchThreeEditorPreviewTexture(this.textInstanceTextureB, patches.filter(patch => patch.kind === "textB"));
+    patchThreeEditorPreviewTexture(this.textGlyphMetaTextureA, patches.filter(patch => patch.kind === "glyphA"));
+  }
+
   /** Restore the ordinary page-range culling path. */
   clearSelectedTextInstanceIds(): void {
     if (!this.usingExternalSelection) {
@@ -549,6 +560,11 @@ export class ThreeMaterialTextLayer {
       rangeCount += 1;
     }
 
+    const moved = this.editorMovedText.filter(id => {
+      for (let i = 0; i < rangeCount; i++) if (id >= this.rangeStarts[i] && id < this.rangeStarts[i] + this.rangeCounts[i]) return false;
+      return true;
+    });
+    visibleInstanceCount += moved.length;
     this.renderedTextInstanceCount = visibleInstanceCount;
     this.mesh.geometry.instanceCount = visibleInstanceCount;
 
@@ -558,15 +574,17 @@ export class ThreeMaterialTextLayer {
       return;
     }
 
-    let outCount = 0;
+    let outCount = 0, movedIndex = 0;
     for (let rangeIndex = 0; rangeIndex < rangeCount; rangeIndex += 1) {
       const start = this.rangeStarts[rangeIndex];
       const end = start + this.rangeCounts[rangeIndex];
+      while (movedIndex < moved.length && moved[movedIndex] < start) this.textInstanceIds[outCount++] = moved[movedIndex++];
       for (let instanceIndex = start; instanceIndex < end; instanceIndex += 1) {
         this.textInstanceIds[outCount] = instanceIndex;
         outCount += 1;
       }
     }
+    while (movedIndex < moved.length) this.textInstanceIds[outCount++] = moved[movedIndex++];
 
     this.rememberRanges(rangeCount);
     this.usingAllTextInstances = false;

@@ -22,6 +22,7 @@ const {
   NativePdfFormAppearanceRegistry
 } = await import("../src/pdf/nativeForms.ts");
 const { compileDensePdfContent } = await import("../src/pdf/nativeContentCompiler.ts");
+const { choosePdfFormAutoFontSize } = await import("../src/pdf/formAutoFontSize.ts");
 const decoder = new TextDecoder();
 const NOOP_TEXT_SINK = Object.freeze({ applyOperator() {} });
 const document = await openNativePdfDocument({ kind: "bytes", bytes: fixture() });
@@ -163,12 +164,58 @@ try {
   await testLinkAppearanceSynthesis();
   await testSquareAppearanceSynthesis();
   await testSquareAppearanceGeometryAndGuards();
+  await testAutoFontSizeSynthesis();
 } finally {
   await document.close();
   hooks.deregister();
 }
 
 console.log("native annotation appearance synthesis tests passed");
+
+async function testAutoFontSizeSynthesis() {
+  assert.equal(choosePdfFormAutoFontSize(false, size => size <= 11.9), 10, "single-line auto sizes use discrete PDFium steps");
+  assert.equal(choosePdfFormAutoFontSize(false, () => true), 144);
+  assert.equal(choosePdfFormAutoFontSize(true, () => true), 12, "multiline auto sizes use PDFium's first-quarter ceiling");
+  assert.equal(choosePdfFormAutoFontSize(false, () => true, 13), 12, "caller limits still select a supported step");
+  assert.equal(choosePdfFormAutoFontSize(true, () => true, 8), 8);
+  assert.equal(choosePdfFormAutoFontSize(false, () => false), 4, "no-fit fields keep usable clipped text");
+  assert.equal(choosePdfFormAutoFontSize(false, () => false, 2), 2, "an explicit caller limit below the smallest step is respected");
+  for (const invalid of [0, -1, NaN, Infinity]) assert.throws(() => choosePdfFormAutoFontSize(false, () => true, invalid), /positive finite/);
+  const specs = [
+    { name: "Single", width: 500, height: 13, text: "Hello", size: 0, expected: 10 },
+    { name: "Large", width: 500, height: 500, text: "I", size: 0, expected: 144 },
+    { name: "Multi", width: 500, height: 500, text: "One two\nThree", size: 0, multiline: true, expected: 12 },
+    { name: "FixedOverflow", width: 20, height: 10, text: "Overflowing field text", size: 37, expected: 37 },
+    { name: "TinyAuto", width: 2.1, height: 2.1, text: "Overflow", size: 0, expected: 4 },
+    { name: "FixedMulti", width: 30, height: 8, text: "Long text wraps beyond this field", size: 18, multiline: true, expected: 18 }
+  ];
+  const bytes = writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+    { number: 3, body: `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1000 1000] /Annots [${specs.map((_, i) => `${10 + i} 0 R`).join(" ")}] >>` },
+    { number: 4, body: `<< /Fields [${specs.map((_, i) => `${10 + i} 0 R`).join(" ")}] /DR << /Font << /Helv 5 0 R >> >> >>` },
+    { number: 5, body: "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>" },
+    { number: 6, body: "<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 /Ascent 800 /Descent -200 /CapHeight 700 /ItalicAngle 0 /StemV 80 /MissingWidth 500 >>" },
+    ...specs.map((spec, index) => ({ number: 10 + index, body: `<< /Type /Annot /Subtype /Widget /FT /Tx /T (${spec.name}) /V (${spec.text}) /Ff ${spec.multiline ? 4096 : 0} /Rect [0 0 ${spec.width} ${spec.height}] /DA (/Helv ${spec.size} Tf 0 g) >>` }))
+  ] });
+  const document = await openNativePdfDocument({ kind: "bytes", bytes });
+  try {
+    const registry = new NativePdfFormAppearanceRegistry(document), annotations = await registry.listPageAnnotations(0);
+    const synthesizer = new NativePdfAppearanceSynthesizer(document);
+    for (let index = 0; index < specs.length; index++) {
+      const spec = specs[index], appearance = await synthesizer.synthesize(annotations[index]); assert(appearance?.synthesized);
+      const content = decoder.decode(appearance.decodedContent);
+      assert.match(content, new RegExp(`/Helv ${spec.expected} Tf`), `${spec.name}: source font and selected point size`);
+      assert.match(content, / re W n/, `${spec.name}: overflowing text is clipped to its widget`);
+      assert.equal(appearance.normalAppearance.form.resources, annotations[index].widget.acroForm.defaultResources, `${spec.name}: declared overflow keeps the original font resources`);
+      await compileDensePdfContent(appearance.decodedContent, { pageMatrix: [1, 0, 0, 1, 0, 0],
+        pageBounds: { minX: 0, minY: 0, maxX: spec.width, maxY: spec.height }, output: "display-program", textOperatorSink: NOOP_TEXT_SINK });
+    }
+    const capped = new NativePdfAppearanceSynthesizer(document, { maxAutoFontSize: 13 });
+    assert.match(decoder.decode((await capped.synthesize(annotations[1])).decodedContent), /\/Helv 12 Tf/);
+    assert.match(decoder.decode((await capped.synthesize(annotations[3])).decodedContent), /\/Helv 37 Tf/, "auto-size maximum never changes an explicit DA size");
+  } finally { await document.close(); }
+}
 
 async function testLinkAppearanceSynthesis() {
   const linkDocument = await openNativePdfDocument({

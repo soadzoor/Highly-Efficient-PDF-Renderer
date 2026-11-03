@@ -1,10 +1,13 @@
 import "./readerViewport.css";
+import "./viewerWorkspace.css";
+import "./toolbarIcons.css";
 import { WebGlPdfRenderer } from "./webGlPdfRenderer";
 import type { RendererApi } from "./rendererTypes";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { RetainedPageReplay } from "./retainedPageReplay";
 import { createDefaultOptionalContentSnapshot } from "./optionalContent";
 import type { ThumbnailPixels } from "./thumbnailTypes";
+import { toolbarButton } from "./toolbarIcons";
 import {
   READER_ACTUAL_SIZE_ZOOM, READER_MARGIN, readerCaptureAnchor, readerContentMetrics,
   readerFitZoom, readerPageAtPoint, readerRestoreAnchor, readerScrollFromView,
@@ -20,6 +23,7 @@ export interface ReaderViewportSnapshot {
 }
 export interface ReaderViewportOptions {
   getCanvas(): HTMLCanvasElement;
+  settingsPanel?: HTMLElement;
   layouts: readonly { value: string; label: string }[];
   onLayoutChange(layout: string): void | Promise<void>;
   onViewChange(view: ReaderView): void;
@@ -45,22 +49,22 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     <div class="reader-primary-controls"></div>
     <label class="reader-layout-label">Layout <select class="reader-layout" aria-label="Page layout"></select></label>
     <div class="reader-reading-controls">
-      <button type="button" data-reader="thumbnails" aria-label="Toggle page thumbnails" aria-expanded="false">▤</button>
-      <button type="button" data-reader="previous" aria-label="Previous page">‹</button>
+      ${toolbarButton("thumbnails", "Toggle page thumbnails", 'data-reader="thumbnails" aria-expanded="false"')}
+      ${toolbarButton("previous", "Previous page", 'data-reader="previous"')}
       <input class="reader-page-number" type="number" min="1" value="1" aria-label="Page number" />
       <span class="reader-page-count">/ 0</span>
-      <button type="button" data-reader="next" aria-label="Next page">›</button>
-      <button type="button" data-reader="zoom-out" aria-label="Zoom out">−</button>
+      ${toolbarButton("next", "Next page", 'data-reader="next"')}
+      ${toolbarButton("zoom-out", "Zoom out", 'data-reader="zoom-out"')}
       <input class="reader-zoom" type="text" inputmode="decimal" value="100%" aria-label="Zoom percentage" />
-      <button type="button" data-reader="zoom-in" aria-label="Zoom in">+</button>
-      <button type="button" data-reader="fit-width">Fit Width</button>
-      <button type="button" data-reader="fit-page">Fit Page</button>
+      ${toolbarButton("zoom-in", "Zoom in", 'data-reader="zoom-in"')}
+      ${toolbarButton("fit-width", "Fit Width", 'data-reader="fit-width"')}
+      ${toolbarButton("fit-page", "Fit Page", 'data-reader="fit-page"')}
     </div>
-    <button type="button" data-reader="find">Find</button>
-    <button type="button" data-reader="settings">Settings</button>
-    <button type="button" data-reader="hide-toolbar" aria-controls="reader-toolbar" aria-expanded="true">Hide toolbar</button>
+    ${toolbarButton("find", "Find text in the document (Ctrl/Cmd+F)", 'data-reader="find"')}
+    ${toolbarButton("settings", "Settings", 'data-reader="settings"')}
+    ${toolbarButton("hide-toolbar", "Hide toolbar", 'data-reader="hide-toolbar" aria-controls="reader-toolbar" aria-expanded="true"')}
     <span class="reader-announcement" role="status" aria-live="polite"></span>
-  </div><button type="button" class="reader-toolbar-restore" data-reader="show-toolbar" aria-controls="reader-toolbar" aria-expanded="false" hidden>Show toolbar</button><div class="reader-workspace">
+  </div>${toolbarButton("show-toolbar", "Show toolbar", 'data-reader="show-toolbar" aria-controls="reader-toolbar" aria-expanded="false" hidden', "reader-toolbar-restore")}<div class="reader-workspace viewer-workspace">
     <aside class="reader-thumbnails" aria-label="Page thumbnails" hidden></aside>
     <div class="reader-scroll" tabindex="0" role="region" aria-label="Document pages">
       <div class="reader-surface"></div>
@@ -72,6 +76,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   const showToolbar = query<HTMLButtonElement>('[data-reader="show-toolbar"]');
   const scroller = query<HTMLDivElement>(".reader-scroll"), surface = query<HTMLDivElement>(".reader-surface");
   const sidebar = query<HTMLElement>(".reader-thumbnails");
+  const settingsButton = query<HTMLButtonElement>('[data-reader="settings"]');
   const layoutSelect = query<HTMLSelectElement>(".reader-layout");
   const pageInput = query<HTMLInputElement>(".reader-page-number"), zoomInput = query<HTMLInputElement>(".reader-zoom");
   const pageCount = query<HTMLSpanElement>(".reader-page-count");
@@ -87,9 +92,15 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   }
   // Move controls rather than duplicate IDs or attach a second set of handlers.
   const primary = query<HTMLDivElement>(".reader-primary-controls");
-  for (const selector of [".package-version", "#open-file", "#example-dropdown"]) {
+  for (const selector of [".package-version", "#open-file", "#new-pdf", "#example-dropdown"]) {
     const element = document.querySelector<HTMLElement>(selector);
     if (element) primary.append(element);
+  }
+  if (options.settingsPanel) {
+    options.settingsPanel.classList.add("viewer-settings");
+    query<HTMLElement>(".reader-workspace").append(options.settingsPanel);
+    if (options.settingsPanel.id) settingsButton.setAttribute("aria-controls", options.settingsPanel.id);
+    settingsButton.setAttribute("aria-expanded", String(!options.settingsPanel.classList.contains("collapsed")));
   }
   document.body.append(shell);
   document.body.classList.add("has-reader-toolbar");
@@ -104,7 +115,9 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   let logicalScroll = { left: 0, top: 0 }, domScroll = { left: 0, top: 0 };
   let resizeFrame = 0, inertiaFrame = 0;
   let thumbnailRevision = 0, thumbnailRunning = false;
+  const thumbnailPageRevisions = new Map<number, number>();
   const thumbnailWanted = new Set<number>(), thumbnailCanvases = new Map<number, HTMLCanvasElement>();
+  const thumbnailDirty = new Set<number>();
   const thumbnailFailed = new Set<number>(), thumbnailJobs = new Map<number, AbortController>();
   const rows: HTMLButtonElement[] = [], rowTops: number[] = [];
   let scratchCanvas: HTMLCanvasElement | null = null, scratchRenderer: WebGlPdfRenderer | null = null;
@@ -222,6 +235,11 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     }
     updateThumbnails();
   }
+  function settingsChanged(): void {
+    if (!options.settingsPanel) return;
+    settingsButton.setAttribute("aria-expanded", String(!options.settingsPanel.classList.contains("collapsed")));
+    cancelActiveGesture(); resize();
+  }
   function stopInertia(): void { if (inertiaFrame) window.cancelAnimationFrame(inertiaFrame); inertiaFrame = 0; }
   function updateToolbarOffset(): void {
     document.documentElement.style.setProperty("--reader-toolbar-height", `${toolbar.hidden ? 16 : toolbar.getBoundingClientRect().height + 16}px`);
@@ -255,6 +273,11 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   function setView(view: ReaderCameraView): void {
     if (!Number.isFinite(view.zoom) || view.zoom <= 0 || !Number.isFinite(view.centerX) || !Number.isFinite(view.centerY)) return;
     savedView = view; prepareZoom(view.zoom); positionView(view); present();
+  }
+  function panByPixels(dx: number, dy: number): void {
+    if (!active || !Number.isFinite(dx) || !Number.isFinite(dy)) return;
+    stopInertia(); navigationTarget = null; fit = null; initialView = false;
+    scrollBy(-dx, -dy); present();
   }
   function zoomAt(nextZoom: number, x = metrics.width / 2, y = metrics.height / 2): void {
     setView(readerZoomAt(getView(), nextZoom, x, y));
@@ -295,16 +318,29 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     else resize();
     updateToolbar();
   }
-  function invalidateThumbnails(): void {
-    thumbnailRevision++;
-    for (const job of thumbnailJobs.values()) job.abort();
-    for (const canvas of thumbnailCanvases.values()) { canvas.remove(); canvas.width = canvas.height = 0; }
-    thumbnailCanvases.clear(); thumbnailFailed.clear();
-    for (const row of rows) { row.classList.remove("reader-thumbnail-failed"); row.title = ""; }
+  function invalidateThumbnails(pageIndices?: readonly number[]): void {
+    if (pageIndices?.length === 0) return;
+    const pages = pageIndices === undefined ? rows.map((_, page) => page)
+      : [...new Set(pageIndices)].filter(page => Number.isInteger(page) && page >= 0 && page < rows.length);
+    if (pageIndices === undefined) {
+      thumbnailRevision++; thumbnailPageRevisions.clear();
+      for (const job of thumbnailJobs.values()) job.abort();
+      for (const canvas of thumbnailCanvases.values()) { canvas.remove(); canvas.width = canvas.height = 0; }
+      thumbnailCanvases.clear(); thumbnailDirty.clear(); thumbnailFailed.clear();
+    }
+    for (const page of pages) {
+      if (pageIndices !== undefined) {
+        thumbnailPageRevisions.set(page, (thumbnailPageRevisions.get(page) ?? 0) + 1);
+        thumbnailJobs.get(page)?.abort(); thumbnailDirty.add(page);
+      }
+      thumbnailFailed.delete(page);
+      rows[page].classList.remove("reader-thumbnail-failed"); rows[page].title = "";
+    }
     updateThumbnails();
   }
   function setDocument(next: { identity: unknown; pageRects: Float32Array }): void {
     const same = identity === next.identity && rects.length > 0;
+    const samePages = same && rects.length === next.pageRects.length && rects.every((value, index) => value === next.pageRects[index]);
     const before = getView(), anchor = same ? readerCaptureAnchor(rects, before) : null;
     identity = next.identity; rects = next.pageRects;
     navigationTarget = null;
@@ -314,20 +350,22 @@ export function createReaderViewport(options: ReaderViewportOptions) {
       positionScroll(0, 0); sidebar.scrollTop = 0;
     }
     sidebar.hidden = !active || !sidebarOpen;
-    rows.length = rowTops.length = 0; sidebar.replaceChildren();
-    let top = 12;
-    const fragment = document.createDocumentFragment();
-    for (let page = 0; page < rects.length / 4; page++) {
-      const i = page * 4, width = Math.max(.001, rects[i + 2] - rects[i]), height = Math.max(.001, rects[i + 3] - rects[i + 1]);
-      const scale = Math.min(120 / width, 160 / height);
-      const row = document.createElement("button"); row.type = "button"; row.className = "reader-thumbnail";
-      row.setAttribute("aria-label", `Go to page ${page + 1}`); row.dataset.page = String(page);
-      row.style.height = `${height * scale + 32}px`;
-      row.innerHTML = `<span class="reader-thumbnail-image" style="width:${width * scale}px;height:${height * scale}px"></span><span>${page + 1}</span>`;
-      if (page === currentPage) row.setAttribute("aria-current", "page");
-      rowTops.push(top); top += height * scale + 44; rows.push(row); fragment.append(row);
+    if (!samePages) {
+      rows.length = rowTops.length = 0; sidebar.replaceChildren();
+      let top = 12;
+      const fragment = document.createDocumentFragment();
+      for (let page = 0; page < rects.length / 4; page++) {
+        const i = page * 4, width = Math.max(.001, rects[i + 2] - rects[i]), height = Math.max(.001, rects[i + 3] - rects[i + 1]);
+        const scale = Math.min(120 / width, 160 / height);
+        const row = document.createElement("button"); row.type = "button"; row.className = "reader-thumbnail";
+        row.setAttribute("aria-label", `Go to page ${page + 1}`); row.dataset.page = String(page);
+        row.style.height = `${height * scale + 32}px`;
+        row.innerHTML = `<span class="reader-thumbnail-image" style="width:${width * scale}px;height:${height * scale}px"></span><span>${page + 1}</span>`;
+        if (page === currentPage) row.setAttribute("aria-current", "page");
+        rowTops.push(top); top += height * scale + 44; rows.push(row); fragment.append(row);
+      }
+      sidebar.append(fragment); invalidateThumbnails();
     }
-    sidebar.append(fragment); invalidateThumbnails();
     if (!same) releaseScratch();
     sizeSurface();
     if (anchor) {
@@ -337,14 +375,21 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     resize(); updateToolbar();
   }
 
+  function replaceThumbnail(page: number, box: HTMLElement, image: HTMLCanvasElement): void {
+    const previous = thumbnailCanvases.get(page);
+    box.append(image); thumbnailCanvases.set(page, image); thumbnailDirty.delete(page);
+    if (previous) { previous.remove(); previous.width = previous.height = 0; }
+  }
   async function pumpThumbnails(): Promise<void> {
     if (thumbnailRunning || disposed || !active || !sidebarOpen) return;
     thumbnailRunning = true;
     try {
       while (!disposed && active && sidebarOpen) {
-        const page = [...thumbnailWanted].find(index => !thumbnailCanvases.has(index) && !thumbnailFailed.has(index));
+        const page = [...thumbnailWanted].find(index => (!thumbnailCanvases.has(index) || thumbnailDirty.has(index)) && !thumbnailFailed.has(index));
         if (page === undefined) break;
-        const revision = thumbnailRevision, controller = new AbortController();
+        const revision = thumbnailRevision, pageRevision = thumbnailPageRevisions.get(page) ?? 0, controller = new AbortController();
+        const isCurrent = (): boolean => !disposed && revision === thumbnailRevision
+          && pageRevision === (thumbnailPageRevisions.get(page) ?? 0) && thumbnailWanted.has(page);
         thumbnailJobs.set(page, controller);
         try {
           const box = rows[page].querySelector<HTMLElement>(".reader-thumbnail-image")!;
@@ -354,18 +399,18 @@ export function createReaderViewport(options: ReaderViewportOptions) {
           if (options.getPageThumbnail) {
             const pixels = await options.getPageThumbnail(page, { maxDimension: Math.max(width, height), signal: controller.signal });
             controller.signal.throwIfAborted();
-            if (revision !== thumbnailRevision || disposed || !thumbnailWanted.has(page)) continue;
+            if (!isCurrent()) continue;
             const image = document.createElement("canvas"); image.width = pixels.width; image.height = pixels.height;
             const context = image.getContext("2d");
             if (!context) throw new Error("Page thumbnail canvas is unavailable.");
             context.putImageData(new ImageData(new Uint8ClampedArray(pixels.rgba.buffer, pixels.rgba.byteOffset, pixels.rgba.byteLength), pixels.width, pixels.height), 0, 0);
-            box.append(image); thumbnailCanvases.set(page, image);
+            replaceThumbnail(page, box, image);
             await new Promise<void>(resolve => window.setTimeout(resolve, 0));
             continue;
           }
           if (!options.getPagePreviewScene) throw new Error("Page thumbnails are unavailable.");
           const scene = await options.getPagePreviewScene(page, { maximumDimension: Math.max(16, Math.min(4096, Math.max(width, height))), signal: controller.signal });
-          if (controller.signal.aborted || revision !== thumbnailRevision || !thumbnailWanted.has(page)) continue;
+          if (controller.signal.aborted || !isCurrent()) continue;
           scratchCanvas ??= document.createElement("canvas");
           scratchCanvas.width = width; scratchCanvas.height = height;
           scratchRenderer ??= new WebGlPdfRenderer(scratchCanvas, { preserveDrawingBuffer: true });
@@ -379,11 +424,11 @@ export function createReaderViewport(options: ReaderViewportOptions) {
               const visibility = renderer.getOptionalContentVisibility() ?? createDefaultOptionalContentSnapshot(scene);
               const result = await replay.prepare(visibility, { signal: controller.signal });
               controller.signal.throwIfAborted();
-              if (revision !== thumbnailRevision || disposed || !thumbnailWanted.has(page)) continue;
+              if (!isCurrent()) continue;
               const staged = await renderer.prepareRasterLayerUpdatesAsync(result.layers);
               try {
                 controller.signal.throwIfAborted();
-                if (revision !== thumbnailRevision || disposed || !thumbnailWanted.has(page)) continue;
+                if (!isCurrent()) continue;
                 staged.commit(); result.commit();
               } finally { staged.dispose(); }
             }
@@ -393,10 +438,10 @@ export function createReaderViewport(options: ReaderViewportOptions) {
             const context = image.getContext("2d");
             if (!context) throw new Error("Page thumbnail canvas is unavailable.");
             context.drawImage(sourceCanvas, 0, 0);
-            box.append(image); thumbnailCanvases.set(page, image);
+            replaceThumbnail(page, box, image);
           } finally { replay?.dispose(); }
         } catch (error) {
-          if (!controller.signal.aborted && revision === thumbnailRevision) {
+          if (!controller.signal.aborted && isCurrent()) {
             thumbnailFailed.add(page); rows[page]?.classList.add("reader-thumbnail-failed");
             if (rows[page]) rows[page].title = "Preview unavailable. Select to open this page.";
             console.warn(`[HEPR] Thumbnail for page ${page + 1} could not be prepared.`, error);
@@ -547,7 +592,10 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   scroller.addEventListener("wheel", event => {
     stopInertia();
     if (!active || event.defaultPrevented || event.ctrlKey || event.metaKey) return;
-    if (metrics.surfaceWidth <= scroller.scrollWidth + 1 && metrics.surfaceHeight <= scroller.scrollHeight + 1) return;
+    // Editor overlays forward wheel events to the canvas. Synthetic events have
+    // no browser scroll default, so apply their deltas even without compression.
+    const forwarded = !event.isTrusted && event.target === attachedCanvas;
+    if (!forwarded && metrics.surfaceWidth <= scroller.scrollWidth + 1 && metrics.surfaceHeight <= scroller.scrollHeight + 1) return;
     event.preventDefault();
     const unit = event.deltaMode === 1 ? 16 : 1;
     const left = event.shiftKey && !event.deltaX ? event.deltaY : event.deltaX;
@@ -608,9 +656,9 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     for (const job of thumbnailJobs.values()) job.abort();
     releaseScratch();
     for (const canvas of thumbnailCanvases.values()) { canvas.remove(); canvas.width = canvas.height = 0; }
-    thumbnailCanvases.clear(); thumbnailWanted.clear(); thumbnailFailed.clear(); rows.length = rowTops.length = 0;
+    thumbnailCanvases.clear(); thumbnailWanted.clear(); thumbnailDirty.clear(); thumbnailFailed.clear(); thumbnailPageRevisions.clear(); rows.length = rowTops.length = 0;
     announcement.textContent = "";
   }
-  return { setDocument, setLayout, getView, setView, goToPage, resize, canvasChanged,
-    invalidateThumbnails, snapshot, restore, dispose, isActive, cancelActiveGesture };
+  return { setDocument, setLayout, getView, setView, panByPixels, goToPage, resize, canvasChanged,
+    invalidateThumbnails, snapshot, restore, dispose, isActive, cancelActiveGesture, settingsChanged };
 }

@@ -16,6 +16,9 @@ import {
 } from "./nativeWebGlCoreShaders";
 import { vectorIndexedPathStore } from "./vectorCellIndex";
 import { vectorFillCoverageMetadata } from "./vectorFillCoverage";
+import { getEditorSceneTranslationHint } from "./editorScenePreview";
+import { prepareEditorPreviewSceneUpdate, editorPreviewFillCoverage, editorPreviewFillDrawData, editorPreviewRectangleClipTexels,
+  editorPreviewSceneTexels, coalesceEditorPreviewTexels, type EditorPreviewTexture } from "./editorPreviewSceneUpdate";
 import { vectorFillDrawData, fillDrawColorTexels, type VectorFillDrawData } from "./vectorFillDrawSelection";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
 import { buildRasterStripBatches } from "./rasterStripBatches";
@@ -716,6 +719,7 @@ export class WebGlPdfRenderer {
   private vectorClipBounds: Float32Array = new Float32Array(0);
   private vectorClipBoundsTexture: WebGLTexture | null = null;
   private vectorClipStoreTexels = 0;
+  private vectorClipTextureWidth = 1;
   private vectorClipPackingStats: VectorClipPackingStats | null = null;
   private vectorClipIndex = -1;
   private orderedBatches: VectorOrderedBatches | null = null;
@@ -1984,6 +1988,53 @@ export class WebGlPdfRenderer {
     this.requestFrame();
   }
 
+  updateEditorPreviewScene(scene: VectorScene): boolean {
+    if (this.isDisposed || !this.scene || this.vectorLodRuntime || this.textLodGpuActive || this.primitiveColors || this.gl.isContextLost?.()) return false;
+    const update = prepareEditorPreviewSceneUpdate(this.scene, scene);
+    if (!update || update.fills.some(index => this.fillDrawData?.parts.has(index))) return false;
+    const clips = editorPreviewRectangleClipTexels(scene, update, this.vectorClipHeaders); if (!clips) return false;
+    const coverage = editorPreviewFillCoverage(scene, update), patches = editorPreviewSceneTexels(scene, update, coverage);
+    for (const index of update.fills) {
+      if (this.fillBandBase >= 0) patches.push({ kind: "fillSegmentsA", index: this.fillBandBase + index, pixels: new Float32Array(4) });
+      if (this.fillCellBase >= 0) patches.push({ kind: "fillSegmentsA", index: this.fillCellBase + index, pixels: new Float32Array(4) });
+    }
+    const textures: Record<EditorPreviewTexture, { texture: WebGLTexture; width: number }> = {
+      strokeA: { texture: this.segmentTextureA, width: this.segmentTextureWidth }, strokeB: { texture: this.segmentTextureB, width: this.segmentTextureWidth },
+      strokeBounds: { texture: this.segmentTextureD, width: this.segmentTextureWidth }, fillA: { texture: this.fillPathMetaTextureA, width: this.fillPathMetaTextureWidth },
+      fillB: { texture: this.fillPathMetaTextureB, width: this.fillPathMetaTextureWidth }, fillC: { texture: this.fillPathMetaTextureC, width: this.fillPathMetaTextureWidth },
+      fillSegmentsA: { texture: this.fillSegmentTextureA, width: this.fillSegmentTextureWidth }, fillSegmentsB: { texture: this.fillSegmentTextureB, width: this.fillSegmentTextureWidth },
+      textB: { texture: this.textInstanceTextureB, width: this.textInstanceTextureWidth }, glyphA: { texture: this.textGlyphMetaTextureA, width: this.textGlyphMetaTextureWidth }
+    };
+    const widths = Object.fromEntries(Object.entries(textures).map(([kind, value]) => [kind, value.width])) as Record<EditorPreviewTexture, number>;
+    const gl = this.gl; gl.activeTexture(gl.TEXTURE0);
+    for (const row of coalesceEditorPreviewTexels(patches, widths)) {
+      const target = textures[row.kind]; gl.bindTexture(gl.TEXTURE_2D, target.texture);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, row.index % target.width, Math.floor(row.index / target.width), row.count, 1, gl.RGBA, gl.FLOAT, row.pixels);
+    }
+    if (clips.bounds) {
+      gl.bindTexture(gl.TEXTURE_2D, this.vectorClipTexture);
+      for (const row of clips.patches) gl.texSubImage2D(gl.TEXTURE_2D, 0, row.index % this.vectorClipTextureWidth, Math.floor(row.index / this.vectorClipTextureWidth), 1, 1, gl.RGBA, gl.FLOAT, row.pixels);
+      this.vectorClipBounds = clips.bounds;
+      if (this.vectorClipBoundsTexture) {
+        const width = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE) as number, Math.ceil(Math.sqrt(clips.bounds.length / 4)));
+        gl.bindTexture(gl.TEXTURE_2D, this.vectorClipBoundsTexture);
+        for (const index of update.hint.changedClips!) gl.texSubImage2D(gl.TEXTURE_2D, 0, index % width, Math.floor(index / width), 1, 1, gl.RGBA, gl.FLOAT, clips.bounds.subarray(index * 4, index * 4 + 4));
+      }
+    }
+    // Canonical order keeps newly overlapping paints exact. Build its identity
+    // IDs once: ordinary ordered uploads omitted this otherwise unused buffer.
+    if (this.allSegmentIds.length !== this.segmentCount) {
+      this.allSegmentIds = Float32Array.from({ length: this.segmentCount }, (_, index) => index);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.allSegmentIdBuffer); gl.bufferData(gl.ARRAY_BUFFER, this.allSegmentIds, gl.STATIC_DRAW);
+    }
+    this.scene = scene; this.orderedBatches = null; this.mixedVectorBatches = null;
+    this.orderedRunCuller = new VectorDrawRunCuller(scene, undefined, coverage);
+    this.scenePaintVisibility = new ScenePaintVisibility(scene); this.scenePaintVisibility.setVisibility(this.optionalContentVisibility);
+    if (this.fillDrawData) this.fillDrawData = editorPreviewFillDrawData(scene, update, coverage, this.fillDrawData);
+    this.fillCoverageMetadata = this.fillDrawData ?? coverage;
+    this.destroyVectorMinifyResources(); this.resetOrderedState(); this.needsVisibleSetUpdate = true; this.requestFrame(); return true;
+  }
+
   setScene(scene: VectorScene, options: SceneUpdateOptions = {}): SceneStats {
     const transitionStarted = performance.now();
     if (this.isDisposed) {
@@ -2025,7 +2076,7 @@ export class WebGlPdfRenderer {
     this.textLodRuntime?.dispose();
     this.orderedTextLod = null;
     const lodStarted = performance.now();
-    const textLodBuildResult = this.thumbnailMode || this.scenePaintVisibility.requiresCompositing ? null : this.textLodMode === "auto"
+    const textLodBuildResult = this.thumbnailMode || this.scenePaintVisibility.requiresCompositing || getEditorSceneTranslationHint(scene) ? null : this.textLodMode === "auto"
       ? getOrBuildTextLod(scene)
       : getCachedTextLod(scene);
     this.recordPerformanceTransition("pageSwap.textLod", performance.now() - lodStarted);
@@ -3741,12 +3792,14 @@ export class WebGlPdfRenderer {
     // Optional spatial indices accelerate exact clipping at any zoom.
     // Highlight overlays pack their own few clips with bands.
     const data = packVectorClips(scene.clipPaths, Math.min(MAX_VECTOR_CLIP_TEXELS, maxSize ** 2), { cells: true,
+      exclusive: getEditorSceneTranslationHint(scene)?.changedClips?.length ? new Set(getEditorSceneTranslationHint(scene)!.changedClips) : undefined,
       onStats: stats => { this.vectorClipPackingStats = stats; } });
     this.vectorClipStoreTexels = data.length / 4;
     this.vectorClipHeaders = data.slice(0, (scene.clipPaths?.length ?? 0) * 4);
     this.vectorClipBounds = vectorClipChainBounds(scene.clipPaths);
     const texels = data.length / 4;
     const width = Math.min(maxSize, Math.max(1, Math.ceil(Math.sqrt(texels))));
+    this.vectorClipTextureWidth = width;
     const height = Math.ceil(texels / width);
     if (height > maxSize) throw new RangeError("Vector clip data exceeds GPU texture capacity.");
     const padded = new Float32Array(width * height * 4); padded.set(data);
@@ -6050,7 +6103,7 @@ export class WebGlPdfRenderer {
     // Do not retain the previous scene through a dormant mixed plan.
     this.mixedVectorBatches = null;
     if (this.mixedVectorGpu) this.mixedVectorGpu.revision = -1;
-    if (shouldUseVectorStrokeLod(this.vectorLodMode, "webgl", scene.segmentCount)) {
+    if (!getEditorSceneTranslationHint(scene) && shouldUseVectorStrokeLod(this.vectorLodMode, "webgl", scene.segmentCount)) {
       this.vectorLodRuntime = takePrebuiltVectorStrokeLodRuntime(scene) ?? new VectorStrokeLodRuntime(scene);
       this.vectorLodRuntime.setForceExact(this.primitiveColors?.has("stroke") ?? false);
     } else {

@@ -26,6 +26,9 @@ try {
   await writeFile(resolve(scratch, "package.json"), '{"name":"hepr-node-thumbnail-consumer","private":true,"type":"module"}\n');
   await symlink(resolve(root, "node_modules/@napi-rs"), resolve(scratch, "node_modules/@napi-rs"), "junction");
   const manifest = JSON.parse(await readFile(resolve(installed, "package.json"), "utf8"));
+  for (const dependency of Object.keys(manifest.dependencies ?? {})) {
+    await symlink(resolve(root, "node_modules", dependency), resolve(scratch, "node_modules", dependency), "junction");
+  }
   assert.equal(manifest.exports["./node"].import, "./dist/lib/node.js");
   const encoderWorker = manifest.exports["./experimental/thumbnail-encoder-worker"];
   assert.equal(encoderWorker.import, "./dist/lib/thumbnail-encoder-worker.js");
@@ -35,6 +38,8 @@ try {
   assert.match(declarations, /renderPdfThumbnail/);
   assert.match(declarations, /openDocumentSession/);
   assert.match(declarations, /HepBuildResult/);
+  assert.match(declarations, /changePdfProtection/);
+  assert.match(declarations, /manipulatePdfPages/);
   await assert.rejects(access(resolve(installed, "src")), error => error.code === "ENOENT", "published Node APIs require no TypeScript sources");
   const pdfPath = resolve(scratch, "drawing with spaces.pdf");
   await writeFile(pdfPath, writeTinyPdf({ objects: [
@@ -52,7 +57,7 @@ try {
   // default fallbacks beside the bundle deliberately do not exist: successful
   // calls must resolve the published package's worker subpaths.
   const entry = resolve(scratch, "entry.js");
-  await writeFile(entry, 'export { renderPdfThumbnail, openDocumentSession } from "@soadzoor/hepr/node";\n');
+  await writeFile(entry, 'export { renderPdfThumbnail, openDocumentSession, openEditorSession, changePdfProtection, manipulatePdfPages } from "@soadzoor/hepr/node";\n');
   const result = await build({ root: scratch, configFile: false, publicDir: false, logLevel: "error",
     ssr: { noExternal: ["@soadzoor/hepr"] },
     build: { ssr: entry, write: false, minify: true, target: "node22", reportCompressedSize: false,
@@ -73,7 +78,7 @@ try {
   const bundled = await import(pathToFileURL(resolve(bundleRoot, "entry.mjs")));
   await exercise(bundled, pdfPath);
   for (const [name, value] of globals) assert.equal(globalThis[name], value, `Node package must not install a global ${name} shim`);
-  console.log("Packed Node thumbnails: real published entry, default parser/encoder workers, native canvas, lossless WebP/PNG, standard fonts, reuse and relocated SSR bundle passed.");
+  console.log("Packed Node thumbnails and editing: published entry, parser/encoder workers, native canvas, bundled-font HarfBuzz text, PDF/HEP saves and relocated SSR bundle passed.");
 } finally { await rm(scratch, { recursive: true, force: true }); }
 
 async function exercise(library, pdfPath) {
@@ -98,4 +103,29 @@ async function exercise(library, pdfPath) {
     assert.equal(withScene.scene.pageCount, 1);
   } finally { await session.close(); await session.close(); }
   assert(withScene.scene.textInstanceCount > 0, "packed and SSR sessions retain full-quality text after close");
+  const editor = await library.openEditorSession(withScene.scene);
+  try {
+    editor.addObject({ kind: "text", pageIndex: 0, x: 4, y: 4, width: 70, height: 30,
+      fontSize: 9, text: "Office résumé אבג", transform: [1, 0, 0, 1, 0, 0] });
+    const edited = await editor.getScene();
+    assert(edited.textIndex.pages[0].text.includes("résumé אבג"), "published HarfBuzz runtime loads font bytes and retains searchable Unicode");
+    const pdf = await editor.savePdf();
+    assert.equal(new TextDecoder().decode(new Uint8Array(await pdf.arrayBuffer()).subarray(0, 5)), "%PDF-");
+    const protectedPdf = await editor.savePdf({ protection: { mode: "password", password: "packed-editor-password" } });
+    const unlocked = await library.changePdfProtection(new Uint8Array(await protectedPdf.arrayBuffer()), { mode: "remove" }, { password: "packed-editor-password" });
+    const reopened = await library.openDocumentSession(new Uint8Array(await unlocked.arrayBuffer()));
+    try { assert.equal(reopened.info.pageCount, 1, "packed and relocated SSR exports can protect and unlock PDF copies"); }
+    finally { await reopened.close(); }
+    const hep = await editor.saveHep({ compression: "store" });
+    assert.deepEqual([...new Uint8Array(await hep.arrayBuffer()).subarray(0, 4)], [72, 69, 80, 0]);
+    const dimensions = editor.getPages()[0];
+    await editor.rotatePages([0], 90);
+    assert.deepEqual([editor.getPages()[0].width, editor.getPages()[0].height], [dimensions.height, dimensions.width]);
+    await editor.insertPdf(new Uint8Array(await pdf.arrayBuffer()), { at: 1 });
+    assert.equal(editor.getPages().length, 2);
+    await editor.removePages([0]); assert.equal(editor.getPages().length, 1);
+    editor.undo(); assert.equal(editor.getPages().length, 2); editor.redo(); assert.equal(editor.getPages().length, 1);
+    const pageCopy = await library.manipulatePdfPages(new Uint8Array(await (await editor.savePdf()).arrayBuffer()), { kind: "rotate", pages: [0], degrees: 180 });
+    assert.equal(pageCopy.type, "application/pdf", "packed and relocated SSR native page APIs remain available");
+  } finally { editor.dispose(); }
 }

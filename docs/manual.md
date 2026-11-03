@@ -31,6 +31,670 @@ Compressed HEP exports require `CompressionStream("deflate")`; reading them
 requires `DecompressionStream("deflate")`. See [HEP files](#hep-files) for an
 uncompressed option and [Node conversion](#node-conversion) for server requirements.
 
+## Editing documents
+
+Select existing vector artwork or text to change **Color**. Use **Fill** to recolor
+existing filled paths separately. Multi-selection and groups support mixed values;
+changes apply to their supported, unlocked members in one undoable step. Original
+opacity, clipping and masks are retained, and saved PDF/HEP files keep the colors.
+Changing a gradient's color retains its alpha and coverage. These controls do not
+recolor imported image pixels or add/remove fills on original page content.
+Picker changes preview live on the selected objects. Only the final color becomes
+an edit, so one Undo restores the previous color. Escape cancels the preview;
+returning to the original color creates no history entry. Clicking another object
+keeps the final choice attached to the objects that were being recolored.
+
+Both viewers start in **View** mode. Choose **Edit** to prepare full-quality
+editing data and show editing tools. A **Loading Edit mode** card appears inside
+the canvas before the editing tools load, even with Settings closed. It remains
+visible through the first displayed editable frame, including when returning to
+an existing editing session. A spinner and progress bar identify the current
+stage: loading tools, preparing full-quality pages, preparing form fields and
+fonts, preparing controls, or drawing the editable document. Percentages measure
+page or field progress within that stage; stages without a measurable total use
+an indeterminate bar.
+
+The mode button becomes **Cancel editing setup** while preparation is running.
+Cancel or a setup failure returns to View and removes the loading card; failures
+remain in the status message. Choose Edit to retry. Cancelling re-entry preserves
+your earlier modifications. Preparation can take longer and use more memory than
+viewing. Returning to View keeps the modifications and removes the editor overlay
+and its frame work. Setup UI, layout observers and listeners exist only during
+setup. New visible content still has its ordinary rendering cost. Browser/GPU
+performance must be verified on your documents.
+
+View and Edit use the same vector toolbar icons. Hover for descriptive titles,
+or navigate by keyboard with accessible button names and visible focus. Page,
+password, save, flatten and print actions use icons alongside the editing tools;
+busy-state titles describe work such as preparing a print or export.
+
+Drop PDF or HEP files anywhere in either viewer to open them. When a document is
+already open, choose **Replace** or **Attach at end**, or cancel the drop. Attach
+keeps current edits, appends pages in file order and supports Undo; it also works
+in View without showing editing controls. Enter imported PDF passwords when
+prompted. With several files, Replace opens the first and attaches the rest.
+Legacy HEP ZIP files are accepted. HEP attachment preserves its retained visual
+content but cannot restore missing original form or text-authoring semantics.
+Each file attaches separately; if a later file fails or is cancelled, earlier
+completed attachments remain. Press Escape to cancel an operation.
+
+In Edit, drop PNG, JPEG or WebP files onto a document page to insert images at the
+drop location. Images retain their source resolution and transparency and support
+Undo. Drop documents and images separately; image insertion requires Edit mode.
+
+Use Select to move, resize or rotate objects. Ctrl/Cmd-click toggles membership
+in a selection; Shift-click adds. Drag anywhere inside the selection frame to
+move the entire selection. Drag an empty area outside it to select every visible
+object fully contained in the rectangle. Selection handles and numeric controls
+apply to the entire selection. Corner resizing keeps proportions by default;
+hold Shift to resize width and height independently. In Select, textbox resizing
+scales the box and its characters together, matching the drag preview on release.
+While editing textbox content, resizing changes only its bounds and wrapping.
+Modifiers can be changed during a drag. Use undo/redo, duplicate, delete, grouping,
+and arrow-key nudging from the editing tools and shortcuts.
+The selection frame and handles follow the object's rotation and transform.
+Resize along the visible frame's axes; numeric W/H controls use its edge lengths.
+Dragging the rotation grip snaps the resulting absolute frame angle to the
+nearest multiple of 45°, including 0°, only when it is within 5° of that angle
+(inclusive). Other angles rotate freely. Hold Alt (Option on macOS) to bypass
+snapping entirely. Pressing or releasing Alt/Option updates the preview even
+without moving the pointer; the final pointer position and modifier state are
+honored when you release the grip.
+Shift retains its selection and free-resize behavior.
+**Rotate** displays and sets the selection frame's absolute angle, normalized to
+`[-180°, 180°)` with positive angles counterclockwise. Entering 90° sets the frame
+to 90°; entering 90° again keeps it there. During a drag, the value follows the
+displayed preview.
+During a transform, the objects and selection frame advance together with each
+rendered preview. New pointer positions are coalesced while a preview prepares;
+the previous displayed pose remains together until the next one is drawn.
+Transform previews reuse PDF field appearances while the source, values and
+target widgets are unchanged, applying current geometry, clips and paint order
+on each update. Identical glyph resources also reuse the existing text atlas.
+Supported moves prepare the current scene once, then move selected text, paths
+and form appearances while retaining paint order and antialiased clipping.
+Native WebGL/WebGPU reuse GPU resources for compatible poses; Three.js also
+reuses material textures while viewing a single document object, including Grid
+and single-page Reader. Independent multi-page Reader views use the regular
+update path, including when those page views are retained on returning to Grid.
+Rotation, resizing, selected images/gradients, complex effects and incompatible
+clipping/text state keep full compilation. Existing LOD settings are preserved,
+and releasing, cancelling or leaving Edit resumes normal document updates.
+Each source session retains current reusable resource sets rather than an
+appearance history; superseded preparation stops when no active operation needs
+it. Reusable preparation and active export snapshots survive cancellation of a
+single preview, and disposing the source session releases its caches.
+Object transform handles appear in Select; textbox bounds handles also appear
+while editing their content. Rotation and resize cursors remain
+visible throughout a drag; Text and Pencil use their own cursors. Switching
+tools or pressing Escape cancels the current gesture.
+Document selection frames, handles and input controls are clipped at the canvas
+viewport and stay below the toolbars, Settings panel and thumbnails. Captured
+drags can continue beyond the viewport; page edges and Reader gaps do not clamp
+their coordinates. Text-selection popups and annotation bubbles stay within the
+visible document area.
+In Reader layout, the mouse wheel scrolls over the selection frame and drawing
+overlay, including while editing textbox content; Ctrl/Cmd-wheel zooms, and
+Shift-wheel scrolls horizontally. Wheel navigation keeps the textbox draft open
+and preserves its current text selection.
+
+Source annotations and inseparable mask/compositing groups select together.
+Other source content can select as individual strokes, glyphs, fills or images;
+use multi-selection and grouping when the original document has no useful
+object boundaries. An existing raster island moves as a whole image.
+
+Use **Add a form field** in Edit, then drag out its area (or click for a default
+size). Choose text, number, date, email, telephone, URL, checkbox, radio button,
+dropdown or list in the properties dialog. Set its name, current/default value,
+accessible tooltip, required/read-only state, multiline/maximum length, choices,
+font and colors. List options use one line per choice, optionally `value | label`.
+Radio buttons with the same name form a group and need different checked export
+values; other names must be unique. Select a newly added field and choose
+**Edit field properties** to change its settings. Move, resize, rotate, duplicate,
+delete and undo fields with the ordinary editing tools. Copied fields receive
+independent names; copied radio buttons retain their copied group relationships.
+
+Use Fill, or double-click the field with Select, to enter values. Dates use
+`YYYY-MM-DD`; number inputs accept decimal and exponent notation. Save PDF keeps
+real editable AcroForm fields and embeds fonts for later typing. Number/date and
+other typed text fields use native controls in HEPR; other PDF readers receive
+ordinary editable text fields and may not enforce the specialized format.
+No PDF scripts are added. HEP and flattened PDF retain the rendered appearance;
+HEP does not retain the field authoring model or font programs.
+
+The Fill tool shows controls for ordinary AcroForm text, checkbox, radio and
+choice fields, respecting read-only flags and text limits. With Select active,
+double-click a field to switch to Fill and focus that widget for typing or
+keyboard interaction. Typing uses the PDF's
+font and point size, with automatic sizing similar to Chrome/PDFium. Unfocused
+controls retain the document's appearance, including checkmarks in radio groups;
+keyboard focus remains visible. PDF actions and JavaScript are not executed.
+After a value changes, the native control keeps the current value visible even
+after losing focus, until its matching regenerated appearance is drawn. This
+also covers shared widgets and cleared fields, so the previous value does not
+flash while the document updates. Failed regeneration keeps the current value
+visible for correction or retry.
+Pending checkbox/radio marks use vector shapes following the field's color and PDF
+mark choice, including checkmarks on radio fields, while retaining radio-group
+and keyboard behavior. The document's own appearance takes over after rendering.
+Field borders and controls follow the document's rendered zoom and pan frames
+without replacing focused inputs or their drafts.
+Rotate or resize a field with Select, then return to Fill to type in its original
+local dimensions at the new angle and scale. Saved HEPR PDFs retain that field
+plane when reopened and filled again.
+Textboxes support mixed formatting, sizes, colors, highlighting,
+underline, strikethrough and alignment. Choose bundled fonts, import TTF/OTF
+files, or request installed fonts in a browser that supports local font access.
+Font bytes are used for committed rendering and PDF output.
+While editing a textbox, drag its edge or corner handles to change its width,
+height and wrapping without scaling characters. Use W/H for exact dimensions;
+arrow keys on a focused handle resize by 1 unit, or 10 with Shift. Escape during
+a drag restores the previous bounds and keeps the content editor open.
+New drafts grow vertically until manually resized. Reopened and manually sized
+boxes keep their chosen height; excess text remains editable but is clipped to
+the box after applying or saving. Increase its height to display that text.
+Outside content editing, numeric W/H scales the textbox and its characters together.
+Click outside a textbox to apply its draft and return to Select. Double-click a
+textbox to edit it again, or select it and click **Edit text**. The **Text** tool
+also opens an existing textbox when clicked inside it. Saved HEPR textboxes retain
+their rich formatting and embedded fonts when reopened. Existing PDF page text
+supports transforms and formatting; rewriting its words requires an editable textbox.
+
+Use shapes, polygon/polyline and pencil tools for vector markup, with stroke
+width, color, opacity and optional closed-area fill. **Color opacity** controls
+the stroke (or text/image), and **Fill opacity** independently controls closed
+fills. Each has a linked slider and number input from 0 to 1, with 0.1 steps.
+Slider movement updates the number immediately; releasing commits one undoable
+change. Existing fill opacity is preserved when changing stroke opacity.
+Rectangle, ellipse, line, arrow, polygon and polyline previews show their actual
+outlines, chosen document-scaled width, colors and separate stroke/fill opacities,
+including closed fills and arrowheads. Polygon/polyline styles are captured on
+the first click; the next segment follows the pointer on that original page.
+Press Enter or double-click to finish using clicked vertices only.
+Finished shapes, pencil strokes and signature copies remain visible independently
+until their matching document frame is drawn. You can start the next drawing on
+the same document while an earlier one compiles. Returning to View waits for
+that handoff before removing the previews.
+The signature library saves
+drawn vector handwriting in this browser's `localStorage`; placed copies can
+have independent size, stroke thickness and color. Saved signatures show clickable
+vector previews with their names. New signatures offer **Smooth strokes** to
+straighten small sampling zigzags and fit compact curves; turn it off to keep
+the raw handwriting. Smoothed captures also discard redundant stored points.
+Pencil strokes share the curve fitter with a smaller error budget and preview
+their committed fitted curves. Endpoints, pen lifts, loops and dots are retained,
+and reopening stored captures does not
+repeatedly smooth or rewrite them. Choosing a signature activates its toolbar
+button and shows a translucent preview centered on the cursor. Click a page to
+stamp the preview's size, color and stroke width; click again for another copy,
+or press Escape to return to Select. The preview follows zoom and page rotation
+and hides outside the document or when leaving the canvas or Edit mode.
+Existing saved signatures remain usable. There is no application count
+limit, but browser storage capacity and privacy settings still apply. General
+PNG/JPEG/WebP images use the separate image-import tool.
+
+**Save PDF** retains editable newly added annotations, including when starting
+from a HEP. Existing forms are preserved when the original source PDF is
+available. Source edits preserve unrelated drawing operations and resources,
+including the original character codes and fonts for supported text transforms.
+Editing one shared Form invocation keeps other copies unchanged. Inseparable
+operations or reordered ranges use their edited vector appearances with a
+diagnostic; exceptional ancestor clips or semantic replacement scopes can require
+a reported page-vector fallback. A flattened PDF copy and PDF-based
+printing are also available. If direct printing is unavailable, download the PDF
+and print it with your preferred PDF viewer.
+
+Chrome and some other readers paint editable form fields above annotations,
+including newly added pencil strokes and signatures. When artwork may overlap
+field areas, **Save PDF** offers an explicit choice: **Save flattened PDF** keeps
+the artwork above the fields, turning fields and annotations into page graphics
+in that copy; **Save editable PDF** retains their editing behavior, with a note
+that those readers may cover overlapping artwork. Your active document stays
+editable with either choice. **Flattened PDF** exports directly without this
+choice, and printing uses the compiled visual result. Bounds checks are
+conservative, so a reported overlap does not always mean a stroke is covered.
+
+**Print** is also available in the main toolbar in View mode, for PDF and HEP
+documents. It includes modifications retained after leaving Edit mode. Unedited
+PDFs print from their original resources; HEP content is rebuilt as a vector PDF.
+The loaded page selection is respected, and an already supplied PDF password is
+used to prepare a temporary printable copy without changing the source file.
+
+**PDF password** opens the output protection settings. Keep the existing
+protection, remove it, or set/replace the opening password and confirm it. Open a
+protected source with its current password first; it does not need to be entered
+again in the editor. These settings apply to both editable and flattened PDF
+saves. New protection uses AES-256. Passwords stay in memory and are not stored
+in `localStorage`. The chosen output policy stays selected for subsequent PDF
+exports. A browser download does not confirm a completed disk write, and retains
+the document's local unsaved state. HEP files remain unencrypted.
+
+**Pages** opens page management. Select pages using checkboxes or page ranges,
+rotate them left/right by 90 degrees or by 180 degrees, or remove them. A document
+must retain at least one page. Drag a selected page's grip with mouse, touch or
+pen to move the selected pages together; **Move up/down** or **Alt+Up/Down** on a
+page row moves the selection one position. Arrow keys and Home/End move row focus;
+Space toggles a focused row's selection.
+
+Choose PDFs to insert before/after a chosen page or at the end; selecting multiple
+files merges their pages in file order. **Duplicate selected** uses the same
+position controls and keeps each copy's author objects, groups and form values
+independent. **Extract selected PDF** downloads the selected pages in their current
+order without changing the open document or its unsaved-change state. Enter each
+imported PDF's password when prompted.
+
+**Crop visible page area** accepts Left, Bottom, Width and Height in points from
+the displayed lower-left corner. The rectangle must fit every selected page.
+**Use current page size** fills in the first selected page's current dimensions;
+**Reset crop** restores its media box. Cropping changes the visible boundary and
+retains hidden content; it is not redaction.
+
+Page changes support progress, cancellation, undo and redo alongside other edits.
+The destination keeps its existing PDF protection; the PDF password settings
+control exported copies. Current object and layer ordering stays intact during
+page operations.
+
+**Save HEP** stores the current appearance as ordinary compact scene data. It
+does not embed the original PDF, source font files or editing history. Reopening
+allows geometry transforms, but does not promise rich-text or form-authoring
+semantics. PDF export from a HEP rebuilds the document from the geometry, glyph
+outlines, Unicode mappings and images that remain; it needs no original PDF.
+
+### Layout, review and editing locks
+
+Hold the middle mouse button and drag to pan the camera while any editing tool
+is active. Release to resume that tool. This also works over selected artwork
+and does not create an undo step. Wheel scrolling and zooming remain available.
+Right-click with Select to **Duplicate**, **Copy**, **Cut**, **Paste**, **Delete**, change
+drawing order, **Lock**, **Unlock**, or **Edit comment** when supported.
+
+Use the six alignment icons with **Relative to: Selection** or **Page** to align
+visual bounds. Distribution makes equal gaps between three or more selected
+objects and keeps the outer objects fixed. Layout is applied separately on each
+page and supports Undo. The **Guides** toggle snaps movement near page boundaries,
+page centers, and known editable objects. Hold Alt/Option to bypass snapping.
+Unvisited source primitives are not exhaustively indexed for guides during a
+drag; selecting source artwork makes it available as a target.
+
+Choose **Select text**, drag over searchable text, then click **B**, **I**, **U**,
+**S** or **Highlight** to toggle formatting. The selection stays
+active so styles can be combined or removed with another click. Mixed selections
+receive the style on the first click. Textbox selections retain other run styles;
+double-click a textbox to format text while typing. Existing PDF glyphs use
+synthetic bold/italic that preserve their original outlines and positions;
+toggling these off restores the original font appearance. Saved source emphasis
+is baked into its appearance, without editable font-style metadata.
+The normal **Select** tool also supports underline, strikethrough and highlighting on selected
+PDF text objects and groups, with the same toggle, mixed-state and Undo behavior.
+
+**Highlight** adds a yellow background after text has been selected. Click it
+again to remove highlighting. Textbox highlights follow their text through edits
+and wrapping; existing PDF text uses translucent glyph-bound review annotations,
+including rotated text. Highlight, Underline and Strikethrough also recognize
+saved review annotations and can remove only the selected portion.
+**Comment** places a note; enter its text and optional author, then Apply.
+Double-click a review annotation or use **Edit comment** to edit its note.
+Comments support Ctrl/Cmd+Enter to apply and Escape to cancel. PDF saves retain
+standard annotation types, text quadrilaterals and explicit appearances. HEP
+retains their visual geometry and review annotation metadata.
+
+**Lock** prevents moving, resizing, rotation, deletion and appearance changes to
+selected objects or groups. Locked objects remain selectable and copyable;
+**Unlock** restores editing. These editing locks are separate from a layer's
+**Lock visibility** setting. PDF annotation locks use standard annotation flags.
+Locks on ordinary source primitives remain in the session and local recovery;
+HEP does not add editing-lock metadata.
+
+Property controls show mixed values and disable changes that the selection does
+not support. Group appearance changes apply to supported descendants. Changing
+a drawing tool's defaults does not restyle the previous selection. Existing page
+text supports synthetic emphasis; the textbox tool creates editable new text.
+
+Downloads report **Download started** and keep local edits and recovery available
+because the browser may cancel its save dialog. Printing also retains the
+unsaved state. The reusable save APIs can mark a document saved after a host
+confirms its own file write.
+
+### Links and same-document references
+
+Select a highlight or another object and use **Link** (Ctrl/Cmd+K outside text or
+form typing) to add or edit its target.
+Choose a URL or pick another object in the document, including an object on a
+different page. URL targets accept HTTP, HTTPS, `mailto` and `tel`. Selecting an
+object target uses its current position and size when the document is exported.
+Use **Remove link** to remove the hotspot while keeping its text or artwork.
+Link edits follow the usual locks, Undo and Redo behavior.
+Copying both the linked object and its target links the independent copies to
+each other. Copying just the linked object retains its original target. Removing
+a target leaves a broken reference that is omitted with an export warning;
+Undo restores it.
+Editing a reopened textbox preserves its outgoing link and updates incoming
+object references to follow the edited textbox.
+
+The dialog lists known objects and offers **Pick in document** for selecting a
+destination directly. Press Escape while picking to return to the same draft;
+Apply commits it. Ctrl/Cmd+Enter also applies a link. An imported page destination
+can be retained as-is or replaced with a URL/object target.
+
+Links attached to highlighted text keep the highlighting and comment intact;
+only the individual text quads are clickable. In View mode, click or tap a link
+to open its URL or navigate to its internal destination. While editing, ordinary
+selection remains available for changing the linked artwork.
+
+Saved PDFs use standard link annotations and local destinations. Reopened links
+to identifiable authored annotations keep their object binding; a reference to
+anonymous source geometry remains a functional page destination after reopen.
+HEP keeps link actions and destination mappings in its existing metadata.
+Script and executable PDF actions remain informational and are never executed.
+Verify links in both View layouts/backends, save and reopen a PDF, and inspect
+the same files in an independent reader. Repeat after moving the target and
+after page reordering; a multi-line highlight's inter-line gaps should not
+activate its link.
+
+### Local recovery
+
+Edit mode checkpoints committed changes and unfinished text/form drafts in this
+browser's IndexedDB storage. Recovery runs after editing pauses, outside pointer
+previews and camera gestures. It stores the latest draft for each source document,
+including authoring models, fonts, fields, layers, editing locks and current pages;
+the original file and PDF/HEP format are unchanged. Undo history and the object
+clipboard are not stored.
+
+Reopen the same source and enter Edit to receive a **Restore**, **Discard**, or
+**Later** choice when a matching draft exists. **Later** keeps the older draft and
+pauses new checkpoints until you decide. **Recovery** opens the local draft list
+for restoration or deletion; another draft can be restored after opening its
+matching source. Restoring keeps added textboxes, images, shapes and handwriting
+editable, and applies the captured form values and page changes.
+
+Protected-source drafts encrypt their scene, authoring models and font bytes
+with the opening password. Passwords are never stored, and the source PDF must
+still open normally before recovery is applied. When no suitable password is
+available, recovery reports the problem instead of storing protected content in
+plaintext. Output-password changes must be entered again. Browser storage can
+be cleared or fill up; reported storage failures leave the active document intact.
+
+A completed recovery checkpoint is separate from exporting a PDF/HEP or writing
+a file. Browser-download exports report that the download started; the app cannot
+confirm whether the browser's save dialog was accepted.
+
+### Layers
+
+Use the **Layers** toolbar icon to open layer editing in the right Settings dock.
+Each row has a name, **Visible by default** checkbox under the eye column and
+**Lock visibility** checkbox under the padlock column. Click a row to make it the
+active destination without changing the selected artwork. Double-click its name,
+or press F2/Enter on the row, to rename in place; Enter or blur commits, Escape
+cancels. Drag the six-dot grip with a mouse, touchscreen or pen above or below
+another row to reorder complete layer subtrees. Hold near the list's top or
+bottom edge to scroll through longer lists. Swiping names or other list areas
+scrolls normally. Release over a valid insertion marker to commit; Escape,
+pointer cancellation or release outside the list cancels the drag.
+Up/Down/Home/End select rows; Alt+Up/Down reorders siblings.
+Choose a parent and access removal controls in **Layer options**.
+The top layer paints in front; reordering
+also changes artwork stacking. Unlayered artwork keeps its existing paint slots,
+and compositing groups move as units so their clips, masks and blending survive.
+Content associated with several layers uses its frontmost listed membership.
+Newly creating or renaming a layer alone does not reorder existing artwork.
+
+The blue highlighted row chooses the destination for new text, shapes,
+signatures, images and pasted objects. Click **Unlayered** at the top of the list to add
+independent content. A hidden active layer must be
+shown before placing new content. Select existing objects, choose their destination
+and use **Assign selection**; **Select contents** selects a layer's visible objects.
+**Remove layer, keep artwork** removes the visibility membership, retaining other
+memberships, or redirects it to the chosen destination. Select its contents and
+delete them separately when the artwork itself should be removed. All document
+layer edits participate in Undo/Redo; changing the active layer is a preference.
+New textbox drafts retain the layer chosen when typing begins. Editing a reopened
+textbox preserves its actual compound membership; hiding a layer hides its typing
+draft without discarding the text, and showing it restores the draft.
+
+Select artwork and use **Copy** (Ctrl/Cmd+C) or **Cut** (Ctrl/Cmd+X), click a
+different layer row, then **Paste** (Ctrl/Cmd+V). The same commands are available
+in the toolbar and Select-tool context menu, including Paste on empty document
+space. Copies use successive small offsets; **Paste in place**
+(Ctrl/Cmd+Shift+V) preserves the original position. Cut/paste preserves position
+by default. Cut and paste have separate Undo steps. Layer-row focus keeps object
+shortcuts available; typing in a layer name, textbox or form retains normal text
+copy/paste and IME input.
+
+The clipboard belongs to the open document and stays in memory. Added textboxes,
+images, handwriting and groups retain their editing models; source PDF artwork
+and form widgets copy their current appearance as independent artwork. Changing
+the original field later does not change its copy, and copied widgets do not
+become new linked form fields. Paste retains the source pages and assigns the
+chosen layer, including hidden destinations without showing them automatically.
+After a page-structure change, recopy before pasting, or undo that page change.
+Neither PDF nor HEP stores the clipboard.
+
+With **Select** active, right-click an object or anywhere inside the current
+selection frame to open its drawing-order menu. **Bring to front** and **Send to
+back** move the selection to the ends of its layer; **Bring forward** and **Send
+backward** move it one position. Selected objects keep their relative order.
+Selections spanning layers or pages arrange independently in each layer/page;
+unlayered objects arrange among other unlayered objects. Other layers keep their
+order. Clips, masks and inseparable compositing groups move with their content.
+Commands that cannot change the order are disabled. These changes support
+Undo/Redo and are baked into normal PDF/HEP drawing data. Use the keyboard's
+context-menu key or Shift+F10 to open the menu for the selection, then arrow keys
+and Enter to choose a command; Escape closes it without clearing the selection.
+
+Layer visibility changes respect PDF radio alternatives and visibility locks.
+These locks prevent visibility toggles; they do not lock artwork against editing.
+Layers excluded by a source PDF's View intent retain that intent. The editor does
+not expose internal annotation-visibility groups as user layers. Hidden layer
+content is excluded from picking, form interaction, text search and selection.
+PDF and HEP saves preserve layers, hierarchy and edited default visibility; HEP
+uses its existing optional-content data without embedding editing history.
+
+Standard PDF readers always paint editable annotations above page graphics, and
+may paint widgets above other annotations. After reordering objects or layers in a document
+with annotations, **Save PDF** offers editable output or a flattened copy that
+preserves the displayed stacking. Printing uses the compiled visual result.
+The active document stays editable after either export.
+
+Check layer creation, nested reordering, visibility, assignment, removal and
+Undo/Redo in both viewers. Reopen saved PDF and HEP copies, toggle their layers,
+and compare overlaps in an independent PDF reader; check the flattened copy for
+crossings between page artwork, annotations and form widgets.
+Check the four right-click commands with overlapping source and newly added
+objects, multi-selections and separate layers. Reopen saved copies and verify
+that clicking an overlap selects the object now in front.
+Check inline renaming, row visibility/locks, mouse/touch/pen drag insertion markers,
+edge scrolling, cancellation, nested reordering and narrow dock layout in both
+viewers. Check real touch scrolling outside grips. Copy/cut artwork, select a
+different row and paste; test paste-in-place, hidden destinations, Undo/Redo,
+normal text clipboard behavior and cancelled source captures.
+
+### Manual editing verification
+
+Run the viewer yourself, open a PDF with forms, switch to Edit, change multiple
+field types, add mixed-font text/shapes/ink/a signature/an image, and transform a
+selection made with both modifier clicks and area selection. Verify undo/redo,
+View/Edit switching, Reader/Grid layouts, and WebGL/WebGPU switching. Save PDF,
+flattened PDF and HEP, reopen each, inspect text search and appearance, and print
+using your browser and an independent PDF reader. Compare matched performance
+captures in default View mode and after editing; offline Canvas2D checks do not
+prove browser or GPU behavior.
+With each editing tool active, hold the middle button over the canvas, selected
+artwork and handles, drag, and release outside the canvas. Verify camera-only
+movement, no history entry, unchanged active tool, and cancellation on Escape,
+blur or mode/backend changes. Check Duplicate/Copy/Cut/Paste in the context menu,
+including current form appearances, imported textboxes, groups and hidden layers.
+Align and distribute rotated objects, then Undo once. Check snapping near page
+edges/centers and selected source artwork, including stationary Alt changes and
+the final pointer release. Lock objects/groups, verify edits are disabled while
+copy/unlock remain available, and distinguish editing locks from visibility locks.
+Highlight multi-line, Unicode and rotated searchable text; add, edit and cancel
+comments. Reopen PDF annotations in an independent reader and check their notes,
+quad positions and appearances; reopened HEP keeps their ordinary geometry.
+Reload the same source after editing text/form drafts and page/layer changes.
+Try Restore, Later, Discard and storage failure; verify protected drafts need the
+source password and no password is stored. Cancel the browser's download dialog
+and verify that local changes/recovery remain available. During export, verify
+that edits are blocked and Cancel/Escape remains usable.
+In both viewers with WebGL and WebGPU, close Settings and enter Edit with a large
+PDF or a slow tool download. Check that **Loading Edit mode** appears before tool
+loading and stays visible until the editable document is drawn. Check stage
+labels, measured page/field percentages and indeterminate stages; percentages
+describe each stage rather than the entire setup. Cancel during preparation and
+initial drawing, then retry. Make edits, return to View and cancel re-entry;
+verify that another attempt retains the edits. Force a setup failure, such as a
+blocked editor-tool download, and check that its status remains visible with no
+stuck card or editing controls. Replace the document during preparation and
+verify that late progress cannot affect the replacement. Check the card's bounds
+with Settings open/closed and on narrow screens, and that setup UI and its layout
+work are absent in idle View mode.
+Select and rotate objects near each canvas edge, then pan or zoom them beneath
+the top bar, thumbnails and Settings panel. Confirm selection graphics and fields
+stay behind those controls and do not intercept their clicks. Check Examples
+menus and toolbar hide/restore on narrow screens. In View, check touch-selection
+handles, Copy/context menus and annotation bubbles near every canvas edge.
+Continue a captured drag across the top bar and release or cancel outside the
+canvas; its final position and undo/redo should remain correct.
+Check icon tooltips and keyboard focus in View and Edit in both viewers. Verify
+page navigation, zoom/fit, search, Settings, downloads and mode switching, then
+Pages, PDF password, PDF/HEP saves, flattening and printing in Edit. Check that
+busy/cancel transitions retain the icons and update their descriptions, and that
+the toolbar can still be hidden and restored on narrow screens.
+Drop PDF/HEP files in View and Edit and check Replace, Attach and Cancel with
+existing edits, multiple files and protected PDFs. Check Undo/Redo, page order,
+Reader thumbnails, search, export and printing after attachment; View should stay
+in View. Cancel during preparation or password entry and check earlier completed
+imports remain. Drop transparent PNGs, JPEGs and WebPs on rotated/cropped pages
+in Edit, then change tools, zoom or switch documents during decoding to check
+that images retain their captured page location or cancel safely.
+In Reader layout with Select active, scroll over empty space, selected objects,
+and their handles. Repeat with a drawing tool; check wheel/trackpad scrolling,
+Shift-wheel horizontal movement and Ctrl/Cmd-wheel zoom in both viewers/backends.
+Double-click empty, filled, rotated and resized form fields with Select active.
+Create each form-field type in both viewers/backends, including a radio group,
+multiline text and a multi-select list. Test click/drag placement, property edits,
+required/read-only behavior, fonts, long values, colors, transforms, copy/paste
+and undo/redo. Save/reopen in HEPR and Chrome, enter characters absent from the
+initial value, and verify field values and appearances remain editable. Rotate,
+reorder and duplicate pages, checking independent copied names/radio groups and
+no doubled search text or appearances. Check flattened PDF, HEP and printing.
+Check that Fill activates and the clicked widget receives focus without moving
+the viewport or changing its value. Test shared widgets and read-only fields;
+switch tools or leave Edit before a pending frame and verify focus is cancelled.
+With Fill active, zoom in and out rapidly and pan across text, checkbox, radio
+and choice fields. Check that their borders remain aligned with the document,
+including the final zoom frame, in both viewers and both backends. Repeat in
+Reader and Grid, while a text field is focused, after backend switches and after
+leaving and reentering Edit; verify that typing drafts and the caret survive zoom.
+With slow form regeneration or delayed drawing, type and click outside the field;
+check that the current value remains visible without exposing the previous value
+or doubling the text. Repeat with shared widgets, rapid successive changes and
+deleting all text. Check undo/redo, switching tools, leaving and reentering Edit,
+and a failed regeneration followed by retry. Verify that the correct value stays
+visible and pending updates preserve an active typing draft and caret.
+Repeat on rotated/resized fields and fields with custom backgrounds;
+check that the original appearance returns only after the matching value is drawn.
+Check checkbox/radio changes during and after the update, including radio fields
+using checkmarks and circles. Verify keyboard/group behavior, undo and save/reopen,
+with no browser-blue mark flash or duplicate marks.
+Rotate and resize text and choice fields, return to Fill, and type several values.
+Check that the control, text size and appearance keep their orientation without
+expanding to the rotated bounds. Repeat after undo/redo and PDF save/reopen.
+After filling a PDF, drag a source field, a new shape, a textbox and a
+multi-selection in both viewers and backends. Compare repeated drags before and
+after filling; check that unchanged fields keep their appearance while moved
+fields, clips, stacking and text/search geometry follow the current transform.
+Repeat after undo, gesture cancellation, further value changes, source replacement
+and backend switching. Change checkbox/radio values quickly during pending
+preparation, and verify the latest value appears while active save snapshots
+retain their captured values. Browser/GPU drag performance remains a manual check.
+Repeat translation over overlapping artwork and partially clipped glyphs; compare
+the moving pose with the released result, with no changed stacking, clipping-edge
+coverage or selection-frame lag. Compare native and Three WebGL/WebGPU in Grid,
+single-page Reader and multi-page Reader, including Reader-to-Grid transitions.
+Cancel by Escape, change selection or source during preparation, and switch
+backend or mode; verify current geometry, LOD behavior and field values remain
+correct. Save/reopen PDF and HEP after releasing and after cancelling a gesture.
+For performance comparisons, keep document, zoom, selection and backend matched;
+separate initial gesture preparation from repeated moves. Offline CPU timings
+and mocked uploads do not establish browser frame rates or GPU performance.
+In Pages, reorder nonadjacent selections with mouse, touch, pen and Alt+Up/Down.
+Cancel a drag with Escape and verify ordinary touch scrolling outside grips still
+works. Duplicate before the originals, then edit copied text, shapes, groups and
+shared form fields independently. Check Undo/Redo and extract selected pages;
+extraction must include current edits while leaving the active document unchanged.
+Crop and reset rotated/cropped pages with nondefault UserUnit, including objects
+crossing the new boundary; verify hidden content returns after Reset crop. Repeat
+with layer restacking, protected files, PDF/HEP saves and independent readers.
+Before entering Edit, print a PDF and a HEP from the main toolbar. Print a
+protected PDF using its existing unlock password, and check selected-page scope.
+After editing, return to View and print again; verify the retained changes are
+included and printing leaves the unsaved-change indicator intact.
+Check all four resize corners and rotation while dragging beyond the handles.
+Rotate objects and groups, release the handle, reselect them, and check undo/redo.
+Rotate a multi-selection and check its frame during the drag and after committing.
+Start from a non-grid angle and approach 0°, 45° and negative multiples of 45°.
+Check that absolute angles within 5° of each target, including exactly 5°, snap;
+angles outside that range remain free. Hold Alt/Option to bypass snapping, then
+press and release it without moving the pointer. Release at a new pointer
+position and verify the final angle respects the latest modifier state. Check that
+**Rotate** follows the displayed frame, accepts signed absolute angles, and leaves
+the angle unchanged when the same value is entered twice.
+Check that corner cursors follow the frame's angle and the rotation grip remains
+outside its top edge at different zooms.
+Drag handles beyond a page border and across Reader gaps; they should stay tied
+to the selected page rather than stop or jump to an adjacent page.
+Move, resize and rotate selections quickly, then release or cancel while a
+preview is preparing. Check that objects, frame and handles stay aligned until
+the final or restored pose appears, including after switching renderer backends.
+Draw pencil strokes at several zooms on rotated/cropped pages, using thin/wide
+strokes, transparency and optional fills. Check that the fitted curve, thickness,
+colors and opacities stay consistent while drawing, on release and when the
+document appears. Delay rendering with several strokes pending; verify there is
+no gap or doubled opacity as each matching frame takes over. Check undo/delete,
+gesture cancellation, tool/mode/document changes and failed compilation for
+stray previews or lost committed strokes.
+Repeat with rectangles, ellipses, lines and arrows in every drag direction,
+releasing at a new position without another move event. Check directed arrowheads
+and closed fills. For polygons/polylines, move the next segment around the first
+page, change toolbar styles after the first click, and finish with Enter or
+double-click; only clicked vertices and the initially chosen style should commit.
+Check repeated vertices and double-click completion for extra endpoints. Draw
+several shapes or stamp signatures while earlier drawings are pending, then
+return to View; verify independent, continuous handoffs to the rendered document.
+Resize images, shapes, signatures and multi-selections with and without Shift;
+press and release Shift during the drag and check both preview and final size.
+Check textbox appearance scaling with plain/Shift resizing in Select, including
+textboxes on rotated pages; the released result must match the drag preview.
+Open content editing and resize the box with handles or W/H; wrapping should
+change while character size stays fixed.
+Open saved textboxes in Chrome or another independent reader and check letters,
+spacing and formatting, including imported fonts and Unicode.
+Switch to each drawing, placement, form and Pan tool with objects selected;
+confirm that transform handles disappear and the cursor matches the action.
+Cancel drags with Escape and switch tools during a pending selection.
+Also save protected editable/flattened PDFs, reopen them with the new password,
+then remove or replace protection and verify that old passwords stop working.
+Rotate cropped pages, remove pages, and insert multiple PDFs, including protected
+ones and forms with overlapping field names. Check page order, Reader thumbnails,
+search, field editing, undo/redo and PDF/HEP round trips after each operation.
+
+Optional offline comparisons use small synthetic technical/form, book-text, and
+image-heavy fixtures. Install the independent pdf.js reference outside the repo,
+then generate before/after PDF, baked HEP, rebuilt PDF, and comparison PNGs:
+
+```sh
+npm install --prefix /tmp/hepr-editor-reference --no-audit --no-fund --ignore-scripts pdfjs-dist@6.4.299
+node scripts/check-editor-visuals.mjs /tmp/hepr-editor-validation
+node scripts/check-editor-pages-visuals.mjs /tmp/hepr-editor-pages-validation
+node scripts/check-editor-source-visuals.mjs /tmp/hepr-editor-source-validation
+```
+
+The output includes `overview.png`, `book-overview.png`, `image-overview.png`,
+and JSON reports. These compare HEPR Canvas2D with pdf.js; they do not measure
+browser interaction or GPU rendering. The source comparison also covers native
+glyph edits, independent shared Form invocations, images, clipping and stacking;
+the page comparison covers rotation, merging and PDF/HEP rebuilding.
+
 ## Loading documents
 
 `pdfObjectGenerator(source, options, backend)` accepts:
@@ -113,13 +777,29 @@ and End; editing the page number, zoom, or search field keeps normal input behav
 Reader can also be selected for single-page documents, which retain their
 existing default view.
 
+Editing refreshes thumbnails only for affected pages, including all pages sharing
+a changed form field. Selection, editing locks, link destinations and temporary
+drag/color previews keep the cached images. A changed page keeps its previous
+thumbnail until the replacement is ready. Page insertion/removal/reordering and
+document-wide appearance changes can refresh the whole sidebar.
+
 The demos retain **Grid**, and the Three demo also retains **Sphere** and
 **Helix**. Switching back to Reader restores its zoom and reading position.
+You can switch between **Reader** and **Grid** while staying in Edit mode.
+Edits, selection, unfinished text/form input and Undo/Redo stay with the document;
+switching layout only changes page presentation. Controls pause briefly while
+the layout or another document/editor operation is being prepared. Three's
+Sphere and Helix remain unavailable during Edit mode.
 Reader does not change package loading defaults or the canonical layout saved
 by Download HEP.
 
 Download PDF and Download HEP are available inside the expanded Settings panel.
-Close Settings to hide the entire panel. Select **Hide toolbar** to reclaim its
+Settings occupies a separate column to the right of the canvas in the native,
+Three.js and room detection demos. It scrolls independently and never covers
+the document; editing tools stay within the document column. In the native and
+Three.js viewers, close Settings to return its space to the canvas, or reopen it
+from the main toolbar. Reader retains the reading position and updates Fit Width
+or Fit Page for the available space. Select **Hide toolbar** to reclaim its
 screen space while keeping your reading position and zoom; use the floating
 **Show toolbar** button to bring the controls back.
 
@@ -424,7 +1104,9 @@ document restores that document's defaults.
 Most visibility changes only invalidate rendering and text caches. Compatibility
 effects that need regenerated images show preparation progress; the previous
 applied state remains visible until preparation finishes. Failed changes show an
-error and leave that state intact. Runtime layer choices are never exported.
+error and leave that state intact. View-mode runtime layer choices are not exported.
+Edit mode provides the authoring controls described under **Layers** above;
+their default-visibility and layer changes are saved in PDF and HEP.
 
 Layer eligibility is cached when visibility changes. When every paint is visible,
 rendering uses the ordinary culling and batching path without scanning layer

@@ -55,6 +55,24 @@ export interface NativeTextCompilation {
   readonly diagnostics: readonly PdfDiagnostic[];
 }
 
+/** Transient editor source state; never part of display/HEP data. @internal */
+export interface NativeEditorTextState {
+  readonly matrix: PdfMatrix;
+  readonly lineMatrix: PdfMatrix;
+  readonly transform: PdfMatrix;
+  readonly font: NativeTextFontResource;
+  readonly fontName: string | null;
+  readonly fontSize: number;
+  readonly characterSpacing: number;
+  readonly wordSpacing: number;
+  readonly horizontalScale: number;
+  readonly leading: number;
+  readonly rise: number;
+  readonly renderingMode: number;
+  readonly glyphCount: number;
+}
+export interface NativeEditorSourceGlyph { readonly code: number; readonly matrix: PdfMatrix }
+
 export type NativeTextArrayItem = Uint8Array | number;
 
 export interface NativeTextCompilerOptions {
@@ -197,6 +215,17 @@ export class NativeTextCompiler {
       this.transformTuple[index] = this.transforms[index];
     }
     this.transformIndexes.set(hashTransformWords(this.transformTupleWords), 0);
+  }
+
+  /** Snapshot only when an editor explicitly requests source-operation provenance. @internal */
+  editorSourceState(): NativeEditorTextState {
+    return { ...this.state, matrix: [...this.textMatrix], lineMatrix: [...this.lineMatrix], transform: [...this.ctm],
+      font: this.currentFont(), fontName: this.state.fontResourceName, glyphCount: this.glyphIds.length };
+  }
+  /** Glyph transforms/codes already produced by this interpreter; no extra ordinary-view stores. @internal */
+  editorSourceGlyphs(first: number): NativeEditorSourceGlyph[] {
+    return this.characterCodes.slice(first).map((code, index) => ({ code,
+      matrix: Array.from(this.transforms.slice(this.transformIndices[first + index] * 6, this.transformIndices[first + index] * 6 + 6)) as unknown as PdfMatrix }));
   }
 
   saveGraphicsState(shareTransform = false): void {
