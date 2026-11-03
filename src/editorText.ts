@@ -7,6 +7,7 @@ import createBidi from "bidi-js";
 import { allocateEditorTextCodes } from "./editorTextEncoding";
 import { editorTextGlyphOutline } from "./editorTextGlyphOutline";
 import { choosePdfFormAutoFontSize } from "./pdf/formAutoFontSize";
+import { waitForLoad } from "./loadCancellation";
 
 export interface EditorPositionedGlyph {
   font: EditorFont; glyph: number; unicode: string; x: number; y: number;
@@ -14,14 +15,19 @@ export interface EditorPositionedGlyph {
   advance: number; italic: boolean; bold: boolean;
   backgroundColor: readonly number[] | null; ascent: number; descent: number;
   logicalIndex: number;
+  /** Optional per-run multipliers supplied by headless composition. */
+  opacity?: number; backgroundOpacity?: number;
 }
-export interface EditorTextLayout { glyphs: EditorPositionedGlyph[]; width: number; height: number }
+export interface EditorTextLayout { glyphs: EditorPositionedGlyph[]; width: number; height: number; baselines?: number[] }
 /** Internal field layout; ordinary textbox layout keeps its existing defaults. */
 export interface EditorTextLayoutOptions {
   wrap?: boolean;
   verticalAlignment?: "top" | "middle";
   autoFontSize?: boolean;
   onFontMetrics?(metrics: { ascent: number; descent: number }): void;
+  /** Internal composition can reuse measured glyphs and omit textbox clipping. */
+  layout?: EditorTextLayout;
+  clip?: boolean;
 }
 const bidi = createBidi();
 
@@ -123,7 +129,7 @@ export async function layoutEditorText(object: EditorTextObject, fonts: EditorFo
     if (options.wrap !== false && lineWidth && lineWidth + item.width > object.width && !/^\s+$/.test(token.text)) { lines.push([]); lineWidth = 0; }
     lines.at(-1)!.push(item); lineWidth += item.width;
   }
-  const glyphs: EditorPositionedGlyph[] = [], metrics = new Map<string, { ascent: number; descent: number }>();
+  const glyphs: EditorPositionedGlyph[] = [], baselines: number[] = [], metrics = new Map<string, { ascent: number; descent: number }>();
   let y = object.y + object.height, widest = 0;
   for (const line of lines) {
     const width = line.reduce((sum, item) => sum + item.width, 0);
@@ -142,6 +148,7 @@ export async function layoutEditorText(object: EditorTextObject, fonts: EditorFo
       baseline = options.verticalAlignment === "middle" && lines.length === 1
         ? object.y + (object.height - (ascent - descent)) / 2 - descent : y + height - ascent;
     }
+    baselines.push(baseline);
     const first = line[0]?.start ?? 0, end = line.at(-1)?.end ?? first;
     const order = Array.from({ length: Math.max(0, end - first + 1) }, (_, i) => i + first);
     for (const [a, b] of bidi.getReorderSegments(fullText, levels, first, end)) {
@@ -158,13 +165,13 @@ export async function layoutEditorText(object: EditorTextObject, fonts: EditorFo
   }
   if (metrics.size) options.onFontMetrics?.({ ascent: Math.max(...[...metrics.values()].map(metric => metric.ascent)),
     descent: Math.min(...[...metrics.values()].map(metric => metric.descent)) });
-  return { glyphs, width: widest, height: object.y + object.height - y };
+  return { glyphs, width: widest, height: object.y + object.height - y, baselines };
 }
 
 /** A portable PDF appearance using embedded source fonts and positioned glyphs. */
 export async function editorTextPdf(object: EditorTextObject, fonts: EditorFontRegistry,
   signal?: AbortSignal, options?: EditorTextLayoutOptions): Promise<Uint8Array> {
-  const layout = await layoutEditorText(object, fonts, signal, options);
+  const layout = options?.layout ?? await layoutEditorText(object, fonts, signal, options);
   const hb = await import("harfbuzzjs");
   const writer = new PdfByteWriter({ signal }); const root = writer.reserve(), pages = writer.reserve();
   const fontResources: string[] = []; const codes = new Map<EditorPositionedGlyph, { name: string; code: string }>();
@@ -180,7 +187,7 @@ export async function editorTextPdf(object: EditorTextObject, fonts: EditorFontR
   for (const run of [{ text: object.text }, ...(object.runs ?? [])]) {
     const style = { ...object, ...run };
     if (style.fontId) retainFont(fonts.get(style.fontId));
-    retainFont(await fonts.resolve(style));
+    retainFont(await waitForLoad(fonts.resolve(style), signal));
   }
   for (const { asset, glyphs: group } of fontGroups.values()) {
     const face = new hb.Face(new hb.Blob(asset.bytes)); const font = new hb.Font(face);
@@ -223,18 +230,26 @@ export async function editorTextPdf(object: EditorTextObject, fonts: EditorFontR
   }
   const opacity = object.opacity ?? 1;
   const alpha = writer.add(`<< /Type /ExtGState /ca ${n(opacity)} /CA ${n(opacity)} >>`);
-  const commands = ["q", "/HEPRTextAlpha gs", `${n(object.x)} ${n(object.y)} ${n(object.width)} ${n(object.height)} re W n`];
+  const commands = ["q", "/HEPRTextAlpha gs"];
+  if (options?.clip !== false) commands.push(`${n(object.x)} ${n(object.y)} ${n(object.width)} ${n(object.height)} re W n`);
+  const alphas = new Map<number, string>([[opacity, "HEPRTextAlpha"]]);
+  const selectAlpha = (multiplier = 1): string => {
+    const value = opacity * multiplier;
+    let name = alphas.get(value);
+    if (!name) { name = `HEPRTextAlpha${alphas.size}`; alphas.set(value, name); }
+    return `/${name} gs`;
+  };
   // All backgrounds precede glyph paint, so highlights never cover neighboring
   // letters or combining marks and remain attached to textbox reflow/transforms.
   for (const glyph of layout.glyphs) if (glyph.backgroundColor && glyph.advance !== 0) {
     const x = Math.min(glyph.x, glyph.x + glyph.advance), height = Math.max(0, glyph.ascent - glyph.descent);
-    commands.push(`${glyph.backgroundColor.map(n).join(" ")} rg`, `${n(x)} ${n(glyph.y + glyph.descent)} ${n(Math.abs(glyph.advance))} ${n(height)} re f`);
+    commands.push(selectAlpha(glyph.backgroundOpacity), `${glyph.backgroundColor.map(n).join(" ")} rg`, `${n(x)} ${n(glyph.y + glyph.descent)} ${n(Math.abs(glyph.advance))} ${n(height)} re f`);
   }
   // Absolute positions determine appearance. Emit clusters in logical order so
   // searchable Unicode retains bidi semantics without collapsing a whole box
   // into one ActualText selection quad.
   for (const glyph of [...layout.glyphs].sort((a, b) => a.logicalIndex - b.logicalIndex)) {
-    commands.push(`${glyph.color.map(n).join(" ")} rg ${glyph.color.map(n).join(" ")} RG`);
+    commands.push(selectAlpha(glyph.opacity), `${glyph.color.map(n).join(" ")} rg ${glyph.color.map(n).join(" ")} RG`);
     if (glyph.unicode) {
       const code = codes.get(glyph)!;
       commands.push("BT", `/${code.name} ${n(glyph.size)} Tf`, glyph.bold ? `${n(glyph.size * .025)} w 2 Tr` : "0 Tr",
@@ -256,7 +271,8 @@ export async function editorTextPdf(object: EditorTextObject, fonts: EditorFontR
     }
   }
   commands.push("Q"); const content = await writer.stream(commands.join("\n"));
-  const page = writer.add(`<< /Type /Page /Parent ${pdfRef(pages)} /MediaBox [0 0 ${n(Math.max(1, object.x + object.width))} ${n(Math.max(1, object.y + object.height))}] /Resources << /Font << ${fontResources.join(" ")} >> /ExtGState << /HEPRTextAlpha ${pdfRef(alpha)} >> >> /Contents ${pdfRef(content)} >>`);
+  const alphaResources = [...alphas].map(([value, name]) => `/${name} ${pdfRef(name === "HEPRTextAlpha" ? alpha : writer.add(`<< /Type /ExtGState /ca ${n(value)} /CA ${n(value)} >>`))}`).join(" ");
+  const page = writer.add(`<< /Type /Page /Parent ${pdfRef(pages)} /MediaBox [0 0 ${n(Math.max(1, object.x + object.width))} ${n(Math.max(1, object.y + object.height))}] /Resources << /Font << ${fontResources.join(" ")} >> /ExtGState << ${alphaResources} >> >> /Contents ${pdfRef(content)} >>`);
   writer.set(pages, `<< /Type /Pages /Count 1 /Kids [${pdfRef(page)}] >>`); writer.set(root, `<< /Type /Catalog /Pages ${pdfRef(pages)} >>`);
   return writer.build(root);
 }

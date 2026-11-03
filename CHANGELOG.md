@@ -8,6 +8,14 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Added
 
+- Add headless `createPdfDocument()` composition with native PDF or HEP-scene
+  backgrounds, mixed-size pages, ordered vector/SVG paths, clipping/transforms,
+  reusable transparent images, measured rich/baseline text and PDF links.
+  Preserve source page geometry, layer defaults and visible annotation appearances
+  below new artwork; support hidden backgrounds and viewport crops without
+  changing MediaBox. Include a general PDF composition guide and runnable
+  example for images, SVG artwork, text and annotations. Composed artwork has
+  no editable HEPR author models.
 - Add a Select text workflow with selection-based bold, italic, underline,
   strikethrough and highlight toggles, mixed-state controls and undoable partial
   text changes. Also apply and remove underline/strikethrough/highlight on
@@ -174,6 +182,8 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
+- Preserve indirect font-stream lengths, filters and decode parameters when
+  importing PDF resources, while retaining shared font programs and cyclic metadata.
 - Finish textbox drafts when clicking outside and reopen their content through
   double-click, the Text tool or the explicit Edit text button. Recognize click
   pairs across replaced selection overlays, retain font styles and saved HEPR

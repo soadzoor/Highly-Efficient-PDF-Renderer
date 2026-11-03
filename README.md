@@ -189,6 +189,11 @@ const pdf = await createPdf({ title: "My document", pageSize: "A4", pageCount: 3
 See the [creation and numbering API](docs/api.md#new-pdfs-and-automatic-page-numbers)
 for custom dimensions, blank-page insertion, resizing and numbering controls.
 
+For ordered PDF drawing with original PDF pages, reusable raster images,
+SVG/vector paths, text and links, use [`createPdfDocument`](docs/api.md#pdf-composition).
+See the [PDF composition guide](docs/pdf-composition.md) and
+[runnable example](examples/pdf-composition.mjs).
+
 ## Render your own polylines
 
 Use `buildStrokeScene` and `createThreePdfObject` to render your own polylines

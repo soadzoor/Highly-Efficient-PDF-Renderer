@@ -48,6 +48,115 @@ Shader comments are removed only from build output; TypeScript sources keep thei
 comments and indentation. Shader code whitespace remains intact for exact source
 patches. Vite builds requesting source maps retain the original strings and mappings.
 
+## PDF composition
+
+`await createPdfDocument(options?)` creates a headless `PdfDocumentComposer` for
+ordinary PDF artwork. It is available from the main, `/bundler`, and `/node`
+entries. Paths and SVG artwork stay vector-based; supplied images stay raster.
+No editor session, canvas, Three.js renderer, or `pdf-lib` is required to compose
+pages. New objects have no HEPR editing models. Text remains searchable and links
+are standard invisible PDF annotations.
+
+```ts
+import { createPdfDocument } from "@soadzoor/hepr/bundler";
+
+const pdf = await createPdfDocument({
+  metadata: { title: "PDF composition", author: "My application" },
+  signal,
+  onDiagnostic: diagnostic => console.warn(diagnostic)
+});
+try {
+  const source = await pdf.importPdf(originalPdfBytes);
+  const page = pdf.addSourcePage(source, 0);
+  page.drawRectangle({ x: 20, y: 30, width: 120, height: 60,
+    fill: "#45a5bc", fillOpacity: .2, stroke: "#123456", strokeWidth: 1.5 });
+  page.drawText("Caption", { x: 28, y: 55, fontSize: 14, underline: true });
+  page.addLink({ x: 20, y: 30, width: 120, height: 60 },
+    { type: "url", url: "https://example.com/item" });
+  const blob = await pdf.save({ signal });
+} finally {
+  await pdf.dispose();
+}
+```
+
+Document options accept `metadata` (title, author, subject, keywords, creator,
+producer, and creation/modification `Date`s), `signal`, `onProgress`,
+`onDiagnostic`, and `loadFontAsset`. Producer defaults to HEPR. `save` can override
+its signal/progress/diagnostic callbacks, snapshots the page commands immediately,
+and returns an `application/pdf` Blob. Failed or cancelled saves leave the document
+usable. Restore every saved graphics state before saving. Dispose the composer
+when finished; it closes owned sources and releases assets. It does not fetch
+application model data, create downloads, or display notifications.
+
+| Method | Behavior |
+| --- | --- |
+| `addPage({ width, height })` | Append a blank custom-sized page in points. Use `resolvePdfPageSize` for presets. |
+| `importPdf(bytes, { password?, signal? }?)` | Open a reusable document-owned source and expose its displayed page dimensions. |
+| `addSourcePage(source, index, { background? }?)` | Append exactly one zero-based source page; false copies geometry without background resources or links. |
+| `importScene(scene, options?)` | Reconstruct reusable source pages with `writeScenePdf`; usable with a complete HEP scene. Do not mutate the scene during import. |
+| `fonts.register(bytes, metadata?)` | Register application TTF/OTF faces using the existing font registry. `fonts.loadBundled` loads Liberation faces. |
+| `registerImage({ encoding, bytes })` | Decode PNG/JPEG into a reusable image handle. Node decoding uses optional `@napi-rs/canvas`; browser decoding uses browser image APIs. |
+| `registerImage({ width, height, data })` | Register straight-alpha RGBA8 pixels without a canvas. Inputs are copied; identical pixels share an image handle. |
+| `measureText(text, style)` | Return shaped width, line-box height and font ascent/descent in points using the same fonts as drawing. |
+
+Each page exposes `drawPath`, `drawSvgPath`, `drawRectangle`, `drawEllipse`,
+`drawText`, `drawTextBox`, `drawImage`, and `addLink`. Paint follows drawing-call
+order across all content types. `saveState()`, `restoreState()`,
+`transform([a,b,c,d,e,f])`, `clipPath(commands, fillRule?)`, and
+`clipRectangle({ x,y,width,height })` provide nested affine groups and clipping.
+Images take their registered handle and `{ x,y,width,height,opacity?,transform? }`;
+rotation/reflection belongs in the transform. Handles belong to their composer.
+
+Path commands are tuples `['M',x,y]`, `['L',x,y]`, `['Q',cx,cy,x,y]`,
+`['C',c1x,c1y,c2x,c2y,x,y]`, and `['Z']`. A path starts with a move and may
+contain multiple contours. SVG input supports absolute/relative M/L/H/V/C/S/Q/T/A/Z
+commands and repeated coordinate groups. SVG Y points down by default: its path
+is reflected about local Y=0 before the supplied transform. Set `svgYAxis: 'up'`
+for PDF-style data. This accepts path data, not complete SVG DOM/CSS documents.
+
+Paint accepts `fill`/`stroke` colors or null (omission also means absent),
+`fillOpacity`/`strokeOpacity` (0–1, default 1), `strokeWidth` (default 1; zero is
+a hairline), `lineCap` (butt/round/square), `lineJoin` (miter/round/bevel),
+`miterLimit` (default 10), `dashArray`, `dashPhase`, `fillRule` (nonzero/evenodd),
+and `transform`. Rectangle/ellipse/image x/y denote the lower-left bounds.
+
+`drawText(text, { x,y,fontSize,...style })` uses a baseline origin, retains
+explicit newlines, and does not automatically wrap. `drawTextBox({ x,y,width,
+height,text,fontSize,...style })` wraps and clips text, with left/center/right
+`align` and top/middle/bottom `verticalAlignment`. Both accept registered `fontId`
+or `fontFamily`, weight/style, color, opacity, underline/strikethrough, lineHeight,
+and rich `runs`. Runs can change font/size/color/decorations and multiply overall
+opacity with their own `opacity`. `backgroundColor` highlights glyph/run areas;
+`backgroundOpacity` controls those highlights. Draw a preceding rectangle for a
+full textbox or caption background. Missing faces/characters emit diagnostics;
+register the exact application fonts for matching typography.
+
+Page coordinates are measured from the initial displayed lower-left crop, X right
+and Y up, in points. Source CropBox origin, rotation and UserUnit are applied once
+by the page writer. Native page boxes, rotation, resources, transparency groups,
+and layer defaults are retained. Visible source annotation/widget appearances
+are baked before overlays; source editable fields are not copied. Unsupported
+appearances are synthesized or diagnosed with a bounded visible approximation.
+Ordinary source links survive when their destinations exist in the output; repeated
+source targets resolve to the first matching output page. Unavailable targets are
+diagnosed and omitted. The output is a fresh document and does not retain source
+scripts, form semantics, bookmarks, or cryptographic signatures.
+
+`setViewport({ x,y,width,height })` changes Crop/Trim/Bleed/Art boxes without moving
+drawing coordinates or changing MediaBox. Rectangles may extend outside the
+initial visible crop; readers still intersect them with MediaBox. It does not
+create blank margins beyond MediaBox. `addLink(rect, { type:'url',url })` or
+`{ type:'page',pageIndex,x?,y? }` creates an independent hotspot transformed by the
+current state. Hotspots do not inherit artwork clip paths; keep their geometry
+inside the intended clickable area. Only ordinary web/contact URLs and local
+destinations are authored.
+
+HEP does not contain original PDF bytes. Scene reconstruction retains the content
+available to `writeScenePdf`, including existing raster fallback islands, and
+cannot recover discarded fonts or PDF authoring structures. Keep original PDF
+bytes for the native import route. See the [PDF composition guide](pdf-composition.md)
+and [runnable example](../examples/pdf-composition.mjs).
+
 ## Editing APIs
 
 `openEditorSession(scene, options?)` opens an immutable compiled `VectorScene`

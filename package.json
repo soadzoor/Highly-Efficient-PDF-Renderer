@@ -81,6 +81,8 @@
     "README.md",
     "CHANGELOG.md",
     "docs/HEP_CONTAINER.md",
+    "docs/pdf-composition.md",
+    "examples/pdf-composition.mjs",
     "LICENSE",
     "THIRD_PARTY_NOTICES"
   ],

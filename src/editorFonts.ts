@@ -23,6 +23,8 @@ export function createEditorFontRegistry(options: {
   loadAsset?: (url: URL) => Promise<Uint8Array>;
 } = {}): EditorFontRegistry {
   const fonts = new Map<string, EditorFont>(); const pending = new Map<string, Promise<EditorFont>>();
+  let disposed = false;
+  const assertLive = () => { if (disposed) throw new Error("The font registry is disposed."); };
   const styles = (style: EditorFontOptions) => ({ fontWeight: style.fontWeight === "bold" ? 700
     : typeof style.fontWeight === "number" ? style.fontWeight : 400,
     fontStyle: (style.fontStyle === "italic" || style.fontStyle === "oblique" ? "italic" : "normal") as "normal" | "italic" });
@@ -30,14 +32,17 @@ export function createEditorFontRegistry(options: {
     list: () => [...fonts.values()],
     get(id) { const font = fonts.get(id); if (!font) throw new RangeError(`Unknown font ${id}.`); return font; },
     async register(input, metadata = {}) {
+      assertLive();
       if (!(input instanceof Uint8Array) || input.length < 12) throw new TypeError("Import a valid TTF or OTF font.");
       const bytes = input.slice();
       const signature = new DataView(bytes.buffer).getUint32(0);
       if (signature !== 0x00010000 && signature !== 0x4f54544f && signature !== 0x74727565) throw new TypeError("Import an outline TTF or OTF font.");
       const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+      assertLive();
       const id = "font-" + [...digest].map(n => n.toString(16).padStart(2, "0")).join("");
       if (fonts.has(id)) return fonts.get(id)!;
       const hb = await import("harfbuzzjs");
+      assertLive();
       const face = new hb.Face(new hb.Blob(bytes));
       if (!(face.upem > 0) || (face.referenceTable("head")?.length ?? 0) < 54) throw new TypeError("The font has no valid OpenType face.");
       if (!face.referenceTable("glyf") && !face.referenceTable("CFF ") && !face.referenceTable("CFF2")) throw new TypeError("This font has no vector outlines. Choose an outline TTF or OTF font.");
@@ -49,6 +54,7 @@ export function createEditorFontRegistry(options: {
       fonts.set(id, font); return font;
     },
     async loadBundled(family = "Liberation Sans", style = {}) {
+      assertLive();
       const resolved = styles(style); const mono = /mono|courier/i.test(family), serif = /serif|times/i.test(family) && !/sans/i.test(family);
       const stem = mono ? "mono" : serif ? "serif" : "sans";
       const suffix = resolved.fontWeight >= 600 ? resolved.fontStyle === "italic" ? "bold-italic" : "bold"
@@ -68,6 +74,7 @@ export function createEditorFontRegistry(options: {
       return promise;
     },
     async resolve(style) {
+      assertLive();
       if (style.fontId) {
         const selected = api.get(style.fontId), requested = styles({
           fontWeight: style.fontWeight ?? selected.fontWeight, fontStyle: style.fontStyle ?? selected.fontStyle
@@ -92,7 +99,7 @@ export function createEditorFontRegistry(options: {
       }));
       return result;
     },
-    dispose() { fonts.clear(); pending.clear(); }
+    dispose() { disposed = true; fonts.clear(); pending.clear(); }
   };
   return api;
 }

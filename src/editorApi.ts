@@ -6,6 +6,14 @@ import type { PdfOutputProtection } from "./pdf/pdfProtection";
 import type { PdfProtectionChangeOptions } from "./editorPdfProtection";
 import type { PdfPageOperation, PdfPageOperationOptions } from "./editorPdfPages";
 import type { PdfCreateOptions } from "./pdfCreation";
+import type { PdfCompositionOptions, PdfDocumentComposer } from "./pdfCompositionTypes";
+
+/** Compose ordinary PDF page artwork with native backgrounds and reusable assets. */
+export async function createPdfDocument(options: PdfCompositionOptions = {}): Promise<PdfDocumentComposer> {
+  const settings = { ...options, metadata: options.metadata && structuredClone(options.metadata) };
+  settings.signal?.throwIfAborted();
+  return (await import("./pdfComposition")).createPdfDocument(settings);
+}
 
 /** Create a blank, editable PDF using a paper preset or custom point dimensions. */
 export async function createPdf(options: PdfCreateOptions = {}): Promise<Blob> {

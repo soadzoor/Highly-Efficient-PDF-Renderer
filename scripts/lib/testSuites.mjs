@@ -10,6 +10,10 @@ export const fastTests = [
   "changelog",
   "editor-session",
   "pdf-creation",
+  "pdf-composition",
+  "pdf-composition-path",
+  "pdf-composition-import",
+  "pdf-composition-source",
   "document-authoring-persistence",
   "editor-page-numbering",
   "editor-page-creation",
@@ -479,7 +483,7 @@ export const fastTests = [
 // Suites with prerequisites are opt-in. HEP package conversion deliberately
 // stays outside the packaging gate invoked by build:lib.
 export const explicitSuites = {
-  package: ["browser-package", "bundler-package", "lod-worker-package", "raster-worker-package", "thumbnail-worker-package", "node-thumbnail-package", "built-material-shaders", "pdf-to-hep-package", "pdf-thumbnail-cli-package"],
+  package: ["browser-package", "bundler-package", "pdf-composition-package", "lod-worker-package", "raster-worker-package", "thumbnail-worker-package", "node-thumbnail-package", "built-material-shaders", "pdf-to-hep-package", "pdf-thumbnail-cli-package"],
   browser: [
     "example-assets",
     "pdf-source-cancellation",
