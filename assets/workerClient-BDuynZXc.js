@@ -1,0 +1,1 @@
+import{n as e,t}from"./workerClient-gcK_7o_2.js";export{t as openPdfInBrowserWorker,e as openPdfInNodeWorker};

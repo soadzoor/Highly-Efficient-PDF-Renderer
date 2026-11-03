@@ -1,0 +1,1 @@
+function e(e){return{...e,withVectorLod:e.withVectorLod??!0,withTextLod:e.withTextLod??!0}}export{e as t};

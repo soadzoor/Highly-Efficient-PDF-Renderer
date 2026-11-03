@@ -1,0 +1,1 @@
+var e=new WeakMap;function t(t){let n=new Uint8Array;return e.set(n,t),n}function n(t){return t instanceof Uint8Array?e.get(t):void 0}export{n,t};

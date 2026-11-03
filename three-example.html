@@ -4,32 +4,73 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>HEPR Three.js Example</title>
-    <style>:root{--lightningcss-light:initial;--lightningcss-dark: ;color-scheme:light}html,body{overscroll-behavior:none;color:#e8edf5;background:#11161d;height:100%;margin:0;font-family:Segoe UI,Tahoma,Geneva,Verdana,sans-serif;overflow:hidden}#app{position:fixed;inset:0}#viewport{touch-action:none;cursor:grab;width:100%;height:100%;display:block}#viewport:active{cursor:grabbing}#panel{box-sizing:border-box;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);z-index:2;background:#0d121ae6;border:1px solid #ffffff1f;border-radius:10px;width:min(620px,100vw - 32px);max-height:calc(100vh - 50px);padding:12px;position:fixed;top:16px;left:16px;overflow-y:auto}#panel.collapsed{display:none}#load-diagnostics-report{box-sizing:border-box;width:100%;height:200px;font-size:12px}#load-diagnostics-status{overflow-wrap:anywhere;font-size:12px}.panel-header{justify-content:space-between;align-items:center;gap:10px;display:flex}.panel-content{margin-top:8px}.panel-title{margin:0;font-size:16px}.row,.toolbar,.toggles,.number-row{align-items:center;gap:8px;margin-bottom:8px;display:flex}.row:last-child,.number-row:last-child{margin-bottom:0}select,button,input{font:inherit}.toolbar,.toggles{flex-wrap:wrap}.has-reader-toolbar .startup-controls{display:none}select,button{color:#e8edf5;background:#162030;border:1px solid #ffffff2e;border-radius:6px;padding:7px 10px}button{cursor:pointer}button:disabled{opacity:.6;cursor:default}.settings-close{justify-content:center;align-items:center;gap:6px;height:30px;padding:5px 8px;line-height:1;display:inline-flex}.toggle{-webkit-user-select:none;user-select:none;align-items:center;gap:6px;font-size:13px;display:inline-flex}.toggle input{margin:0}.number-row{grid-template-columns:max-content minmax(110px,1fr);font-size:13px;display:grid}.number-row select{width:min(220px,100%)}.number-row>input[type=number]{width:min(120px,100%);min-width:0}.number-row input[type=color]{border-radius:6px;width:44px;height:28px;padding:0}.color-controls{align-items:center;gap:6px;min-width:0;display:flex}.color-controls input[type=number]{width:64px;min-width:0}.color-controls input[type=range]{width:min(180px,22vw)}.color-suffix{color:#e8edf5a8;font-size:12px}#status{opacity:.92;font-size:13px}.meter-row{color:#e8edf5e0;justify-content:space-between;font-size:13px}.meter-label{color:#e8edf5a8}.meter-value{font-variant-numeric:tabular-nums}#parse-loader{opacity:.94;align-items:center;gap:8px;font-size:13px;display:inline-flex}#parse-loader[hidden]{display:none!important}#drop-indicator{pointer-events:none;opacity:0;color:#e8edf5;text-shadow:0 1px 10px #00000080;background:0 0;place-items:center;font-size:clamp(1.1rem,2.2vw,1.6rem);font-weight:600;transition:opacity .12s ease-out;display:grid;position:fixed;inset:0}#drop-indicator.active{opacity:1}#drop-indicator.dragging{background:#0a162880}.row[hidden],.toggle[hidden]{display:none!important}.example-dropdown{position:relative}.example-trigger{cursor:pointer;justify-content:space-between;align-items:center;gap:10px;min-width:190px;max-width:100%;transition:border-color .12s,box-shadow .12s,background .12s;display:inline-flex}.example-trigger:hover:not(:disabled){background:#1d2a3e;border-color:#ffffff52}.example-trigger:disabled{opacity:.6;cursor:not-allowed}.example-dropdown.open .example-trigger{border-color:#60a5fab3;box-shadow:0 0 0 3px #60a5fa2e}.example-trigger-label{text-overflow:ellipsis;white-space:nowrap;align-items:center;gap:8px;display:inline-flex;overflow:hidden}.example-trigger-count{color:#e8edf5d9;background:#ffffff1f;border-radius:999px;justify-content:center;align-items:center;min-width:20px;height:20px;padding:0 6px;font-size:12px;font-weight:600;line-height:1;display:inline-flex}.example-trigger-chevron{color:#e8edf599;font-size:12px;line-height:1;transition:transform .14s}.example-dropdown.open .example-trigger-chevron{transform:rotate(180deg)}.example-menu{z-index:40;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);background:#131a26f7;border:1px solid #ffffff24;border-radius:12px;outline:none;width:max-content;max-width:min(460px,100vw - 32px);padding:6px;animation:.12s ease-out menu-pop;position:fixed;overflow-y:auto;box-shadow:0 12px 32px #00000080}.example-menu[hidden]{display:none}@keyframes menu-pop{0%{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}.example-menu-row{border-radius:8px;justify-content:space-between;align-items:center;gap:14px;padding:6px 10px;display:flex}.example-menu-row:hover{background:#ffffff0f}.example-menu-name{text-overflow:ellipsis;white-space:nowrap;color:#e8edf5;flex:1;min-width:0;font-size:13px;overflow:hidden}.example-menu-actions{flex-shrink:0;gap:6px;display:inline-flex}.example-chip{color:#e8edf5;cursor:pointer;background:#ffffff0a;border:1px solid #fff3;border-radius:999px;align-items:center;gap:6px;padding:3px 10px;font-size:12px;line-height:1.3;transition:background .1s,color .1s,border-color .1s;display:inline-flex}.example-chip:hover,.example-chip:focus-visible{color:#11161d;background:#e8edf5;border-color:#e8edf5}.example-chip-kind{font-weight:600}.example-chip-size{color:#e8edf58c;font-family:Cascadia Mono,Consolas,monospace;font-size:11px}.example-chip:hover .example-chip-size,.example-chip:focus-visible .example-chip-size{color:#11161da6}.search-row{grid-template-columns:max-content 1fr}.search-controls{align-items:center;gap:6px;min-width:0;display:flex}.search-controls input[type=search]{color:#e8edf5;background:#162030;border:1px solid #ffffff2e;border-radius:6px;flex:1;min-width:0;padding:6px 8px}.search-controls input[type=search]:disabled{opacity:.6}.search-count{text-align:right;color:#e8edf5a8;font-variant-numeric:tabular-nums;flex-shrink:0;min-width:3.2em;font-size:12px}.search-count[hidden]{display:none}.search-controls button{width:32px;min-width:32px;padding:6px 0;font-size:12px}#text-search-case[aria-pressed=true],.page-layout-buttons button[aria-pressed=true]{color:#11161d;background:#e8edf5;border-color:#e8edf5}.number-row[hidden]{display:none!important}.page-layout-controls{flex-wrap:wrap;align-items:center;gap:10px;display:flex}.page-layout-buttons{gap:6px;display:flex}.page-layout-progress{color:#e8edf5cc;font-variant-numeric:tabular-nums;align-items:center;gap:6px;font-size:12px;display:inline-flex}.page-layout-progress[hidden]{display:none}.page-layout-progress progress{appearance:none;background:#ffffff24;border:none;border-radius:3px;width:90px;height:6px;overflow:hidden}.page-layout-progress progress::-webkit-progress-bar{background:#ffffff24}.page-layout-progress progress::-webkit-progress-value{background:#60a5fa}.page-layout-progress progress::-moz-progress-bar{background:#60a5fa}.page-layout-buttons button{padding:5px 12px;font-size:13px}.loader-spinner{border:2px solid #e8edf540;border-top-color:#e8edf5;border-radius:50%;width:14px;height:14px;animation:.8s linear infinite spin}@keyframes spin{0%{transform:rotate(0)}to{transform:rotate(360deg)}}</style>
-    <script type="module" crossorigin src="./assets/three-BeO9HlNW.js"></script>
+    <style>:root{--lightningcss-light:initial;--lightningcss-dark: ;color-scheme:light}html,body{overscroll-behavior:none;color:#e8edf5;background:#11161d;height:100%;margin:0;font-family:Segoe UI,Tahoma,Geneva,Verdana,sans-serif;overflow:hidden}#app{position:fixed;inset:0}#viewport{touch-action:none;cursor:grab;width:100%;height:100%;display:block}#viewport:active{cursor:grabbing}#panel{--viewer-settings-background:#151b24;color:#e8edf5;box-sizing:border-box;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);z-index:2;background:#0d121ae6;border:1px solid #ffffff1f;border-radius:10px;width:min(620px,100vw - 32px);max-height:calc(100vh - 50px);padding:12px;position:fixed;top:16px;left:16px;overflow-y:auto}#panel.collapsed{display:none}#load-diagnostics-report{box-sizing:border-box;width:100%;height:200px;font-size:12px}#load-diagnostics-status{overflow-wrap:anywhere;font-size:12px}.panel-header{justify-content:space-between;align-items:center;gap:10px;display:flex}.panel-content{margin-top:8px}.panel-title{margin:0;font-size:16px}.row,.toolbar,.toggles,.number-row{align-items:center;gap:8px;margin-bottom:8px;display:flex}.row:last-child,.number-row:last-child{margin-bottom:0}select,button,input{font:inherit}.toolbar,.toggles{flex-wrap:wrap}.has-reader-toolbar .startup-controls{display:none}select,button{color:#e8edf5;background:#162030;border:1px solid #ffffff2e;border-radius:6px;padding:7px 10px}button{cursor:pointer}button:disabled{opacity:.6;cursor:default}.settings-close{justify-content:center;align-items:center;gap:6px;height:30px;padding:5px 8px;line-height:1;display:inline-flex}.toggle{-webkit-user-select:none;user-select:none;align-items:center;gap:6px;font-size:13px;display:inline-flex}.toggle input{margin:0}.number-row{grid-template-columns:max-content minmax(110px,1fr);font-size:13px;display:grid}.number-row select{width:min(220px,100%)}.number-row>input[type=number]{width:min(120px,100%);min-width:0}.number-row input[type=color]{border-radius:6px;width:44px;height:28px;padding:0}.color-controls{align-items:center;gap:6px;min-width:0;display:flex}.color-controls input[type=number]{width:64px;min-width:0}.color-controls input[type=range]{width:min(180px,22vw)}.color-suffix{color:#e8edf5a8;font-size:12px}#status{opacity:.92;font-size:13px}.meter-row{color:#e8edf5e0;justify-content:space-between;font-size:13px}.meter-label{color:#e8edf5a8}.meter-value{font-variant-numeric:tabular-nums}#parse-loader{opacity:.94;align-items:center;gap:8px;font-size:13px;display:inline-flex}#parse-loader[hidden]{display:none!important}#drop-indicator{pointer-events:none;opacity:0;color:#e8edf5;text-shadow:0 1px 10px #00000080;background:0 0;place-items:center;font-size:clamp(1.1rem,2.2vw,1.6rem);font-weight:600;transition:opacity .12s ease-out;display:grid;position:fixed;inset:0}#drop-indicator.active{opacity:1}#drop-indicator.dragging{background:#0a162880}.row[hidden],.toggle[hidden]{display:none!important}.example-dropdown{position:relative}.example-trigger{cursor:pointer;justify-content:space-between;align-items:center;gap:10px;min-width:190px;max-width:100%;transition:border-color .12s,box-shadow .12s,background .12s;display:inline-flex}.example-trigger:hover:not(:disabled){background:#1d2a3e;border-color:#ffffff52}.example-trigger:disabled{opacity:.6;cursor:not-allowed}.example-dropdown.open .example-trigger{border-color:#60a5fab3;box-shadow:0 0 0 3px #60a5fa2e}.example-trigger-label{text-overflow:ellipsis;white-space:nowrap;align-items:center;gap:8px;display:inline-flex;overflow:hidden}.example-trigger-count{color:#e8edf5d9;background:#ffffff1f;border-radius:999px;justify-content:center;align-items:center;min-width:20px;height:20px;padding:0 6px;font-size:12px;font-weight:600;line-height:1;display:inline-flex}.example-trigger-chevron{color:#e8edf599;font-size:12px;line-height:1;transition:transform .14s}.example-dropdown.open .example-trigger-chevron{transform:rotate(180deg)}.example-menu{z-index:40;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);background:#131a26f7;border:1px solid #ffffff24;border-radius:12px;outline:none;width:max-content;max-width:min(460px,100vw - 32px);padding:6px;animation:.12s ease-out menu-pop;position:fixed;overflow-y:auto;box-shadow:0 12px 32px #00000080}.example-menu[hidden]{display:none}@keyframes menu-pop{0%{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}.example-menu-row{border-radius:8px;justify-content:space-between;align-items:center;gap:14px;padding:6px 10px;display:flex}.example-menu-row:hover{background:#ffffff0f}.example-menu-name{text-overflow:ellipsis;white-space:nowrap;color:#e8edf5;flex:1;min-width:0;font-size:13px;overflow:hidden}.example-menu-actions{flex-shrink:0;gap:6px;display:inline-flex}.example-chip{color:#e8edf5;cursor:pointer;background:#ffffff0a;border:1px solid #fff3;border-radius:999px;align-items:center;gap:6px;padding:3px 10px;font-size:12px;line-height:1.3;transition:background .1s,color .1s,border-color .1s;display:inline-flex}.example-chip:hover,.example-chip:focus-visible{color:#11161d;background:#e8edf5;border-color:#e8edf5}.example-chip-kind{font-weight:600}.example-chip-size{color:#e8edf58c;font-family:Cascadia Mono,Consolas,monospace;font-size:11px}.example-chip:hover .example-chip-size,.example-chip:focus-visible .example-chip-size{color:#11161da6}.search-row{grid-template-columns:max-content 1fr}.search-controls{align-items:center;gap:6px;min-width:0;display:flex}.search-controls input[type=search]{color:#e8edf5;background:#162030;border:1px solid #ffffff2e;border-radius:6px;flex:1;min-width:0;padding:6px 8px}.search-controls input[type=search]:disabled{opacity:.6}.search-count{text-align:right;color:#e8edf5a8;font-variant-numeric:tabular-nums;flex-shrink:0;min-width:3.2em;font-size:12px}.search-count[hidden]{display:none}.search-controls button{width:32px;min-width:32px;padding:6px 0;font-size:12px}#text-search-case[aria-pressed=true],.page-layout-buttons button[aria-pressed=true]{color:#11161d;background:#e8edf5;border-color:#e8edf5}.number-row[hidden]{display:none!important}.page-layout-controls{flex-wrap:wrap;align-items:center;gap:10px;display:flex}.page-layout-buttons{gap:6px;display:flex}.page-layout-progress{color:#e8edf5cc;font-variant-numeric:tabular-nums;align-items:center;gap:6px;font-size:12px;display:inline-flex}.page-layout-progress[hidden]{display:none}.page-layout-progress progress{appearance:none;background:#ffffff24;border:none;border-radius:3px;width:90px;height:6px;overflow:hidden}.page-layout-progress progress::-webkit-progress-bar{background:#ffffff24}.page-layout-progress progress::-webkit-progress-value{background:#60a5fa}.page-layout-progress progress::-moz-progress-bar{background:#60a5fa}.page-layout-buttons button{padding:5px 12px;font-size:13px}.loader-spinner{border:2px solid #e8edf540;border-top-color:#e8edf5;border-radius:50%;width:14px;height:14px;animation:.8s linear infinite spin}@keyframes spin{0%{transform:rotate(0)}to{transform:rotate(360deg)}}</style>
+    <script type="module" crossorigin src="./assets/three-B_1wNPxh.js"></script>
+    <link rel="modulepreload" crossorigin href="./assets/modulepreload-polyfill-P2Xu9kJm.js">
     <link rel="modulepreload" crossorigin href="./assets/loadCancellation-B_fcKR7q.js">
     <link rel="modulepreload" crossorigin href="./assets/optionalContentData-CFyj-zla.js">
-    <link rel="modulepreload" crossorigin href="./assets/annotationLayers-CsdPppGk.js">
-    <link rel="modulepreload" crossorigin href="./assets/optionalContent-B2TrsKvv.js">
-    <link rel="modulepreload" crossorigin href="./assets/retainedRasterBounds-CTuCWKTg.js">
+    <link rel="modulepreload" crossorigin href="./assets/annotationLayers-5cuDepLO.js">
+    <link rel="modulepreload" crossorigin href="./assets/optionalContent-Dcp1CWWT.js">
+    <link rel="modulepreload" crossorigin href="./assets/colorInput-CmUnBn5h.js">
+    <link rel="modulepreload" crossorigin href="./assets/gradientSampling-gSAS7Ld3.js">
+    <link rel="modulepreload" crossorigin href="./assets/vectorFillCoverage-BUaiD7x0.js">
+    <link rel="modulepreload" crossorigin href="./assets/structureData-eNj79wS5.js">
     <link rel="modulepreload" crossorigin href="./assets/scenePaintQuery-qB8GKFGQ.js">
-    <link rel="modulepreload" crossorigin href="./assets/rasterRepeat-2nX8zjEJ.js">
-    <link rel="modulepreload" crossorigin href="./assets/scenePaintGraph-Bq99RSsx.js">
-    <link rel="modulepreload" crossorigin href="./assets/nativeWebGlMixedVectorShaders-MxHRyw4l.js">
-    <link rel="modulepreload" crossorigin href="./assets/drawCallMetrics-D_OSxKVt.js">
-    <link rel="modulepreload" crossorigin href="./assets/pdfVectorExtractor-CCHHC29U.js">
-    <link rel="modulepreload" crossorigin href="./assets/textRasterAtlas-D3cFB_6P.js">
+    <link rel="modulepreload" crossorigin href="./assets/rasterRepeat-BXTXTB67.js">
+    <link rel="modulepreload" crossorigin href="./assets/scenePrimitives-BNAERvAx.js">
+    <link rel="modulepreload" crossorigin href="./assets/editorScenePreview-C3Xe9kDC.js">
+    <link rel="modulepreload" crossorigin href="./assets/primitiveHighlightShaders-DOTYoo5t.js">
+    <link rel="modulepreload" crossorigin href="./assets/optionalContentText-BVn7-O5s.js">
+    <link rel="modulepreload" crossorigin href="./assets/viewerWorkspace-BKhEVYnv.js">
+    <link rel="modulepreload" crossorigin href="./assets/hepLodOptions-CJDRnI5c.js">
+    <link rel="modulepreload" crossorigin href="./assets/preload-helper-uBIymjUX.js">
+    <link rel="modulepreload" crossorigin href="./assets/scenePaintGraph-DoidsDAj.js">
+    <link rel="modulepreload" crossorigin href="./assets/vectorStrokePaintOrder-C5Kh-5Px.js">
+    <link rel="modulepreload" crossorigin href="./assets/vectorStrokeLodCore-Ddp5h7L_.js">
+    <link rel="modulepreload" crossorigin href="./assets/pdfSignature-b94fXhPM.js">
+    <link rel="modulepreload" crossorigin href="./assets/toolbarIcons-Ce8uaoVN.js">
+    <link rel="modulepreload" crossorigin href="./assets/heprDocumentData-BnKXbCiZ.js">
+    <link rel="modulepreload" crossorigin href="./assets/retainedPageReplay-DV_LnrUj.js">
+    <link rel="modulepreload" crossorigin href="./assets/nativeTypes-BQHnFu7D.js">
+    <link rel="modulepreload" crossorigin href="./assets/monochromeRaster-BN5vDsqU.js">
+    <link rel="modulepreload" crossorigin href="./assets/rasterTiles-GlD7ia5J.js">
+    <link rel="modulepreload" crossorigin href="./assets/rasterMemoryBudget-DeP7mAKz.js">
+    <link rel="modulepreload" crossorigin href="./assets/compactMonochromeRaster-D9s21du4.js">
+    <link rel="modulepreload" crossorigin href="./assets/nativeWebGlMixedVectorShaders-BXMcFByo.js">
+    <link rel="modulepreload" crossorigin href="./assets/rasterPreparationCore-2qN4u_36.js">
+    <link rel="modulepreload" crossorigin href="./assets/textRasterAtlas-B7l818B2.js">
+    <link rel="modulepreload" crossorigin href="./assets/webGlRasterCompression-BN9_O_FJ.js">
     <link rel="modulepreload" crossorigin href="./assets/vectorFillBandShaders-CRyg2aoB.js">
-    <link rel="modulepreload" crossorigin href="./assets/searchHighlights-Cfj5Rbu6.js">
-    <link rel="modulepreload" crossorigin href="./assets/webGlPdfRenderer-CVKBHTci.js">
-    <link rel="modulepreload" crossorigin href="./assets/readerViewport-BUGhxxea.js">
-    <link rel="modulepreload" crossorigin href="./assets/hepReader-DKa6v1Gq.js">
-    <link rel="modulepreload" crossorigin href="./assets/pdfObjectGenerator-nF00jys3.js">
-    <link rel="modulepreload" crossorigin href="./assets/webGpuRasterCompression-BfBwkZAB.js">
-    <link rel="modulepreload" crossorigin href="./assets/src-CR9UD9tS.js">
-    <link rel="modulepreload" crossorigin href="./assets/hepBuilder-4hQ5nlKA.js">
-    <link rel="modulepreload" crossorigin href="./assets/three.webgpu-BV_Gj-Wm.js">
-    <link rel="stylesheet" crossorigin href="./assets/drawCallMetrics-DWXyxfIy.css">
-    <link rel="stylesheet" crossorigin href="./assets/readerViewport-BFtxbRAz.css">
+    <link rel="modulepreload" crossorigin href="./assets/searchHighlights-CboHZOCl.js">
+    <link rel="modulepreload" crossorigin href="./assets/webGlPdfRenderer-N8FoKiLh.js">
+    <link rel="modulepreload" crossorigin href="./assets/readerViewport-D_MjsBmb.js">
+    <link rel="modulepreload" crossorigin href="./assets/loadProgress-VGhG0z56.js">
+    <link rel="modulepreload" crossorigin href="./assets/annotationData-CuYoLLdT.js">
+    <link rel="modulepreload" crossorigin href="./assets/scenePageViews-D1o8eF6F.js">
+    <link rel="modulepreload" crossorigin href="./assets/emptyVectorScene-seyRMHWb.js">
+    <link rel="modulepreload" crossorigin href="./assets/preparedRasterSections-qaDs6JFU.js">
+    <link rel="modulepreload" crossorigin href="./assets/nativeIcc-CZ7LVBAr.js">
+    <link rel="modulepreload" crossorigin href="./assets/pdfVectorExtractor-CtmkjqWG.js">
+    <link rel="modulepreload" crossorigin href="./assets/hepContainerPaths-BThvwmEM.js">
+    <link rel="modulepreload" crossorigin href="./assets/parsedDataVarint-CbwD-1lW.js">
+    <link rel="modulepreload" crossorigin href="./assets/documentAuthoring-C4BUrEjj.js">
+    <link rel="modulepreload" crossorigin href="./assets/heprDocumentDataValidation-D5Nf5ipB.js">
+    <link rel="modulepreload" crossorigin href="./assets/nodeCanvas-C4Ya6NK_.js">
+    <link rel="modulepreload" crossorigin href="./assets/sourceJpxRaster-CQNyeAJG.js">
+    <link rel="modulepreload" crossorigin href="./assets/hepRasterLayers-DTHMb3z5.js">
+    <link rel="modulepreload" crossorigin href="./assets/hepReader-tJHKlnkW.js">
+    <link rel="modulepreload" crossorigin href="./assets/pageRasterPreview-gdc6TLa0.js">
+    <link rel="modulepreload" crossorigin href="./assets/pdfObjectGenerator-DZGV3uqp.js">
+    <link rel="modulepreload" crossorigin href="./assets/viewerLinkNavigation-DIZuS3ps.js">
+    <link rel="modulepreload" crossorigin href="./assets/threeRasterTextures-BLwxdxlY.js">
+    <link rel="modulepreload" crossorigin href="./assets/webGpuRasterCompression-Cz_OinKD.js">
+    <link rel="modulepreload" crossorigin href="./assets/src-J-tZtBpH.js">
+    <link rel="modulepreload" crossorigin href="./assets/hepSizePolicy-CO_f3PrJ.js">
+    <link rel="modulepreload" crossorigin href="./assets/hepBuilder--9HBWdaT.js">
+    <link rel="modulepreload" crossorigin href="./assets/three.webgpu-DwNcL5YA.js">
+    <link rel="stylesheet" crossorigin href="./assets/viewerWorkspace-Bpfmakh6.css">
+    <link rel="stylesheet" crossorigin href="./assets/toolbarIcons-CouB_J_r.css">
+    <link rel="stylesheet" crossorigin href="./assets/readerViewport-B1XHgnZ-.css">
   </head>
   <body>
     <div id="app">
@@ -39,17 +80,17 @@
     <div id="panel" role="group" aria-label="Three.js HEPR controls">
       <div class="panel-header">
         <h2 class="panel-title">Settings</h2>
-        <button id="toggle-panel" class="settings-close" type="button" aria-expanded="true" aria-controls="panel-content" aria-label="Close settings" title="Close settings">
-          <span id="toggle-panel-icon" aria-hidden="true">×</span>
-          <span>Close</span>
-        </button>
+        <button id="toggle-panel" class="settings-close" type="button" data-toolbar-icon="close" aria-expanded="true" aria-controls="panel-content" aria-label="Close settings" title="Close settings">Close settings</button>
       </div>
       <div id="panel-content" class="panel-content">
         <div class="toolbar startup-controls">
-          <a class="package-version" href="https://www.npmjs.com/package/@soadzoor/hepr" target="_blank" rel="noopener noreferrer" title="HEPR package version used by this build">npm v0.1.71</a>
-          <button id="open-file" type="button" title="Open a PDF or HEPR-exported .hep file">Open PDF / HEP</button>
+          <a class="package-version" href="https://www.npmjs.com/package/@soadzoor/hepr" target="_blank" rel="noopener noreferrer" title="HEPR package version used by this build">npm v0.2.0</a>
+          <button id="open-file" type="button" data-toolbar-icon="open" title="Open a PDF or HEPR-exported .hep file">Open PDF / HEP</button>
+          <button id="new-pdf" type="button" data-toolbar-icon="pages" title="Create a new PDF">New PDF</button>
+          <button id="editor-mode" type="button" data-toolbar-icon="edit" aria-pressed="false" title="Enter PDF editing mode">Edit PDF</button>
+          <button id="print-pdf" type="button" data-toolbar-icon="print" title="Print the current document" disabled>Print</button>
           <div id="example-dropdown" class="example-dropdown">
-            <button id="example-select" class="example-trigger" type="button" aria-label="Load example PDF or HEP file" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
+            <button id="example-select" class="example-trigger" type="button" title="Load example PDF or HEP file" aria-label="Load example PDF or HEP file" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
               <span id="example-select-label" class="example-trigger-label">Examples (loading...)</span>
               <span class="example-trigger-chevron" aria-hidden="true">▾</span>
             </button>
@@ -58,8 +99,8 @@
         </div>
         <input id="file-input" type="file" accept=".pdf,.hep,application/pdf,application/x-hep" hidden />
         <div class="toolbar settings-downloads">
-          <button id="download-data" type="button" hidden disabled>Download HEP</button>
-          <button id="download-pdf" type="button" hidden disabled>Download PDF</button>
+          <button id="download-data" type="button" data-toolbar-icon="download-hep" hidden disabled>Download HEP</button>
+          <button id="download-pdf" type="button" data-toolbar-icon="download-pdf" hidden disabled>Download PDF</button>
         </div>
       <div class="toggles">
         <label class="toggle">
@@ -92,19 +133,19 @@
         <div class="search-controls">
           <input id="text-search-input" type="search" placeholder="Load a document to search" autocomplete="off" spellcheck="false" disabled />
           <span id="text-search-count" class="search-count" hidden>0/0</span>
-          <button id="text-search-prev" type="button" title="Previous match (Shift+Enter)" aria-label="Previous match" disabled>▲</button>
-          <button id="text-search-next" type="button" title="Next match (Enter)" aria-label="Next match" disabled>▼</button>
-          <button id="text-search-case" type="button" title="Match case" aria-label="Match case" aria-pressed="false" disabled>Aa</button>
+          <button id="text-search-prev" type="button" data-toolbar-icon="search-previous" title="Previous match (Shift+Enter)" aria-label="Previous match (Shift+Enter)" disabled>▲</button>
+          <button id="text-search-next" type="button" data-toolbar-icon="search-next" title="Next match (Enter)" aria-label="Next match (Enter)" disabled>▼</button>
+          <button id="text-search-case" type="button" data-toolbar-icon="match-case" title="Match case" aria-label="Match case" aria-pressed="false" disabled>Aa</button>
         </div>
       </div>
       <div id="page-layout-row" class="number-row" hidden>
         <span id="page-layout-label">Page Layout</span>
         <div class="page-layout-controls">
           <div class="page-layout-buttons" role="group" aria-labelledby="page-layout-label">
-            <button type="button" data-page-layout="reader" aria-pressed="false">Reader</button>
-            <button type="button" data-page-layout="grid" aria-pressed="true">Grid</button>
-            <button type="button" data-page-layout="sphere" aria-pressed="false">Sphere</button>
-            <button type="button" data-page-layout="helix" aria-pressed="false">Helix</button>
+            <button type="button" data-page-layout="reader" data-toolbar-icon="reader" aria-pressed="false">Reader</button>
+            <button type="button" data-page-layout="grid" data-toolbar-icon="grid" aria-pressed="true">Grid</button>
+            <button type="button" data-page-layout="sphere" data-toolbar-icon="sphere" aria-pressed="false">Sphere</button>
+            <button type="button" data-page-layout="helix" data-toolbar-icon="helix" aria-pressed="false">Helix</button>
           </div>
           <span id="page-layout-progress" class="page-layout-progress" role="status" hidden>
             <span class="loader-spinner" aria-hidden="true"></span>
@@ -139,7 +180,7 @@
           <option value="off">Off</option>
         </select>
       </div>
-      <div class="number-row">
+      <div class="number-row number-row-color">
         <label for="page-bg-color">Page Background</label>
         <div class="color-controls">
           <input id="page-bg-color" type="color" value="#ffffff" />
@@ -148,7 +189,7 @@
           <span class="color-suffix">%</span>
         </div>
       </div>
-      <div class="number-row">
+      <div class="number-row number-row-color">
         <label for="vector-color">Vector Override</label>
         <div class="color-controls">
           <input id="vector-color" type="color" value="#000000" />
@@ -162,8 +203,8 @@
         <span>Record loading diagnostics</span>
       </label>
       <div class="row">
-        <button id="show-load-report" type="button">Show load report</button>
-        <button id="copy-load-report" type="button">Copy load report</button>
+        <button id="show-load-report" type="button" data-toolbar-icon="pages">Show load report</button>
+        <button id="copy-load-report" type="button" data-toolbar-icon="duplicate">Copy load report</button>
       </div>
       <div id="load-diagnostics-status" class="row" role="status"></div>
       <textarea id="load-diagnostics-report" readonly hidden aria-label="Loading diagnostics report"></textarea>

@@ -1,0 +1,1 @@
+import{n as e,t}from"./nativeDocument-C6bjfUCe.js";export{t as NativePdfDocument,e as openNativePdfDocument};
