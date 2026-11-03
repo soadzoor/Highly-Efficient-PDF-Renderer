@@ -73,7 +73,16 @@ export function applyEditorPropertyPatch(session: EditorSession, patch: Partial<
       !(object.kind === "source" && key === "fill" && (patch as Record<string, unknown>).fill == null))
       .map(key => [key, (patch as Record<string, unknown>)[key]]));
     if (!Object.keys(supported).length) return [];
+    const size = supported.fontSize;
+    let bounds = {};
+    if (object.kind === "text" && typeof size === "number" && Number.isFinite(size) && size > 0) {
+      const sizes = object.runs?.filter(run => run.text.length).map(run => run.fontSize ?? object.fontSize);
+      const previous = sizes?.length && sizes.every(value => value === sizes[0]) ? sizes[0] : object.fontSize;
+      const ratio = size / previous;
+      if (ratio !== 1) bounds = { width: object.width * ratio, height: object.height * ratio, y: object.y + object.height - object.height * ratio };
+    }
     return [{ id: object.id, patch: object.kind === "text" ? { ...supported,
+      ...bounds,
       ...(object.runs ? { runs: object.runs.map(run => ({ ...run, ...Object.fromEntries(Object.entries(supported).filter(([key]) => key !== "align")) })) } : {}) } : supported }];
   });
   if (updates.length) session.transaction("Change appearance", () => { for (const update of updates) session.updateObject(update.id, update.patch); });

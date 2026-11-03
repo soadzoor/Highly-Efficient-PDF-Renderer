@@ -26,7 +26,7 @@
 .hepr-editor-handle[data-handle=ne],.hepr-editor-handle[data-handle=sw]{cursor:nesw-resize}
 .hepr-editor-handle[data-handle=rotate]{cursor:var(--hepr-editor-rotate-cursor)}
 .hepr-editor-overlay[data-gesture=move]{cursor:move}
-.hepr-editor-overlay[data-gesture=marquee]{cursor:crosshair}
+.hepr-editor-overlay[data-gesture=marquee],.hepr-editor-overlay[data-gesture=text]{cursor:crosshair}
 .hepr-editor-overlay[data-gesture=resize]{cursor:nwse-resize}
 .hepr-editor-overlay[data-gesture=resize][data-resize-handle=ne],.hepr-editor-overlay[data-gesture=resize][data-resize-handle=sw]{cursor:nesw-resize}
 .hepr-editor-overlay[data-gesture=rotate]{cursor:var(--hepr-editor-rotate-cursor)}

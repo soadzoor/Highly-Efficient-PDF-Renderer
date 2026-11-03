@@ -290,25 +290,6 @@ try {
   assert.deepEqual(editingEvents, [], "an empty new textbox does not modify the document");
 
   const uiSource = await readFile(new URL("../src/editorUi.ts", import.meta.url), "utf8");
-  {
-    const contents = new Element("fragment"), first = new Element("span", { fontSize: "18px", fontWeight: "700" }), second = new Element("span", { fontSize: "10px", color: "rgb(255, 0, 0)" });
-    first.style.fontSize = "18px"; second.style.fontSize = "10px";
-    first.append(text("Bold")); second.append(text(" red")); contents.append(first, second);
-    let inserted, selected;
-    const range = { extractContents: () => contents, insertNode: node => { inserted = node; }, selectNodeContents: node => { selected = node; } };
-    const selection = { rangeCount: 1, isCollapsed: false, getRangeAt: () => range, removeAllRanges() {}, addRange(value) { assert.equal(value, range); } };
-    const sizeDocument = { createElement: tag => new Element(tag), getSelection: () => selection };
-    const sizeHost = uiContext();
-    vm.runInContext(sourceFunction(uiSource, "applySelectionCss"), sizeHost);
-    sizeHost.applySelectionCss(sizeDocument, "fontSize", "30px");
-    const updated = readRichTextRuns(inserted, { getComputedStyle: node => ({ ...node.computedStyle, ...node.style }) }, fonts);
-    assert.deepEqual(updated.map(run => run.fontSize), [30, 30], "one size change overrides all selected run sizes");
-    assert.equal(updated[0].fontWeight, 700); assert.equal(updated[1].color, "#ff0000", "other selected formatting survives resizing");
-    assert.equal(selected, inserted, "the formatted text stays selected for subsequent styling");
-    selection.isCollapsed = true; inserted = null;
-    sizeHost.applySelectionCss(sizeDocument, "fontSize", "40px");
-    assert.equal(inserted, null, "a collapsed caret does not replace surrounding rich text");
-  }
   const { editorIconButton } = await import("../src/editorToolbarIcons.ts");
   const toolbarTemplate = uiSource.match(/toolbar\.innerHTML = (`[\s\S]*?`);/)?.[1];
   assert(toolbarTemplate, "the editor exposes its actual toolbar markup");

@@ -22,7 +22,7 @@ try {
     query: selector => button(selector.match(/data-style="([^"]+)"/)[1]), styleEnabled: name => button(name).value === "true",
     property: name => name === "fill-enabled" ? { checked: true } : { value: "#123456" },
     commit: action => action(), report: error => errors.push(error), selectedFont: async () => ({ id: "font-choice", family: "Chosen font" }), activateFont: async () => {},
-    document: { execCommand: (...args) => calls.push(args) }, applySelectionCss: (...args) => calls.push(args), recovery: { draftChanged: () => draftChanges++ }
+    document: { execCommand: (...args) => calls.push(args) }, changeTextFontSize: value => { calls.push(["fontSize", value]); draftChanges++; }, recovery: { draftChanged: () => draftChanges++ }
   });
   for (const name of ["changeAppearance", "applyTextStyle"]) vm.runInContext(sourceFunction(source, name), context);
   const change = (name, value) => context.changeAppearance({ dataset: { prop: name }, value });

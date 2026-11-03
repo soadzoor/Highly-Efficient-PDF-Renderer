@@ -5,10 +5,12 @@ interface ResizeOptions {
   getBounds(): EditorTextBoxBounds;
   canResize(): boolean;
   clientToLocal(point: Point): Point | null;
+  getContentSize?(fitWidth: boolean, fitHeight: boolean): { width: number; height: number } | null;
+  onResizeStart?(): void;
   onResize(bounds: EditorTextBoxBounds): void;
-  onChange(): void;
+  onChange(canceled?: boolean): void;
 }
-interface Drag { id: number; handle: Handle; start: Point; bounds: EditorTextBoxBounds; cursor: string; previousCursor: string }
+interface Drag { id: number; handle: Handle; target: HTMLButtonElement; start: Point; bounds: EditorTextBoxBounds; cursor: string; previousCursor: string; changed: boolean }
 
 const finitePoint = (point: Point | null): point is Point => point !== null && Number.isFinite(point.x) && Number.isFinite(point.y);
 const validBounds = (bounds: EditorTextBoxBounds): boolean =>
@@ -34,9 +36,10 @@ export function createEditorTextResizeControls(document: Document, overlay: HTML
     s: "bottom edge", sw: "bottom left corner", w: "left edge", nw: "top left corner" };
   const buttons = (Object.keys(labels) as Handle[]).map(handle => {
     const button = document.createElement("button"); button.type = "button"; button.className = "hepr-editor-text-resize-handle";
-    button.dataset.textResize = handle; button.title = `Resize textbox ${labels[handle]}`;
+    button.dataset.textResize = handle; button.title = `Resize textbox ${labels[handle]} (double-click to fit content)`;
     button.setAttribute("aria-label", button.title);
-    button.addEventListener("pointerdown", event => pointerDown(event, handle), { signal: lifetime.signal });
+    button.addEventListener("pointerdown", event => pointerDown(event, handle, button), { signal: lifetime.signal });
+    button.addEventListener("dblclick", event => fitContent(event, handle), { signal: lifetime.signal });
     button.addEventListener("keydown", event => keydown(event, handle), { signal: lifetime.signal });
     container.append(button); return { handle, button };
   });
@@ -51,28 +54,30 @@ export function createEditorTextResizeControls(document: Document, overlay: HTML
   function release(current: Drag): void {
     container.style.cursor = "";
     if (overlay.style.cursor === current.cursor) overlay.style.cursor = current.previousCursor;
-    if (container.hasPointerCapture?.(current.id)) container.releasePointerCapture(current.id);
+    if (current.target.hasPointerCapture?.(current.id)) current.target.releasePointerCapture(current.id);
   }
   function cancel(): boolean {
     const current = drag; if (!current) return false;
     drag = null; release(current);
-    if (!disposed && options.canResize() && !sameBounds(options.getBounds(), current.bounds)) {
-      options.onResize({ ...current.bounds }); options.onChange();
+    if (!disposed && options.canResize() && current.changed) {
+      if (!sameBounds(options.getBounds(), current.bounds)) options.onResize({ ...current.bounds });
+      options.onChange(true);
     }
     return true;
   }
   function abandon(): void {
     const current = drag; drag = null; if (current) release(current);
   }
-  function pointerDown(event: PointerEvent, handle: Handle): void {
+  function pointerDown(event: PointerEvent, handle: Handle, target: HTMLButtonElement): void {
     if (event.button !== 0) return;
     consume(event);
     if (disposed || drag || !options.canResize() || event.isPrimary === false) return;
     const start = options.clientToLocal({ x: event.clientX, y: event.clientY }), bounds = options.getBounds();
     if (!finitePoint(start) || !validBounds(bounds)) return;
-    drag = { id: event.pointerId, handle, start, bounds: { ...bounds }, cursor: "", previousCursor: overlay.style.cursor ?? "" };
+    drag = { id: event.pointerId, handle, target, start, bounds: { ...bounds }, cursor: "", previousCursor: overlay.style.cursor ?? "", changed: false };
     updateDragCursor();
-    try { container.setPointerCapture?.(event.pointerId); } catch { abandon(); }
+    try { target.setPointerCapture?.(event.pointerId); } catch { abandon(); return; }
+    options.onResizeStart?.();
   }
   function resizeAt(event: PointerEvent): boolean {
     if (!drag) return false;
@@ -81,7 +86,7 @@ export function createEditorTextResizeControls(document: Document, overlay: HTML
     if (!finitePoint(point)) { cancel(); return false; }
     const next = resizedBounds(drag.bounds, drag.handle, point.x - drag.start.x, point.y - drag.start.y);
     if (!validBounds(next)) { cancel(); return false; }
-    if (!sameBounds(options.getBounds(), next)) options.onResize(next);
+    if (!sameBounds(options.getBounds(), next)) { drag.changed = true; options.onResize(next); }
     return true;
   }
   function pointerMove(event: PointerEvent): void {
@@ -94,10 +99,22 @@ export function createEditorTextResizeControls(document: Document, overlay: HTML
     if (event.button !== 0) { cancel(); return; }
     if (!resizeAt(event) || !drag) return;
     const current = drag; drag = null; release(current);
-    if (!sameBounds(options.getBounds(), current.bounds)) options.onChange();
+    if (current.changed) options.onChange();
   }
   function pointerCancel(event: PointerEvent): void {
     if (drag && event.pointerId === drag.id) { consume(event); cancel(); }
+  }
+  function fitContent(event: MouseEvent, handle: Handle): void {
+    if (event.button !== 0) return;
+    consume(event);
+    if (disposed || drag || !options.canResize()) return;
+    const bounds = options.getBounds(); if (!validBounds(bounds)) return;
+    const fitWidth = /[ew]/.test(handle), fitHeight = /[ns]/.test(handle);
+    const size = options.getContentSize?.(fitWidth, fitHeight); if (!size) return;
+    const width = fitWidth ? Math.max(1, size.width) : bounds.width, height = fitHeight ? Math.max(1, size.height) : bounds.height;
+    const next = { x: handle.includes("w") ? bounds.x + bounds.width - width : bounds.x,
+      y: handle.includes("s") ? bounds.y + bounds.height - height : bounds.y, width, height };
+    if (validBounds(next) && !sameBounds(bounds, next)) { options.onResize(next); options.onChange(); }
   }
   function keydown(event: KeyboardEvent, handle?: Handle): void {
     if (event.key === "Escape" && drag) { consume(event); cancel(); return; }
@@ -122,14 +139,20 @@ export function createEditorTextResizeControls(document: Document, overlay: HTML
       const bounds = options.getBounds();
       if (!visible || !options.canResize() || !validBounds(bounds)) { container.hidden = true; abandon(); return; }
       const middle = project(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
-      const projected = buttons.map(({ handle, button }) => ({ button, point: project(bounds.x + bounds.width * (handle.includes("w") ? 0 : handle.includes("e") ? 1 : .5),
+      const projected = buttons.map(({ handle, button }) => ({ handle, button, point: project(bounds.x + bounds.width * (handle.includes("w") ? 0 : handle.includes("e") ? 1 : .5),
         bounds.y + bounds.height * (handle.includes("s") ? 0 : handle.includes("n") ? 1 : .5)) }));
       if (!finitePoint(middle) || !projected.every(item => finitePoint(item.point)) || !finitePoint(offset)) { container.hidden = true; abandon(); return; }
+      const east = projected.find(item => item.handle === "e")!.point!, north = projected.find(item => item.handle === "n")!.point!;
+      const horizontalLength = Math.hypot(east.x - middle.x, east.y - middle.y), verticalLength = Math.hypot(north.x - middle.x, north.y - middle.y);
+      if (!(horizontalLength > 0 && verticalLength > 0)) { container.hidden = true; abandon(); return; }
       container.hidden = false;
-      for (const { button, point } of projected) {
+      for (const { handle, button, point } of projected) {
         const position = point!;
         button.style.left = `${position.x - offset.x}px`; button.style.top = `${position.y - offset.y}px`;
-        const sector = ((Math.round(Math.atan2(position.y - middle.y, position.x - middle.x) / (Math.PI / 4)) % 4) + 4) % 4;
+        const horizontal = handle.includes("e") ? 1 : handle.includes("w") ? -1 : 0, vertical = handle.includes("n") ? 1 : handle.includes("s") ? -1 : 0;
+        const dx = horizontal * (east.x - middle.x) / horizontalLength + vertical * (north.x - middle.x) / verticalLength;
+        const dy = horizontal * (east.y - middle.y) / horizontalLength + vertical * (north.y - middle.y) / verticalLength;
+        const sector = ((Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) % 4) + 4) % 4;
         button.style.cursor = ["ew-resize", "nwse-resize", "ns-resize", "nesw-resize"][sector];
       }
       updateDragCursor();

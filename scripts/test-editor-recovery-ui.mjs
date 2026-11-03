@@ -80,10 +80,17 @@ try {
     });
     vm.runInContext(sourceFunction(source, "initializeRecovery"), context); await context.initializeRecovery();
     assert.equal(configuration.key, "source-key"); assert.equal(configuration.protected, true);
-    await configuration.applyDraft({ fields: [{ id: "field", signature: "recovered value" }], text: { object: { kind: "text" }, objectId: "author:1" }, comment: { contents: "Comment draft" } });
+    await configuration.applyDraft({ fields: [{ id: "field", signature: "recovered value" }], text: { object: { kind: "text" }, objectId: "author:1", autoSize: { width: 72, height: 15 } }, comment: { contents: "Comment draft" } });
     assert.equal(currentControl.value, "recovered value"); assert.equal(oldControl.value, "old"); assert(textStarted);
     assert.equal(context.activeText.objectId, "author:1"); assert.equal(context.activeText.baseline.html, "");
+    assert.deepEqual(JSON.parse(JSON.stringify(context.activeText.autoSize)), { width: 72, height: 15 }, "restoring a click-created draft retains automatic growth");
+    const savedDraft = await configuration.getDraft();
+    assert.deepEqual(JSON.parse(JSON.stringify(savedDraft.text.autoSize)), { width: 72, height: 15 }, "recovery checkpoints include the original minimum size");
     assert(events.indexOf("fonts") < events.indexOf("form")); assert(events.includes("Comment draft"));
+    for (const autoSize of [undefined, { width: Infinity, height: 15 }, { width: 72, height: -1 }]) {
+      await configuration.applyDraft({ text: { object: { kind: "text" }, autoSize } });
+      assert.equal(context.activeText.autoSize, undefined, "older or invalid sizing metadata keeps the recovered box fixed");
+    }
   }
   {
     let resolveProbe, shown = 0, modalOptions; const gate = new Promise(resolve => { resolveProbe = resolve; });

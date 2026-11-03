@@ -6,6 +6,24 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Changed
+
+- Click with Text to create a smaller textbox centered on the pointer that grows
+  with typing, or drag to draw a textbox that retains its chosen dimensions.
+  Manual sizing keeps the selected bounds and character sizes.
+
+### Fixed
+
+- Apply textbox font-size changes live to selected characters or the typing caret
+  without losing the text selection when using the Size input. Scale selected
+  textbox bounds proportionally with font-size changes outside content editing,
+  keeping the transformed top-left position and undoing both changes together.
+- Move selected objects by 1 screen pixel with the arrow keys, or 10 with Shift,
+  using the current zoom and view projection instead of fixed document units.
+- Keep textbox corner cursors diagonal regardless of box proportions, following
+  transformed axes. Double-click an edge handle to fit its axis to the content,
+  or a corner to fit both axes, keeping the opposite edges anchored.
+
 ## [0.2.0] - 2026-11-03
 
 ### Added

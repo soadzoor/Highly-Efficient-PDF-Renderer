@@ -27,6 +27,8 @@ import { commitEditorText, hasPendingEditorTextChanges, normalizeEditorTextColor
 import type { EditorFont } from "./editorFonts";
 import { editorTextEditingDescriptors, editorTextEditingFamily } from "./editorTextEditingMetrics";
 import { createEditorTextResizeControls, type EditorTextBoxBounds } from "./editorTextResizeControls";
+import { measureEditorTextBox } from "./editorTextBox";
+import { applyEditorTextRangeCss, captureEditorTextRange, editorTextRangeWithin } from "./editorTextFormatting";
 import { editorIconButton } from "./editorToolbarIcons";
 import { canEditEditorField, createEditorFieldControl, createEditorFieldOptions, editorFieldDraftSignature, flushEditorFieldDrafts, hasPendingEditorFields, setEditorFieldControlValue, styleEditorFieldControl, updateEditorFieldControlAppearance, type EditorFieldControl } from "./editorFormControls";
 import { createEditorFieldActivation } from "./editorFieldActivation";
@@ -117,9 +119,11 @@ type EditorShapeInput = Extract<EditorObjectInput, { kind: "shape" }>;
 type EditorDrawingInput = Extract<EditorObjectInput, { kind: "shape" | "ink" | "signature" }>;
 type EditorDrawingCache = ReturnType<typeof createEditorInkPreviewCache> | ReturnType<typeof createEditorShapePreviewCache>;
 type TextDraft = EditorTextBoxBounds & { element: HTMLDivElement; objectId?: string; sourceAnnotationId?: string; layerId?: string | null; hiddenHeight?: number; fixedHeight?: boolean;
+  autoSize?: { width: number; height: number };
+  selection?: Range; appliedFontSize?: { value: number; range: Range };
   pageIndex: number; transform: EditorMatrix; opacity?: number; lineHeight?: number; baseline: EditorTextDraftBaseline; resizeControls?: ReturnType<typeof createEditorTextResizeControls>;
   backdrop?: HTMLDivElement; originalBounds?: EditorTextBoxBounds };
-type PointerGesture = { id: number; start: PrimitivePoint; startClient: PrimitivePoint; last: PrimitivePoint; points: [number, number][]; bounds: Bounds | null; frame?: EditorSelectionFrame; action: "draw" | "marquee" | "move" | "resize" | "rotate"; additive: boolean; dragging?: boolean; handle?: string; freeResize?: boolean; freeRotation?: boolean; ink?: EditorInkInput; shape?: EditorShapeInput };
+type PointerGesture = { id: number; start: PrimitivePoint; startClient: PrimitivePoint; last: PrimitivePoint; points: [number, number][]; bounds: Bounds | null; frame?: EditorSelectionFrame; action: "draw" | "text" | "marquee" | "move" | "resize" | "rotate"; additive: boolean; dragging?: boolean; handle?: string; freeResize?: boolean; freeRotation?: boolean; ink?: EditorInkInput; shape?: EditorShapeInput; textPageIndex?: number };
 interface PresentedScene {
   sourceScene: VectorScene;
   revision: number;
@@ -229,7 +233,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     ${editorIconButton("tool", "form", "Fill PDF form fields")}
     ${editorIconButton("tool", "add-field", "Add a form field: draw its area, then choose its type and properties")}
     ${editorIconButton("action", "edit-field", "Edit the selected form field's properties")}
-    ${editorIconButton("tool", "text", "Add a text box, or click an existing textbox to edit its content")}
+    ${editorIconButton("tool", "text", "Click for an expanding textbox, drag to draw a fixed-size textbox, or click an existing textbox to edit")}
     ${editorIconButton("action", "edit-text", "Edit the selected textbox's content")}
     ${editorIconButton("tool", "select-text", "Select text, then use Bold, Italic, Underline, Strikethrough or Highlight")}
     ${editorIconButton("tool", "comment", "Add a comment")}
@@ -536,10 +540,11 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         if (pointer.ink) drawDrawingPreview(pointer.ink, inkPreview, rect);
       } else if (pointer.action === "draw" && pointer.shape) {
         drawDrawingPreview(pointer.shape, shapePreview, rect);
-      } else if (pointer.action === "marquee") {
-        const p = host.sceneToClientPoint(pointer.last.x, pointer.last.y);
-        if (p) svg("rect", { x: Math.min(pointer.startClient.x, p.x) - rect.left, y: Math.min(pointer.startClient.y, p.y) - rect.top,
-          width: Math.abs(p.x - pointer.startClient.x), height: Math.abs(p.y - pointer.startClient.y), class: "hepr-editor-marquee" });
+      } else if (pointer.action === "marquee" || pointer.action === "text") {
+        const start = pointer.action === "text" ? host.sceneToClientPoint(pointer.start.x, pointer.start.y, pointer.textPageIndex) : pointer.startClient;
+        const p = host.sceneToClientPoint(pointer.last.x, pointer.last.y, pointer.textPageIndex);
+        if (start && p) svg("rect", { x: Math.min(start.x, p.x) - rect.left, y: Math.min(start.y, p.y) - rect.top,
+          width: Math.abs(p.x - start.x), height: Math.abs(p.y - start.y), class: "hepr-editor-marquee" });
       }
     }
     if (polygon) drawDrawingPreview(polygon.preview, shapePreview, rect);
@@ -566,6 +571,41 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   function textDraftBounds(editing: TextDraft): EditorTextBoxBounds {
     const height = editing.fixedHeight ? editing.height : Math.max(editing.height, editing.element.scrollHeight, editing.hiddenHeight ?? 0);
     return { x: editing.x, y: editing.y + editing.height - height, width: editing.width, height };
+  }
+  function rememberTextSelection(): void {
+    const editing = activeText; if (!editing || editing.selection && document.activeElement !== editing.element) return;
+    const range = captureEditorTextRange(editing.element, document.getSelection());
+    if (range) { editing.selection = range; editing.appliedFontSize = undefined; }
+  }
+  function restoreTextSelection(editing = activeText): void {
+    if (!editing || activeText !== editing || !editorTextRangeWithin(editing.element, editing.selection ?? null)) return;
+    const selection = document.getSelection(); if (!selection) return;
+    selection.removeAllRanges(); selection.addRange(editing.selection!.cloneRange());
+  }
+  function changeTextFontSize(value: string): void {
+    const editing = activeText, size = Number(value);
+    if (!editing || !Number.isFinite(size) || size <= 0) return;
+    let range = editing.selection ?? null;
+    if (document.activeElement === editing.element || !editorTextRangeWithin(editing.element, range))
+      range = captureEditorTextRange(editing.element, document.getSelection()) ?? range;
+    if (!editorTextRangeWithin(editing.element, range)) return;
+    if (editing.appliedFontSize?.value === size && editing.appliedFontSize.range === range) return;
+    const allText = !editing.element.textContent || !range.collapsed && range.toString() === editing.element.textContent;
+    const next = applyEditorTextRangeCss(editing.element, range, "fontSize", `${size}px`); if (!next) return;
+    if (allText) editing.element.style.fontSize = `${size}px`;
+    editing.selection = next; editing.appliedFontSize = { value: size, range: next };
+    if (document.activeElement === editing.element) restoreTextSelection(editing);
+    updateTextAutoSize(editing); updateGeometry(); recovery?.draftChanged();
+  }
+  function textContentSize(editing: TextDraft, fitWidth: boolean): { width: number; height: number } {
+    return measureEditorTextBox(document, editing.element, fitWidth ? undefined : editing.width);
+  }
+  function updateTextAutoSize(editing: TextDraft): void {
+    if (!editing.autoSize || editing.element.hidden) return;
+    const size = textContentSize(editing, true), top = editing.y + editing.height;
+    editing.width = Math.max(editing.autoSize.width, size.width);
+    editing.height = Math.max(editing.autoSize.height, size.height);
+    editing.y = top - editing.height;
   }
   function canResizeTextDraft(editing: TextDraft): boolean {
     if (activeText !== editing || !active || disposed || running || savePreparing || structuralRunning || editing.element.hidden) return false;
@@ -1053,7 +1093,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (activeText) {
       if ((name !== "width" && name !== "height") || !Number.isFinite(value) || value <= 0 || !canResizeTextDraft(activeText)) return;
       const bounds = textDraftBounds(activeText);
-      Object.assign(activeText, bounds, { [name]: value, ...(name === "height" ? { y: bounds.y + bounds.height - value } : {}), fixedHeight: true });
+      Object.assign(activeText, bounds, { [name]: value, ...(name === "height" ? { y: bounds.y + bounds.height - value } : {}), fixedHeight: true, autoSize: undefined });
       recovery?.draftChanged(); updateGeometry(); return;
     }
     const bounds = session.getSelectionBounds(), frame = session.getSelectionFrame();
@@ -1194,7 +1234,12 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (tool === "text") {
       const existing = textAtClientPoint(client);
       if (existing) await openTextEditor(existing, point);
-      else await startText(point);
+      else {
+        pointer = { id: event.pointerId, start: point, startClient: client, last: point, points: [], bounds: null,
+          action: "text", additive: false, textPageIndex: pageAt(point) };
+        updatePointerCursor();
+        try { overlay.setPointerCapture?.(event.pointerId); } catch { cancelPointerGesture(); }
+      }
       return;
     }
     if (tool === "signature") { signatureHover = event.pointerType === "touch" ? null : client; if (signature) placeSignature(point); return; }
@@ -1283,7 +1328,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     }
     if (pendingPick?.id === event.pointerId) pendingPick.lastClient = { x: event.clientX, y: event.clientY };
     if (!pointer || event.pointerId !== pointer.id) return;
-    const point = host.clientToScenePoint(event.clientX, event.clientY, pointer.ink?.pageIndex ?? pointer.shape?.pageIndex ?? (pointer.action !== "draw" && pointer.action !== "marquee" ? pointer.frame?.pageIndex : undefined)); if (!point) return;
+    const point = host.clientToScenePoint(event.clientX, event.clientY, pointer.textPageIndex ?? pointer.ink?.pageIndex ?? pointer.shape?.pageIndex ?? (pointer.action !== "draw" && pointer.action !== "marquee" ? pointer.frame?.pageIndex : undefined)); if (!point) return;
     pointer.last = point; pointer.freeResize = event.shiftKey; pointer.freeRotation = event.altKey;
     if (pointer.action === "draw" && tool === "ink") {
       const pageIndex = pointer.ink!.pageIndex;
@@ -1341,7 +1386,12 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       clearPreview(true);
       overlay.releasePointerCapture?.(event.pointerId);
       const moved = Math.hypot(event.clientX - p.startClient.x, event.clientY - p.startClient.y) > 2;
-      if (p.action === "marquee") {
+      if (p.action === "text") {
+        const last = host.clientToScenePoint(event.clientX, event.clientY, p.textPageIndex) ?? p.last;
+        const [x, y] = pageLocal(p.start, p.textPageIndex!), [endX, endY] = pageLocal(last, p.textPageIndex!);
+        void startText(p.start, undefined, undefined, moved ? { x: Math.min(x, endX), y: Math.min(y, endY),
+          width: Math.max(1, Math.abs(endX - x)), height: Math.max(1, Math.abs(endY - y)) } : undefined).catch(report);
+      } else if (p.action === "marquee") {
         interaction.selectArea({ minX: Math.min(p.start.x, p.last.x), minY: Math.min(p.start.y, p.last.y), maxX: Math.max(p.start.x, p.last.x), maxY: Math.max(p.start.y, p.last.y) }, { shiftKey: p.additive });
       } else if (p.action !== "draw") {
         if (moved && p.bounds) {
@@ -1441,7 +1491,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (delta) restored.transform = transformEditorAnnotationText(restored.transform, delta, sourceScene.pageRects[offset], sourceScene.pageRects[offset + 1]);
     restored.pageIndex = annotation.pageIndex; await startText(point, restored, annotation.id);
   }
-  async function startText(point: PrimitivePoint, object?: EditorTextObject, sourceAnnotationId?: string): Promise<void> {
+  async function startText(point: PrimitivePoint, object?: EditorTextObject, sourceAnnotationId?: string, drawnBounds?: EditorTextBoxBounds): Promise<void> {
     if (structuralRunning || running || savePreparing) return;
     const request = ++textRequest;
     const sourceScene = session.sourceScene, revision = session.revision, ownerId = sourceAnnotationId ? `annotation:${sourceAnnotationId}` : object?.id;
@@ -1474,7 +1524,13 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     const element = document.createElement("div"); element.className = "hepr-editor-text-input"; element.contentEditable = "true";
     element.setAttribute("role", "textbox"); element.setAttribute("aria-label", "Textbox text"); element.setAttribute("aria-multiline", "true");
     element.addEventListener("paste", event => { event.preventDefault(); document.execCommand("insertText", false, event.clipboardData?.getData("text/plain") ?? ""); });
-    element.addEventListener("input", () => recovery?.draftChanged());
+    element.addEventListener("input", () => {
+      if (activeText !== editing) return;
+      editing.appliedFontSize = undefined;
+      if (document.getSelection?.()) rememberTextSelection();
+      updateTextAutoSize(editing); updateGeometry(); recovery?.draftChanged();
+    });
+    element.addEventListener("focus", () => { if (document.getSelection?.()) restoreTextSelection(editing); });
     Object.assign(element.style, { fontFamily: `"${editorTextEditingFamily(font.id, lineHeight)}"`, fontSize: `${object?.fontSize ?? Number(property("font-size").value)}px`,
       color: object ? colorCss(object.color) : property("color").value, fontWeight: "normal", fontStyle: "normal",
       whiteSpace: "pre-wrap", textAlign: object?.align ?? query<HTMLSelectElement>('[data-prop="align"]').value,
@@ -1491,11 +1547,15 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       }
     } else element.textContent = "";
     if (!current()) return;
-    activeText = { element, objectId: sourceAnnotationId ? undefined : object?.id, sourceAnnotationId, layerId, pageIndex, x, y: object ? y : y - 50,
-      width: object?.width ?? 220, height: object?.height ?? 50, transform: object?.transform ?? IDENTITY, opacity: object?.opacity ?? objectOpacity, lineHeight: object?.lineHeight,
-      fixedHeight: Boolean(object),
+    const width = object?.width ?? drawnBounds?.width ?? Math.max(1, Number(property("font-size").value) * 6);
+    const height = object?.height ?? drawnBounds?.height ?? Math.max(1, Math.ceil(Number(property("font-size").value) * lineHeight));
+    activeText = { element, objectId: sourceAnnotationId ? undefined : object?.id, sourceAnnotationId, layerId, pageIndex,
+      x: object ? x : drawnBounds?.x ?? x - width / 2, y: object ? y : drawnBounds?.y ?? y - height / 2,
+      width, height, transform: object?.transform ?? IDENTITY, opacity: object?.opacity ?? objectOpacity, lineHeight: object?.lineHeight,
+      fixedHeight: true, autoSize: !object && !drawnBounds ? { width, height } : undefined,
       baseline: { html: element.innerHTML, align: element.style.textAlign, opacity: object?.opacity ?? objectOpacity } };
     const editing = activeText;
+    let resizeAutoSize: TextDraft["autoSize"];
     editing.baseline.bounds = { x: editing.x, y: editing.y, width: editing.width, height: editing.height };
     const canResize = (): boolean => canResizeTextDraft(editing);
     if (object) {
@@ -1508,14 +1568,17 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     overlay.append(element); query('[data-action="apply-text"]').hidden = false; query('[data-action="cancel-text"]').hidden = false;
     editing.resizeControls = createEditorTextResizeControls(document, overlay, { getBounds: () => textDraftBounds(editing), canResize,
       clientToLocal: point => textClientToLocal(point, editing),
-      onResize: bounds => { if (canResize()) { Object.assign(editing, bounds, { fixedHeight: true }); updateGeometry(); } },
-      onChange: () => recovery?.draftChanged() });
+      getContentSize: fitWidth => textContentSize(editing, fitWidth),
+      onResizeStart: () => { resizeAutoSize = editing.autoSize; },
+      onResize: bounds => { if (canResize()) { Object.assign(editing, bounds, { fixedHeight: true, autoSize: undefined }); updateGeometry(); } },
+      onChange: canceled => { if (canceled && resizeAutoSize) editing.autoSize = resizeAutoSize; resizeAutoSize = undefined; recovery?.draftChanged(); } });
     updateClipboardButtons();
     updateTextEditButton();
     updateAppearanceControls();
     updateGeometry();
     if (!element.hidden) {
       element.focus();
+      if (document.getSelection?.()) rememberTextSelection();
       if (!object) for (const name of ["bold", "italic", "underline", "strikethrough"]) if (styleEnabled(name)) document.execCommand(name === "strikethrough" ? "strikeThrough" : name);
       if (!object && styleEnabled("highlight")) document.execCommand("hiliteColor", false, "#ffdc00");
     }
@@ -1568,14 +1631,16 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   async function readTextDraft(): Promise<Extract<EditorObjectInput, { kind: "text" }> | null> {
     const editing = activeText; if (!editing) return null;
     const font = await selectedFont(), element = editing.element;
+    if (editing.autoSize) { updateTextAutoSize(editing); updateGeometry(); }
     const text = element.innerText ?? element.textContent ?? "";
-    const runs = readRichTextRuns(element, window, editorServices.fonts.list(), font?.id, font?.family);
+    const runs = readRichTextRuns(element, window, editorServices.fonts.list(), font?.id, font?.family).filter(run => run.text.length > 0);
+    const fontSize = parseFloat(element.style.fontSize) || Number(property("font-size").value);
     const height = editing.fixedHeight ? editing.height : Math.max(editing.height, element.scrollHeight, editing.hiddenHeight ?? 0);
     return { kind: "text", pageIndex: editing.pageIndex, x: editing.x, y: editing.y + editing.height - height, width: editing.width,
       transform: editing.transform, opacity: editing.opacity, lineHeight: editing.lineHeight,
       ...(!editing.objectId ? { layerId: editing.sourceAnnotationId ? null : editing.layerId ?? null } : {}),
       height, text, fontId: font?.id, fontFamily: font?.family,
-      fontSize: Number(property("font-size").value), color: property("color").value, fontWeight: styleEnabled("bold") ? "bold" : "normal",
+      fontSize, color: property("color").value, fontWeight: styleEnabled("bold") ? "bold" : "normal",
       fontStyle: styleEnabled("italic") ? "italic" : "normal", underline: styleEnabled("underline"), strikethrough: styleEnabled("strikethrough"),
       backgroundColor: styleEnabled("highlight") ? "#ffdc00" : null,
       align: query<HTMLSelectElement>('[data-prop="align"]').value as "left" | "center" | "right", runs };
@@ -1612,6 +1677,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       activeText.element.focus();
       if (name === "highlight") document.execCommand("hiliteColor", false, styleEnabled(name) ? "#ffdc00" : "transparent");
       else document.execCommand(name === "strikethrough" ? "strikeThrough" : name);
+      if (activeText.autoSize) { updateTextAutoSize(activeText); updateGeometry(); }
       recovery?.draftChanged();
     }
     else if (tool === "select") {
@@ -1623,6 +1689,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (!activeText) return;
     const selection = document.getSelection();
     if (!selection?.anchorNode || !activeText.element.contains(selection.anchorNode)) return;
+    rememberTextSelection();
     for (const name of ["bold", "italic", "underline", "strikethrough", "highlight"]) {
       const command = name === "highlight" ? "hiliteColor" : name === "strikethrough" ? "strikeThrough" : name;
       const color = name === "highlight" ? document.queryCommandValue(command) : "";
@@ -1891,7 +1958,10 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       throw error;
     }
   }
-  toolbar.addEventListener("pointerdown", event => { if ((event.target as Element).closest("[data-style]")) event.preventDefault(); });
+  toolbar.addEventListener("pointerdown", event => {
+    if (activeText) rememberTextSelection();
+    if ((event.target as Element).closest("[data-style]")) event.preventDefault();
+  });
   toolbar.addEventListener("click", event => {
     const button = (event.target as Element).closest<HTMLButtonElement>("button"); if (!button) return;
     if (running || savePreparing || structuralRunning) { if (button.dataset.action === "cancel-operation") operation?.abort(); return; }
@@ -1960,6 +2030,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   function toolbarInput(event: Event): void {
     if (running || savePreparing || structuralRunning) return;
     const input = event.target as HTMLInputElement;
+    if (activeText && input.dataset.prop === "font-size") { changeAppearance(input); return; }
     if (input.dataset.transform === "rotation") rotationDraft = { selection: currentState.selection, sourceScene: session.sourceScene };
     else if (!stageColorDraft(input)) opacityInput(event);
   }
@@ -2054,21 +2125,25 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   function changeAppearance(input: Pick<HTMLInputElement, "dataset" | "value">, targetSelection?: readonly string[], targetFillEnabled?: boolean): void {
     if (running || savePreparing || structuralRunning) return;
+    if (input.dataset.prop === "font-size" && (!Number.isFinite(Number(input.value)) || Number(input.value) <= 0)) return;
     if (!targetSelection && (input.dataset.prop === "color" || input.dataset.prop === "fill")) {
       if (colorDraft?.input === input) { colorDraft.requested = true; flushColorDraft(); return; }
       if (colorChangeHandled.has(input)) { colorChangeHandled.delete(input); return; }
     }
     if (activeText && !targetSelection) {
+      if (input.dataset.prop === "font-size") { changeTextFontSize(input.value); return; }
       activeText.element.focus();
       if (input.dataset.prop === "color") document.execCommand("foreColor", false, input.value);
       if (input.dataset.prop === "font") {
         const editing = activeText;
         void selectedFont(input.value).then(async font => { await activateFont(font, editing.lineHeight ?? 1.2);
           if (disposed || running || savePreparing || structuralRunning || activeText !== editing) return;
-          document.execCommand("fontName", false, editorTextEditingFamily(font.id, editing.lineHeight ?? 1.2)); recovery?.draftChanged(); }).catch(report);
+          document.execCommand("fontName", false, editorTextEditingFamily(font.id, editing.lineHeight ?? 1.2));
+          if (editing.autoSize) { updateTextAutoSize(editing); updateGeometry(); }
+          recovery?.draftChanged(); }).catch(report);
       }
-      if (input.dataset.prop === "font-size") applySelectionCss(document, "fontSize", `${Number(input.value)}px`);
       if (input.dataset.prop === "align") activeText.element.style.textAlign = input.value;
+      if (activeText.autoSize) { updateTextAutoSize(activeText); updateGeometry(); }
       recovery?.draftChanged();
     } else if (tool === "select" || targetSelection) {
       const selection = targetSelection ?? (input.dataset.prop === "fill-enabled" ? editorFillSelection(session) : session.getSelection());
@@ -2195,6 +2270,22 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     await editTextObject(id, point, request);
   }
   overlay.addEventListener("dblclick", event => { void doubleClick(event).catch(report); });
+  function nudgeSelectionByPixels(dx: number, dy: number): void {
+    const selection = session.getSelection(), frame = session.getSelectionFrame();
+    if (!selection.length || !frame) return;
+    let center = editorFrameCenter(frame), pageIndex = frame.pageIndex;
+    // A multi-page frame's center can lie in a gap between displayed pages.
+    if (pageIndex === undefined) {
+      const object = session.getObject(selection[0]), bounds = session.getObjectBounds(object.id);
+      pageIndex = object.pageIndex; center = { x: (bounds.minX + bounds.maxX) / 2, y: (bounds.minY + bounds.maxY) / 2 };
+    }
+    const client = host.sceneToClientPoint(center.x, center.y, pageIndex); if (!client) return;
+    const start = host.clientToScenePoint(client.x, client.y, pageIndex);
+    const end = host.clientToScenePoint(client.x + dx, client.y + dy, pageIndex);
+    if (!start || !end) return;
+    const x = end.x - start.x, y = end.y - start.y;
+    if (Number.isFinite(x) && Number.isFinite(y) && (x || y)) commit(() => interaction.nudge(x, y));
+  }
   function keydown(event: KeyboardEvent): void {
     if (!active || event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
     if (event.key === "Escape" && colorDraft) { event.preventDefault(); event.stopPropagation(); cancelColorDraft(); return; }
@@ -2231,8 +2322,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "d") { event.preventDefault(); void runClipboard("duplicate"); }
     else if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); commit(() => session.deleteSelection()); }
     else if (event.key === "Enter" && polygon) { event.preventDefault(); completePolygon(); }
-    else if (/^Arrow/.test(event.key) && session.getSelection().length && !selectionLocked()) { event.preventDefault(); const d = event.shiftKey ? 10 : 1;
-      commit(() => interaction.nudge(event.key === "ArrowLeft" ? -d : event.key === "ArrowRight" ? d : 0, event.key === "ArrowDown" ? -d : event.key === "ArrowUp" ? d : 0)); }
+    else if (/^Arrow(?:Left|Right|Up|Down)$/.test(event.key) && session.getSelection().length && !selectionLocked()) { event.preventDefault(); const d = event.shiftKey ? 10 : 1;
+      nudgeSelectionByPixels(event.key === "ArrowLeft" ? -d : event.key === "ArrowRight" ? d : 0, event.key === "ArrowUp" ? -d : event.key === "ArrowDown" ? d : 0); }
   }
   window.addEventListener("keydown", keydown, { signal: lifetime.signal });
   window.addEventListener("keydown", transformModifiers, { signal: lifetime.signal });
@@ -2250,7 +2341,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         protected: protectedSource, createdDocument: source.createdDocument,
         isInteracting: () => Boolean(pointer || pendingPick || cameraPan.isPanning() || review.isSelecting() || links.isPicking() || structuralRunning || running || savePreparing),
         getDraft: async () => { const editing = activeText; return { text: editing ? { object: await readTextDraft(), objectId: editing.objectId,
-          sourceAnnotationId: editing.sourceAnnotationId, layerId: editing.layerId } : null,
+          sourceAnnotationId: editing.sourceAnnotationId, layerId: editing.layerId, autoSize: editing.autoSize } : null,
           fields: [...fieldDrafts].filter(([control, baseline]) => editorFieldDraftSignature(control) !== baseline)
             .map(([control]) => ({ id: control.dataset.fieldId, signature: editorFieldDraftSignature(control) })),
           comment: review.getDraft(), link: links.getDraft() }; },
@@ -2258,7 +2349,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
           cancelPointerGesture(false); cancelText();
           await refreshScene(lifetime.signal, false, true); updateFonts();
           if (!value || typeof value !== "object") return;
-          const draft = value as { text?: { object?: EditorTextObject; objectId?: string; sourceAnnotationId?: string; layerId?: string | null }; fields?: { id: string; signature: string }[]; comment?: unknown; link?: unknown };
+          const draft = value as { text?: { object?: EditorTextObject; objectId?: string; sourceAnnotationId?: string; layerId?: string | null; autoSize?: { width: number; height: number } }; fields?: { id: string; signature: string }[]; comment?: unknown; link?: unknown };
           if (draft.fields?.length) {
             setTool("form"); renderFields();
             for (const item of draft.fields) {
@@ -2274,7 +2365,11 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
           if (draft.text?.object) {
             setTool("select"); const object = draft.text.object;
             await startText({ x: 0, y: 0 }, { ...object, id: draft.text.objectId ?? "recovered-text-draft" }, draft.text.sourceAnnotationId);
-            if (activeText) { activeText.objectId = draft.text.objectId; activeText.layerId = draft.text.layerId; activeText.baseline.html = ""; }
+            if (activeText) {
+              activeText.objectId = draft.text.objectId; activeText.layerId = draft.text.layerId; activeText.baseline.html = "";
+              const size = draft.text.autoSize;
+              if (size && Number.isFinite(size.width) && size.width > 0 && Number.isFinite(size.height) && size.height > 0) activeText.autoSize = { ...size };
+            }
           }
           if (draft.comment) review.restoreDraft(draft.comment);
           if (draft.link) { setTool("select"); links.restoreDraft(draft.link); }
@@ -2401,15 +2496,4 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if (!options.preserveHostMode) { document.body.classList.remove("hepr-editing"); host.setEditing(false); host.onModeChange?.(false); }
     }
   };
-}
-
-function applySelectionCss(document: Document, property: string, value: string): void {
-  const selection = document.getSelection(); if (!selection?.rangeCount || selection.isCollapsed) return;
-  const range = selection.getRangeAt(0), span = document.createElement("span");
-  (span.style as unknown as Record<string, string>)[property] = value;
-  const contents = range.extractContents();
-  // Extracted run wrappers retain their inline sizes, which would otherwise
-  // override the new size when the selection crosses multiple styled runs.
-  for (const child of contents.querySelectorAll<HTMLElement>("*")) (child.style as unknown as Record<string, string>)[property] = value;
-  span.append(contents); range.insertNode(span); range.selectNodeContents(span); selection.removeAllRanges(); selection.addRange(range);
 }

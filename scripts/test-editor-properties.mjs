@@ -37,12 +37,65 @@ try {
     const text = session.getObject(id); assert.equal(text.fontSize, 17); assert.equal(text.align, "right");
     assert.equal(text.color, "purple"); assert.equal(text.strokeWidth, undefined);
     if (text.runs) assert(text.runs.every(run => run.fontSize === 17 && run.color === "purple"));
+    const original = originals.find(object => object.id === id), ratio = 17 / original.fontSize;
+    assert.equal(text.width, original.width * ratio); assert.equal(text.height, original.height * ratio);
+    assert.equal(text.x, original.x); assert.equal(text.y + text.height, original.y + original.height, "font sizing keeps each text's local top-left anchor");
   }
   assert.deepEqual(session.getObject(image), originals[3]);
   assert.equal(session.getSourceEdits().length, 1); assert.equal(editorPropertyState(session, "color", [source]).value, "#800080");
   assert.equal(session.getObject(group).kind, "group"); assert(session.undo());
   assert.deepEqual([shape, a, b, image].map(id => session.getObject(id)), originals, "one Undo restores all changed children");
   assert.deepEqual(session.getSourceEdits(), [], "the same Undo restores original page colors");
+
+  const sized = createEditorSession(scene), near = (actual, expected) => assert(Math.abs(actual - expected) < 1e-9);
+  try {
+    const projectTopLeft = object => {
+      const [a, b, c, d, e, f] = object.transform;
+      return [a * object.x + c * (object.y + object.height) + e, b * object.x + d * (object.y + object.height) + f];
+    };
+    for (const transform of [[1, 0, 0, 1, 0, 0], [0, 1, -1, 0, 170, 12], [1.5, .2, .3, .8, 40, 10], [-2, .1, .4, 1.1, 300, 20]]) {
+      const id = sized.addObject({ kind: "text", pageIndex: 0, x: 20, y: 40, width: 80, height: 30, text: "Mixed sizes", fontSize: 12,
+        transform, runs: [{ text: "Mixed", fontSize: 18, fontWeight: 700, underline: true }, { text: " sizes", fontSize: 8, color: "red" }] });
+      sized.select([id]); const original = sized.getObject(id), anchor = projectTopLeft(original), revision = sized.revision;
+      assert.equal(applyEditorPropertyPatch(sized, { fontSize: 24 }), 1);
+      const enlarged = sized.getObject(id);
+      assert.equal(sized.revision, revision + 1, "font size and bounds commit as a single edit");
+      assert.deepEqual([enlarged.x, enlarged.y, enlarged.width, enlarged.height], [20, 10, 160, 60]);
+      assert.deepEqual(enlarged.transform, transform); projectTopLeft(enlarged).forEach((value, i) => near(value, anchor[i]));
+      assert.deepEqual(enlarged.runs, original.runs.map(run => ({ ...run, fontSize: 24 })), "font sizing preserves all other run styles");
+      const frame = sized.getSelectionFrame();
+      near(frame.bounds.maxX - frame.bounds.minX, 160); near(frame.bounds.maxY - frame.bounds.minY, 60);
+      assert(sized.undo()); assert.deepEqual(sized.getObject(id), original, "one Undo restores text and original bounds");
+      assert(sized.redo()); assert.deepEqual(sized.getObject(id), enlarged, "one Redo restores text and enlarged bounds");
+      applyEditorPropertyPatch(sized, { fontSize: 6 }); const shrunk = sized.getObject(id);
+      assert.deepEqual([shrunk.x, shrunk.y, shrunk.width, shrunk.height], [20, 55, 40, 15]);
+      projectTopLeft(shrunk).forEach((value, i) => near(value, anchor[i]));
+    }
+    const shapeId = sized.addObject({ kind: "shape", shape: "rectangle", pageIndex: 0, x: 0, y: 0, width: 10, height: 10, strokeWidth: 0, color: "red" });
+    const textId = sized.addObject({ kind: "text", pageIndex: 0, x: 20, y: 40, width: 80, height: 30, text: "Text", fontSize: 12 });
+    const fieldId = sized.addObject({ kind: "field", fieldType: "text", name: "font-size-field", pageIndex: 0, x: 110, y: 40, width: 10, height: 30, fontSize: 12 });
+    sized.select([shapeId, textId, fieldId]); const groupId = sized.groupSelection(), originalBounds = sized.getObjectBounds(groupId), originalField = sized.getObject(fieldId);
+    applyEditorPropertyPatch(sized, { fontSize: 24 });
+    const scaledBounds = sized.getObjectBounds(groupId), scaledField = sized.getObject(fieldId);
+    assert.equal(scaledBounds.minY, originalBounds.minY); assert.equal(scaledBounds.maxY, originalBounds.maxY);
+    assert.equal(scaledBounds.maxX, sized.getObjectBounds(textId).maxX, "group frame includes the child's resized right edge");
+    assert(scaledBounds.maxX > originalBounds.maxX, "group bounds follow the resized textbox child");
+    assert.equal(scaledField.fontSize, 24);
+    assert.deepEqual([scaledField.x, scaledField.y, scaledField.width, scaledField.height], [originalField.x, originalField.y, originalField.width, originalField.height], "form fields keep their authored dimensions");
+    assert(sized.undo()); assert.deepEqual(sized.getObjectBounds(groupId), originalBounds);
+    for (const invalid of [0, -1, Infinity, NaN]) {
+      const before = sized.getState(), objects = [shapeId, textId, fieldId].map(id => sized.getObject(id));
+      assert.throws(() => applyEditorPropertyPatch(sized, { color: "purple", fontSize: invalid }), /Font size|font size/);
+      assert.deepEqual(sized.getState(), before); assert.deepEqual([shapeId, textId, fieldId].map(id => sized.getObject(id)), objects, "invalid sizing cannot partially update selection leaves");
+    }
+    sized.setObjectsLocked([textId], true); const locked = sized.getObject(textId);
+    assert.equal(applyEditorPropertyPatch(sized, { fontSize: 36 }, [textId]), 0); assert.deepEqual(sized.getObject(textId), locked);
+    const inheritedBase = sized.addObject({ kind: "text", pageIndex: 0, x: 20, y: 10, width: 160, height: 60, text: "Sized runs", fontSize: 12,
+      runs: [{ text: "Sized", fontSize: 24 }, { text: " runs", fontSize: 24, fontStyle: "italic" }, { text: "", fontSize: 8 }] });
+    applyEditorPropertyPatch(sized, { fontSize: 48 }, [inheritedBase]);
+    const actualSize = sized.getObject(inheritedBase);
+    assert.deepEqual([actualSize.x, actualSize.y, actualSize.width, actualSize.height], [20, -50, 320, 120], "uniform run size supplies the ratio when an older root font size differs");
+  } finally { sized.dispose(); }
 
   class Control {
     value = ""; checked = false; disabled = false; dataset = {}; attributes = new Map(); children = []; placeholder = "";

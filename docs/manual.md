@@ -91,7 +91,9 @@ hold Shift to resize width and height independently. In Select, textbox resizing
 scales the box and its characters together, matching the drag preview on release.
 While editing textbox content, resizing changes only its bounds and wrapping.
 Modifiers can be changed during a drag. Use undo/redo, duplicate, delete, grouping,
-and arrow-key nudging from the editing tools and shortcuts.
+and arrow-key nudging from the editing tools and shortcuts. Each arrow-key press
+moves the selection by 1 screen pixel at the current zoom; Shift moves it by
+10 screen pixels. Movement follows the screen directions.
 The selection frame and handles follow the object's rotation and transform.
 Resize along the visible frame's axes; numeric W/H controls use its edge lengths.
 Dragging the rotation grip snaps the resulting absolute frame angle to the
@@ -186,12 +188,24 @@ Textboxes support mixed formatting, sizes, colors, highlighting,
 underline, strikethrough and alignment. Choose bundled fonts, import TTF/OTF
 files, or request installed fonts in a browser that supports local font access.
 Font bytes are used for committed rendering and PDF output.
+While editing content, Size updates the selected characters immediately; at a
+caret it sets the size for newly typed text. You can keep typing in the Size
+input without losing the saved text selection. In Select, changing Size updates
+all text in each selected textbox and scales its width and height proportionally,
+keeping its transformed top-left position fixed. Undo restores size and bounds
+together. Form fields retain their chosen dimensions.
+With **Text**, click to create a compact textbox centered on the click; it grows
+in width and height as you type, keeping its text's top-left anchor steady.
+Drag instead to draw a textbox that keeps the width and height you choose.
 While editing a textbox, drag its edge or corner handles to change its width,
 height and wrapping without scaling characters. Use W/H for exact dimensions;
 arrow keys on a focused handle resize by 1 unit, or 10 with Shift. Escape during
 a drag restores the previous bounds and keeps the content editor open.
-New drafts grow vertically until manually resized. Reopened and manually sized
-boxes keep their chosen height; excess text remains editable but is clipped to
+Double-click an edge handle to fit that axis to the content, or a corner to fit
+both axes. Fitting height respects the current wrapping width; fitting width
+uses the longest explicit line. The opposite edges stay anchored.
+Drawing, reopening or manually resizing a box keeps its chosen size;
+excess text remains editable but is clipped to
 the box after applying or saving. Increase its height to display that text.
 Outside content editing, numeric W/H scales the textbox and its characters together.
 Click outside a textbox to apply its draft and return to Select. Double-click a
@@ -667,6 +681,11 @@ Check textbox appearance scaling with plain/Shift resizing in Select, including
 textboxes on rotated pages; the released result must match the drag preview.
 Open content editing and resize the box with handles or W/H; wrapping should
 change while character size stays fixed.
+Check diagonal corner cursors on wide/tall and rotated textboxes. Double-click
+each edge and corner to fit the expected axes, including styled multiline text.
+Click with Text to check centered placement and growth while typing, then draw
+in both directions to check fixed bounds. Cancel a resize on a growing draft
+and verify that typing still expands it.
 Open saved textboxes in Chrome or another independent reader and check letters,
 spacing and formatting, including imported fonts and Unicode.
 Switch to each drawing, placement, form and Pan tool with objects selected;

@@ -82,7 +82,7 @@ try {
     target.dispatchEvent(pointer); return pointer;
   };
   try {
-    await context.pointerDown(event(0, 30, 100)); assert(context.activeText);
+    await context.pointerDown(event(0, 30, 100)); context.pointerUp(event(10, 250, 50)); await tick(); assert(context.activeText);
     assert.equal(context.activeText.element.style.fontFamily, `"${textMetrics.editorTextEditingFamily(font.id)}"`, "draft text uses the committed baseline metrics");
     context.activeText.element.textContent = "Original textbox";
     {
