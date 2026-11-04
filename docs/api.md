@@ -1109,6 +1109,7 @@ Use `"webgpu"` with a WebGPU-capable Three.js renderer and browser/GPU support.
 | `invisibleCull` | `true` | Drop known invisible content during PDF parsing. |
 | `extractText` | `false` | Also populate scene-space text items for tasks such as room-label seeding. |
 | `ocrTextOnly` | `false` | PDF viewing approximation: draw existing visible and invisible text at its stored positions and widths, substituting bundled fonts for glyphless or missing outlines. Skip image decoding and other graphics. Pages without drawable stored text remain blank and emit a diagnostic. |
+| `textRecognition` | `"off"` | `"auto"` probes native OCR after display; a configuration object can provide a local `provider` or lazy `fallback`, `dpi` (default 300), `languages`, and `onProgress`. Recognizes image-dominant pages without stored text. See [text recognition](text-recognition.md). |
 | `annotationAppearances` | `"render"` | Which annotation appearances become page content: `"render"` all, `"forms"` only form fields (Widgets), `"none"` none. Annotation metadata is extracted in every mode. See [hiding annotation appearances](#hiding-annotation-appearances). |
 | `onProgress` | — | Receive overall progress (`value` from 0 to 1) and the current `stage`. |
 | `imageCodecResolver` | Bundled codecs | Supply a raw-sample image decoder; works through PDF workers and PDF-to-HEP conversion. See [image compatibility](#rendering-compatibility-and-diagnostics). |
@@ -2143,13 +2144,16 @@ closing a session does not invalidate a successful returned scene.
 
 | Input | Options |
 | --- | --- |
-| PDF source (`PdfObjectSource`) | `BuildHepFromPdfOptions`: shared encoding options, `password`, `pages`, `maxPagesPerRow`, `segmentMerge`, `invisibleCull`, `iccTransformResolver`, `iccEngine`, and `onDiagnostic`. |
+| PDF source (`PdfObjectSource`) | `BuildHepFromPdfOptions`: shared encoding options, `password`, `pages`, `maxPagesPerRow`, `segmentMerge`, `invisibleCull`, `iccTransformResolver`, `iccEngine`, `textRecognition`, and `onDiagnostic`. |
 | Parsed `VectorScene` | `BuildHepFromSceneOptions`: shared encoding options. |
 
 PDF-to-HEP conversion compiles the complete original content. Viewing options
 `compressScans`, `ocrTextOnly`, and `pageLoading` are not `buildHep` options.
 Prepared GPU display data is not saved in HEP, including when exporting an
 already-prepared scene; viewers rebuild it as needed from canonical pixels.
+Explicit `textRecognition` options recognize selected PDF pages before saving
+their text index. Document-session `buildHep()` and `buildHepWithScene()` support
+the same option. [Recognition providers and lifecycle](text-recognition.md).
 
 Shared encoding options are `sourceLabel`, `sourcePdfByteLength`, `encodeRasterImages` (default `true`),
 `compression` (`"deflate"` by default, or `"store"`), `onProgress`, `onWarning`, and `signal`.

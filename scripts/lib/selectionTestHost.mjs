@@ -6,12 +6,19 @@ export function installSelectionTestHost() {
     style = { setProperty() {}, removeProperty() {} };
     offsetWidth = 80;
     offsetHeight = 24;
+    attributes = new Map();
+    isContentEditable = false;
     addEventListener() {}
     appendChild() {}
     remove() {}
     setPointerCapture() {}
     hasPointerCapture() { return false; }
     releasePointerCapture() {}
+    hasAttribute(name) { return this.attributes.has(name); }
+    getAttribute(name) { return this.attributes.get(name) ?? null; }
+    setAttribute(name, value) { this.attributes.set(name, value); }
+    removeAttribute(name) { this.attributes.delete(name); }
+    focus(options) { this.focusOptions = options; globals.document.activeElement = this; }
     getBoundingClientRect() { return { left: 0, top: 0, right: globals.window.innerWidth, bottom: globals.window.innerHeight }; }
   }
   const listeners = new Map();
@@ -36,21 +43,34 @@ export function installSelectionTestHost() {
     Object.defineProperty(globalThis, key, { value, configurable: true });
   }
   const canvas = new Element();
+  function dispatch(type, options) {
+    const event = {
+      type, cancelable: true, propagationStopped: false, defaultPrevented: false,
+      ...options,
+      stopPropagation() { this.propagationStopped = true; },
+      preventDefault() { this.defaultPrevented = true; }
+    };
+    for (const listener of listeners.get(type) ?? []) listener(event);
+    return event;
+  }
   return {
     canvas,
     pointer(type, x, y, options = {}) {
-      const event = {
-        type,
+      return dispatch(type, {
         target: canvas, clientX: x, clientY: y, pointerId: 1,
         pointerType: "mouse", button: 0, isPrimary: true, ctrlKey: false,
         buttons: type === "pointerup" ? 0 : 1,
-        cancelable: true, propagationStopped: false, defaultPrevented: false,
-        ...options,
-        stopPropagation() { this.propagationStopped = true; },
-        preventDefault() { this.defaultPrevented = true; }
-      };
-      for (const listener of listeners.get(type) ?? []) listener(event);
-      return event;
+        ...options
+      });
+    },
+    key(options = {}) {
+      return dispatch("keydown", { target: globals.document.activeElement, key: "c", code: "KeyC",
+        ctrlKey: false, metaKey: false, altKey: false, ...options });
+    },
+    copy(options = {}) {
+      const clipboard = new Map();
+      return Object.assign(dispatch("copy", { target: globals.document.activeElement,
+        clipboardData: { setData(type, text) { clipboard.set(type, text); } }, ...options }), { clipboard });
     },
     advanceTime(elapsed) { now += elapsed; },
     close() {

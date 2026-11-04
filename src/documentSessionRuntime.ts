@@ -266,32 +266,73 @@ export class ProcessingSession implements DocumentSession {
       const completeDocument = indexes.length === this.info.pageCount && indexes.every((page, index) => page === index);
       const prepare = retainScene || options.encodeRasterImages === false ? undefined : (await import("./hepRasterPreparation")).createHepRasterPagePreparer();
       const pages: VectorScene[] = [];
-      const diagnosticStart = this.diagnostics.length;
-      for (let index = 0; index < indexes.length; index++) {
+      const recognitionPages: VectorScene[] = [];
+      let recognition: import("./textRecognitionController").TextRecognitionController | undefined;
+      if (options.textRecognition && options.textRecognition !== "off") {
+        const [{ TextRecognitionController }, { createEmptyVectorScene }] = await Promise.all([
+          import("./textRecognitionController"), import("./emptyVectorScene")
+        ]);
         signal.throwIfAborted();
-        const page = await this.pdf.compileVectorPage(indexes[index], {
-          signal, optimization: options.segmentMerge === false && options.invisibleCull === false ? "none" : "safe",
-          enableSegmentMerge: options.segmentMerge !== false, enableInvisibleCull: options.invisibleCull !== false,
-          annotationAppearances: options.annotationAppearances
+        for (const sourceIndex of indexes) {
+          const placeholder = createEmptyVectorScene(), size = this.info.pages[sourceIndex];
+          placeholder.pageRects = Float32Array.of(0, 0, size.width, size.height);
+          placeholder.pendingPagePreviews = Uint8Array.of(1);
+          recognitionPages.push(placeholder);
+        }
+        recognition = new TextRecognitionController(options.textRecognition, {
+          renderPage: (index, dpi, recognitionSignal) => this.renderRecognitionPage(indexes[index], dpi, recognitionSignal),
+          onChange: () => {},
+          onDiagnostic: diagnostic => { this.diagnostics.push(diagnostic); this.openOptions.onDiagnostic?.(diagnostic); }
         });
-        if (!completeDocument) page.documentAuthoring = undefined;
-        signal.throwIfAborted();
-        await prepare?.(page, signal);
-        signal.throwIfAborted();
-        pages.push(page);
-        options.onProgress?.({ stage: "pdf-page", sourceType: "pdf", value: (index + 1) / indexes.length * .8,
-          unit: "pages", processed: index + 1, total: indexes.length, sourcePageIndex: indexes[index] });
       }
-      const combined = composeVectorScenesInGrid(pages, options.maxPagesPerRow ?? Math.max(1, Math.ceil(Math.sqrt(pages.length))), options.onDiagnostic);
-      if (retainScene) combined.sourcePdfByteLength = options.sourcePdfByteLength ?? this.sourceByteLength;
-      if (options.onDiagnostic !== this.openOptions.onDiagnostic) {
-        for (const diagnostic of this.diagnostics.slice(diagnosticStart)) options.onDiagnostic?.(diagnostic);
-      }
-      signal.throwIfAborted();
-      return buildHep(combined, { ...options, signal, sourcePdfByteLength: options.sourcePdfByteLength ?? this.sourceByteLength,
-        sourceLabel: options.sourceLabel ?? this.label,
-        onProgress: options.onProgress ? event => options.onProgress!({ ...event, value: .8 + event.value * .2, sourceType: "pdf" }) : undefined });
+      const diagnosticStart = this.diagnostics.length;
+      try {
+        for (let index = 0; index < indexes.length; index++) {
+          signal.throwIfAborted();
+          const page = await this.pdf.compileVectorPage(indexes[index], {
+            signal, optimization: options.segmentMerge === false && options.invisibleCull === false ? "none" : "safe",
+            enableSegmentMerge: options.segmentMerge !== false, enableInvisibleCull: options.invisibleCull !== false,
+            annotationAppearances: options.annotationAppearances
+          });
+          if (!completeDocument) page.documentAuthoring = undefined;
+          signal.throwIfAborted();
+          if (recognition) {
+            recognitionPages[index] = page;
+            await recognition.recognizeAll(recognitionPages, signal);
+            signal.throwIfAborted();
+          }
+          await prepare?.(page, signal);
+          signal.throwIfAborted();
+          pages.push(page);
+          options.onProgress?.({ stage: "pdf-page", sourceType: "pdf", value: (index + 1) / indexes.length * .8,
+            unit: "pages", processed: index + 1, total: indexes.length, sourcePageIndex: indexes[index] });
+        }
+        const combined = composeVectorScenesInGrid(pages, options.maxPagesPerRow ?? Math.max(1, Math.ceil(Math.sqrt(pages.length))), options.onDiagnostic);
+        if (retainScene) combined.sourcePdfByteLength = options.sourcePdfByteLength ?? this.sourceByteLength;
+        if (options.onDiagnostic !== this.openOptions.onDiagnostic) {
+          for (const diagnostic of this.diagnostics.slice(diagnosticStart)) options.onDiagnostic?.(diagnostic);
+        }
+        signal.throwIfAborted();
+        return await buildHep(combined, { ...options, signal, sourcePdfByteLength: options.sourcePdfByteLength ?? this.sourceByteLength,
+          sourceLabel: options.sourceLabel ?? this.label,
+          onProgress: options.onProgress ? event => options.onProgress!({ ...event, value: .8 + event.value * .2, sourceType: "pdf" }) : undefined });
+      } finally { recognition?.dispose(); }
     });
+  }
+
+  private async renderRecognitionPage(sourcePageIndex: number, dpi: number, signal: AbortSignal): Promise<ThumbnailPixels> {
+    const size = this.info.pages[sourcePageIndex];
+    const options = { maxDimension: Math.max(1, Math.ceil(Math.max(size.width, size.height) * dpi / 72)),
+      background: [1, 1, 1, 1] as const, backend: "canvas2d" as const };
+    const result = await this.pdf!.renderThumbnailPage(sourcePageIndex, { ...options, signal });
+    signal.throwIfAborted();
+    if ("page" in result && result.page) {
+      const { renderThumbnailPageCanvas2d } = await import("./thumbnailCanvas2d");
+      return renderThumbnailPageCanvas2d(result.page, options, signal, result.limits,
+        diagnostic => { this.diagnostics.push(diagnostic); this.openOptions.onDiagnostic?.(diagnostic); });
+    }
+    if ("rgba" in result) return result;
+    throw new Error("Recognition rasterization did not provide Canvas2D page data.");
   }
 
   getDiagnostics(): readonly PdfDiagnostic[] { return this.diagnostics.slice(); }

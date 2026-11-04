@@ -32,6 +32,7 @@ function fixture() {
     lastLoadedSource: null, lastLoadedPdfPassword: null, lastDownloadablePdf: null,
     documentPageScenes: [initial], activePdfPageLoader: null, parsedPdfPageCache: null,
     editorSceneApplicationActive: false, updateBackendSelectDisabledState: noop,
+    synchronizeNativeTextRecognition: record("recognition-sync"),
     backendSwitcher: { runWhenIdle: callback => Promise.resolve(callback()) },
     renderer: { getViewState: () => view, setViewState: noop,
       updateEditorPreviewScene(scene) { calls.push(["preview", scene]); return state.eligible; },
@@ -69,6 +70,7 @@ for (const affectedPages of [undefined, [], [1, 3]]) {
   assert.equal(f.thumbnails()[0][1], affectedPages, "the exact affected-page set reaches Reader invalidation");
   assert.equal(f.calls.find(call => call[0] === "search")[1], next);
   assert.equal(f.calls.find(call => call[0] === "availability")[1], "ready");
+  assert.equal(f.calls.find(call => call[0] === "recognition-sync")[1], true, "committed publication refreshes recognition against the current page placement");
   f.visibility.onChange({ revision: 1 });
   assert.equal(f.thumbnails().length, 2, "an actual viewer layer toggle refreshes thumbnails");
   assert.equal(f.thumbnails()[1][1], undefined, "viewer layer visibility remains a global appearance change");

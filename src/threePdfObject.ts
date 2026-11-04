@@ -78,6 +78,9 @@ import {
 } from "./vectorStrokeLod";
 import type { DrawStats, ViewState } from "./webGlPdfRenderer";
 import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
+import type { TextRecognitionProgress, TextRecognitionSetting } from "./textRecognition";
+import { TextRecognitionController } from "./textRecognitionController";
+import { canonicalTextRecognitionScene } from "./textRecognitionScene";
 
 export type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 
@@ -184,6 +187,8 @@ export type HeprColorInput = number | string | [number, number, number];
  * ```
  */
 export interface HeprThreeObjectOptions {
+  /** Optional background text recognition. Defaults to disabled. */
+  textRecognition?: TextRecognitionSetting;
   /**
    * Native upload/render backend. Defaults to `"webgl"` when passed through
    * `pdfObjectGenerator`.
@@ -323,7 +328,7 @@ interface RendererConfig {
 export interface HeprThreePdfObjectEventMap extends THREE.Object3DEventMap {
   /** Request another frame for asynchronous content, overlays or visible loading animation. */
   change: { reason: "primitive-highlights-ready" | "pages-loaded" | "raster-ready" | "page-loading-animation" | "editor-preview" |
-    "mixed-vector-batching" | "mixed-vector-ready" | "fill-rendering" | "stroke-rendering" };
+    "mixed-vector-batching" | "mixed-vector-ready" | "fill-rendering" | "stroke-rendering" | "text-recognized" };
 }
 
 /**
@@ -561,6 +566,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
       if (this.textSelectionHighlightGroup) this.textSelectionHighlightGroup.visible = false;
       if (this.primitiveHighlightLayer) this.primitiveHighlightLayer.mesh.visible = false;
       this.pagePartition = partition; this.pageViews = prepared; this.pageBatch = batch;
+      this.applyTextRecognition();
       for (const { object } of prepared) this.add(object);
       if (batch) this.add(batch);
       this.setSearchHighlights(this.searchHighlightMatches, { currentIndex: this.searchHighlightIndex });
@@ -905,6 +911,15 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   private readonly pageDemand: PdfPageDemandLoader | undefined;
   private previewPagePartition: ScenePageViews | null = null;
   private thumbnailSceneRenderer: import("./thumbnailRenderer").ThumbnailSceneRenderer | undefined;
+  private textRecognitionSetting: TextRecognitionSetting | undefined;
+  private textRecognitionController: TextRecognitionController | undefined;
+  private textRecognitionStartTimer: ReturnType<typeof setTimeout> | null = null;
+  private textRecognitionDisplayed = false;
+  private textRecognitionScene: VectorScene | null = null;
+  private textRecognitionPages: VectorScene[] = [];
+  private textRecognitionVisiblePages: number[] = [];
+  private textRecognitionSubmittedVisiblePages: readonly number[] | null = null;
+  private textRecognitionCanonicalScene: Promise<VectorScene> | undefined;
   private loadingAnimationActive = false;
   private demandUpdateTimer: ReturnType<typeof setTimeout> | null = null;
   private demandUpdatePending = false;
@@ -1294,6 +1309,121 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   pausePageLoading(): void { this.pageDemand?.pause(); }
   resumePageLoading(): void { this.pageDemand?.resume(); }
 
+  /** Current recognition configuration; omitted means disabled. */
+  get textRecognition(): TextRecognitionSetting | undefined { return this.textRecognitionSetting; }
+
+  /** Reconfigure background OCR without replacing rendered page content or completed recognition. */
+  configureTextRecognition(setting: TextRecognitionSetting | undefined): void {
+    if (this.pageOwner) { this.pageOwner.configureTextRecognition(setting); return; }
+    if (this.isDisposed) return;
+    if (typeof setting === "object" && setting.dpi !== undefined && (!Number.isFinite(setting.dpi) || setting.dpi <= 0)) {
+      throw new RangeError("Text recognition dpi must be a positive finite number.");
+    }
+    this.textRecognitionSetting = setting;
+    if (this.sourceOptions) this.sourceOptions.textRecognition = setting;
+    if (this.textRecognitionController) this.textRecognitionController.configure(setting);
+    else if (this.textRecognitionDisplayed) this.scheduleTextRecognition();
+  }
+
+  getTextRecognitionProgress(): TextRecognitionProgress {
+    return (this.pageOwner ?? this).textRecognitionController?.getProgress() ?? {
+      state: this.isDisposed ? "disposed" : "idle", completed: 0, total: this.pageCount
+    };
+  }
+
+  pauseTextRecognition(): void { (this.pageOwner ?? this).textRecognitionController?.pause(); }
+  retryTextRecognition(): void { (this.pageOwner ?? this).textRecognitionController?.retry(); }
+
+  private scheduleTextRecognition(): void {
+    if (this.pageOwner || this.isDisposed || this.textRecognitionController || this.textRecognitionStartTimer !== null ||
+        this.textRecognitionSetting === undefined || this.textRecognitionSetting === "off") return;
+    // Queue recognition after the host has submitted its first displayed frame.
+    this.textRecognitionStartTimer = setTimeout(() => {
+      this.textRecognitionStartTimer = null;
+      if (this.isDisposed || this.textRecognitionSetting === undefined || this.textRecognitionSetting === "off") return;
+      this.textRecognitionController = new TextRecognitionController(this.textRecognitionSetting, {
+        renderPage: (index, dpi, signal) => this.renderTextRecognitionPage(index, dpi, signal),
+        onChange: index => {
+          if (this.isDisposed) return;
+          this.applyTextRecognition(index);
+          this.dispatchEvent({ type: "change", reason: "text-recognized" });
+        },
+        onDiagnostic: this.sourceOptions?.onDiagnostic
+      });
+      this.updateTextRecognitionPages();
+    }, 0);
+  }
+
+  private updateTextRecognitionPages(): void {
+    const controller = this.textRecognitionController;
+    if (!controller || this.isDisposed) return;
+    const sceneChanged = this.textRecognitionScene !== this.sceneData;
+    let pagesChanged = sceneChanged;
+    if (this.pageDemand) {
+      const pages = this.pageDemand.displayPageScenes;
+      pagesChanged = pages.length !== this.textRecognitionPages.length ||
+        pages.some((page, index) => page !== this.textRecognitionPages[index]);
+      if (pagesChanged) this.textRecognitionPages = pages;
+    } else if (sceneChanged) {
+      const scene = this.sceneData;
+      const rasters = Array.from({ length: this.pageCount }, () => [] as RasterLayer[]);
+      for (const raster of scene.rasterLayers) rasters[raster.pageIndex ?? 0]?.push(raster);
+      // Eligibility needs only metadata; do not copy a large document's geometry for OCR scheduling.
+      this.textRecognitionPages = Array.from({ length: this.pageCount }, (_, index) => ({ ...scene,
+        pageCount: 1, pageRects: scene.pageRects.slice(index * 4, index * 4 + 4),
+        pendingPagePreviews: scene.pendingPagePreviews?.slice(index, index + 1), rasterLayers: rasters[index],
+        pdfPages: scene.pdfPages?.filter(page => page.pageIndex === index).map(page => ({ ...page, pageIndex: 0 })),
+        textIndex: scene.textIndex?.pages[index] ? { version: 2 as const, pages: [scene.textIndex.pages[index]] } : null
+      }));
+    }
+    const visibilityChanged = this.textRecognitionSubmittedVisiblePages !== this.textRecognitionVisiblePages;
+    if (!sceneChanged && !pagesChanged && !visibilityChanged) return;
+    this.textRecognitionScene = this.sceneData;
+    this.textRecognitionSubmittedVisiblePages = this.textRecognitionVisiblePages;
+    if (pagesChanged || visibilityChanged) controller.update(this.textRecognitionPages, this.textRecognitionVisiblePages);
+    if (sceneChanged || pagesChanged) this.applyTextRecognition();
+  }
+
+  private applyTextRecognition(changedPageIndex?: number): void {
+    const controller = this.textRecognitionController;
+    if (!controller) return;
+    controller.apply(this.sceneData);
+    if (changedPageIndex !== undefined) {
+      const page = this.pageViews?.[changedPageIndex];
+      if (page) controller.apply(page.object.sceneData, [changedPageIndex]);
+    } else {
+      for (const [index, page] of (this.pageViews ?? []).entries()) controller.apply(page.object.sceneData, [index]);
+    }
+    if (this.pageBatch && this.pageBatch.sceneData !== this.sceneData) {
+      controller.apply(this.pageBatch.sceneData);
+    }
+  }
+
+  private async renderTextRecognitionPage(index: number, dpi: number, signal: AbortSignal): Promise<import("./thumbnailTypes").ThumbnailPixels> {
+    const offset = index * 4, rects = this.sceneData.pageRects;
+    const options = { maxDimension: Math.max(1, Math.ceil(Math.max(Math.abs(rects[offset + 2] - rects[offset]),
+      Math.abs(rects[offset + 3] - rects[offset + 1])) * dpi / 72)),
+      background: [1, 1, 1, 1] as const, backend: "auto" as const, rasterQuality: "source" as const, ocrTextOnly: false, signal };
+    if (this.sourceOptions?.ocrTextOnly && !this.pageDemand && this.sourceBytes) {
+      this.textRecognitionCanonicalScene ??= import("./pdfObjectGenerator").then(({ loadPdfSceneFromSource }) =>
+        loadPdfSceneFromSource(this.sourceBytes!, { ...this.sourceOptions, signal: this.pagePreparationAbort.signal,
+          ocrTextOnly: false, compressScans: false })).then(loaded => loaded.scene);
+      const scene = await waitForLoad(this.textRecognitionCanonicalScene, signal);
+      const { ThumbnailSceneRenderer } = await import("./thumbnailRenderer");
+      signal.throwIfAborted();
+      this.thumbnailSceneRenderer ??= new ThumbnailSceneRenderer();
+      return this.thumbnailSceneRenderer.render(canonicalTextRecognitionScene(new ScenePageViews(scene).extract(index).scene), options, signal);
+    }
+    if (this.pageDemand) return this.getPageThumbnail(index, options);
+    const partition = this.pagePartition?.scene === this.sceneData ? this.pagePartition
+      : this.previewPagePartition?.scene === this.sceneData ? this.previewPagePartition
+      : this.previewPagePartition = new ScenePageViews(this.sceneData);
+    const { ThumbnailSceneRenderer } = await import("./thumbnailRenderer");
+    signal.throwIfAborted();
+    this.thumbnailSceneRenderer ??= new ThumbnailSceneRenderer();
+    return this.thumbnailSceneRenderer.render(canonicalTextRecognitionScene(partition.extract(index).scene), options, signal);
+  }
+
   /** A small, self-contained page scene for thumbnails, including HEPs without source PDF bytes. */
   async getPagePreviewScene(index: number, options: PagePreviewSceneOptions): Promise<LoadedPdfScene["scene"]> {
     const signal = options.signal ? AbortSignal.any([options.signal, this.pagePreparationAbort.signal])
@@ -1342,12 +1472,18 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
         this.sceneData.pagesPerRow, this.sourceOptions?.onDiagnostic));
       scene.sourcePdfByteLength = this.sceneData.sourcePdfByteLength ?? this.sourceBytes?.byteLength;
       signal.throwIfAborted();
+      this.textRecognitionController?.apply(scene);
       return scene;
     }
-    if ((!this.pageDemand && !this.sourceOptions?.ocrTextOnly) || !this.sourceBytes) return this.sceneData;
+    if ((!this.pageDemand && !this.sourceOptions?.ocrTextOnly) || !this.sourceBytes) {
+      this.textRecognitionController?.apply(this.sceneData);
+      return this.sceneData;
+    }
     const { loadPdfSceneFromSource } = await import("./pdfObjectGenerator");
-    return (await loadPdfSceneFromSource(this.sourceBytes, { ...this.sourceOptions, ...options, signal,
+    const scene = (await loadPdfSceneFromSource(this.sourceBytes, { ...this.sourceOptions, ...options, signal,
       ocrTextOnly: false, compressScans: false })).scene;
+    this.textRecognitionController?.apply(scene);
+    return scene;
   }
 
   private scheduleDemandUpdate(): void {
@@ -1392,6 +1528,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     const update = this.pageDemand.getDisplayUpdate(this.sceneData);
     if (update) {
       await this.applyDemandRasterUpdate(update);
+      this.updateTextRecognitionPages();
       this.transitionProfile?.recordTransition("pageSwap.total", performance.now() - started);
       this.dispatchEvent({ type: "change", reason: "pages-loaded" });
       return;
@@ -1466,6 +1603,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
       this.pageDemand.bindDisplayScene(scene, pageScenes);
       const initialUpdate = this.pageDemand.getDisplayUpdate(scene);
       if (initialUpdate) await this.applyDemandRasterUpdate(initialUpdate);
+      this.updateTextRecognitionPages();
       this.transitionProfile?.recordTransition("pageSwap.total", performance.now() - started);
       this.dispatchEvent({ type: "change", reason: "pages-loaded" });
     } finally {
@@ -1534,7 +1672,10 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   }
 
   private updatePageDemand(renderer: ThreeHostRenderer, camera: THREE.Camera): void {
-    if (this.isDisposed || (!this.pageDemand && !this.sceneData.pendingPagePreviews)) {
+    const recognitionState = this.textRecognitionController?.getProgress().state;
+    const recognitionPending = !this.pageOwner && this.textRecognitionSetting !== undefined && this.textRecognitionSetting !== "off" &&
+      (recognitionState === undefined || recognitionState === "idle" || recognitionState === "recognizing");
+    if (this.isDisposed || (!this.pageDemand && !this.sceneData.pendingPagePreviews && !recognitionPending)) {
       this.loadingAnimationActive = false;
       return;
     }
@@ -1551,6 +1692,33 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     this.loadingAnimationActive = this.rendererConfig.pageBackground[3] > 0 && hasVisiblePagePlaceholders(this.sceneData, view);
     if (!this.pageOwner && this.needsLoadingAnimation) this.dispatchEvent({ type: "change", reason: "page-loading-animation" });
     this.pageDemand?.update(view, this.sceneData.pageRects);
+    if (recognitionPending) {
+      const visible: { index: number; distance: number }[] = [];
+      const rects = this.sceneData.pageRects;
+      for (let index = 0; index < this.pageCount; index++) {
+        const offset = index * 4, m = "projection" in view ? view.projection(index) : view.localToClip;
+        if (!m) continue;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, front = 0;
+        for (const [x, y] of [[rects[offset], rects[offset + 1]], [rects[offset + 2], rects[offset + 1]],
+          [rects[offset], rects[offset + 3]], [rects[offset + 2], rects[offset + 3]]]) {
+          const w = m[3] * x + m[7] * y + m[15];
+          if (!(w > 1e-8)) continue;
+          front++;
+          const cx = (m[0] * x + m[4] * y + m[12]) / w, cy = (m[1] * x + m[5] * y + m[13]) / w;
+          minX = Math.min(minX, cx); maxX = Math.max(maxX, cx);
+          minY = Math.min(minY, cy); maxY = Math.max(maxY, cy);
+        }
+        if (front && (front < 4 || (maxX >= -1 && minX <= 1 && maxY >= -1 && minY <= 1))) {
+          visible.push({ index, distance: Math.hypot((minX + maxX) / 2, (minY + maxY) / 2) });
+        }
+      }
+      const indexes = visible.sort((a, b) => a.distance - b.distance || a.index - b.index).map(page => page.index);
+      if (indexes.length !== this.textRecognitionVisiblePages.length ||
+          indexes.some((index, offset) => index !== this.textRecognitionVisiblePages[offset])) {
+        this.textRecognitionVisiblePages = indexes;
+        this.updateTextRecognitionPages();
+      }
+    }
   }
 
   /** Release one generation of content without changing the Group, page handles or controls. */
@@ -2967,6 +3135,13 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
       return;
     }
     this.disposeMixedVectorLayer();
+    if (this.textRecognitionStartTimer !== null) clearTimeout(this.textRecognitionStartTimer);
+    this.textRecognitionStartTimer = null;
+    this.textRecognitionController?.dispose();
+    this.textRecognitionPages = [];
+    this.textRecognitionScene = null;
+    this.textRecognitionSubmittedVisiblePages = null;
+    this.textRecognitionCanonicalScene = undefined;
     this.deferredMaterials = null;
     if (this.demandUpdateTimer !== null) clearTimeout(this.demandUpdateTimer);
     this.demandUpdateTimer = null; this.demandUpdatePending = false;
@@ -3267,7 +3442,11 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     this.mixedVectorLayer?.restore();
     if (renderer.isWebGPURenderer) installThreeWebGpuSubmissionBatch(renderer);
     this.lastHostRenderer = renderer;
-    if (!shaderPreparationOnly) this.updatePageDemand(renderer, camera);
+    if (!shaderPreparationOnly) {
+      this.textRecognitionDisplayed = true;
+      this.scheduleTextRecognition();
+      this.updatePageDemand(renderer, camera);
+    }
     if (this.pageViews && !this.isDisposed) {
       // Pages still in the loaded layout draw exactly the document. Its own
       // pipeline then skips all per-page work; only page overlays follow.
@@ -4736,7 +4915,12 @@ export async function createThreePdfObject(
   deferMaterials = false
 ): Promise<HeprThreePdfObject> {
   const content = await createThreePdfContent(loadedScene, options, signal, preparedVectorLod, pageRenderer, pageTransforms, yieldControl, undefined, undefined, undefined, deferMaterials);
-  try { signal?.throwIfAborted(); return new HeprThreePdfObject(...content); }
+  try {
+    signal?.throwIfAborted();
+    const object = new HeprThreePdfObject(...content);
+    object.configureTextRecognition(options.textRecognition ?? loadedScene.sourceOptions?.textRecognition);
+    return object;
+  }
   catch (error) { disposeThreePdfContent(content); content[2].dispose(); throw error; }
 }
 

@@ -483,7 +483,7 @@ try {
   creationHost.pointerUp({ pointerId: 4, clientX: 9, clientY: 11, getCoalescedEvents: () => [] });
   assert.deepEqual(Array.from(created.at(-1).paths[0].at(-1)), [9, 11], "pencil release appends the actual final pen location");
   const textCreationHost = uiContext({ disposed: false, textRequest: 0,
-    activeText: { element: { innerText: "Opacity", scrollHeight: 20 }, layerId: "draft-layer", pageIndex: 0, x: 5, y: 5, width: 100, height: 30, transform: [1, 0, 0, 1, 0, 0], opacity: .375 },
+    activeText: { element: { innerText: "Opacity", scrollHeight: 20, style: {} }, layerId: "draft-layer", pageIndex: 0, x: 5, y: 5, width: 100, height: 30, transform: [1, 0, 0, 1, 0, 0], opacity: .375 },
     selectedFont: async () => ({ id: "font", family: "Test" }), editorServices: { fonts: { list: () => [] } }, window: {},
     readRichTextRuns: () => [{ text: "Opacity", fontSize: 12 }], styleEnabled: () => false,
     property: name => ({ value: name === "font-size" ? "12" : "#123456" }), query: () => ({ value: "left" }),

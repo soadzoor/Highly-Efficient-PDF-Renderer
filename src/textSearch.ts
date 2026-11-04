@@ -174,9 +174,18 @@ function unionHighlightBounds(rects: readonly Bounds[]): Bounds {
 }
 
 export function createSceneTextSearcher(scene: VectorScene): SceneTextSearcher {
-  const pages = scene.textIndex?.pages ?? [];
-  const hasText = pages.some((page) => page.text.length > 0);
+  let textIndex = scene.textIndex;
+  let pages = textIndex?.pages ?? [];
+  let hasText = pages.some((page) => page.text.length > 0);
   let foldedPages: string[] | null = null;
+
+  const refreshIndex = (): void => {
+    if (scene.textIndex === textIndex) return;
+    textIndex = scene.textIndex;
+    pages = textIndex?.pages ?? [];
+    hasText = pages.some(page => page.text.length > 0);
+    foldedPages = null;
+  };
 
   const getFoldedPages = (): string[] => {
     if (!foldedPages) {
@@ -186,9 +195,10 @@ export function createSceneTextSearcher(scene: VectorScene): SceneTextSearcher {
   };
 
   return {
-    hasText,
+    get hasText(): boolean { refreshIndex(); return hasText; },
 
     search(query: string, options: SceneTextSearchOptions = {}): TextSearchMatch[] {
+      refreshIndex();
       const matches: TextSearchMatch[] = [];
       if (!hasText) {
         return matches;
@@ -272,6 +282,7 @@ export function createTextSearchController(options: TextSearchControllerOptions)
   };
 
   const collectMatches = (): void => {
+    hasTextIndex = searcher?.hasText === true;
     matches = searcher ? searcher.search(query, { caseSensitive, maxMatches: MAX_MATCHES,
       optionalContent: options.getRenderer()?.getOptionalContentVisibility?.() }) : [];
     matchCountCapped = matches.length >= MAX_MATCHES;

@@ -826,6 +826,14 @@ Search and selection APIs return zero-based page indexes within the composed
 subset. Page-scoped progress includes `pageIndex` / `pageCount` for that subset
 and `sourcePageIndex` / `sourcePageCount` for the original PDF.
 
+For image-only scanned pages, the **Recognize scanned text** checkbox is enabled
+by default beside the text settings and tries browser OCR after display.
+**Use local OCR** permits the optional PaddleOCR engine/model download when
+native recognition is unavailable. Document pixels stay on the device. Uncheck
+recognition to cancel it, or use Retry after a failure. Completed text is saved
+in HEP. Handwriting accuracy and partial-word selection can vary;
+see [text recognition](text-recognition.md) for provider APIs and limitations.
+
 The native and Three demos enable **GPU compress scans** by default. They decode
 every selected PDF page before display and prepare bounded scan textures during
 parsing, trading longer loading and more CPU memory for faster zoom refinement.

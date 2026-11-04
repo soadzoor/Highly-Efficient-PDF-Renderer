@@ -5,6 +5,7 @@ import { RetainedPageReplay } from "./retainedPageReplay";
 import { thumbnailSize, type ThumbnailPixels, type ThumbnailRenderOptions, type ThumbnailStageTiming } from "./thumbnailTypes";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 import { WebGlPdfRenderer } from "./webGlPdfRenderer";
+import { canonicalTextRecognitionScene } from "./textRecognitionScene";
 
 type ThumbnailCanvas = HTMLCanvasElement | OffscreenCanvas;
 
@@ -21,6 +22,7 @@ export class ThumbnailWebGlUnavailableError extends Error {
 export class ThumbnailSceneRenderer {
   private canvas: ThumbnailCanvas | null = null;
   private renderer: WebGlPdfRenderer | null = null;
+  private rasterQuality: "display" | "source" = "display";
   private readonly lifetime = new AbortController();
   private pending: Promise<void> = Promise.resolve();
 
@@ -44,7 +46,7 @@ export class ThumbnailSceneRenderer {
     const bounds = scene.pageBounds;
     const size = thumbnailSize(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY, options.maxDimension);
     if (!Number.isSafeInteger(size.width * size.height * 4)) throw new RangeError("Thumbnail pixel dimensions exceed safe integer limits.");
-    const local = copyScene(scene);
+    const local = copyScene(options.rasterQuality === "source" ? canonicalTextRecognitionScene(scene) : scene);
     const visibility = thumbnailVisibility(local, options.optionalContent);
     const background = validateColor(options.background);
     const vector = validateColor(options.vectorOverride ?? [0, 0, 0, 0]);
@@ -54,8 +56,8 @@ export class ThumbnailSceneRenderer {
       // A task boundary allows worker cancellation without depending on RAF or
       // a foreground browser tab. GPU upload and the draw stay in one task.
       await waitForLoad(new Promise<void>(resolve => setTimeout(resolve, 0)), signal);
-      const needsFactory = !this.renderer, factoryStarted = performance.now();
-      this.ensureRenderer();
+      const needsFactory = !this.renderer || this.rasterQuality !== (options.rasterQuality ?? "display"), factoryStarted = performance.now();
+      this.ensureRenderer(options.rasterQuality ?? "display");
       if (needsFactory) timings.push({ stage: "factory", durationMs: performance.now() - factoryStarted });
       const canvas = this.canvas!, renderer = this.renderer!;
       canvas.width = size.width; canvas.height = size.height;
@@ -92,8 +94,10 @@ export class ThumbnailSceneRenderer {
     } finally { replay?.dispose(); }
   }
 
-  private ensureRenderer(): void {
-    if (this.renderer) return;
+  private ensureRenderer(rasterQuality: "display" | "source"): void {
+    if (this.renderer && this.rasterQuality === rasterQuality) return;
+    if (this.renderer) this.releaseRenderer();
+    this.rasterQuality = rasterQuality;
     let failure: unknown;
     const factories: (() => ThumbnailCanvas)[] = [];
     if (typeof OffscreenCanvas === "function") factories.push(() => new OffscreenCanvas(1, 1));
@@ -111,7 +115,7 @@ export class ThumbnailSceneRenderer {
         continue;
       }
       try {
-        const renderer = new WebGlPdfRenderer(canvas, { thumbnail: true, minimumStrokeWidth: 1 });
+        const renderer = new WebGlPdfRenderer(canvas, { thumbnail: true, minimumStrokeWidth: 1, rasterQuality });
         this.canvas = canvas; this.renderer = renderer;
         return;
       } catch (error) { releaseCanvas(canvas); throw error; }

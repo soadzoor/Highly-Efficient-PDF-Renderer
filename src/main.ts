@@ -94,6 +94,10 @@ import { ScenePageViews } from "./scenePageViews";
 import { createReaderViewport, type ReaderView, type ReaderViewportSnapshot } from "./readerViewport";
 import { computeReaderPageRects, readerCaptureAnchor } from "./readerGeometry";
 import { buildRasterScenePreview } from "./pageRasterPreview";
+import { TextRecognitionController } from "./textRecognitionController";
+import type { TextRecognitionSetting } from "./textRecognition";
+import { createViewerTextRecognitionControls } from "./viewerTextRecognition";
+import { canonicalTextRecognitionScene } from "./textRecognitionScene";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#viewport");
 const hudElement = document.querySelector<HTMLDivElement>("#hud");
@@ -283,6 +287,12 @@ let demandPdfUpdateRunning = false;
 let demandPdfUpdatePending = false;
 let backendSwitcher: ReturnType<typeof createBackendSwitcher> | null = null;
 let editorSceneApplicationActive = false;
+let nativeTextRecognition: TextRecognitionController | null = null;
+let nativeRecognitionIdentity: Uint8Array | null = null;
+let recognitionRasterRenderer: ThumbnailSceneRenderer | undefined;
+let recognitionInputsDirty = true;
+let recognitionDisplayScene: VectorScene | null = null;
+let recognitionViewKey = "";
 
 const uiControlManager = createUiControlManager(
   {
@@ -337,6 +347,7 @@ textSearchController = createTextSearchController({
 });
 
 function applyTextSearchScene(scene: VectorScene, affectedPages?: readonly number[]): void {
+  synchronizeNativeTextRecognition(true);
   readerThumbnailScene = scene;
   layerVisibility.sceneChanged();
   pdfLayerControls.refresh();
@@ -529,6 +540,7 @@ function onRendererFrame(stats: DrawStats): void {
   // text hundreds of times per second adds unnecessary browser work.
   if (now - lastRuntimeTextUpdate < 100) return;
   lastRuntimeTextUpdate = now;
+  synchronizeNativeTextRecognition();
   metricFpsTextElement.textContent = `${fpsSmoothed.toFixed(0)} FPS`;
   const rendered = stats.renderedSegments.toLocaleString();
   const total = stats.totalSegments.toLocaleString();
@@ -549,6 +561,7 @@ function onRendererFrame(stats: DrawStats): void {
 
 /** Coalesce worker completions, preserving navigation while replacing the bounded page window. */
 function scheduleDemandPdfUpdate(): void {
+  recognitionInputsDirty = true;
   demandPdfUpdatePending = true;
   if (demandPdfUpdateTimer !== null || demandPdfUpdateRunning) return;
   demandPdfUpdateTimer = window.setTimeout(() => {
@@ -701,9 +714,106 @@ readerViewport = createReaderViewport({
   onSettings: () => setHudCollapsed(!hudPanelElement.classList.contains("collapsed"))
 });
 document.querySelector(".reader-primary-controls")?.append(editorModeButton, printPdfButton);
+const recognitionControls = createViewerTextRecognitionControls({
+  onSettingsChange(setting) {
+    nativeTextRecognition?.configure(nativeRecognitionSettings(setting));
+    synchronizeNativeTextRecognition(true);
+  }
+});
+document.querySelector("#text-recognition-controls")?.append(recognitionControls.element);
+
+function nativeRecognitionSettings(setting: TextRecognitionSetting): TextRecognitionSetting {
+  if (setting === "off") return setting;
+  const options = setting === "auto" ? {} : setting;
+  return { ...options, onProgress(progress) {
+    options.onProgress?.(progress);
+    if (options.onProgress !== recognitionControls.setProgress) recognitionControls.setProgress(progress);
+  } };
+}
+
+/** Recognition owns page-local text independently of the current display layout. */
+function synchronizeNativeTextRecognition(force = false): void {
+  if (force) recognitionInputsDirty = true;
+  const source = lastLoadedSource, scene = lastParsedScene;
+  if (activeSceneLoadToken !== null || pendingSourceLoadCount > 0 || editorSceneApplicationActive || layoutChangeRunning) return;
+  if (activeHepExportController !== null) { nativeTextRecognition?.pause(); return; }
+  const available = source?.kind === "pdf" && !!scene && !loadedOcrTextOnly;
+  recognitionControls.setDocumentAvailable(available);
+  if (!available) {
+    nativeTextRecognition?.dispose(); nativeTextRecognition = null; nativeRecognitionIdentity = null;
+    recognitionRasterRenderer?.close(); recognitionRasterRenderer = undefined;
+    return;
+  }
+  if (pdfEditor?.isEditing()) { nativeTextRecognition?.pause(); return; }
+  if (nativeRecognitionIdentity !== source.bytes || !nativeTextRecognition) {
+    nativeTextRecognition?.dispose();
+    recognitionRasterRenderer?.close(); recognitionRasterRenderer = undefined;
+    nativeRecognitionIdentity = source.bytes;
+    recognitionInputsDirty = true;
+    const identity = source.bytes;
+    nativeTextRecognition = new TextRecognitionController(nativeRecognitionSettings(recognitionControls.settings), {
+      async renderPage(index, dpi, signal) {
+        signal.throwIfAborted();
+        if (lastLoadedSource?.bytes !== identity || !lastParsedScene) throw new DOMException("Document replaced.", "AbortError");
+        const rects = lastParsedScene.pageRects, offset = index * 4;
+        const maxDimension = Math.max(1, Math.ceil(Math.max(Math.abs(rects[offset + 2] - rects[offset]),
+          Math.abs(rects[offset + 3] - rects[offset + 1])) * dpi / 72));
+        const appearance = { maxDimension, backend: "auto" as const, background: [1, 1, 1, 1] as const,
+          rasterQuality: "source" as const };
+        if (activePdfPageLoader) return activePdfPageLoader.getPageThumbnail(index, { ...appearance, signal });
+        const page = documentPageScenes?.[index];
+        if (!page) throw new Error("Recognition page is unavailable.");
+        const { ThumbnailSceneRenderer } = await import("./thumbnailRenderer");
+        signal.throwIfAborted();
+        recognitionRasterRenderer ??= new ThumbnailSceneRenderer();
+        return recognitionRasterRenderer.render(canonicalTextRecognitionScene(page), appearance, signal);
+      },
+      onChange() {
+        if (lastLoadedSource?.bytes !== identity || !nativeTextRecognition || !lastParsedScene) return;
+        applyNativeRecognizedText();
+        textSearchController.setScene(lastParsedScene);
+        textSelection.refreshHighlights();
+        const hasText = lastParsedScene.textIndex?.pages.some(page => page.text.trim().length > 0);
+        textSearchWidget.setAvailability(hasText ? "ready" : "no-text-index");
+      },
+      onDiagnostic: diagnostic => {
+        if (diagnostic.severity === "info") console.info(`[HEPR] ${diagnostic.message}`, diagnostic.details);
+        else console.warn(`[HEPR] ${diagnostic.message}`, diagnostic.details);
+      }
+    });
+  }
+  if (nativeTextRecognition.getProgress().state === "paused" && recognitionControls.settings !== "off") {
+    nativeTextRecognition.configure(nativeRecognitionSettings(recognitionControls.settings));
+    recognitionInputsDirty = true;
+  }
+  const view = renderer.getPresentedViewState();
+  const viewKey = `${view.cameraCenterX}:${view.cameraCenterY}:${view.zoom}:${canvasElement.width}:${canvasElement.height}`;
+  if (!recognitionInputsDirty && recognitionDisplayScene === scene && recognitionViewKey === viewKey) return;
+  recognitionInputsDirty = false; recognitionDisplayScene = scene; recognitionViewKey = viewKey;
+  const pages = activePdfPageLoader?.displayPageScenes ?? documentPageScenes;
+  if (!pages) return;
+  const halfWidth = canvasElement.width / (2 * view.zoom), halfHeight = canvasElement.height / (2 * view.zoom);
+  const visible = pages.map((_, index) => index).filter(index => {
+    const r = scene.pageRects, p = index * 4;
+    return r[p + 2] >= view.cameraCenterX - halfWidth && r[p] <= view.cameraCenterX + halfWidth &&
+      r[p + 3] >= view.cameraCenterY - halfHeight && r[p + 1] <= view.cameraCenterY + halfHeight;
+  });
+  nativeTextRecognition.update(pages, visible);
+  applyNativeRecognizedText();
+}
+
+function applyNativeRecognizedText(): void {
+  if (!nativeTextRecognition) return;
+  for (const [index, page] of (documentPageScenes ?? []).entries()) nativeTextRecognition.apply(page, [index]);
+  for (const [index, page] of (activePdfPageLoader?.displayPageScenes ?? []).entries()) nativeTextRecognition.apply(page, [index]);
+  if (lastCanonicalScene) nativeTextRecognition.apply(lastCanonicalScene);
+  if (lastParsedScene) nativeTextRecognition.apply(lastParsedScene);
+}
 editorModeButton.addEventListener("click", () => { void togglePdfEditing(); });
 
 function setNativeEditing(active: boolean): void {
+  if (active) nativeTextRecognition?.pause();
+  else synchronizeNativeTextRecognition(true);
   if (active) { drawingSelection.disable(); textSelection.disable(); annotationOverlay.hide(); }
   else if (textSelectionCheckbox!.checked) textSelection.enable();
   if (!active) activePdfPageLoader?.resume();
@@ -1300,6 +1410,9 @@ downloadAllDataButtonElement.addEventListener("click", () => {
 });
 
 window.addEventListener("beforeunload", () => {
+  nativeTextRecognition?.dispose();
+  recognitionControls.dispose();
+  recognitionRasterRenderer?.close();
   fileDropController.dispose();
   viewerPrintAction?.cancel();
   readerViewport?.dispose();
@@ -2218,11 +2331,13 @@ function setParsingLoader(isVisible: boolean, text = "0.00% Parsing / loading...
 }
 
 function beginSceneLoad(token: number): void {
+  nativeTextRecognition?.pause();
   activeSceneLoadToken = token;
   updateBackendSelectDisabledState();
 }
 
 function beginSourceLoad(): number {
+  nativeTextRecognition?.pause();
   viewerPrintAction?.cancel();
   sourceLoadController?.abort();
   sourceLoadController = new AbortController();
@@ -2248,6 +2363,7 @@ function finishSourceLoad(token: number): void {
     setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
   }
   updateBackendSelectDisabledState();
+  synchronizeNativeTextRecognition();
 }
 
 function finishSceneLoad(token: number): void {
@@ -2256,6 +2372,7 @@ function finishSceneLoad(token: number): void {
   }
   activeSceneLoadToken = null;
   updateBackendSelectDisabledState();
+  synchronizeNativeTextRecognition();
 }
 
 function updateBackendSelectDisabledState(): void {
@@ -2426,6 +2543,7 @@ async function downloadAllExampleHeps(): Promise<void> {
   isBatchExampleExportRunning = true;
   const exportController = new AbortController();
   activeHepExportController = exportController;
+  nativeTextRecognition?.pause();
   setPrimaryLoadControlsEnabled(false);
   updateBackendSelectDisabledState();
   setDownloadDataButtonState(Boolean(lastParsedScene && lastParsedSceneLabel), false);
@@ -2497,6 +2615,7 @@ async function downloadAllExampleHeps(): Promise<void> {
       setDownloadDataButtonState(Boolean(lastParsedScene && lastParsedSceneLabel), false);
       setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
       setDownloadAllDataButtonState(exampleManifestEntries.length > 0, false);
+      synchronizeNativeTextRecognition(true);
     }
   }
 }
@@ -2539,6 +2658,7 @@ async function downloadHep(): Promise<boolean> {
 
   const exportController = new AbortController();
   activeHepExportController = exportController;
+  nativeTextRecognition?.pause();
   setDownloadDataButtonState(true, true);
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
   setDownloadAllDataButtonState(exampleManifestEntries.length > 0, true, "Export in progress...");
@@ -2582,6 +2702,7 @@ async function downloadHep(): Promise<boolean> {
     }
     exportController.signal.throwIfAborted();
     if (activeHepExportController !== exportController) return false;
+    nativeTextRecognition?.apply(exportScene);
     const buildOptions = {
       ...lodOptions,
       sourceLabel: label,
@@ -2631,6 +2752,7 @@ async function downloadHep(): Promise<boolean> {
       setDownloadDataButtonState(Boolean(lastParsedScene && lastParsedSceneLabel), false);
       setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
       setDownloadAllDataButtonState(exampleManifestEntries.length > 0, false);
+      synchronizeNativeTextRecognition(true);
     }
   }
 }
@@ -2729,6 +2851,7 @@ function cancelActiveHepExport(): void {
   setDownloadDataButtonState(Boolean(lastParsedScene && lastParsedSceneLabel), false);
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
   setDownloadAllDataButtonState(exampleManifestEntries.length > 0, false);
+  synchronizeNativeTextRecognition(true);
 }
 
 function setMetricPlaceholder(label: string = "-"): void {

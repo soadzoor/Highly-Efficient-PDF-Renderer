@@ -6,6 +6,35 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Added
+
+- Recognize image-only scanned pages in the background with native browser OCR
+  or an optional local PaddleOCR download in both viewers. Add application-owned
+  recognition providers, progress/cancellation/retry, and explicit PDF-to-HEP OCR
+  options without new mandatory OCR dependencies. Preserve completed selectable,
+  searchable text in HEP across page loading and layout changes. Line-only OCR
+  uses approximate character positions; handwriting accuracy depends on the engine.
+  Put a default-enabled recognition checkbox beside the text settings, prefer
+  native OCR, show the active engine and progress inline, and retain failure
+  reasons in diagnostics.
+  Keep the local engine download opt-in, initialize OpenCV without an unresolved
+  thenable wait, and sample full-resolution source pixels without lossy GPU
+  compression or adaptive viewing tiers. Require matching PDF workers (protocol
+  18) for source-quality recognition snapshots.
+  Prefer WebGPU for local inference with CPU fallback, keep initialized models
+  warm between documents, reuse identical-scan results in viewer memory, and
+  display the actual execution backend and elapsed inference time after asset
+  downloads finish. Turning recognition off releases models and cached results.
+  Retry failing large GPU detectors at a smaller detection resolution before
+  switching to CPU, keeping original-resolution recognition crops and reusing a
+  successful GPU recovery. Expose detector sizing and full-source overrides;
+  resized detection can change regions, grouping and recognized text.
+  Verify empty or invalid GPU results with the same models, pixels and original
+  detector parameters on CPU. Retain CPU after confirmed GPU failures, while
+  blank scans keep GPU available for later pages. Report scans with no usable
+  text separately from successful recognition, and retry empty attempts without
+  retaining them in the viewer's cross-document cache.
+
 ### Changed
 
 - Click with Text to create a smaller textbox centered on the pointer that grows
@@ -14,6 +43,9 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
+- Copy selected page text with Ctrl/Cmd+C after using viewer text inputs or
+  controls. Give canvas selections clipboard focus, use the native copy event,
+  and preserve input, DOM-text and editor object clipboard behavior.
 - Apply textbox font-size changes live to selected characters or the typing caret
   without losing the text selection when using the Size input. Scale selected
   textbox bounds proportionally with font-size changes outside content editing,

@@ -6,6 +6,11 @@ export type { NodeDocumentSource, NodeDocumentSessionOpenOptions, NodePdfThumbna
 export type { PdfThumbnailResult, PdfThumbnailTiming } from "./pdfThumbnail";
 export type { DocumentSessionHepOptions, DocumentSessionInfo } from "./documentSession";
 export type { HepBuildResult } from "./hepBuilder";
+export type { TextRecognitionSetting, TextRecognitionOptions, TextRecognitionProvider, TextRecognitionInput,
+  TextRecognitionResult, TextRecognitionLine, TextRecognitionCharacter, TextRecognitionPolygon, TextRecognitionProgress } from "./textRecognition";
+export { createPaddleTextRecognitionProvider } from "./paddleTextRecognition";
+export type { PaddleTextRecognitionClient, PaddleTextRecognitionProviderOptions,
+  PaddleTextRecognitionPrediction, PaddleTextRecognitionItem } from "./paddleTextRecognition";
 export { openEditorSession } from "./editorSession";
 export { createEditorAppServices, createEditorInteractionController, createPdf, createPdfDocument, writeScenePdf, changePdfProtection, manipulatePdfPages } from "./editorApi";
 export type * from "./pdfCompositionTypes";

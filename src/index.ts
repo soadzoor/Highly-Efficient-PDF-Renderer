@@ -49,6 +49,13 @@ export { buildStrokeScene } from "./strokeSceneBuilder";
 export { renderPdfThumbnail } from "./pdfThumbnail";
 export type { PdfThumbnailOptions, PdfThumbnailResult, PdfThumbnailTiming } from "./pdfThumbnail";
 export { openDocumentSession } from "./documentSession";
+export type { TextRecognitionSetting, TextRecognitionOptions, TextRecognitionProvider, TextRecognitionInput,
+  TextRecognitionResult, TextRecognitionLine, TextRecognitionCharacter, TextRecognitionPolygon, TextRecognitionProgress } from "./textRecognition";
+export { createNativeTextRecognitionProvider } from "./nativeTextRecognition";
+export type { NativeTextRecognitionProviderOptions } from "./nativeTextRecognition";
+export { createPaddleTextRecognitionProvider } from "./paddleTextRecognition";
+export type { PaddleTextRecognitionClient, PaddleTextRecognitionProviderOptions,
+  PaddleTextRecognitionPrediction, PaddleTextRecognitionItem } from "./paddleTextRecognition";
 export { openEditorSession } from "./editorSession";
 export { createEditorAppServices, createEditorUi, createEditorInteractionController, createPdf, createPdfDocument, writeScenePdf, changePdfProtection, manipulatePdfPages } from "./editorApi";
 export type * from "./pdfCompositionTypes";

@@ -11,6 +11,12 @@ export async function buildHepRuntime(
   input: PdfObjectSource | VectorScene,
   options: BuildHepFromPdfOptions | BuildHepFromSceneOptions = {}
 ): Promise<Blob> {
+  if (!isVectorScene(input)) {
+    const pdfOptions = options as BuildHepFromPdfOptions;
+    if (pdfOptions.textRecognition && pdfOptions.textRecognition !== "off") {
+      return buildRecognizedPdf(input, pdfOptions, false);
+    }
+  }
   return (await buildHepResultRuntime(input, options)).blob;
 }
 
@@ -38,6 +44,9 @@ async function buildHepFromPdf(
   options: BuildHepFromPdfOptions,
   retainScene = false
 ): Promise<HepBuildResult> {
+  if (options.textRecognition && options.textRecognition !== "off") {
+    return buildRecognizedPdf(source, options, true);
+  }
   const progress = createLoadProgressReporter(options.onProgress);
   const parseProgress = progress.child(0, 0.82, { sourceType: "pdf" });
   const loaded = await loadPdfSceneFromSource(source, {
@@ -73,6 +82,25 @@ async function buildHepFromPdf(
   progress.complete({ sourceType: "pdf" });
   options.signal?.throwIfAborted();
   return result;
+}
+
+function buildRecognizedPdf(source: PdfObjectSource, options: BuildHepFromPdfOptions, retainScene: false): Promise<Blob>;
+function buildRecognizedPdf(source: PdfObjectSource, options: BuildHepFromPdfOptions, retainScene: true): Promise<HepBuildResult>;
+async function buildRecognizedPdf(source: PdfObjectSource, options: BuildHepFromPdfOptions, retainScene: boolean): Promise<Blob | HepBuildResult> {
+  // Retain the parser while recognition requests appearance pixels, and apply
+  // recognized text before page encoding can release original image pixels.
+  const { openDocumentSession } = await import("./documentSession");
+  const session = await openDocumentSession(source, {
+    password: options.password, imageCodecResolver: options.imageCodecResolver,
+    iccTransformResolver: options.iccTransformResolver, iccEngine: options.iccEngine,
+    embeddedFontPaint: options.embeddedFontPaint, sourceKind: "pdf", sourceLabel: options.sourceLabel,
+    signal: options.signal, onDiagnostic: options.onDiagnostic
+  });
+  try {
+    const { password: _password, imageCodecResolver: _codec, iccTransformResolver: _icc,
+      iccEngine: _engine, embeddedFontPaint: _fontPaint, ...buildOptions } = options;
+    return retainScene ? await session.buildHepWithScene(buildOptions) : await session.buildHep(buildOptions);
+  } finally { await session.close(); }
 }
 
 async function buildHepFromScene(

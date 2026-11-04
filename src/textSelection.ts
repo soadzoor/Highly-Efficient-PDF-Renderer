@@ -333,6 +333,8 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
   let mouseClick: { x: number; y: number; time: number; moved: boolean } | null = null;
 
   let lastScene: VectorScene | null = null;
+  let lastTextIndex: VectorScene["textIndex"] | undefined;
+  let lastTextPages: readonly PageTextIndex[] = [];
   let lastVisibilityRevision = -1;
   let visibility: OptionalContentSnapshot | null | undefined;
   const pageLayouts = new Map<number, PageTextLayout>();
@@ -423,7 +425,20 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
       lastScene = scene;
       pageLayouts.clear();
       resetSelection(false);
+    } else if (scene?.textIndex !== lastTextIndex) {
+      const pages = scene?.textIndex?.pages ?? [];
+      let selectedPageChanged = false;
+      for (let index = 0; index < Math.max(pages.length, lastTextPages.length); index++) {
+        if (pages[index] === lastTextPages[index]) continue;
+        pageLayouts.delete(index);
+        if (selectionRange && index >= selectionRange.start.pageIndex && index <= selectionRange.end.pageIndex) {
+          selectedPageChanged = true;
+        }
+      }
+      if (selectedPageChanged) resetSelection(false);
     }
+    if (scene?.textIndex !== lastTextIndex) lastTextPages = scene?.textIndex?.pages.slice() ?? [];
+    lastTextIndex = scene?.textIndex;
     return scene;
   }
 
@@ -866,6 +881,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
    * nearby DOM text (the canvas has none), alongside ours.
    */
   let guardedCanvas: HTMLElement | null = null;
+  let addedCanvasTabIndex = false;
 
   function ensureCanvasSelectionGuards(canvas: HTMLElement): void {
     if (guardedCanvas === canvas) {
@@ -883,8 +899,24 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
       guardedCanvas.style.userSelect = "";
       guardedCanvas.style.removeProperty("-webkit-user-select");
       guardedCanvas.style.removeProperty("-webkit-touch-callout");
+      if (addedCanvasTabIndex && guardedCanvas.getAttribute("tabindex") === "-1") {
+        guardedCanvas.removeAttribute("tabindex");
+      }
       guardedCanvas = null;
+      addedCanvasTabIndex = false;
     }
+  }
+
+  function focusSelectionCanvas(canvas: HTMLElement): void {
+    ensureCanvasSelectionGuards(canvas);
+    if (!canvas.hasAttribute("tabindex")) {
+      canvas.setAttribute("tabindex", "-1");
+      addedCanvasTabIndex = true;
+    }
+    // Selection suppresses the pointer's default action, including the blur
+    // that would normally move keyboard/clipboard focus away from HUD inputs.
+    canvas.focus({ preventScroll: true });
+    clearNativeDomSelection();
   }
 
   function clearNativeDomSelection(): void {
@@ -1040,7 +1072,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
         selectionIsTouch = true;
         // Drop any native HTML selection the OS long-press may have started
         // in surrounding UI text before ours takes over.
-        clearNativeDomSelection();
+        focusSelectionCanvas(canvas);
         overlay.hide();
         if (selectWordAt(hit)) {
           (navigator as Navigator & { vibrate?: (pattern: number) => boolean }).vibrate?.(10);
@@ -1074,6 +1106,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     }
 
     stopEvent(event);
+    focusSelectionCanvas(canvas);
     try {
       canvas.setPointerCapture(event.pointerId);
     } catch {
@@ -1214,17 +1247,25 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     }
   };
 
-  const handleKeyDown = (event: KeyboardEvent): void => {
-    if (!enabled || disposed || !selectionRange) {
+  const handleCopy = (event: ClipboardEvent): void => {
+    if (!enabled || disposed || !selectionRange || event.defaultPrevented || !event.clipboardData) {
       return;
     }
-    if ((event.key === "c" || event.key === "C") && (event.ctrlKey || event.metaKey) && !event.altKey) {
-      if (isEditableTarget(document.activeElement)) {
-        return;
-      }
-      event.preventDefault();
-      void copySelection();
+    const target = event.composedPath?.()[0] ?? event.target;
+    if (isEditableTarget(target) || isEditableTarget(document.activeElement) ||
+        document.getSelection()?.isCollapsed === false ||
+        document.activeElement !== options.getCanvas() && target !== options.getCanvas()) {
+      return;
     }
+    const scene = getSceneChecked();
+    if (!scene || !selectionRange) return;
+    const text = selectedTextFor(scene, selectionRange);
+    if (!text) return;
+    // Use the browser's copy command for Ctrl/Cmd+C (and other platform copy
+    // shortcuts), without depending on a keyboard layout or async permissions.
+    event.clipboardData.setData("text/plain", text);
+    event.preventDefault();
+    options.onCopy?.(text);
   };
 
   const handleSelectStart = (event: Event): void => {
@@ -1267,12 +1308,12 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
   window.addEventListener("pointermove", handlePointerMove, { capture: true });
   window.addEventListener("pointerup", handlePointerEnd, { capture: true });
   window.addEventListener("pointercancel", handlePointerEnd, { capture: true });
-  window.addEventListener("keydown", handleKeyDown);
+  window.addEventListener("copy", handleCopy);
   window.addEventListener("contextmenu", handleContextMenu);
   window.addEventListener("selectstart", handleSelectStart, { capture: true });
 
   async function copySelection(): Promise<boolean> {
-    const scene = lastScene;
+    const scene = getSceneChecked();
     if (!scene || !selectionRange) {
       return false;
     }
@@ -1293,6 +1334,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     if (disposed) {
       return;
     }
+    getSceneChecked();
     if (!enabled || !selectionRange || !selectionRects || selectionRects.length < 4) {
       overlay.hide();
       return;
@@ -1358,16 +1400,19 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     },
 
     getSelectionRange(): TextSelectionRange | null {
+      getSceneChecked();
       return selectionRange ? toPublicRange(selectionRange) : null;
     },
 
     getSelectedText(): string {
+      getSceneChecked();
       if (!lastScene || !selectionRange) {
         return "";
       }
       return selectedTextFor(lastScene, selectionRange);
     },
     getSelectedSpans(): readonly TextSelectionSpan[] {
+      getSceneChecked();
       const spans: TextSelectionSpan[] = [];
       if (lastScene && selectionRange) forEachSelectedLineSpan(lastScene, selectionRange,
         (pageIndex, _layout, _line, from, to) => spans.push({ pageIndex, start: from, length: to - from }));
@@ -1377,6 +1422,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     copySelection,
 
     refreshHighlights(): void {
+      getSceneChecked();
       if (selectionRects && selectionRects.length > 0) {
         adapter.setSelectionHighlights(selectionRects);
       }
@@ -1403,7 +1449,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
       window.removeEventListener("pointermove", handlePointerMove, { capture: true });
       window.removeEventListener("pointerup", handlePointerEnd, { capture: true });
       window.removeEventListener("pointercancel", handlePointerEnd, { capture: true });
-      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("copy", handleCopy);
       window.removeEventListener("contextmenu", handleContextMenu);
       window.removeEventListener("selectstart", handleSelectStart, { capture: true });
       overlay.dispose();

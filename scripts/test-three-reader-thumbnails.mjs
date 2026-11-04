@@ -8,6 +8,7 @@ const noop = () => {};
 function fixture() {
   const calls = [], identity = {}, rects = Float32Array.of(0, 0, 100, 200);
   const makeObject = () => ({ sceneData: {}, sourceKind: "hep", pageCount: 1,
+    getTextRecognitionProgress: () => ({ state: "idle", completed: 0, total: 0 }),
     renderer: { setInteractionViewportProvider: noop }, listeners: {},
     setMinimumStrokeWidth: noop, setFrameListener: noop,
     addEventListener(name, callback) { this.listeners[name] = callback; },
@@ -36,7 +37,9 @@ function fixture() {
     refreshSearchAvailability: noop, textSearchInputElement: { value: "" }, requestRender: noop,
     updateSceneMetrics: noop, setDownloadPdfButtonState: noop, lastDownloadablePdf: null,
     fileValueElement: {}, sourceSegmentsValueElement: {}, visibleSegmentsValueElement: {},
-    timesValueElement: {}, setDrawStatsText: noop, setLodStatsText: noop, setTextLodStatsText: noop
+    timesValueElement: {}, setDrawStatsText: noop, setLodStatsText: noop, setTextLodStatsText: noop,
+    textRecognitionControls: { setDocumentAvailable: noop, setProgress: noop },
+    textSelection: { refreshHighlights() { calls.push(["selection-refresh"]); } }
   });
   for (const name of ["releasePdfObject", "disposeCurrentObject", "replacePdfObject"])
     vm.runInContext(sourceFunction(source, name), host);
@@ -58,6 +61,9 @@ function fixture() {
   assert.equal(f.calls.filter(call => call[0] === "thumbnails").length, 0, "GPU raster residency does not dirty thumbnail pixels");
   next.listeners.change({ reason: "pages-loaded" });
   assert.equal(f.calls.filter(call => call[0] === "thumbnails").length, 0, "display page swaps do not alter canonical thumbnail pages");
+  next.listeners.change({ reason: "text-recognized" });
+  assert.equal(f.calls.filter(call => call[0] === "selection-refresh").length, 1, "recognition refreshes selection metadata");
+  assert.equal(f.calls.filter(call => call[0] === "thumbnails").length, 0, "recognition metadata retains canonical thumbnail pixels");
 }
 {
   const f = fixture(), next = f.makeObject();

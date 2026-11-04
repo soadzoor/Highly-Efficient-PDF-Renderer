@@ -132,6 +132,99 @@ function checkTitleBlock(scene) {
 checkTitleBlock(makeScene(titleRuns));
 checkTitleBlock(makeScene(titleRuns, true));
 
+// Scene selection owns clipboard focus even when a HUD search/checkbox was
+// focused before the pointer's default focus change was prevented. Exercise
+// OCR fallback quads as well as instanced text through the browser copy event.
+for (const fallback of [false, true]) for (const previousType of ["search", "checkbox"]) {
+  const scene = makeScene([{ text: "Árvíz scan", x: 20, y: 100, height: 10 }], fallback);
+  const copied = [];
+  withSelection(scene, (host, controller) => {
+    const input = new HTMLInputElement(); input.type = previousType; input.focus();
+    const domSelection = { isCollapsed: false, removeAllRanges() { this.isCollapsed = true; } };
+    document.getSelection = () => domSelection;
+    const start = point(scene, 0, .1), end = point(scene, 9, .9);
+    host.pointer("pointerdown", ...start); host.pointer("pointermove", ...end); host.pointer("pointerup", ...end);
+    assert.equal(document.activeElement, host.canvas, "canvas selection moves focus away from the HUD");
+    assert.deepEqual(host.canvas.focusOptions, { preventScroll: true });
+    assert.equal(domSelection.isCollapsed, true, "scene selection replaces stale DOM text selection");
+    assert.equal(host.canvas.getAttribute("tabindex"), "-1", "a canvas can receive clipboard focus without entering the tab order");
+    controller.updateOverlay(); controller.refreshHighlights();
+    assert.equal(controller.getSelectedText(), "Árvíz scan", "render-time selection refresh preserves copied OCR text");
+    for (const shortcut of [
+      { key: "c", code: "KeyC", ctrlKey: true },
+      { key: "C", code: "KeyC", ctrlKey: true, repeat: true },
+      { key: "с", code: "KeyC", ctrlKey: true },
+      { key: "Unidentified", code: "", ctrlKey: true },
+      { key: "c", code: "KeyC", metaKey: true }
+    ]) {
+      const key = host.key(shortcut);
+      assert.equal(key.defaultPrevented, false, "native copy shortcuts must reach the browser, regardless of keyboard layout");
+      // Browsers dispatch copy after their platform shortcut handling; the
+      // mock dispatches that event explicitly without requiring a browser.
+      const event = host.copy();
+      assert.equal(event.defaultPrevented, true);
+      assert.equal(event.clipboard.get("text/plain"), "Árvíz scan");
+    }
+    assert.deepEqual(copied, Array(5).fill("Árvíz scan"), "each copy command reports success once, synchronously");
+
+    for (const editable of [new HTMLInputElement(), new HTMLTextAreaElement(), new HTMLElement()]) {
+      editable.isContentEditable = !(editable instanceof HTMLInputElement || editable instanceof HTMLTextAreaElement);
+      editable.focus();
+      const event = host.copy();
+      assert.equal(event.defaultPrevented, false, "focused form controls and editor content keep native copy behavior");
+      assert.equal(event.clipboard.size, 0);
+    }
+    host.canvas.focus();
+    const shadowInput = new HTMLInputElement();
+    const shadowCopy = host.copy({ composedPath: () => [shadowInput] });
+    assert.equal(shadowCopy.defaultPrevented, false, "shadow-root edit controls keep their own copy event");
+    const handled = host.copy({ defaultPrevented: true });
+    assert.equal(handled.clipboard.size, 0, "another editor's handled copy event is preserved");
+    domSelection.isCollapsed = false;
+    const domCopy = host.copy();
+    assert.equal(domCopy.defaultPrevented, false, "a native DOM selection takes precedence over retained scene highlights");
+    assert.equal(domCopy.clipboard.size, 0);
+    controller.disable();
+    assert.equal(host.canvas.hasAttribute("tabindex"), false, "temporary canvas focusability is removed on disable");
+    assert.equal(host.copy().clipboard.size, 0);
+  }, { onCopy: text => copied.push(text) });
+}
+
+for (const existingTabIndex of ["0", "-1"]) {
+  const scene = makeScene([{ text: "Text", x: 20, y: 100, height: 10 }], true);
+  withSelection(scene, (host, controller) => {
+    host.canvas.setAttribute("tabindex", existingTabIndex);
+    host.pointer("pointerdown", ...point(scene, 0, .1));
+    host.pointer("pointermove", ...point(scene, 3, .9));
+    host.pointer("pointerup", ...point(scene, 3, .9));
+    controller.disable();
+    assert.equal(host.canvas.getAttribute("tabindex"), existingTabIndex, "host-owned focus configuration is preserved");
+  });
+}
+
+// Recognizing another page must preserve selection on an unchanged page.
+{
+  const scene = makeScene([{ text: "Hello", x: 10, y: 30, height: 10 }], true);
+  scene.pageRects = Float32Array.of(0, 0, 1200, 900, 1300, 0, 2500, 900);
+  scene.textIndex.pages.push({ text: "", charInstance: new Int32Array(), fallbackQuads: new Float32Array() });
+  withSelection(scene, (host, controller) => {
+    const start = point(scene, 0, .1), end = point(scene, 4, .9);
+    host.pointer("pointerdown", ...start); host.pointer("pointermove", ...end); host.pointer("pointerup", ...end);
+    assert.equal(controller.getSelectedText(), "Hello");
+    const recognized = makeScene([{ text: "Other", x: 1310, y: 30, height: 10 }], true).textIndex.pages[0];
+    scene.textIndex = { version: 2, pages: [scene.textIndex.pages[0], recognized] };
+    controller.refreshHighlights();
+    assert.equal(controller.getSelectedText(), "Hello", "another page's recognition retains selection");
+    scene.textIndex = { version: 2, pages: [
+      makeScene([{ text: "World", x: 10, y: 30, height: 10 }], true).textIndex.pages[0], recognized
+    ] };
+    controller.refreshHighlights();
+    assert.equal(controller.getSelectionRange(), null, "replacing selected text clears obsolete carets");
+    host.pointer("pointerdown", ...start); host.pointer("pointermove", ...end); host.pointer("pointerup", ...end);
+    assert.equal(controller.getSelectedText(), "World", "selection uses the replacement page layout");
+  });
+}
+
 // UO.400 DETAILS, last page: Tm places each title-block field with no text
 // index separator, so the drawing number "H7" ends at the very offset where
 // the visually earlier "Blok" field starts (and the small "H7" where

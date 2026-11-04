@@ -27,6 +27,8 @@ for (const [file, ensureName, discardName, setName] of [
       AbortController, DOMException, Uint8Array,
       pdfEditor: null, editorInitialization: null, activeEditorSetup: null, editorModeButton: button,
       viewerPrintAction: { refresh() {} },
+      nativeTextRecognition: { pause() { events.push(["recognition-pause"]); } },
+      synchronizeNativeTextRecognition: force => events.push(["recognition-sync", force]),
       editorSetupLoading: { begin(initial) {
         if (state.currentHandle) state.currentHandle.finished = true;
         const handle = { finished: false, report(progress) { if (!this.finished && state.currentHandle === this) events.push(["report", progress.stage, progress.value]); },
@@ -113,7 +115,9 @@ for (const [file, ensureName, discardName, setName] of [
     if (file === "three-example.ts") assert(!test.layout.disabled, "completed Three setup restores Reader/Grid selection");
     assert(test.events.findIndex(([name]) => name === "presented") < test.events.findIndex(([name]) => name === "finish"));
     assert.equal(test.button.icon, "view");
+    if (file === "main.ts") assert(test.events.some(([name]) => name === "recognition-pause"), "native editing pauses background recognition");
     await test.context.togglePdfEditing(); assert.equal(test.handles.length, 1, "returning to View does not mount an Edit setup indicator");
+    if (file === "main.ts") assert(test.events.some(([name, force]) => name === "recognition-sync" && force), "returning to View refreshes recognition work");
     const imports = test.events.filter(([name]) => name === "import").length;
     test.state.displayGate = deferred(); const reentry = test.context.togglePdfEditing();
     await until(() => test.handles.length === 2 && test.events.filter(([name]) => name === "display").length === 2);

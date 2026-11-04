@@ -31,7 +31,8 @@ import { buildRasterTileSeams, type RasterTileSeamDescriptor } from "./rasterTil
 import { rasterTileSeamVertexGlsl, rasterTileSeamFragmentGlsl } from "./rasterTileSeamShaders";
 import { buildPackedCoverageMipAtlas, type PackedMonochromeCoverageAtlas } from "./packedMonochromeCoverage";
 import { automaticRasterMemoryBudget, estimateRasterTilePlanBytes, planSceneRasterMemory,
-  estimateRasterSourcePlanBytes, estimateRasterTextureBytes, rememberMonochromePlanBytes, reportRasterMemoryBudget } from "./rasterMemoryBudget";
+  estimateRasterSourcePlanBytes, estimateRasterTextureBytes, rememberMonochromePlanBytes, reportRasterMemoryBudget,
+  type SceneRasterMemoryPlan } from "./rasterMemoryBudget";
 import { RasterResolutionPlanner, type RasterResolutionView } from "./rasterResolution";
 import type { SceneUpdateOptions } from "./rendererTypes";
 import { buildPackedMonochromeMipAtlas, detectMonochromeRaster,
@@ -300,6 +301,8 @@ export interface WebGlPdfRendererOptions {
   mixedVectorBatching?: boolean;
   /** @internal Static offscreen rendering without interactive preparation. */
   thumbnail?: boolean;
+  /** @internal Source snapshots bypass viewing-only raster compression and memory tiers. */
+  rasterQuality?: "display" | "source";
 }
 
 /** @deprecated Use WebGlPdfRendererOptions. */
@@ -827,6 +830,7 @@ export class WebGlPdfRenderer {
   private rasterResolutionSources: RasterLayerSource[] | null = null;
   private rasterStagedBytes = 0;
   private rasterCompression: WebGlRasterCompression | null = null;
+  private readonly rasterQuality: "display" | "source";
 
   private readonly rasterStripBatches = new Map<number, RasterStripBatchGpu>();
 
@@ -1029,6 +1033,7 @@ export class WebGlPdfRenderer {
     this.canvas = canvas;
     this.minimumStrokeWidthPx = normalizeMinimumStrokeWidth(options.minimumStrokeWidth);
     this.thumbnailMode = options.thumbnail === true;
+    this.rasterQuality = options.rasterQuality ?? "display";
     if (this.thumbnailMode) {
       this.externalFrameDriver = true;
       this.vectorLodMode = "off";
@@ -1899,11 +1904,12 @@ export class WebGlPdfRenderer {
       const stagedBytes = this.rasterStagedBytes ?? 0;
       const availableBytes = Math.max(0, Math.min(budget.bytes - unchangedBytes - stagedBytes,
         budget.peakBytes - this.estimatedRasterResidentBytes() - stagedBytes));
-      const canCompress = selectRasterCompressionFormat((this.rasterCompression ??= new WebGlRasterCompression(this.gl)).capabilities) !== null;
+      const canCompress = this.rasterQuality !== "source" &&
+        selectRasterCompressionFormat((this.rasterCompression ??= new WebGlRasterCompression(this.gl)).capabilities) !== null;
       const sources = changed.map(([, layer]) => this.classifyRasterLayerSource(layer, canCompress));
       for (let attempt = 0; attempt < 3; attempt++) {
         const memoryPlan = this.planRasterLayerMemory(sources, availableBytes);
-        reportRasterMemoryBudget(memoryPlan, this);
+        if (this.rasterQuality !== "source") reportRasterMemoryBudget(memoryPlan, this);
         try {
           reservedBytes = memoryPlan.estimatedBytes;
           this.rasterStagedBytes = (this.rasterStagedBytes ?? 0) + reservedBytes;
@@ -2049,7 +2055,7 @@ export class WebGlPdfRenderer {
           width: this.canvas.width, height: this.canvas.height,
           cameraCenterX: this.cameraCenterX, cameraCenterY: this.cameraCenterY, zoom: this.zoom };
       } else {
-        this.rasterResolutionPlanner = new RasterResolutionPlanner();
+        this.rasterResolutionPlanner = this.rasterQuality === "source" ? null : new RasterResolutionPlanner();
         this.rasterResolutionView = null;
         this.rasterResolutionSources = null;
       }
@@ -5358,7 +5364,8 @@ export class WebGlPdfRenderer {
   }
 
   private uploadRasterLayers(scene: VectorScene): void {
-    const canCompress = selectRasterCompressionFormat((this.rasterCompression ??= new WebGlRasterCompression(this.gl)).capabilities) !== null;
+    const canCompress = this.rasterQuality !== "source" &&
+      selectRasterCompressionFormat((this.rasterCompression ??= new WebGlRasterCompression(this.gl)).capabilities) !== null;
     const rasterSources = this.getSceneRasterLayers(scene).map(source => this.classifyRasterLayerSource(source, canCompress));
     if (this.rasterResolutionPlanner && this.rasterResolutionSources) {
       this.rasterResolutionPlanner.inheritTiers(this.rasterResolutionPlanner, this.rasterResolutionSources, rasterSources);
@@ -5368,7 +5375,7 @@ export class WebGlPdfRenderer {
     this.destroyRasterLayerTextures(true);
     for (let attempt = 0; attempt < 3; attempt++) {
       const memoryPlan = this.planRasterLayerMemory(rasterSources);
-      reportRasterMemoryBudget(memoryPlan, this);
+      if (this.rasterQuality !== "source") reportRasterMemoryBudget(memoryPlan, this);
       try {
         for (const [index, source] of rasterSources.entries()) {
           this.rasterLayers.push(this.createRasterLayerGpu(source, index, memoryPlan.plans[index], memoryPlan.compressionFormats[index]));
@@ -5402,6 +5409,10 @@ export class WebGlPdfRenderer {
   }
 
   private classifyRasterLayerSource(source: RasterLayerSource, canCompress = false): RasterLayerSource {
+    if (this.rasterQuality === "source") return Object.create(source, {
+      gpuCompression: { value: undefined }, gpuPreparation: { value: undefined },
+      compressionEligible: { value: false }, preferCompression: { value: false }
+    }) as RasterLayerSource;
     if (source.monochrome) return source;
     const monochrome = source.gpuCompression ? undefined : detectMonochromeRaster(source.data, source.width, source.height);
     const compressionEligible = !monochrome && canCompress && (!!source.gpuCompression || assessRasterCompression(source).eligible);
@@ -5413,7 +5424,15 @@ export class WebGlPdfRenderer {
       { ...(monochrome ? { monochrome } : {}), compressionEligible, preferCompression });
   }
 
-  private planRasterLayerMemory(sources: readonly RasterLayerSource[], availableBytes?: number) {
+  private planRasterLayerMemory(sources: readonly RasterLayerSource[], availableBytes?: number): SceneRasterMemoryPlan {
+    if (this.rasterQuality === "source") {
+      const maxTextureSize = Number(this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE));
+      const plans = sources.map(source => planRasterTiles(source.width, source.height, maxTextureSize));
+      const estimatedBytes = plans.reduce((sum, plan, index) => sum + estimateRasterSourcePlanBytes(sources[index], plan), 0);
+      const budget = automaticRasterMemoryBudget();
+      return { plans, compressionFormats: sources.map(() => null), budget, availableBytes: estimatedBytes,
+        unscaledBytes: estimatedBytes, estimatedBytes, protectedBytes: estimatedBytes, resolutionScale: 1, overBudget: false };
+    }
     const encoder = this.rasterCompression ??= new WebGlRasterCompression(this.gl);
     const format = selectRasterCompressionFormat(encoder.capabilities);
     const maxTextureSize = Number(this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE));

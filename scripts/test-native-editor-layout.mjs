@@ -31,6 +31,8 @@ try {
     const document = { querySelector: () => layoutSelect }, noop = () => {};
     const context = vm.createContext({ AbortController, Uint8Array, Error,
       document, lastParsedScene: editSourceScene, lastCanonicalScene: canonical, documentPageScenes: pages,
+      nativeTextRecognition: { pause: () => calls.push(["recognition-pause"]) },
+      synchronizeNativeTextRecognition: () => calls.push(["recognition-sync"]),
       editSourceScene, initialEditScene: editSourceScene, originalLayout: initialLayout, editSourceLayout: initialLayout,
       lastLoadedSource: { kind: "hep", bytes: Uint8Array.of(1) }, lastParsedSceneLabel: "layout.hep", nativeLayout: initialLayout,
       originalSource: {}, originalPassword: undefined, originalDownload: null, pendingEditorSource: null,
@@ -81,6 +83,7 @@ try {
     const f = await fixture(initialLayout), initialRevision = f.session.revision, original = f.session.sourceScene;
     try {
       f.context.setNativeEditing(true); assert.equal(f.layoutSelect.disabled, false, "idle Edit mode leaves Reader/Grid selectable");
+      assert(f.calls.some(([name]) => name === "recognition-pause"), "editing pauses recognition before layout or drawing changes");
       for (const layout of [initialLayout === "reader" ? "grid" : "reader", initialLayout, initialLayout === "reader" ? "grid" : "reader"]) {
         f.layoutSelect.value = layout; await f.context.changeNativeLayout(layout);
         assert.equal(f.context.nativeLayout, layout); assert.equal(f.context.pdfEditor, f.editor);

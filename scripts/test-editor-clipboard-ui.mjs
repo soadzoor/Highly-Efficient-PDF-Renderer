@@ -90,6 +90,18 @@ for (const options of [{ defaultPrevented: true }, { isComposing: true }, { keyC
   assert(!h.key("c").prevented); await flush(); assert(!h.calls.includes("copy"), "selected DOM text retains normal copying");
 }
 {
+  const h = harness();
+  h.context.review.getTextSelection = () => ({ text: "Recognized scan text" });
+  assert.equal(h.selection.length, 1, "a prior object selection can remain while selecting text");
+  assert(!h.key("c").prevented, "selected canvas text must reach the browser's native copy command");
+  await flush();
+  assert(!h.calls.includes("copy"), "scene text copy must not overwrite the object clipboard");
+  h.context.review.getTextSelection = () => null;
+  assert(h.key("c").prevented, "object copy still applies after text selection is cleared");
+  await flush();
+  assert(h.calls.includes("copy"));
+}
+{
   const h = harness(); h.setAvailable(true);
   const event = h.key("v", { target: { closest: selector => selector === "dialog" ? h.context.layerDialog : null } }); await flush();
   assert(event.prevented); assert(h.calls.some(call => Array.isArray(call) && call[0] === "paste"), "a selected layer row can paste in the custom host's layer dialog");

@@ -135,6 +135,13 @@ try {
   await assert.rejects(async () => service.render(scene, options), /closed/);
   await assert.rejects(renderThumbnailScene(scene, { ...options, backend: "canvas2d" }), /Canvas2D.*PDF/);
 
+  const sourceService = new ThumbnailSceneRenderer();
+  await sourceService.render(scene, { ...options, rasterQuality: "source" });
+  assert.equal(sourceService.renderer.rasterQuality, "source", "recognition quality reaches the actual native renderer");
+  assert.equal(sourceService.renderer.rasterResolutionPlanner, null, "source snapshots skip the interactive low-resolution tier");
+  assert.equal(sourceService.renderer.rasterCompression, null, "source thumbnails do not create a raster encoder");
+  sourceService.close();
+
   setGlobal("OffscreenCanvas", class { constructor() { return { width: 1, height: 1, getContext: () => null }; } });
   let domCanvases = 0;
   setGlobal("document", { createElement(name) { assert.equal(name, "canvas"); domCanvases++; return mockCanvas(1, 1); } });

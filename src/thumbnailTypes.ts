@@ -18,6 +18,8 @@ export interface ThumbnailRenderOptions {
   readonly maxDimension: number;
   readonly background: readonly [number, number, number, number];
   readonly backend: "auto" | "webgl" | "canvas2d";
+  /** Source snapshots retain raster detail and bypass viewing-only lossy compression and memory tiers. */
+  readonly rasterQuality?: "display" | "source";
   readonly optionalContent?: OptionalContentSnapshot;
   readonly vectorOverride?: readonly [number, number, number, number];
   /** Reader-only viewing policy; public thumbnails retain scan appearance. */

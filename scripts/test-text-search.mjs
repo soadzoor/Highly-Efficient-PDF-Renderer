@@ -247,6 +247,21 @@ assert.equal(
   "an unknown fallback direction must not merge aligned glyphs across a separator"
 );
 
+// Background recognition replaces only the index, retaining the rendered scene.
+{
+  const scene = createFallbackScene("", () => ({ x: 0, y: 0 }));
+  const searcher = createSceneTextSearcher(scene);
+  assert.equal(searcher.hasText, false);
+  scene.textIndex = createFallbackScene("Scanned text", index => ({ x: index * 2, y: 10 })).textIndex;
+  assert.equal(searcher.hasText, true, "recognition makes an existing searcher available");
+  assert.equal(searcher.search("SCANNED").length, 1);
+  scene.textIndex = createFallbackScene("Updated text", index => ({ x: index * 2, y: 10 })).textIndex;
+  assert.equal(searcher.search("scanned").length, 0, "replacing an index invalidates folded text");
+  assert.equal(searcher.search("UPDATED").length, 1);
+  scene.textIndex = null;
+  assert.equal(searcher.hasText, false);
+}
+
 // A scrolling host owns navigation when supplied; legacy consumers still move their renderer.
 globalThis.window = { devicePixelRatio: 2 };
 const rendererViews = [], delegatedViews = [];

@@ -196,6 +196,7 @@ try {
   const replacementAction = createViewerPrintAction({ button: replacementButton, document: {}, getDocument: () => replacementDocument,
     isBusy: () => Boolean(replacementContext?.pendingSourceLoadCount), setStatus() {} });
   replacementContext = vm.createContext({ AbortController, loadToken: 10, pendingSourceLoadCount: 0, sourceLoadSerial: 7,
+    nativeTextRecognition: { pause() { replacementEvents.push("pause recognition"); assert.equal(replacementContext.pendingSourceLoadCount, 0); } },
     sourceLoadController: { abort() { replacementEvents.push("abort previous source"); assert.equal(replacementOptions.signal.aborted, true); } },
     viewerPrintAction: { cancel() { replacementEvents.push("cancel print"); assert.equal(replacementContext.pendingSourceLoadCount, 0); replacementAction.cancel(); },
       refresh() { replacementEvents.push("refresh disabled print"); assert.equal(replacementContext.pendingSourceLoadCount, 1); replacementAction.refresh(); } },
@@ -206,7 +207,7 @@ try {
   const printsBeforeReplacement = printed.length, oldPrint = replacementAction.print(); await tick();
   assert.equal(replacementButton.disabled, true);
   assert.equal(replacementContext.beginSourceLoad(), 8);
-  assert.deepEqual(replacementEvents, ["cancel print", "abort previous source", "refresh disabled print"], "native replacement cancels printing before invalidating and beginning its source load");
+  assert.deepEqual(replacementEvents, ["pause recognition", "cancel print", "abort previous source", "refresh disabled print"], "native replacement pauses recognition and cancels printing before invalidating and beginning its source load");
   assert.equal(replacementOptions.signal.aborted, true); assert.equal(replacementContext.loadToken, 11);
   assert.equal(replacementContext.pendingSourceLoadCount, 1); assert.equal(replacementButton.disabled, true);
   assert.equal(replacementButton.textContent, "Print", "canceled print preparation yields button ownership to the source load");

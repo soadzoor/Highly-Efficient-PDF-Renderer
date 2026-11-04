@@ -17,6 +17,7 @@ import type { NativeEmbeddedFontPaint } from "./pdf/nativeFont";
 import { validateAnnotationAppearanceMode, type AnnotationAppearanceMode } from "./annotationData";
 import { openPdfPageDemand, type PdfPageDemandLoader } from "./pdfPageDemand";
 import { resolvePdfViewingOptions } from "./pdfViewingOptions";
+import type { TextRecognitionSetting } from "./textRecognition";
 
 /**
  * Source input accepted by HEPR loaders.
@@ -33,6 +34,8 @@ export type PdfObjectSourceKind = "pdf" | "hep";
  * Options used while loading and parsing a source into HEPR scene data.
  */
 export interface PdfObjectGeneratorOptions extends PdfIccOptions {
+  /** Optional background recognition for scanned pages; disabled unless configured. */
+  textRecognition?: TextRecognitionSetting;
   /** Embedded font painting: PDF rules by default; `font` honors the font's PaintType. */
   embeddedFontPaint?: NativeEmbeddedFontPaint;
   /** Override the human-readable source label (for example, when reopening retained bytes). */

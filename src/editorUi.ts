@@ -2313,6 +2313,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "k") { event.preventDefault(); openLinkEditor(); return; }
     if ((event.ctrlKey || event.metaKey) && !event.altKey && /^[cxv]$/i.test(event.key)) {
       const action = event.key.toLowerCase() === "c" ? "copy" : event.key.toLowerCase() === "x" ? "cut" : "paste";
+      if (action === "copy" && review.getTextSelection()?.text) return;
       if (action !== "paste" && document.getSelection()?.isCollapsed === false) return;
       if (canUseClipboard(action)) { event.preventDefault(); void runClipboard(action, action === "paste" && event.shiftKey); }
       return;

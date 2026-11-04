@@ -17,6 +17,7 @@ import { warmViewerRendering } from "./viewerRenderWarmup";
 import { createThreeExampleLoadDiagnostics } from "./threeExampleLoadDiagnostics";
 import { createViewerPrintAction, type ViewerPrintAction, type ViewerPrintDocument } from "./viewerPrint";
 import { createViewerFileDropController } from "./viewerFileDrop";
+import { createViewerTextRecognitionControls } from "./viewerTextRecognition";
 import { initializeToolbarIcons, setToolbarIconButton, toolbarIconMarkup } from "./toolbarIcons";
 import { createEditorSetupLoading, type EditorSetupLoadingHandle } from "./editorSetupLoading";
 import type { CreatedDocumentSource, NewPdfRequest } from "./newPdfUi";
@@ -316,6 +317,13 @@ updatePerspectiveCameraProjection();
 let controls = createMapControls();
 
 let currentPdfObject: HeprThreePdfObject | null = null;
+const textRecognitionControls = createViewerTextRecognitionControls({
+  onSettingsChange(setting) {
+    currentPdfObject?.configureTextRecognition(setting);
+    requestRender();
+  }
+});
+document.querySelector("#text-recognition-controls")?.append(textRecognitionControls.element);
 
 /** Page views of the current document, prepared once it first leaves the grid. */
 interface PageLayoutView {
@@ -1997,6 +2005,7 @@ function disposeExample(): void {
   captureProfiler?.dispose();
   captureProfiler = null;
   layerControls.dispose();
+  textRecognitionControls.dispose();
   annotationControls.dispose();
   annotationInteraction?.dispose();
   drawingSelection.dispose();
@@ -2013,6 +2022,7 @@ function readThreeObjectOptions(): Omit<HeprThreeObjectOptions, "rendererType"> 
   const pageBackground = readPageBackgroundColor();
   const vectorOverride = readVectorOverrideColor();
   return {
+    textRecognition: textRecognitionControls.settings,
     ocrTextOnly: ocrTextCheckboxElement.checked,
     compressScans: compressScansCheckboxElement.checked && !ocrTextCheckboxElement.checked,
     pageLoading: compressScansCheckboxElement.checked && !ocrTextCheckboxElement.checked ? "eager"
@@ -2501,6 +2511,8 @@ function replacePdfObject(
   });
   if (!sameScene) disposeCurrentObject({ clearMetrics: options.fitCamera !== false, preserveReaderDocument: options.fitCamera === false, retainObject: options.retainPrevious });
   currentPdfObject = nextObject;
+  textRecognitionControls.setDocumentAvailable(true);
+  textRecognitionControls.setProgress(nextObject.getTextRecognitionProgress());
   if (nextObject.sourceKind === "pdf") {
     loadedCompressScansPreference = compressScansCheckboxElement.checked && !nextObject.sourceOptions?.ocrTextOnly;
   }
@@ -2512,6 +2524,11 @@ function replacePdfObject(
       annotationOverlay.sceneChanged(); annotationControls.sceneChanged(); annotationInteraction?.refresh();
       refreshSearchAvailability();
       if (textSearchInputElement.value.trim()) runSearch(textSearchInputElement.value, false);
+    }
+    if (event.reason === "text-recognized") {
+      refreshSearchAvailability();
+      if (textSearchInputElement.value.trim()) runSearch(textSearchInputElement.value, false);
+      textSelection.refreshHighlights();
     }
     // Page-demand thumbnails use canonical pages independently of display
     // residency; neither page swaps nor raster readiness change their source.
@@ -2571,6 +2588,7 @@ function disposeCurrentObject(options: { clearMetrics?: boolean; preserveReaderD
   const clearMetrics = options.clearMetrics !== false;
   const previousObject = currentPdfObject;
   currentPdfObject = null;
+  textRecognitionControls.setDocumentAvailable(false);
   resetPageLayout();
   if (!options.preserveReaderDocument) {
     readerEditorThumbnailScene = null;

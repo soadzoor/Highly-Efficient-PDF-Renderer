@@ -43,7 +43,8 @@ import type {
 // Version 14 requires workers to honor the embedded-font painting policy.
 // Version 15 preserves scan appearance for independent page thumbnails.
 // Version 17 adds resolution-aware snapshot preparation and worker rendering.
-export const PDF_WORKER_PROTOCOL_VERSION = 17 as const;
+// Version 18 requires source-quality snapshots to bypass display compression and raster tiers.
+export const PDF_WORKER_PROTOCOL_VERSION = 18 as const;
 
 // Thousands of tiny matrices cost far more to transfer individually than to
 // clone. This selects the cheaper transport; it does not limit response data.

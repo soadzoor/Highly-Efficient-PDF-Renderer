@@ -10,6 +10,7 @@ import type { NativeEmbeddedFontPaint } from "./pdf/nativeFont";
 import type { AnnotationAppearanceMode } from "./annotationData";
 import { waitForLoad } from "./loadCancellation";
 import { validateSourcePdfByteLength } from "./hepSizePolicy";
+import type { TextRecognitionSetting } from "./textRecognition";
 
 /** Compression algorithm used inside a generated HEP file. */
 export type HepCompression = "deflate" | "store";
@@ -44,6 +45,8 @@ export interface HepEncodingOptions extends HepLodOptions {
  * HEP stores canonical image pixels; GPU display preparations are not serialized.
  */
 export interface BuildHepFromPdfOptions extends HepEncodingOptions, PdfIccOptions {
+  /** Recognize image-only scans before serialization. Omitted disables recognition. */
+  textRecognition?: TextRecognitionSetting;
   /** Honor embedded Type1/CFF PaintType for Ghostscript compatibility. @default "pdf" */
   embeddedFontPaint?: NativeEmbeddedFontPaint;
   /** Optional raw-sample image decoder; omitted uses the bundled codecs. */

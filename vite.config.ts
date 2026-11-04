@@ -37,8 +37,11 @@ export default defineConfig(({ mode }) => {
   }
 
   const { version } = JSON.parse(readFileSync(resolve(import.meta.dirname, "package.json"), "utf8"));
+  const ortVersion = JSON.parse(readFileSync(resolve(import.meta.dirname, "node_modules/onnxruntime-web/package.json"), "utf8")).version;
   return {
-    define: { __HEPR_PACKAGE_VERSION__: JSON.stringify(version) },
+    define: { __HEPR_PACKAGE_VERSION__: JSON.stringify(version), __HEPR_OCR_ORT_VERSION__: JSON.stringify(ortVersion) },
+    // The viewer supplies an exact-version WASM URL after local-OCR consent.
+    resolve: { conditions: ["onnxruntime-web-use-extern-wasm"] },
     plugins: [shaderCommentCompactionPlugin(sourceDir), {
       name: "package-version-label",
       transformIndexHtml(html) {

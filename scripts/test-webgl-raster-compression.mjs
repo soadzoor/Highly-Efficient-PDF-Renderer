@@ -169,6 +169,29 @@ try {
   renderer.destroyRasterLayerTextures(); renderer.rasterCompression.dispose();
   assert.equal(success.alive.size, 0);
 
+  // OCR/source snapshots use original pixels even when display tiers would
+  // compress or reduce them to fit a small device-memory target.
+  const snapshotScene = { ...scene, rasterLayers: scene.rasterLayers.map(layer => ({ ...layer,
+    compressionHint: "scan", gpuCompression: { viewingOnly: true }, gpuPreparation: { viewingOnly: true }
+  })) };
+  const snapshotGl = mockGl(4096); snapshotGl.fail = "compressed";
+  const snapshot = makeRenderer(WebGlPdfRenderer, snapshotGl.gl, snapshotScene);
+  snapshot.rasterQuality = "source";
+  const warningCount = warnings.length;
+  snapshot.uploadRasterLayers(snapshotScene);
+  assert(snapshot.rasterLayers.every(layer => !layer.compressionFormat && layer.rasterPlan.width === 1024 && layer.rasterPlan.height === 1024));
+  assert(snapshot.planRasterLayerMemory(snapshot.rasterResolutionSources).estimatedBytes > automaticRasterMemoryBudget().bytes,
+    "source snapshots retain requested detail beyond the interactive memory target");
+  assert.equal(snapshot.rasterCompression, undefined, "source upload never creates a GPU encoder or uploads compressed blocks");
+  assert(snapshotGl.rgbaUploads.every(upload => upload.width === 1024 && upload.height === 1024));
+  const snapshotUpdate = snapshot.prepareRasterLayerUpdates(new Map([[0, { ...snapshotScene.rasterLayers[0],
+    matrix: Float32Array.of(1024, 0, 0, 1024, 9, 0) }]]));
+  assert.equal(snapshot.rasterCompression, undefined, "retained source updates cannot start an encoder");
+  snapshotUpdate.dispose(); snapshot.destroyRasterLayerTextures();
+  assert.equal(snapshotGl.alive.size, 0);
+  assert.equal(warnings.length, warningCount, "source snapshots do not report lossy-compression retries or display memory reductions");
+  assert.equal(snapshotScene.rasterLayers[0].gpuCompression.viewingOnly, true, "source policy preserves caller display caches");
+
   const fallback = mockGl(4096); fallback.astc = false; fallback.fail = "compressed";
   const fallbackRenderer = makeRenderer(WebGlPdfRenderer, fallback.gl, scene);
   fallbackRenderer.uploadRasterLayers(scene);

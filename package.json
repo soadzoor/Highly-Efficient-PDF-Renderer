@@ -82,6 +82,7 @@
     "CHANGELOG.md",
     "docs/HEP_CONTAINER.md",
     "docs/pdf-composition.md",
+    "docs/text-recognition.md",
     "examples/pdf-composition.mjs",
     "LICENSE",
     "THIRD_PARTY_NOTICES"
@@ -130,7 +131,10 @@
     "@napi-rs/canvas": "1.0.9"
   },
   "devDependencies": {
+    "@paddleocr/paddleocr-js": "0.4.2",
+    "@techstark/opencv-js": "4.10.0-release.1",
     "@types/three": "0.186.0",
+    "onnxruntime-web": "1.31.1",
     "three": "0.186.1",
     "typescript": "7.0.2",
     "vite": "8.3.1"

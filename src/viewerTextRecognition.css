@@ -1,0 +1,17 @@
+.viewer-text-recognition {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.viewer-text-recognition-toggle { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+.viewer-text-recognition-toggle input { width: 16px; height: 16px; margin: 0; }
+.viewer-text-recognition-native .viewer-text-recognition-toggle { display: grid; grid-template-columns: max-content minmax(70px, 120px); gap: 8px; }
+.viewer-text-recognition-native .viewer-text-recognition-toggle input { order: 2; }
+.viewer-text-recognition-native .viewer-text-recognition-toggle span { order: 1; }
+.viewer-text-recognition-status { font-size: 11px; opacity: 0.75; }
+.viewer-text-recognition button { padding: 0; border: 0; border-radius: 0; background: none; box-shadow: none; color: inherit; font: inherit; font-size: 11px; text-decoration: underline; cursor: pointer; }
+.viewer-text-recognition [hidden] { display: none !important; }
