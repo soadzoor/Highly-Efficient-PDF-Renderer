@@ -1,0 +1,1 @@
+export{t as BUNDLED_STANDARD_FONT_ASSETS,n as createBundledStandardFontResolver,r as resolveBundledStandardFontAsset}from"./standardFontResolver-CJvAqV4k.js";

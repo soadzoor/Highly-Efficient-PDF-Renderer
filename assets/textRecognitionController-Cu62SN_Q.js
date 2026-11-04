@@ -1,0 +1,1 @@
+export{t as TextRecognitionController}from"./textRecognitionController-C3IoN9MH.js";

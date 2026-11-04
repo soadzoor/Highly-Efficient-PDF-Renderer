@@ -1,0 +1,1 @@
+export{t as createEmptyVectorScene}from"./emptyVectorScene-seyRMHWb.js";

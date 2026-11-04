@@ -1,0 +1,1 @@
+export{t as NativePdfDocument,n as openNativePdfDocument}from"./nativeDocument-deugvQFF.js";

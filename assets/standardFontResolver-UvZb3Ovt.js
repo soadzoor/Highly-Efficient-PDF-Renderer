@@ -1,1 +1,0 @@
-import{n as e,r as t,t as n}from"./standardFontResolver-CJvAqV4k.js";export{n as BUNDLED_STANDARD_FONT_ASSETS,e as createBundledStandardFontResolver,t as resolveBundledStandardFontAsset};

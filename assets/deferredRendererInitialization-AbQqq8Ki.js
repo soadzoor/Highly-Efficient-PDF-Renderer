@@ -1,0 +1,1 @@
+export{t as deferRendererInitialization}from"./deferredRendererInitialization-DhJ2dpG-.js";

@@ -1,0 +1,1 @@
+export{a as remapEditorPagePoint}from"./editorCoordinates-CW_VYN82.js";
