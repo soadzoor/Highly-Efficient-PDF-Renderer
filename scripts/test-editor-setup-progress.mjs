@@ -14,6 +14,7 @@ function startup({ progress = true, abortStage, failure } = {}) {
   let disposedServices = 0, disposedSession = 0, prepareCalls = 0, receivedProgress, fieldProgress;
   const session = { dispose() { disposedSession++; } };
   const context = editorUiTestContext({ AbortController,
+    editorTabClipboard: () => ({}),
     yieldAfterPaint: async signal => { events.push(["paint", events.at(-1)?.[1]]); if (events.at(-1)[1] === abortStage) controller.abort(); signal.throwIfAborted(); },
     createEditorAppServices: async options => {
       assert.equal(options.sourcePdf, sourcePdf);
@@ -28,7 +29,7 @@ function startup({ progress = true, abortStage, failure } = {}) {
     }
   });
   vm.runInContext(initialize, context);
-  const host = { getSource: () => ({ pdf: sourcePdf, label: "fixture.pdf" }),
+  const host = { getSource: () => ({ pdf: sourcePdf, label: "fixture.pdf" }), getCanvas: () => ({ ownerDocument: { defaultView: {} } }),
     async prepareScene(signal, onProgress) {
       prepareCalls++; receivedProgress = onProgress;
       signal.throwIfAborted(); if (failure === "document") throw new Error("Document failed");

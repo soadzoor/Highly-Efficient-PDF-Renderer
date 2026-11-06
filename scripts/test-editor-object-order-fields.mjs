@@ -8,6 +8,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 } });
 try {
   const { openPdf } = await import("../src/pdfSession.ts");
+  const { createNodeBundledStandardFontResolver } = await import("../src/nodePdfResources.ts");
   const { openEditorSession } = await import("../src/editorSession.ts");
   const { renderHeprPageToCanvas2d } = await import("../src/heprCanvas2dRenderer.ts");
   const { writeScenePdf } = await import("../src/editorPdfWriter.ts");
@@ -61,7 +62,8 @@ try {
     editor.setFieldValue("Name", "Changed after rotation");
     assert.deepEqual(await pixel(await editor.getScene(), true), [0, 255, 0, 255], "typing into a rebased field retains its namespaced original ordered paint owner");
     assert.equal(editor.getObject(added).kind, "shape");
-    const saved = new Uint8Array(await (await editor.savePdf()).arrayBuffer()), reopened = await openPdf({ kind: "bytes", bytes: saved });
+    const saved = new Uint8Array(await (await editor.savePdf()).arrayBuffer()), reopened = await openPdf({ kind: "bytes", bytes: saved },
+      { missingFontResolver: createNodeBundledStandardFontResolver() });
     try { assert.equal((await reopened.compileVectorPage(0, { optimization: "none" })).annotations.find(annotation => annotation.field?.name === "Name").field.value, "Changed after rotation"); }
     finally { await reopened.close(); }
   } finally { editor.dispose(); }

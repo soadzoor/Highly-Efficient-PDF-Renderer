@@ -64,7 +64,8 @@ function harness(frameHost = true) {
     displayedSelection: () => ({ frame: null }), pointer: null, polygon: null, activeText: null, tool: "form", running: false,
     active: false, disposed: false, structuralRunning: false, clipboardRunning: false, releaseFrameListener: null, frame: 0, previewFrame: 0,
     toolRequest: 0, textRequest: 0, pendingFieldFocus: null, fieldDrafts: new Map(), fieldPaintCache: null, fontFaces: new Map(),
-    session: { sourceScene, getFieldValues: () => fieldValues, setFieldValue: (name, value) => fieldValues.set(name, value), isAnnotationVisible: () => true, dispose: noop },
+    session: { sourceScene, getFieldValues: () => fieldValues, setFieldValue: (name, value) => fieldValues.set(name, value), isAnnotationVisible: () => true,
+      select(selection) { context.currentState.selection = [...selection]; }, dispose: noop },
     layerControls: { setActive: noop, dispose: noop }, layerDialog: null,
     contextMenu: { close: noop, dispose: noop },
     cameraPan: { cancel: noop, isPanning: () => false, setActive: noop, dispose: noop }, updateAppearanceControls: noop,
@@ -151,8 +152,12 @@ async function pointerHarness() {
   });
   for (const name of ["isSceneSettling", "updatePointerCursor", "clearPreview", "cancelPointerGesture", "updateShapeGesture", "pointerDown", "pointerMove", "pointerUp", "forwardWheel"])
     vm.runInContext(sourceFunction(nested, name), c);
-  for (const type of ["pointerdown", "pointermove", "pointercancel", "lostpointercapture", "dblclick"])
-    vm.runInContext(uiSource.match(new RegExp(`^  overlay\\.addEventListener\\("${type}",[^\\n]+$`, "m"))[0].trim(), c);
+  for (const type of ["pointerdown", "pointermove", "pointercancel", "lostpointercapture", "dblclick"]) {
+    const callback = type === "pointerdown" ? " event =>" : "";
+    const registration = uiSource.match(new RegExp(`^  overlay\\.addEventListener\\("${type}",${callback}[^\\n]+$`, "m"))?.[0];
+    assert(registration, `the editor registers its ${type} gesture handler`);
+    vm.runInContext(registration.trim(), c);
+  }
   c.window.addEventListener = (name, listener, options) => { assert.equal(options.signal, c.lifetime.signal); windowListeners.set(name, listener); };
   vm.runInContext(uiSource.match(/^  window\.addEventListener\("blur",[^\n]+$/m)[0].trim(), c);
   const event = (timeStamp, options = {}) => ({ button: 0, pointerId: 1, pointerType: "mouse", isPrimary: true,
@@ -191,7 +196,8 @@ for (const jitter of [0, .5, 1.5]) {
   assert.equal(c.tool, "form"); assert.equal(request.canceled, true); assert.equal(aborted, 1);
   assert.equal(c.pendingPick, null); assert.equal(h.captures.size, 0);
   finishPick("older-source-object"); await settlePointers();
-  assert.equal(c.tool, "form"); assert.equal(c.pointer, null); assert.equal(c.currentState.selection.length, 0);
+  assert.equal(c.tool, "form"); assert.equal(c.pointer, null);
+  assert.deepEqual(c.currentState.selection, ["annotation:pdf-axes"], "a stale pick cannot replace the active field selection");
   h.draw(); assert.equal(h.document.activeElement, h.controls[0]); c.api.dispose();
 }
 

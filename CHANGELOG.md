@@ -29,6 +29,8 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   selection when changing Size in Select or Fill. Preserve font-size edits
   across shared widgets, rendering, undo/recovery and editable PDF output;
   respect field styles and requested sizes when regenerating portable text.
+  Preserve default-appearance operators, comments and widget-local colors when
+  refilling fields or changing their size, keeping sibling style inheritance.
 - Let auto-sized textboxes shrink below their original minimum dimensions when
   reducing the size of all their text. Release Size input focus on canvas clicks
   or Enter so arrow keys can move selected objects again.

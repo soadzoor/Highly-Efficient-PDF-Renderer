@@ -4,7 +4,7 @@ import { NativePdfFormAppearanceRegistry, decodePdfString, type NativePdfAnnotat
 import { NativePdfAppearanceSynthesizer, parseDefaultAppearance } from "./pdf/nativeAppearanceSynthesis";
 import { convertDeviceCmykToSrgb } from "./pdf/deviceCmyk";
 import { createBundledStandardFontResolver } from "./standardFontResolver";
-import { isPdfDictionary, isPdfName, isPdfRef, isPdfStream, isPdfString, type PdfDictionary, type PdfRef, type PdfValue } from "./pdf/nativeCos";
+import { isPdfDictionary, isPdfName, isPdfRef, isPdfStream, isPdfString, type PdfDictionary, type PdfRef, type PdfString, type PdfValue } from "./pdf/nativeCos";
 import type { EditorFieldValue, EditorMatrix, EditorObject, EditorPdfSaveOptions, EditorSession, EditorSourceEdit, EditorTextObject } from "./editorTypes";
 import type { PdfBox } from "./heprDocumentData";
 import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
@@ -99,9 +99,41 @@ function fieldPdfValue(value: EditorFieldValue, type?: string, onValue = "Yes"):
   return value === null ? pdfTextValue("") : pdfTextValue(String(value));
 }
 
+async function readEditorPdfDefaultAppearance(writer: NativePdfWriter, dictionary: PdfDictionary,
+  signal?: AbortSignal): Promise<PdfString | undefined> {
+  const document = writer.document;
+  const resolve = async (value: PdfValue | undefined): Promise<PdfValue | undefined> => isPdfRef(value)
+    ? writer.get(value) ?? await document.resolveValue(value, signal) : value;
+  let current: PdfDictionary | undefined = dictionary;
+  const visited = new Set<PdfDictionary>();
+  while (current) {
+    signal?.throwIfAborted(); current = pendingEditorPdfDictionary(writer, current);
+    if (visited.has(current)) break;
+    visited.add(current);
+    const value = await resolve(current.get("DA"));
+    if (isPdfString(value)) return value;
+    const parent = await resolve(current.get("Parent")); current = isPdfDictionary(parent) ? parent : undefined;
+  }
+  const form = await resolve(pendingEditorPdfDictionary(writer, document.catalog).get("AcroForm"));
+  const value = isPdfDictionary(form) ? await resolve(pendingEditorPdfDictionary(writer, form).get("DA")) : undefined;
+  return isPdfString(value) ? value : undefined;
+}
+
+function resizeEditorPdfDefaultAppearance(before: PdfString | undefined, fontSize: number,
+  annotation: NativePdfAnnotationAppearance): PdfString {
+  const appearance = before ? parseDefaultAppearance(before.bytes, annotation) : undefined;
+  if (before && appearance?.fontSize === fontSize) return before;
+  const resource = new TextDecoder().decode(serializePdfValue(pdfNameValue(appearance?.fontResourceName ?? "Helv")));
+  const suffix = new TextEncoder().encode(`\n${resource} ${pdfNumberValue(fontSize)} Tf${before ? "" : " 0 g"}\n`);
+  const bytes = new Uint8Array((before?.bytes.length ?? 0) + suffix.length);
+  if (before) bytes.set(before.bytes);
+  bytes.set(suffix, before?.bytes.length ?? 0);
+  return { kind: "string", hex: before?.hex ?? true, bytes };
+}
+
 /** Keep a complete field text recolor when a PDF reader regenerates its appearance.
  * A local override preserves shared values and leaves sibling widgets' defaults alone. */
-async function retainEditorWidgetTextColor(document: NativePdfDocument, annotation: NativePdfAnnotationAppearance, fieldType: string | undefined,
+async function retainEditorWidgetTextColor(writer: NativePdfWriter, annotation: NativePdfAnnotationAppearance, fieldType: string | undefined,
   refs: readonly PrimitiveRef[], edits: readonly EditorSourceEdit[], dictionary: PdfDictionary, signal?: AbortSignal): Promise<void> {
   if (annotation.subtype !== "Widget" || !["Tx", "Ch"].includes(fieldType ?? "")) return;
   const key = (ref: PrimitiveRef): string => `${ref.kind}:${ref.index}`;
@@ -113,20 +145,7 @@ async function retainEditorWidgetTextColor(document: NativePdfDocument, annotati
   const color = uniform(refs.filter(ref => ref.kind === "text")) ?? uniform(refs); if (!color) return;
   // The save loop reads lightweight annotation records. Resolve only this
   // widget's DA instead of validating unrelated fields and appearances.
-  let before: Uint8Array | undefined, current: PdfDictionary | undefined = dictionary;
-  const visited = new Set<PdfDictionary>();
-  while (current && !visited.has(current)) {
-    signal?.throwIfAborted(); visited.add(current);
-    const value = await document.resolveValue(current.get("DA"), signal);
-    if (isPdfString(value)) { before = value.bytes; break; }
-    const parent = await document.resolveValue(current.get("Parent"), signal); current = isPdfDictionary(parent) ? parent : undefined;
-  }
-  if (!before) {
-    const form = await document.resolveValue(document.catalog.get("AcroForm"), signal);
-    const value = isPdfDictionary(form) ? await document.resolveValue(form.get("DA"), signal) : undefined;
-    if (isPdfString(value)) before = value.bytes;
-  }
-  before ??= new Uint8Array();
+  const before = (await readEditorPdfDefaultAppearance(writer, dictionary, signal))?.bytes ?? new Uint8Array();
   const suffix = new TextEncoder().encode(`\n${color.map(pdfNumberValue).join(" ")} rg\n`);
   const bytes = new Uint8Array(before.length + suffix.length); bytes.set(before); bytes.set(suffix, before.length);
   dictionary.set("DA", { kind: "string", bytes, hex: false });
@@ -378,13 +397,18 @@ export async function applyEditorPdfFields(writer: NativePdfWriter, values: Read
     const fontSize = options.fontSizes?.get(name);
     if (fontSize !== undefined) {
       if (!Number.isFinite(fontSize) || fontSize < 0 || !["Tx", "Ch"].includes(field.fieldType ?? "")) throw new TypeError("Invalid form field font size.");
-      const appearance = field.defaultAppearance ? parseDefaultAppearance(field.defaultAppearance.bytes, annotation)
-        : { fontResourceName: "Helv", color: { components: [0] } };
-      const resource = new TextDecoder().decode(serializePdfValue(pdfNameValue(appearance.fontResourceName ?? "Helv")));
-      const color = appearance.color.components;
-      const defaultAppearance = { kind: "string" as const, hex: true, bytes: new TextEncoder().encode(
-        `${resource} ${pdfNumberValue(fontSize)} Tf ${color.map(pdfNumberValue).join(" ")} ${color.length === 1 ? "g" : color.length === 4 ? "k" : "rg"}`) };
-      changed.dictionary.set("DA", defaultAppearance); widget.set("DA", defaultAppearance);
+      // Shared values and sizes still permit widget-local font/color defaults.
+      // Preserve their operators and comments, and keep inheriting widgets local-DA free.
+      const local = owner === annotation.dictionary ? undefined : await document.resolveValue(annotation.dictionary.get("DA"), options.signal);
+      let defaultAppearance: PdfString;
+      if (isPdfString(local)) {
+        defaultAppearance = resizeEditorPdfDefaultAppearance(local, fontSize, annotation);
+        widget.set("DA", defaultAppearance);
+      } else {
+        const before = await readEditorPdfDefaultAppearance(writer, changed.dictionary, options.signal);
+        defaultAppearance = resizeEditorPdfDefaultAppearance(before, fontSize, annotation);
+        if (defaultAppearance !== before) changed.dictionary.set("DA", defaultAppearance);
+      }
       field = { ...field, defaultAppearance };
     }
     const rawAP = await document.resolveValue(widget.get("AP"), options.signal);
@@ -860,7 +884,7 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
         }
         const pendingAnnotation = annotation.ref ? writer.get(annotation.ref) : undefined;
         const originalDictionary = new Map(pendingEditorPdfDictionary(writer, isPdfDictionary(pendingAnnotation) ? pendingAnnotation : annotation.dictionary));
-        if (affected.some(edit => edit.color !== undefined)) await retainEditorWidgetTextColor(document, annotation,
+        if (affected.some(edit => edit.color !== undefined)) await retainEditorWidgetTextColor(writer, annotation,
           session.sourceScene.annotations?.find(item => item.id === annotation.id)?.field?.type, refs, affected, originalDictionary, options.signal);
         if (annotation.subtype === "Link" && !annotation.ref && !originalDictionary.has("NM")) originalDictionary.set("NM", pdfTextValue(annotation.id));
         if (lockChanged) originalDictionary.set("F", originalFlags - (originalFlags & 128) + (locked ? 128 : 0));

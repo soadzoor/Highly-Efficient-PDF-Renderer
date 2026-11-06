@@ -15,6 +15,7 @@ try {
   const { createNodeBundledStandardFontResolver } = await import("../src/nodePdfResources.ts");
   const { createEditorAppServices } = await import("../src/editorAppServices.ts");
   const { openEditorSession } = await import("../src/editorSession.ts");
+  const { applyEditorPropertyPatch } = await import("../src/editorProperties.ts");
   const { getSceneAnnotationRuns } = await import("../src/scenePrimitives.ts");
   const { editorSourcePaintColors } = await import("../src/editorSourceColors.ts");
   const green = [0, 128 / 255, 0], red = [1, 0, 0], decoder = new TextDecoder();
@@ -31,15 +32,19 @@ try {
     } catch (error) { services.dispose(); await parser.close(); throw error; }
   };
   const save = async editor => new Uint8Array(await (await editor.savePdf()).arrayBuffer());
-  const inspect = async (bytes, expectedLocal) => {
+  const inspect = async (bytes, expectedLocal, fontSize = 10) => {
     const document = await NativePdfDocument.open({ kind: "bytes", bytes }, { repair: "off" });
     try {
       const widgets = await new NativePdfFormAppearanceRegistry(document).listPageAnnotations(0), first = widgets[0], second = widgets[1];
       assert.equal(first.widget.fullyQualifiedName, "Name"); assert.equal(second.widget.fullyQualifiedName, "Name");
       const owner = await document.resolveDictionary(first.dictionary.get("Parent"));
-      assert.equal(decoder.decode(owner.get("DA").bytes), originalDA, "recoloring one widget never changes the shared field default");
+      const ownerDA = decoder.decode(owner.get("DA").bytes);
+      if (fontSize === 10) assert.equal(ownerDA, originalDA, "recoloring or refilling one widget never changes the shared field default");
+      else assert(ownerDA.startsWith(originalDA + "\n"), "shared size changes retain the original field default operators and comments");
+      assert.deepEqual(parseDefaultAppearance(owner.get("DA").bytes, first).color.components, red, "a widget-local color never replaces the shared field color");
       assert.equal(second.dictionary.has("DA"), false, "the sibling keeps inheriting its original color");
       assert.deepEqual(parseDefaultAppearance(second.widget.defaultAppearance.bytes, second).color.components, red);
+      for (const annotation of widgets) assert.equal(parseDefaultAppearance(annotation.widget.defaultAppearance.bytes, annotation).fontSize, fontSize);
       if (expectedLocal) {
         const da = decoder.decode(first.dictionary.get("DA").bytes);
         assert(da.startsWith(originalDA + "\n"), "font resource, size, operators and trailing comments stay byte-for-byte intact");
@@ -75,21 +80,64 @@ try {
             `regenerated shared widgets retain their own text color: ${JSON.stringify({ mode, index, colors, field: fields[index].field })}`);
         }
         await inspect(await save(editor), true);
+        editor.select([`annotation:${fields[0].id}`]);
+        applyEditorPropertyPatch(editor, { fontSize: 18 });
+        editor.setFieldValue("Name", "Replacement after size change");
+        const resized = await editor.getScene();
+        for (let index = 0; index < fields.length; index++) {
+          const colors = editorSourcePaintColors(resized, refs(resized, fields[index].id).filter(ref => ref.kind === "text")).color;
+          assert(colors.length > 0 && colors.every(color => same(color, index === 0 ? green : red)), "shared size changes retain widget-local colors while regenerating appearances");
+        }
+        await inspect(await save(editor), true, 18);
       } finally { await reopened.close(); }
     }
   }
+  for (const sizeFirst of [false, true]) {
+    const document = await open(fixture());
+    try {
+      const { editor } = document, annotation = editor.sourceScene.annotations.find(annotation => annotation.annotationIndex === 0);
+      const id = `annotation:${annotation.id}`;
+      editor.select([id]);
+      if (sizeFirst) applyEditorPropertyPatch(editor, { fontSize: 18 });
+      editor.updateObject(id, { color: "green" });
+      if (!sizeFirst) applyEditorPropertyPatch(editor, { fontSize: 18 });
+      editor.setFieldValue("Name", "Same-session color and size change");
+      await inspect(await save(editor), true, 18);
+    } finally { await document.close(); }
+  }
+  // Valid local defaults override an unsupported ancestor; unused operators
+  // must not prevent editing these widgets or be copied into their appearances.
+  const overridden = await open(fixture({ ownerDA: "0 Tc", widgetDA: originalDA }));
+  try {
+    const { editor } = overridden, annotation = editor.sourceScene.annotations.find(annotation => annotation.annotationIndex === 0);
+    editor.select([`annotation:${annotation.id}`]);
+    applyEditorPropertyPatch(editor, { fontSize: 18 });
+    const pdf = await NativePdfDocument.open({ kind: "bytes", bytes: await save(editor) }, { repair: "off" });
+    try {
+      const widgets = await new NativePdfFormAppearanceRegistry(pdf).listPageAnnotations(0);
+      const owner = await pdf.resolveDictionary(widgets[0].dictionary.get("Parent"));
+      assert.equal(decoder.decode(owner.get("DA").bytes), "0 Tc", "unused ancestor defaults remain untouched");
+      for (const widget of widgets) {
+        assert(decoder.decode(widget.dictionary.get("DA").bytes).startsWith(originalDA + "\n"));
+        const appearance = parseDefaultAppearance(widget.widget.defaultAppearance.bytes, widget);
+        assert.equal(appearance.fontSize, 18);
+        assert.deepEqual(appearance.color.components, red);
+      }
+    } finally { await pdf.close(); }
+  } finally { await overridden.close(); }
   console.log("Source field colors in PDF: widget-local DA, retained font/size/operators, shared values, sibling isolation, reopen/refill/resave and partial-glyph guards passed.");
 } finally { hooks.deregister(); }
 
-function fixture() {
+function fixture({ ownerDA = originalDA, widgetDA } = {}) {
+  const localDA = widgetDA === undefined ? "" : ` /DA (${widgetDA})`;
   return writeTinyPdf({ objects: [
     "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [5 0 R] /DR << /Font << /Helv 8 0 R >> >> >> >>",
     "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
     "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /Helv 8 0 R >> >> /Contents 4 0 R /Annots [6 0 R 7 0 R] >>",
     tinyPdfStream("", ""),
-    `<< /FT /Tx /T (Name) /V (Old) /DA (${originalDA}) /Kids [6 0 R 7 0 R] >>`,
-    "<< /Type /Annot /Subtype /Widget /Parent 5 0 R /Rect [10 10 90 30] /F 4 /P 3 0 R /AP << /N 9 0 R >> >>",
-    "<< /Type /Annot /Subtype /Widget /Parent 5 0 R /Rect [100 10 180 30] /F 4 /P 3 0 R /AP << /N 9 0 R >> >>",
+    `<< /FT /Tx /T (Name) /V (Old) /DA (${ownerDA}) /Kids [6 0 R 7 0 R] >>`,
+    `<< /Type /Annot /Subtype /Widget /Parent 5 0 R /Rect [10 10 90 30] /F 4 /P 3 0 R /AP << /N 9 0 R >>${localDA} >>`,
+    `<< /Type /Annot /Subtype /Widget /Parent 5 0 R /Rect [100 10 180 30] /F 4 /P 3 0 R /AP << /N 9 0 R >>${localDA} >>`,
     "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
     tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 80 20] /Resources << /Font << /Helv 8 0 R >> >>", "0 0 1 rg 0 0 80 20 re f BT /Helv 10 Tf 1 0 0 rg 2 4 Td (Old) Tj ET")
   ].map((body, index) => ({ number: index + 1, body })) });

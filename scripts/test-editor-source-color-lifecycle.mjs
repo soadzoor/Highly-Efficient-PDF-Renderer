@@ -76,7 +76,10 @@ try {
         const field = current.annotations.find(value => value.id === annotation.id).field;
         assert.equal(field.value, "New and longer value");
         assert(same(field.textStyle.color, "green"), "typing controls receive the committed source text color");
-        assert.deepEqual({ ...field.textStyle, color: undefined }, { ...annotation.field.textStyle, color: undefined }, "recoloring retains the field's font and inset settings");
+        const { color: beforeColor, appearanceFontSize: beforeAppearanceFontSize, ...beforeStyle } = annotation.field.textStyle;
+        const { color: afterColor, appearanceFontSize: afterAppearanceFontSize, ...afterStyle } = field.textStyle;
+        assert.deepEqual(afterStyle, beforeStyle, "recoloring retains the field's font and inset settings");
+        assert.equal(afterAppearanceFontSize, undefined, "regenerated fields discard their original appearance's size hint");
       } finally { editor.dispose(); }
     }
   } finally { services.dispose(); await parser.close(); }

@@ -273,7 +273,11 @@ try {
   const { createBundledStandardFontResolver } = await import("../src/standardFontResolver.ts");
   const { writeScenePdf } = await import("../src/editorPdfWriter.ts");
   const type1Bytes = formFixture({ standardType1: true }), type1Original = type1Bytes.slice(), customAssetLoads = [], type1Diagnostics = [];
-  const loadFontAsset = async input => { const url = new URL(input); url.search = ""; customAssetLoads.push(url.pathname); return new Uint8Array(await readFile(url)); };
+  const loadFontAsset = async input => {
+    const url = new URL(input); customAssetLoads.push(url.pathname);
+    const response = await fetch(url); assert(response.ok);
+    return new Uint8Array(await response.arrayBuffer());
+  };
   const missingFontResolver = createBundledStandardFontResolver({ loadAsset: asset => loadFontAsset(asset.url) });
   const originalFetch = globalThis.fetch; let browserAssetReads = 0, type1Services, type1Session, type1Parser;
   globalThis.fetch = async (input, options) => {
@@ -288,11 +292,12 @@ try {
     type1Parser = await openPdf({ kind: "bytes", bytes: type1Bytes }, { missingFontResolver });
     const initial = await type1Parser.compileVectorPage(0, { optimization: "none" });
     assert(initial.textIndex.pages[0].text.includes("Original Helvetica"));
+    const initialAssetReads = browserAssetReads;
     type1Services = await createEditorAppServices({ sourcePdf: type1Bytes, loadFontAsset, onDiagnostic: diagnostic => type1Diagnostics.push(diagnostic) });
     type1Session = await openEditorSession(initial, type1Services.sessionOptions);
     type1Session.setFieldValue("Text", "B");
     const modified = await type1Session.getScene();
-    assert(browserAssetReads > 0, "browser-style standard font delivery exercises source Type1 AP synthesis instead of its embedded fallback");
+    assert(browserAssetReads > initialAssetReads, "browser-style standard font delivery exercises source Type1 AP synthesis instead of its embedded fallback");
     assert(customAssetLoads.some(path => path.endsWith("LiberationSans-Regular.ttf")) && customAssetLoads.some(path => path.endsWith("LiberationSerif-Regular.ttf")),
       "the custom asset loader supplies both original body and regenerated field substitutes");
     for (const baseFont of ["Helvetica", "Times-Roman"]) assert(type1Diagnostics.some(diagnostic => diagnostic.code === "font.missing-substituted" && diagnostic.details?.baseFont === baseFont),
