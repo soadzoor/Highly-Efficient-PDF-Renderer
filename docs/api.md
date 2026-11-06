@@ -216,6 +216,11 @@ editable PDF exports. If widgets share a field value, any locked widget protects
 the whole shared value. Reopening and unlocking restores fillability unless the
 field was explicitly read-only. Number values must be finite; dates use `YYYY-MM-DD`.
 
+Imported text/choice fields support `updateAnnotation(annotationId, { fontSize })`,
+with `0` requesting automatic fitting. This updates all widgets sharing that
+field name without changing their bounds or values, respects editing locks,
+and participates in undo, recovery and editable PDF output.
+
 PDF saves create standard AcroForm field trees and widget appearances, embedding
 the actual font programs for later typing. Text-like fields retain an inert
 `/HEPRInputType` hint for HEPR's native controls; other PDF readers can edit the

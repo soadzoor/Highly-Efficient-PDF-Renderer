@@ -54,6 +54,14 @@ for (const tool of ["select", "pan", "form", "text", "rectangle", "ellipse", "li
   assert.equal(shapes.some(item => item.class === "hepr-editor-selection-hit"), tool === "select", `${tool}: the move surface exists only for Select`);
   if (tool === "select") assert.deepEqual(handles.map(item => item["data-handle"]), ["nw", "ne", "se", "sw", "rotate"]);
 }
+geometry.tool = "select"; geometry.updateGeometry();
+const unlockedOutline = shapes.find(item => item.tag === "polygon" && item.class === "hepr-editor-selection").points;
+geometry.selectionLocked = () => true; geometry.updateGeometry();
+assert.equal(shapes.find(item => item.tag === "polygon" && item.class === "hepr-editor-selection").points, unlockedOutline,
+  "locking preserves the selection outline's exact projected rectangle");
+assert.equal(shapes.some(item => item["data-handle"]), false, "locked selections have no resize or rotation handles");
+assert.equal(shapes.some(item => item.class === "hepr-editor-selection-hit"), false, "locked selections have no move surface");
+geometry.selectionLocked = () => false;
 geometry.tool = "select"; geometry.running = true; geometry.updateGeometry();
 assert.equal(shapes.filter(item => item["data-handle"]).length, 0, "busy operations hide nonfunctional transform handles");
 assert.equal(shapes.some(item => item.class === "hepr-editor-selection"), false);

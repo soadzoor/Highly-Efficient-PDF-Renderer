@@ -193,7 +193,7 @@ export interface EditorSourceEdit {
   /** Synthetic source-glyph emphasis. Off restores the original source appearance. */
   textStyle?: { bold?: boolean; italic?: boolean; boldWidth?: number };
 }
-export interface EditorAnnotationEdit { id: string; transform: EditorMatrix; deleted: boolean; contents?: string; author?: string }
+export interface EditorAnnotationEdit { id: string; transform: EditorMatrix; deleted: boolean; contents?: string; author?: string; fontSize?: number }
 export type EditorObjectInput = EditorObject extends infer T ? T extends EditorObject
   ? Omit<T, "id" | "transform"> & { id?: string; transform?: EditorMatrix } : never : never;
 
@@ -353,8 +353,8 @@ export interface EditorSession {
   getFieldValues(): ReadonlyMap<string, EditorFieldValue>;
   getSourceEdits(): readonly EditorSourceEdit[];
   getAnnotationEdits(): readonly EditorAnnotationEdit[];
-  /** Edit inert annotation discussion metadata without replacing its appearance. */
-  updateAnnotation(id: string, patch: { contents?: string; author?: string }): void;
+  /** Edit discussion metadata or the font size of a text/choice form field (0 = automatic). */
+  updateAnnotation(id: string, patch: { contents?: string; author?: string; fontSize?: number }): void;
   getLayers(): readonly OptionalContentGroup[];
   getLayerOrder(): readonly OptionalContentOrderNode[];
   createLayer(options: EditorLayerCreateOptions): string;

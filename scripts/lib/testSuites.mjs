@@ -36,6 +36,7 @@ export const fastTests = [
   "editor-text-editing-metrics",
   "editor-text-formatting",
   "editor-font-size-ui",
+  "editor-field-font-size",
   "editor-text-resize-controls",
   "editor-source-text-style",
   "editor-color-commit",

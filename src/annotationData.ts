@@ -43,6 +43,8 @@ export interface AnnotationFieldTextStyle {
   fontFamily: string;
   /** A zero point size requests automatic field text fitting. */
   fontSize: number;
+  /** Size of the current stored appearance, before editing its value. */
+  appearanceFontSize?: number;
   fontWeight: number;
   fontStyle: "normal" | "italic";
   color: readonly number[];
@@ -308,6 +310,7 @@ export function validateAnnotations(value: unknown, options: {
         array(style.color, 3);
         if ((style.color as number[]).length !== 3 || (style.color as number[]).some(n => n < 0 || n > 1)) fail();
         if (style.contentInset !== undefined && (typeof style.contentInset !== "number" || !Number.isFinite(style.contentInset) || style.contentInset < 0)) fail();
+        if (style.appearanceFontSize !== undefined && (typeof style.appearanceFontSize !== "number" || !Number.isFinite(style.appearanceFontSize) || style.appearanceFontSize <= 0)) fail();
       }
       if (field.options !== undefined) {
         if (!Array.isArray(field.options)) fail();

@@ -171,6 +171,11 @@ keyboard interaction. Typing uses the PDF's
 font and point size, with automatic sizing similar to Chrome/PDFium. Unfocused
 controls retain the document's appearance, including checkmarks in radio groups;
 keyboard focus remains visible. PDF actions and JavaScript are not executed.
+Select a text or choice field to change **Size**, or focus it in Fill and use
+the same Size control without losing its selection. The stored appearance's
+size is used when entering a field, including when its default typing size is
+different. Size edits keep the field rectangle and value, apply to shared
+widgets, support Undo/Redo and recovery, and persist in editable PDF output.
 After a value changes, the native control keeps the current value visible even
 after losing focus, until its matching regenerated appearance is drawn. This
 also covers shared widgets and cleared fields, so the previous value does not

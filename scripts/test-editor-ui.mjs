@@ -569,8 +569,8 @@ try {
   assert.equal(registeredFaces[0].family, typingFont.id); assert.equal(registeredFaces[0].descriptors.ascentOverride, undefined, "form fonts keep their original metrics");
   await fontHost.activateFont(typingFont, 1.5); assert.equal(fontLoads, 3, "custom textbox spacing gets matching editing metrics");
   assert.equal(matchingFace(textMetrics.editorTextEditingFamily(typingFont.id, 1.5)), registeredFaces[2], "the same safe family also matches the toolbar fontName command");
-  const paintedControl = { tagName: "INPUT", type: "text", dataset: { fieldId: "new-appearance" }, value: "focused draft", selectionStart: 4 };
-  const paintHost = uiContext({ fieldPaintCache: null, updateEditorFieldControlAppearance,
+  const paintedControl = { tagName: "INPUT", type: "text", style: {}, dataset: { fieldId: "new-appearance" }, value: "focused draft", selectionStart: 4 };
+  const paintHost = uiContext({ fieldPaintCache: null, updateEditorFieldControlAppearance, styleEditorFieldControl() {}, fieldControlAnnotation: annotation => annotation,
     latestScene: { annotations: [{ id: "new-appearance", hasAppearance: false, field: { value: "focused draft" } }] },
     fieldDrafts: new Map([[paintedControl, "draft"]]), getSceneAnnotationRuns: () => new Map() });
   vm.runInContext(sourceFunction(uiSource.replace(/^ {2}/gm, ""), "updateFieldPaint"), paintHost);

@@ -5,6 +5,7 @@ import { choosePdfFormAutoFontSize } from "./pdf/formAutoFontSize";
 export type EditorFieldControl = HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
 let nextChoiceList = 0;
 const measureContexts = new WeakMap<Document, CanvasRenderingContext2D | null>();
+const controlAnnotations = new WeakMap<EditorFieldControl, SceneAnnotation>();
 
 /** Match the native appearance synthesizer's PDF-local mark proportions. */
 function styleEditorButtonControl(control: HTMLInputElement, annotation: SceneAnnotation): void {
@@ -49,6 +50,7 @@ export function canEditEditorField(annotation: SceneAnnotation): boolean {
 
 /** Sizes are PDF-local units: the existing field matrix supplies zoom and UserUnit. */
 export function styleEditorFieldControl(control: EditorFieldControl, annotation: SceneAnnotation, fontFamily?: string): void {
+  controlAnnotations.set(control, annotation);
   if (control.tagName === "INPUT" && /^(checkbox|radio)$/.test((control as HTMLInputElement).type)) {
     styleEditorButtonControl(control as HTMLInputElement, annotation); return;
   }
@@ -89,7 +91,12 @@ export function styleEditorFieldControl(control: EditorFieldControl, annotation:
     }
     return !tooTall(lines);
   };
-  const size = style?.fontSize === 0 ? choosePdfFormAutoFontSize(multiline, fits) : style?.fontSize ?? 12;
+  const sourceValue = field?.value;
+  const sameValue = JSON.stringify(Array.isArray(sourceValue) ? sourceValue : String(sourceValue ?? "")) ===
+    JSON.stringify(control.tagName === "SELECT" && (control as HTMLSelectElement).multiple
+      ? Array.from((control as HTMLSelectElement).selectedOptions, option => option.value) : control.value);
+  const size = sameValue && style?.appearanceFontSize !== undefined ? style.appearanceFontSize
+    : style?.fontSize === 0 ? choosePdfFormAutoFontSize(multiline, fits) : style?.fontSize ?? 12;
   Object.assign(control.style, { fontFamily: family, fontSize: `${size}px`, fontWeight: String(weight), fontStyle: italic,
     fontSynthesis: "none", lineHeight: "1.2", textAlign: field?.alignment === 1 ? "center" : field?.alignment === 2 ? "right" : "left",
     padding: `${padding}px`, color: style ? `rgb(${style.color.map(component => Math.round(component * 255)).join(",")})` : "#111" });
@@ -224,7 +231,7 @@ export function createEditorFieldControl(document: Document, annotation: SceneAn
   input.className = "hepr-editor-field";
   if (options.usePdfAppearance) input.dataset.pdfAppearance = "true";
   styleEditorFieldControl(input, annotation);
-  input.addEventListener("input", () => styleEditorFieldControl(input, annotation, input.style.fontFamily));
-  input.addEventListener("change", () => { styleEditorFieldControl(input, annotation, input.style.fontFamily); onChange(getValue()); });
+  input.addEventListener("input", () => styleEditorFieldControl(input, controlAnnotations.get(input) ?? annotation, input.style.fontFamily));
+  input.addEventListener("change", () => { styleEditorFieldControl(input, controlAnnotations.get(input) ?? annotation, input.style.fontFamily); onChange(getValue()); });
   return input;
 }

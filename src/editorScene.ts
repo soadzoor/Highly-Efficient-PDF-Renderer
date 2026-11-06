@@ -180,13 +180,16 @@ export function editorUnionBounds(a: Bounds | null, b: Bounds): Bounds {
 
 /** Blank widgets and metadata-only annotations have no primitive ranges to edit. */
 export function bakeEditorAnnotationEdits(scene: VectorScene, edits: readonly EditorAnnotationEdit[]): VectorScene {
-  const pending = new Map(edits.filter(edit => edit.deleted || !editorMatrixIsIdentity(edit.transform) || edit.contents !== undefined || edit.author !== undefined).map(edit => [edit.id, edit]));
+  const pending = new Map(edits.filter(edit => edit.deleted || !editorMatrixIsIdentity(edit.transform) || edit.contents !== undefined || edit.author !== undefined || edit.fontSize !== undefined).map(edit => [edit.id, edit]));
   if (!pending.size || !scene.annotations) return scene;
   const transforms = new Map(annotationTransforms.get(scene));
   const sources = new Map(annotationSources.get(scene));
   const annotations = scene.annotations.flatMap(annotation => {
     const edit = pending.get(annotation.id); if (!edit) return [annotation]; if (edit.deleted) { transforms.delete(annotation.id); sources.delete(annotation.id); return []; }
-    const metadata = { ...(edit.contents === undefined ? {} : { contents: edit.contents }), ...(edit.author === undefined ? {} : { author: edit.author }) };
+    const metadata = { ...(edit.contents === undefined ? {} : { contents: edit.contents }), ...(edit.author === undefined ? {} : { author: edit.author }),
+      ...(edit.fontSize === undefined || !annotation.field ? {} : { field: { ...annotation.field, textStyle: {
+        fontFamily: "Liberation Sans", fontWeight: 400, fontStyle: "normal" as const, color: [0, 0, 0], ascent: .8, descent: -.2,
+        ...annotation.field.textStyle, appearanceFontSize: undefined, fontSize: edit.fontSize } } }) };
     if (editorMatrixIsIdentity(edit.transform)) return [{ ...annotation, ...metadata }];
     const matrix = editorMatrix(edit.transform), bounds = annotation.bounds;
     const linkQuad = annotation.subtype === "Link" && !annotation.quadPoints ? [bounds.minX, bounds.maxY, bounds.maxX, bounds.maxY, bounds.minX, bounds.minY, bounds.maxX, bounds.minY] : undefined;

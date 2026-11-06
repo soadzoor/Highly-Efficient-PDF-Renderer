@@ -7,13 +7,14 @@ import type { NativePdfDocument } from "./pdf/nativeDocument";
 import { parseNativePdfFont, type NativeMissingFontResolution, type NativeMissingFontResolver, type NativePdfFont } from "./pdf/nativeFont";
 import type { NativePdfAnnotationAppearance } from "./pdf/nativeForms";
 import { throwIfAborted, type PdfDiagnostic } from "./pdf/nativeTypes";
+import { readEditorFieldAppearanceFontSize, type EditorFieldAppearanceFrame } from "./editorFieldAppearanceFontSize";
 
 type FieldFont = Pick<AnnotationFieldTextStyle, "fontFamily" | "fontWeight" | "fontStyle" | "ascent" | "descent">;
 
 /** Resolve typing fonts only when editing, retaining font programs in the session registry. */
 export function createEditorFieldAppearanceReader(document: NativePdfDocument, fonts: EditorFontRegistry,
   missingFontResolver: NativeMissingFontResolver, onDiagnostic?: (diagnostic: PdfDiagnostic) => void): {
-    read(annotation: NativePdfAnnotationAppearance, signal?: AbortSignal): Promise<AnnotationFieldTextStyle | undefined>;
+    read(annotation: NativePdfAnnotationAppearance, signal?: AbortSignal, frame?: EditorFieldAppearanceFrame): Promise<AnnotationFieldTextStyle | undefined>;
   } {
   const cache = new WeakMap<PdfDictionary, Map<string, Promise<FieldFont>>>();
   const warning = (annotation: NativePdfAnnotationAppearance, message: string): void => onDiagnostic?.({
@@ -97,7 +98,7 @@ export function createEditorFieldAppearanceReader(document: NativePdfDocument, f
       ascent: Number.isFinite(ascent) && Number.isFinite(descent) && ascent > descent ? ascent : .8,
       descent: Number.isFinite(ascent) && Number.isFinite(descent) && ascent > descent ? descent : -.2 };
   };
-  return { async read(annotation, signal) {
+  return { async read(annotation, signal, frame) {
     throwIfAborted(signal);
     const widget = annotation.widget;
     if (!widget || !["Tx", "Ch"].includes(widget.fieldType ?? "") || !widget.defaultAppearance) return undefined;
@@ -123,7 +124,11 @@ export function createEditorFieldAppearanceReader(document: NativePdfDocument, f
       const components = appearance.color.components;
       const color = components.length === 1 ? [components[0], components[0], components[0]]
         : components.length === 4 ? convertDeviceCmykToSrgb(components[0], components[1], components[2], components[3]) : [...components];
-      return { ...font, fontSize: appearance.fontSize, color, contentInset: await contentInset(annotation, signal) };
+      let appearanceFontSize: number | undefined;
+      try { appearanceFontSize = await readEditorFieldAppearanceFontSize(document, annotation, signal, frame); }
+      catch { throwIfAborted(signal); }
+      return { ...font, fontSize: appearance.fontSize, color, contentInset: await contentInset(frame ? { ...annotation, rectangle: frame.rect } : annotation, signal),
+        ...(appearanceFontSize && Number.isFinite(appearanceFontSize) && appearanceFontSize > 0 ? { appearanceFontSize } : {}) };
     } catch (error) {
       throwIfAborted(signal);
       warning(annotation, `The field's typing style could not be recovered: ${error instanceof Error ? error.message : String(error)}`);

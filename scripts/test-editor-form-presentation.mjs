@@ -77,6 +77,13 @@ try {
     }
     assert.deepEqual(styles.get("Cmyk").color, convertDeviceCmykToSrgb(0, .5, .7, .2));
     assert.equal(styles.get("Radio"), undefined); assert.equal(missingRequests, 1, "all Times-Roman field styles share one font-resolution cache");
+    const styledWidget = widgets.find(widget => widget.widget.fullyQualifiedName === "Styled"), otherAppearance = new Map(styledWidget.dictionary);
+    otherAppearance.set("AP", new Map([["N", { kind: "stream", bytes: new TextEncoder().encode("BT /TiRo 6 Tf (A) Tj ET"), dictionary: new Map([
+      ["BBox", [0, 0, 70, 20]],
+      ["Resources", new Map([["Font", new Map([["TiRo", { kind: "ref", objectNumber: 5, generation: 0 }]])]])]
+    ]) }]]));
+    const differentUnits = await reader.read({ ...styledWidget, dictionary: otherAppearance });
+    assert(Math.abs(differentUnits.appearanceFontSize - 6) < 1e-8, "appearance size comes from PDF text operators independently of font em grids");
     assert(fonts.list().some(font => font.family === "ABCDEF+Tiny" && Buffer.from(font.bytes).equals(Buffer.from(buildTinySfnt()))), "embedded font programs are registered unchanged");
     assert(diagnostics.some(diagnostic => diagnostic.code === "font.missing-substituted"));
     await assert.rejects(reader.read(widgets[0], AbortSignal.abort()), error => error.code === "aborted");

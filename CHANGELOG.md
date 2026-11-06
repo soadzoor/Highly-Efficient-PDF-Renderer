@@ -22,6 +22,13 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
+- Keep form selection frames on the field rectangle when selected or locked,
+  including transformed fields whose clipped text extends beyond their bounds.
+- Match focused form text to its stored appearance size using PDF text operators,
+  including rendering that bakes glyph transforms into outlines. Retain field
+  selection when changing Size in Select or Fill. Preserve font-size edits
+  across shared widgets, rendering, undo/recovery and editable PDF output;
+  respect field styles and requested sizes when regenerating portable text.
 - Let auto-sized textboxes shrink below their original minimum dimensions when
   reducing the size of all their text. Release Size input focus on canvas clicks
   or Enter so arrow keys can move selected objects again.

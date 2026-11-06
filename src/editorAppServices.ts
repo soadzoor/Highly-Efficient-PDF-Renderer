@@ -92,6 +92,8 @@ export async function createEditorAppServicesFromSnapshot(options: EditorAppServ
     signal?.throwIfAborted();
     values = new Map([...values].map(([name, value]) => [name, Array.isArray(value) ? value.slice() : value]));
     const targets = (scene.annotations ?? []).filter(annotation => annotation.field?.name && values.has(annotation.field.name));
+    const fontSizes = new Map(targets.flatMap(annotation => annotation.field?.name && annotation.field.textStyle
+      ? [[annotation.field.name, annotation.field.textStyle.fontSize] as const] : []));
     const partition = new ScenePageViews(scene);
     const pages = Array.from({ length: scene.pageCount }, (_, i) => {
       const view = partition.extract(i); remapEditorPaintIdentity(scene, view.scene, view.primitives); return view.scene;
@@ -105,7 +107,7 @@ export async function createEditorAppServicesFromSnapshot(options: EditorAppServ
         let ids = requests.get(sourceIndex); if (!ids) requests.set(sourceIndex, ids = new Set()); ids.add(annotation.id);
       }
       const key = JSON.stringify([[...values].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([name, value]) => [name, typeof value, value]),
-        [...requests].sort(([a], [b]) => a - b).map(([page, ids]) => [page, [...ids].sort()])]);
+        [...requests].sort(([a], [b]) => a - b).map(([page, ids]) => [page, [...ids].sort()]), [...fontSizes].sort(([a], [b]) => a.localeCompare(b))]);
       const sourcePdf = options.sourcePdf, password = options.password;
       if (!fieldAppearanceCache || fieldAppearanceCache.key !== key || fieldAppearanceCache.sourcePdf !== sourcePdf || fieldAppearanceCache.password !== password) {
         // Cache only canonical appearances. Each consumer still applies its
@@ -116,7 +118,8 @@ export async function createEditorAppServicesFromSnapshot(options: EditorAppServ
           const document = await NativePdfDocument.open({ kind: "bytes", bytes: sourcePdf }, { password, signal: sharedSignal });
           let bytes: Uint8Array;
           try { const writer = new NativePdfWriter(document); await applyEditorPdfFields(writer, capturedValues, fonts,
-            { signal: sharedSignal, onWarning: diagnostic, allowEditorLockReadOnly: true }); bytes = await writer.save(sharedSignal); }
+            { signal: sharedSignal, onWarning: diagnostic, allowEditorLockReadOnly: true, fontSizes,
+              missingFontResolver: await getMissingFontResolver() }); bytes = await writer.save(sharedSignal); }
           finally { await document.close(); }
           // Regenerated appearances can still reference nonembedded source fonts.
           const parser = await openPdf({ kind: "bytes", bytes }, { password, signal: sharedSignal,
@@ -156,6 +159,7 @@ export async function createEditorAppServicesFromSnapshot(options: EditorAppServ
         const delta = getEditorAnnotationFrameTransform(scene, annotation.id) ?? [1, 0, 0, 1, 0, 0];
         const field = annotation.field!, value = values.get(field.name!)!, r = source.bounds;
         const x = r.minX - origin[0], y = r.minY - origin[1], width = r.maxX - r.minX, height = r.maxY - r.minY;
+        let placement = multiplyEditorMatrices(delta, [1, 0, 0, 1, ...origin]);
         let object: EditorObject;
         if (field.type === "Btn") {
           const selected = value === true || String(value) === (field.onValue ?? "Yes");
@@ -163,22 +167,38 @@ export async function createEditorAppServicesFromSnapshot(options: EditorAppServ
           object = { kind: "shape", shape: field.flags & (1 << 15) ? "ellipse" : "line", id: annotation.id, pageIndex: index,
             transform: [1, 0, 0, 1, 0, 0], x: x + width * .2, y: y + height * .2, width: width * .6, height: height * .6,
             fill: 0, color: 0, strokeWidth: 1 };
-        } else object = { kind: "text", id: annotation.id, pageIndex: index, transform: [1, 0, 0, 1, 0, 0],
-          x: x + 2, y: y + 2, width: Math.max(1, width - 4), height: Math.max(1, height - 4),
-          text: Array.isArray(value) ? value.join("\n") : String(value ?? ""), fontSize: Math.min(12, height * .6) };
-        const geometry = await compileObject(object, signal);
+        } else {
+          const style = field.textStyle, inset = style?.contentInset ?? Math.max(1, (annotation.border?.width ?? 0) + 1);
+          const rect = source.pdfGeometry?.rect, mapping = scene.pdfPages?.find(page => page.pageIndex === index)?.pdfToScene;
+          const nativePlane = rect && mapping;
+          if (nativePlane) placement = multiplyEditorMatrices(delta, multiplyEditorMatrices(mapping, [1, 0, 0, 1, Math.min(rect[0], rect[2]), Math.min(rect[1], rect[3])]));
+          const textWidth = nativePlane ? Math.abs(rect[2] - rect[0]) : width, textHeight = nativePlane ? Math.abs(rect[3] - rect[1]) : height;
+          object = { kind: "text", id: annotation.id, pageIndex: index, transform: [1, 0, 0, 1, 0, 0],
+            x: (nativePlane ? 0 : x) + inset, y: (nativePlane ? 0 : y) + inset,
+            width: Math.max(1, textWidth - inset * 2), height: Math.max(1, textHeight - inset * 2),
+            text: Array.isArray(value) ? value.join("\n") : String(value ?? ""), fontSize: style?.fontSize || 12,
+            fontFamily: style?.fontFamily, fontWeight: style?.fontWeight, fontStyle: style?.fontStyle,
+            color: style?.color ? [style.color[0], style.color[1], style.color[2]] : undefined,
+            align: field.alignment === 1 ? "center" : field.alignment === 2 ? "right" : "left" };
+        }
+        const geometry = await compileObject(object, signal, object.kind === "text"
+          ? { wrap: Boolean(field.flags & 4096), verticalAlignment: field.flags & 4096 ? "top" : "middle", autoFontSize: field.textStyle?.fontSize === 0 } : undefined);
         const layers = new AnnotationLayerBuilder(geometry.optionalContent, [...(geometry.optionalContent?.conditions ?? [])]);
         geometry.drawRuns = (geometry.drawRuns ?? defaultVectorDrawRuns(geometry)).map(run => ({ ...run,
           optionalContent: layers.condition(run.optionalContent, annotation.id) }));
         geometry.optionalContent = layers.build();
-        additions[index].set(annotation.id, transformWholeEditorScene(geometry, multiplyEditorMatrices(delta, [1, 0, 0, 1, ...origin]), signal));
+        additions[index].set(annotation.id, transformWholeEditorScene(geometry, placement, signal));
       }
     }
     const preserveNonText = !options.sourcePdf ? new Set(targets.filter(annotation => annotation.field?.type === "Tx").map(annotation => annotation.id)) : undefined;
     const updatedPages = pages.map((page, index) => replaceEditorFieldAppearances(page, additions[index], { preserveNonText, signal }));
     const result = composeOverlappingVectorScenes(updatedPages); composeEditorPaintIdentity(updatedPages, result);
-    result.annotations = scene.annotations?.map(annotation => annotation.field?.name && values.has(annotation.field.name)
-      ? { ...annotation, field: { ...annotation.field, value: values.get(annotation.field.name)! } } : annotation);
+    result.annotations = scene.annotations?.map(annotation => {
+      if (!annotation.field?.name || !values.has(annotation.field.name)) return annotation;
+      const { appearanceFontSize, ...style } = annotation.field.textStyle ?? {};
+      return { ...annotation, field: { ...annotation.field, value: values.get(annotation.field.name)!,
+        ...(annotation.field.textStyle ? { textStyle: style as typeof annotation.field.textStyle } : {}) } };
+    });
     result.pdfPages = scene.pdfPages; result.sourcePdfByteLength = scene.sourcePdfByteLength; result.pagesPerRow = scene.pagesPerRow;
     retainEditorAnnotationPlacements(scene, result);
     return result;
@@ -234,7 +254,9 @@ export async function createEditorAppServicesFromSnapshot(options: EditorAppServ
             const lockState = await readEditorPdfFieldLockState(document, annotation.dictionary, signal);
             if (lockState.readOnlyFromLock) { field = { ...field, flags: field.flags - (field.flags & 1) }; fields.set(annotation.id, field); }
             const frame = await readEditorFieldFrame(document, annotation, signal);
-            const textStyle = await styles.read(frame ? { ...annotation, rectangle: frame.rect } : annotation, signal);
+            const textStyle = await styles.read(annotation, signal, frame ?? undefined);
+            // A stale fixed /DA must not change the visible size on first typing.
+            if (textStyle && textStyle.fontSize > 0 && textStyle.appearanceFontSize !== undefined) textStyle.fontSize = textStyle.appearanceFontSize;
             if (field && textStyle) fields.set(annotation.id, { ...field, textStyle });
             if (frame) frames.set(annotation.id, frame);
             options.onPrepareProgress?.((completedPages + (index + 1) / widgets.length) / sourcePages.size);

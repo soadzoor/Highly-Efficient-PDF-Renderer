@@ -294,22 +294,37 @@ function decorateFieldAppearance(writer: NativePdfWriter, annotation: NativePdfA
   ])));
 }
 
+function sourceFieldValue(value: PdfValue | undefined): EditorFieldValue {
+  if (isPdfString(value)) return documentText(value.bytes);
+  if (isPdfName(value)) return value.value;
+  if (Array.isArray(value)) return value.map(item => String(sourceFieldValue(item) ?? ""));
+  return null;
+}
+
 /** Apply values and explicit appearances without touching unrelated PDF objects. */
 export async function applyEditorPdfFields(writer: NativePdfWriter, values: ReadonlyMap<string, EditorFieldValue>,
   fonts: EditorFontRegistry, options: { signal?: AbortSignal; onWarning?: (message: string) => void; onProgress?: LoadProgressCallback;
+    fontSizes?: ReadonlyMap<string, number>;
+    missingFontResolver?: NativeMissingFontResolver;
     /** Editor sessions enforce object locks separately and can unlock their own synthesized ReadOnly. */
     allowEditorLockReadOnly?: boolean } = {}): Promise<void> {
   const progress = createLoadProgressReporter(options.onProgress);
   progress.report(0, { stage: "compile", sourceType: "pdf", unit: "sections", processed: 0, total: values.size });
-  if (!values.size) { progress.complete({ sourceType: "pdf", unit: "sections", processed: 0, total: 0 }); return; }
+  if (!values.size && !options.fontSizes?.size) { progress.complete({ sourceType: "pdf", unit: "sections", processed: 0, total: 0 }); return; }
   const document = writer.document, optionalContent = await createNativeOptionalContentRegistry(document, { signal: options.signal });
   const registry = new NativePdfFormAppearanceRegistry(document, { optionalContent });
-  const synthesizer = new NativePdfAppearanceSynthesizer(document, { missingFontResolver: createBundledStandardFontResolver(), optionalContent });
+  const synthesizer = new NativePdfAppearanceSynthesizer(document, { missingFontResolver: options.missingFontResolver ?? createBundledStandardFontResolver(), optionalContent });
   const changedOwners = new Map<PdfDictionary, { dictionary: PdfDictionary; ref: PdfRef | null }>();
   const directReplacements = new Map<PdfDictionary, PdfDictionary>();
   const found = new Set<string>();
   const annotations = [];
   for (const page of document.pages) annotations.push(...await registry.listPageAnnotations(page.sourcePageIndex, options.signal));
+  const updates = new Map(values);
+  for (const annotation of annotations) {
+    const field = annotation.widget, name = field?.fullyQualifiedName;
+    if (name && options.fontSizes?.has(name) && !updates.has(name)) updates.set(name, sourceFieldValue(field?.value));
+  }
+  values = updates;
   const buttonStates = new Map<typeof annotations[number], { normal: PdfDictionary | undefined; onValue: string }>();
   const buttonGroups = new Map<string, typeof annotations>();
   const targets = annotations.filter(annotation => annotation.widget?.fullyQualifiedName && values.has(annotation.widget.fullyQualifiedName));
@@ -335,12 +350,12 @@ export async function applyEditorPdfFields(writer: NativePdfWriter, values: Read
     buttonValues.set(name, selected);
   }
   for (const annotation of annotations) {
-    options.signal?.throwIfAborted(); const field = annotation.widget; const name = field?.fullyQualifiedName;
+    options.signal?.throwIfAborted(); let field = annotation.widget; const name = field?.fullyQualifiedName;
     if (!field || !name || !values.has(name)) continue;
     progress.report(processed / Math.max(1, targets.length), { stage: field.fieldType === "Tx" ? "pdf-text" : "compile",
       sourceType: "pdf", unit: "sections", processed, total: targets.length, sourcePageIndex: annotation.pageIndex, sourcePageCount: document.pages.length });
     found.add(name);
-    if (field.fieldFlags & 1 && !(options.allowEditorLockReadOnly &&
+    if (field.fieldFlags & 1 && !(options.fontSizes?.has(name) && JSON.stringify(values.get(name)) === JSON.stringify(sourceFieldValue(field.value))) && !(options.allowEditorLockReadOnly &&
       (await readEditorPdfFieldLockState(document, annotation.dictionary, options.signal)).readOnlyFromLock)) throw new Error(`Field ${name} is read-only.`);
     if (!["Tx", "Ch", "Btn"].includes(field.fieldType ?? "") || (field.fieldType === "Btn" && (field.fieldFlags & (1 << 16)))) {
       throw new Error(`Field ${name} is not a fillable text, choice, checkbox or radio field.`);
@@ -360,6 +375,18 @@ export async function applyEditorPdfFields(writer: NativePdfWriter, values: Read
       if (!ownerRef) directReplacements.set(owner, changed.dictionary);
     }
     const widget: PdfDictionary = owner === annotation.dictionary ? changed.dictionary : new Map(annotation.dictionary);
+    const fontSize = options.fontSizes?.get(name);
+    if (fontSize !== undefined) {
+      if (!Number.isFinite(fontSize) || fontSize < 0 || !["Tx", "Ch"].includes(field.fieldType ?? "")) throw new TypeError("Invalid form field font size.");
+      const appearance = field.defaultAppearance ? parseDefaultAppearance(field.defaultAppearance.bytes, annotation)
+        : { fontResourceName: "Helv", color: { components: [0] } };
+      const resource = new TextDecoder().decode(serializePdfValue(pdfNameValue(appearance.fontResourceName ?? "Helv")));
+      const color = appearance.color.components;
+      const defaultAppearance = { kind: "string" as const, hex: true, bytes: new TextEncoder().encode(
+        `${resource} ${pdfNumberValue(fontSize)} Tf ${color.map(pdfNumberValue).join(" ")} ${color.length === 1 ? "g" : color.length === 4 ? "k" : "rg"}`) };
+      changed.dictionary.set("DA", defaultAppearance); widget.set("DA", defaultAppearance);
+      field = { ...field, defaultAppearance };
+    }
     const rawAP = await document.resolveValue(widget.get("AP"), options.signal);
     const fieldFrame = await readEditorFieldFrame(document, annotation, options.signal);
     const logicalAnnotation = fieldFrame ? { ...annotation, rectangle: fieldFrame.rect } : annotation;
@@ -429,16 +456,18 @@ export async function applyEditorPdfFields(writer: NativePdfWriter, values: Read
         options.signal?.throwIfAborted();
         const [x0, y0, x1, y1] = logicalAnnotation.rectangle; const width = Math.abs(x1 - x0), height = Math.abs(y1 - y0);
         const selected = Array.isArray(value) ? value.join("\n") : String(value ?? "");
-        let color: EditorTextObject["color"] = 0;
+        let color: EditorTextObject["color"] = 0, fontSize = 12, autoFontSize = false;
         if (field.defaultAppearance) try {
-          const components = parseDefaultAppearance(field.defaultAppearance.bytes, annotation).color.components;
+          const appearance = parseDefaultAppearance(field.defaultAppearance.bytes, annotation), components = appearance.color.components;
+          fontSize = appearance.fontSize || 12; autoFontSize = appearance.fontSize === 0;
           color = components.length === 1 ? [components[0], components[0], components[0]] : components.length === 3
             ? [components[0], components[1], components[2]] : convertDeviceCmykToSrgb(components[0], components[1], components[2], components[3]);
         } catch { /* An invalid DA still permits a readable portable appearance. */ }
         const text: EditorTextObject = { id: name, kind: "text", pageIndex: 0, transform: [1, 0, 0, 1, 0, 0],
           x: 2, y: 2, width: Math.max(1, width - 4), height: Math.max(1, height - 4), text: selected, color,
-          fontSize: Math.min(12, Math.max(1, height * .6)), align: field.quadding === 1 ? "center" : field.quadding === 2 ? "right" : "left" };
-        const imported = await importEditorPdfPage(await editorTextPdf(text, fonts, options.signal), writer, options.signal);
+          fontSize, align: field.quadding === 1 ? "center" : field.quadding === 2 ? "right" : "left" };
+        const imported = await importEditorPdfPage(await editorTextPdf(text, fonts, options.signal, { autoFontSize,
+          wrap: Boolean(field.fieldFlags & 4096), verticalAlignment: field.fieldFlags & 4096 ? "top" : "middle" }), writer, options.signal);
         imported.form.set("BBox", [0, 0, width, height]);
         const appearance = writer.add(pdfStreamValue(imported.content, imported.form));
         const form = { bbox: [0, 0, width, height] as const, matrix: FIELD_IDENTITY };
@@ -664,8 +693,14 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
     const annotationEdits = new Map(session.getAnnotationEdits().map(edit => [edit.id, edit]));
     const sourceFieldNames = new Set(session.sourceScene.annotations?.flatMap(annotation => annotation.field?.name &&
       !annotationEdits.get(annotation.id)?.deleted ? [annotation.field.name] : []));
-    await applyEditorPdfFields(writer, new Map([...session.getFieldValues()].filter(([name]) => sourceFieldNames.has(name))),
-      services.fonts, { ...childOptions(.05, .25), allowEditorLockReadOnly: true });
+    const fieldValues = session.getFieldValues();
+    const fontSizes = new Map(session.sourceScene.annotations?.flatMap(annotation => {
+      const edit = annotationEdits.get(annotation.id);
+      const name = annotation.field?.name, size = edit?.fontSize ?? (name && fieldValues.has(name) ? annotation.field?.textStyle?.fontSize : undefined);
+      return name && size !== undefined && !edit?.deleted ? [[name, size] as const] : [];
+    }));
+    await applyEditorPdfFields(writer, new Map([...fieldValues].filter(([name]) => sourceFieldNames.has(name))),
+      services.fonts, { ...childOptions(.05, .25), allowEditorLockReadOnly: true, fontSizes, missingFontResolver: services.missingFontResolver });
     const layerEdits = session.getLayerEdits();
     const objectOrderChanged = layerEdits.objectOrderChanged === true;
     const paintOrderChanged = objectOrderChanged || layerEdits.stackingChanged;

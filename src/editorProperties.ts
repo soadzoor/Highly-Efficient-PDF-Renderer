@@ -19,6 +19,8 @@ export function editorSelectionLeaves(session: EditorSession, ids = session.getS
 export function editorSupportsAppearance(object: EditorObject, property: EditorAppearanceProperty, session?: EditorSession): boolean {
   if (object.kind === "group") return false;
   if (object.kind === "source") {
+    if (property === "fontSize") return !object.isClone && Boolean(object.annotationId && session?.sourceScene.annotations?.some(annotation =>
+      annotation.id === object.annotationId && ["Tx", "Ch"].includes(annotation.field?.type ?? "")));
     if (property === "fontWeight" || property === "fontStyle") return !object.isClone && object.primitives.length > 0 && object.primitives.every(ref => ref.kind === "text");
     if (property !== "color" && property !== "fill") return false;
     return session ? session.getObjectPaintColors(object.id)[property].length > 0 : property === "color" ? object.primitives.some(ref => ref.kind !== "raster")
@@ -44,6 +46,11 @@ export function editorPropertyColor(value: unknown): string {
 export function editorPropertyState(session: EditorSession, property: EditorAppearanceProperty, ids = session.getSelection()) {
   const leaves = editorSelectionLeaves(session, ids), supported = leaves.filter(object => !session.isObjectLocked?.(object.id) && editorSupportsAppearance(object, property, session));
   const fallback = (object: EditorObject): unknown => {
+    if (property === "fontSize" && object.kind === "source") {
+      const field = session.sourceScene.annotations?.find(annotation => annotation.id === object.annotationId)?.field, style = field?.textStyle;
+      return session.getAnnotationEdits().find(edit => edit.id === object.annotationId)?.fontSize
+        ?? (field?.name && session.getFieldValues().has(field.name) ? undefined : style?.appearanceFontSize) ?? style?.fontSize ?? 12;
+    }
     const value = (object as unknown as Record<string, unknown>)[property];
     if (property === "color") return editorPropertyColor(value);
     if (property === "fill") return value == null ? null : editorPropertyColor(value);
@@ -85,7 +92,15 @@ export function applyEditorPropertyPatch(session: EditorSession, patch: Partial<
       ...bounds,
       ...(object.runs ? { runs: object.runs.map(run => ({ ...run, ...Object.fromEntries(Object.entries(supported).filter(([key]) => key !== "align")) })) } : {}) } : supported }];
   });
-  if (updates.length) session.transaction("Change appearance", () => { for (const update of updates) session.updateObject(update.id, update.patch); });
+  if (updates.length) session.transaction("Change appearance", () => { for (const update of updates) {
+    const object = session.getObject(update.id);
+    if (object.kind === "source" && object.annotationId && "fontSize" in update.patch) {
+      const { fontSize, ...rest } = update.patch;
+      if (typeof fontSize !== "number") throw new TypeError("A form font size must be a number.");
+      session.updateAnnotation(object.annotationId, { fontSize });
+      if (Object.keys(rest).length) session.updateObject(update.id, rest);
+    } else session.updateObject(update.id, update.patch);
+  } });
   return updates.length;
 }
 

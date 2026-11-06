@@ -305,7 +305,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     style: name => query<HTMLButtonElement>(`[data-style="${name}"]`), focused: () => document.activeElement,
     note: query("[data-properties-note]") });
   function updateAppearanceControls(): void {
-    appearanceControls.refresh(activeText ? "draft" : tool === "select" && session.getSelection().length ? "selection" : "defaults");
+    appearanceControls.refresh(activeText ? "draft" : (tool === "select" || tool === "form") && session.getSelection().length ? "selection" : "defaults");
     if (tool === "select-text" && !activeText) for (const name of ["bold", "italic", "underline", "strikethrough", "highlight"] as const) {
       const state = selectedTextStyleState(name), button = query<HTMLButtonElement>(`[data-style="${name}"]`);
       button.disabled = !state.supported; button.setAttribute("aria-pressed", state.mixed ? "mixed" : String(state.value));
@@ -1008,6 +1008,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if (input) {
         input.disabled = fieldValueLocked(annotation.id);
         input.hidden = Boolean(host.subscribeToFrames);
+        input.addEventListener("focus", () => { session.select([fieldObjectOwner(annotation.id)]); updateAppearanceControls(); });
         input.addEventListener("input", () => { updateFieldPaint(input); recovery?.draftChanged(); });
         fieldDrafts.set(input, editorFieldDraftSignature(input)); fields.append(input);
         const choices = createEditorFieldOptions(document, annotation, input); if (choices) fields.append(choices);
@@ -1026,6 +1027,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       annotations: new Map(latestScene.annotations?.map(annotation => [annotation.id, annotation])), appearances: getSceneAnnotationRuns(latestScene) };
     for (const control of changedControl ? [changedControl] : fieldDrafts.keys()) {
       const annotation = fieldPaintCache.annotations.get(control.dataset.fieldId!);
+      if (annotation) styleEditorFieldControl(control, fieldControlAnnotation(annotation), control.style.fontFamily);
       updateEditorFieldControlAppearance(control, annotation, Boolean(annotation?.hasAppearance || fieldPaintCache.appearances.get(control.dataset.fieldId!)?.length));
     }
   }
@@ -1071,6 +1073,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   function activateField(id: string): void {
     setTool("form");
+    session.select([fieldObjectOwner(id)]);
+    updateAppearanceControls();
     pendingFieldFocus = { id, sourceScene: session.sourceScene };
     updateGeometry(); host.requestFrame?.();
   }
@@ -2219,7 +2223,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       if (input.dataset.prop === "align") activeText.element.style.textAlign = input.value;
       if (activeText.autoSize) { updateTextAutoSize(activeText); updateGeometry(); }
       recovery?.draftChanged();
-    } else if (tool === "select" || targetSelection) {
+    } else if (tool === "select" || tool === "form" && input.dataset.prop === "font-size" || targetSelection) {
       const selection = targetSelection ?? (input.dataset.prop === "fill-enabled" ? editorFillSelection(session) : session.getSelection());
       if (!selection.length || input.value === "__mixed__") return;
       const fillEnabled = targetFillEnabled ?? property("fill-enabled").checked, fillColor = input.dataset.prop === "fill" ? input.value : property("fill").value;

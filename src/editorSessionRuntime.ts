@@ -250,7 +250,8 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       const primitives: PrimitiveRef[] = [];
       for (const run of getSceneAnnotationRuns(sourceScene).get(annotation.id) ?? []) for (let index = run.first; index < run.first + run.count; index++) primitives.push({ kind: run.kind, index });
       let bounds: Bounds | null = null; for (const ref of primitives) bounds = editorUnionBounds(bounds, getScenePrimitive(sourceScene, ref).bounds);
-      object = { id, kind: "source", pageIndex: annotation.pageIndex, transform: EDITOR_IDENTITY, primitives, bounds: bounds ?? annotation.bounds, annotationId: annotation.id };
+      object = { id, kind: "source", pageIndex: annotation.pageIndex, transform: EDITOR_IDENTITY, primitives,
+        bounds: annotation.subtype === "Widget" ? annotation.bounds : bounds ?? annotation.bounds, annotationId: annotation.id };
       sourceObjects.set(id, object); return object;
     }
     const match = /^source:(stroke|fill|text|raster|gradient-fill|gradient-stroke):(\d+)$/.exec(id);
@@ -330,8 +331,22 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
   const objectDeleted = (object: EditorObject): boolean => object.kind === "source" && !state.objects.has(object.id) &&
     (!!(object.annotationId && state.annotationEdits.get(object.annotationId)?.deleted) ||
       (object.primitives.length > 0 && object.primitives.every(ref => state.edits.get(editorRefKey(ref))?.deleted)));
+  const sourceWidgetFrame = (object: EditorSourceObject, snapshot = state): EditorSelectionFrame | null => {
+    if (!object.annotationId || snapshot.objects.has(object.id)) return null;
+    const annotation = sourceScene.annotations?.find(annotation => annotation.id === object.annotationId);
+    if (annotation?.subtype !== "Widget") return null;
+    const source = getEditorAnnotationSource(sourceScene, annotation.id) ?? annotation;
+    const delta = snapshot.annotationEdits.get(annotation.id)?.transform ?? EDITOR_IDENTITY;
+    const transform = multiplyEditorMatrices(delta, getEditorAnnotationFrameTransform(sourceScene, annotation.id) ?? EDITOR_IDENTITY);
+    const rect = source.pdfGeometry?.rect, mapping = sourceScene.pdfPages?.find(page => page.pageIndex === annotation.pageIndex)?.pdfToScene;
+    if (!rect || !mapping) return { bounds: source.bounds, transform, pageIndex: annotation.pageIndex };
+    return { bounds: { minX: Math.min(rect[0], rect[2]), minY: Math.min(rect[1], rect[3]), maxX: Math.max(rect[0], rect[2]), maxY: Math.max(rect[1], rect[3]) },
+      transform: multiplyEditorMatrices(transform, mapping), pageIndex: annotation.pageIndex };
+  };
   const sourceBounds = (object: EditorSourceObject, snapshot = state): Bounds => {
     if (capturedSource(object)) return editorTransformBounds(object.bounds, object.transform);
+    const widget = sourceWidgetFrame(object, snapshot);
+    if (widget) return editorTransformBounds(widget.bounds, widget.transform);
     if (!object.primitives.length) return editorTransformBounds(object.bounds, snapshot.objects.has(object.id) ? object.transform :
       (object.annotationId ? snapshot.annotationEdits.get(object.annotationId)?.transform : undefined) ?? EDITOR_IDENTITY);
     let box: Bounds | null = null;
@@ -387,6 +402,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     if (object.kind === "source") {
       const captured = capturedSource(object);
       if (captured) return { ...captured.frame, pageIndex: object.pageIndex, transform: multiplyEditorMatrices(object.transform, captured.frame.transform) };
+      const widget = sourceWidgetFrame(object, snapshot); if (widget) return widget;
       if (snapshot.objects.has(id)) return { bounds: object.bounds, transform: object.transform, pageIndex: object.pageIndex };
       if (!object.primitives.length) return { bounds: object.bounds,
         transform: object.annotationId ? snapshot.annotationEdits.get(object.annotationId)?.transform ?? EDITOR_IDENTITY : EDITOR_IDENTITY, pageIndex: object.pageIndex };
@@ -465,7 +481,9 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       if (!sourceObjects.has(id)) {
         const primitives = (getSceneAnnotationRuns(sourceScene).get(info.annotationId) ?? []).flatMap(run => Array.from({ length: run.count }, (_, index) => ({ kind: run.kind, index: run.first + index })));
         let bounds: Bounds | null = null; for (const primitive of primitives) bounds = editorUnionBounds(bounds, getScenePrimitive(sourceScene, primitive).bounds);
-        sourceObjects.set(id, { id, kind: "source", pageIndex: info.pageIndex ?? 0, transform: EDITOR_IDENTITY, primitives: primitives.length ? primitives : [ref], bounds: bounds ?? info.bounds, annotationId: info.annotationId });
+        const annotation = sourceScene.annotations?.find(annotation => annotation.id === info.annotationId);
+        sourceObjects.set(id, { id, kind: "source", pageIndex: info.pageIndex ?? 0, transform: EDITOR_IDENTITY, primitives: primitives.length ? primitives : [ref],
+          bounds: annotation?.subtype === "Widget" ? annotation.bounds : bounds ?? info.bounds, annotationId: info.annotationId });
       }
       return id;
     }
@@ -837,6 +855,8 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     for (const [key, edit] of candidate.annotationEdits) {
       if (key !== edit.id || !sourceScene.annotations?.some(annotation => annotation.id === edit.id)) throw new TypeError("Unknown recovered annotation."); editorMatrix(edit.transform);
       if (typeof edit.deleted !== "boolean" || edit.contents !== undefined && typeof edit.contents !== "string" || edit.author !== undefined && typeof edit.author !== "string") throw new TypeError("Invalid recovered annotation metadata.");
+      if (edit.fontSize !== undefined && (!Number.isFinite(edit.fontSize) || edit.fontSize < 0 ||
+          !sourceScene.annotations?.some(annotation => annotation.id === edit.id && annotation.subtype === "Widget" && annotation.field?.name && ["Tx", "Ch"].includes(annotation.field.type ?? "")))) throw new TypeError("Invalid recovered form font size.");
     }
     for (const [name, value] of candidate.fields) {
       if (typeof name !== "string" || !sourceScene.annotations?.some(annotation => annotation.field?.name === name) || !(value === null || typeof value === "string" || typeof value === "boolean" || typeof value === "number" && Number.isFinite(value) || Array.isArray(value) && value.every(item => typeof item === "string"))) throw new TypeError("Invalid recovered form value.");
@@ -1363,10 +1383,18 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       assertUnlocked([`annotation:${id}`]);
       if (patch.contents !== undefined && typeof patch.contents !== "string" || patch.author !== undefined && typeof patch.author !== "string") throw new TypeError("Annotation contents and author must be text.");
       if (annotation.subtype === "Widget" && patch.author !== undefined) throw new TypeError("A Widget uses PDF /T for its field name; its author cannot be changed.");
-      const supplied = { ...(patch.contents === undefined ? {} : { contents: patch.contents }), ...(patch.author === undefined ? {} : { author: patch.author }) };
+      if (patch.fontSize !== undefined && (!Number.isFinite(patch.fontSize) || patch.fontSize < 0 || annotation.subtype !== "Widget" || !annotation.field?.name || !["Tx", "Ch"].includes(annotation.field.type ?? ""))) throw new TypeError("A text or choice field requires a finite, nonnegative font size.");
+      const supplied = { ...(patch.contents === undefined ? {} : { contents: patch.contents }), ...(patch.author === undefined ? {} : { author: patch.author }),
+        ...(patch.fontSize === undefined ? {} : { fontSize: patch.fontSize }) };
       if (!Object.keys(supplied).length) return;
-      change(() => { const previous = state.annotationEdits.get(id); state.annotationEdits.set(id, { ...previous, id,
-        transform: previous?.transform ?? EDITOR_IDENTITY, deleted: previous?.deleted ?? false, ...supplied }); });
+      const peers = patch.fontSize === undefined ? [annotation] : sourceScene.annotations!.filter(item => item.field?.name === annotation.field?.name);
+      assertUnlocked(peers.map(item => `annotation:${item.id}`));
+      if (patch.fontSize !== undefined && patch.contents === undefined && patch.author === undefined && peers.every(peer => state.annotationEdits.get(peer.id)?.fontSize === patch.fontSize)) return;
+      change(() => { for (const peer of peers) {
+        const previous = state.annotationEdits.get(peer.id);
+        state.annotationEdits.set(peer.id, { ...previous, id: peer.id, transform: previous?.transform ?? EDITOR_IDENTITY,
+          deleted: previous?.deleted ?? false, ...(peer === annotation ? supplied : { fontSize: patch.fontSize }) });
+      } });
     },
     getLayers() { assertLive(); return copy(state.layers.catalog.groups.filter(group => group.annotationId === undefined)); },
     getLayerOrder() { assertLive(); return copy(state.layers.catalog.order); },
@@ -1600,13 +1628,18 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       let base = bakeEditorSourceScene(layeredSource, [...snapshot.edits.values()], signal, options.onDiagnostic);
       const metadataOnly = [...snapshot.annotationEdits.values()].filter(edit => !(getSceneAnnotationRuns(sourceScene).get(edit.id)?.length));
       base = bakeEditorAnnotationEdits(base, metadataOnly);
-      base = bakeEditorAnnotationEdits(base, [...snapshot.annotationEdits.values()].filter(edit => !edit.deleted && (edit.contents !== undefined || edit.author !== undefined))
+      base = bakeEditorAnnotationEdits(base, [...snapshot.annotationEdits.values()].filter(edit => !edit.deleted && (edit.contents !== undefined || edit.author !== undefined || edit.fontSize !== undefined))
         .map(edit => ({ ...edit, transform: EDITOR_IDENTITY, deleted: false })));
       if (JSON.stringify(base.documentAuthoring) !== JSON.stringify(snapshot.documentAuthoring)) base = { ...base, documentAuthoring: copy(snapshot.documentAuthoring) };
       progress.report(.15, compileMeta); signal.throwIfAborted();
-      if (snapshot.fields.size) {
+      const fieldUpdates = new Map(snapshot.fields);
+      for (const edit of snapshot.annotationEdits.values()) if (!edit.deleted && edit.fontSize !== undefined) {
+        const field = base.annotations?.find(annotation => annotation.id === edit.id)?.field;
+        if (field?.name && !fieldUpdates.has(field.name)) fieldUpdates.set(field.name, field.value ?? null);
+      }
+      if (fieldUpdates.size) {
         if (!options.compileFields) throw new Error("Form field updates require the editor's field appearance compiler.");
-        base = await options.compileFields(base, snapshot.fields, signal);
+        base = await options.compileFields(base, fieldUpdates, signal);
       }
       if (snapshot.edits.size) {
         const coloredFields = applyEditorSourceFieldColors(sourceScene, base, [...snapshot.edits.values()]);

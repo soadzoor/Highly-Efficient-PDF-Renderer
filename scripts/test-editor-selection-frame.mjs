@@ -9,7 +9,7 @@ try {
   const { openEditorSession } = await import("../src/editorSession.ts");
   const { buildStrokeScene } = await import("../src/strokeSceneBuilder.ts");
   const { composeOverlappingVectorScenes } = await import("../src/pdfVectorExtractor.ts");
-  const { multiplyEditorMatrices: multiply, editorTransformBounds, editorPoint } = await import("../src/editorScene.ts");
+  const { multiplyEditorMatrices: multiply, editorTransformBounds, editorPoint, invertEditorMatrix, setEditorAnnotationSource } = await import("../src/editorScene.ts");
   const { loadSceneFromHep } = await import("../src/hep.ts");
   const identity = [1, 0, 0, 1, 0, 0];
   const angle = Math.PI / 5, rotation = [Math.cos(angle), Math.sin(angle), -Math.sin(angle), Math.cos(angle), 13, -7];
@@ -100,6 +100,45 @@ try {
     close(annotations.getSelectionFrame().transform, affine, "metadata-only annotations retain affine orientation");
     annotations.undo(); closeFrame(annotations.getSelectionFrame(), empty, "blank field frame undo");
   } finally { annotations.dispose(); }
+
+  for (const flags of [4096, 4097]) for (const mapping of [identity, [0, 2, -2, 0, 250, -120], [1.3, .2, .4, .9, 150, -80]]) {
+    const widgetScene = structuredClone(annotationScene), nativeBounds = { minX: 10, minY: 30, maxX: 45, maxY: 40 };
+    const nativeTransform = [1, .2, .3, 1, 7, 11], nativeFrame = multiply(mapping, nativeTransform);
+    const fieldBounds = editorTransformBounds(nativeBounds, nativeFrame), id = "annotation:a";
+    widgetScene.pdfPages = [{ pageIndex: 0, sourcePageIndex: 0, pdfToScene: mapping }];
+    widgetScene.annotations[0] = { ...widgetScene.annotations[0], subtype: "Widget", field: { type: "Tx", name: "Clipped multiline", flags },
+      pdfGeometry: { rect: [10, 30, 45, 40] }, bounds: fieldBounds };
+    const logical = { ...widgetScene.annotations[0], bounds: editorTransformBounds(nativeBounds, mapping) };
+    setEditorAnnotationSource(widgetScene, logical, multiply(nativeFrame, invertEditorMatrix(mapping)));
+    const widgets = await openEditorSession(widgetScene);
+    try {
+      widgets.selectPrimitives([{ kind: "stroke", index: 0 }]);
+      assert.deepEqual(widgets.getSelection(), [id]); assert.equal(widgets.getObject(id).primitives.length, 2);
+      close(widgets.getObject(id).bounds, fieldBounds, "source field bounds use metadata instead of overflowing ink");
+      close(widgets.getObjectBounds(id), fieldBounds, "painted widget bounds stay on its native rectangle");
+      const original = widgets.getSelectionFrame();
+      closeFrame(original, { bounds: nativeBounds, transform: nativeFrame, pageIndex: 0 }, "selection retains the field's PDF axes and authored wrapper");
+      widgets.setObjectsLocked([id], true);
+      assert(widgets.isObjectLocked(id)); assert(widgets.isObjectLocked("source:stroke:0"), "primitive aliases share the field's editing lock");
+      closeFrame(widgets.getSelectionFrame(), original, "locking keeps selection on the field rectangle");
+      widgets.select([]); widgets.selectAnnotations(["a"]);
+      closeFrame(widgets.getSelectionFrame(), original, "reselecting a locked widget keeps its rectangle");
+      assert.throws(() => widgets.transformSelection(affine), /locked/);
+      widgets.setObjectsLocked([id], false); widgets.transformSelection(affine);
+      const moved = { bounds: nativeBounds, transform: multiply(affine, nativeFrame), pageIndex: 0 };
+      closeFrame(widgets.getSelectionFrame(), moved, "field selection follows affine edits without including clipped text");
+      close(widgets.getObjectBounds(id), editorTransformBounds(nativeBounds, moved.transform), "transformed field hit bounds match selection geometry");
+      widgets.undo(); closeFrame(widgets.getSelectionFrame(), original, "widget frame undo");
+      widgets.redo(); closeFrame(widgets.getSelectionFrame(), moved, "widget frame redo");
+    } finally { widgets.dispose(); }
+    // Direct annotation selection takes a separate lazy source-object path.
+    const direct = await openEditorSession(widgetScene);
+    try {
+      direct.selectAnnotations(["a"]);
+      close(direct.getObject(id).bounds, fieldBounds, "direct widget selection retains metadata bounds");
+      close(direct.getObjectBounds(id), fieldBounds, "direct and primitive selection agree on the field's bounds");
+    } finally { direct.dispose(); }
+  }
 
   const mixedScene = structuredClone(base);
   mixedScene.drawRuns = [{ kind: "stroke", first: 0, count: 1 }, { kind: "stroke", first: 1, count: 1 }];
