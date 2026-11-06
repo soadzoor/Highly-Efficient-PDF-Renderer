@@ -19,6 +19,7 @@ function harness() {
     document: { getSelection: () => ({ isCollapsed: true }) },
     inputTarget: target => Boolean(target?.input), isSceneSettling: () => false,
     contextMenu: { close: () => calls.push("close") }, updatePointerCursor() {},
+    pasteTarget: client => ({ pageIndex: 1, center: client ? [client.x, client.y] : [50, 100] }),
     host: { onBusyChange: busy => calls.push(["busy", busy]) },
     cancelPointerGesture: restore => calls.push(["cancel", restore]),
     setTool(tool) { context.tool = tool; calls.push(["tool", tool]); },
@@ -33,10 +34,11 @@ function harness() {
       async copySelection(options) { options.signal.throwIfAborted(); calls.push("copy"); available = true; return 1; },
       async cutSelection(options) { options.signal.throwIfAborted(); calls.push("cut"); available = true; selection.length = 0; return 1; },
       async duplicateSelection(options) { options.signal.throwIfAborted(); calls.push("duplicate"); selection.splice(0, selection.length, "duplicated"); return selection; },
-      pasteSelection(options) { calls.push(["paste", options && Array.from(options.offset)]); selection.splice(0, selection.length, "pasted"); return selection; }
+      pasteSelection(options) { calls.push(["paste", options?.target ? { pageIndex: options.target.pageIndex, center: Array.from(options.target.center) }
+        : options && Array.from(options.offset)]); selection.splice(0, selection.length, "pasted"); return selection; }
     }
   });
-  for (const name of ["updateClipboardButtons", "canUseClipboard", "runClipboard", "keydown"])
+  for (const name of ["sharedClipboardChanged", "updateClipboardButtons", "canUseClipboard", "runClipboard", "clearObjectClipboardForText", "keydown"])
     vm.runInContext(sourceFunction(source, name), context);
   function key(key, options = {}) {
     const event = { key, ctrlKey: true, metaKey: false, shiftKey: false, altKey: false,
@@ -55,11 +57,20 @@ function harness() {
   assert.equal(h.context.running, false); assert.equal(h.buttons.get('[data-action="paste"]').disabled, false);
   assert.match(h.statuses.at(-1), /Select a layer and paste/);
   const selectionBefore = [...h.selection]; h.key("v", { ctrlKey: false, metaKey: true }); await flush();
-  assert.deepEqual(h.calls.find(call => Array.isArray(call) && call[0] === "paste"), ["paste", undefined]);
+  assert.deepEqual(h.calls.find(call => Array.isArray(call) && call[0] === "paste"), ["paste", { pageIndex: 1, center: [50, 100] }]);
   assert.deepEqual(selectionBefore, ["shape"]);
   h.key("V", { shiftKey: true }); await flush();
   assert.deepEqual(h.calls.filter(call => Array.isArray(call) && call[0] === "paste").at(-1), ["paste", [0, 0]], "Shift+paste preserves the copied position");
   assert.deepEqual(h.errors, []);
+}
+{
+  const h = harness(); h.setAvailable(true); h.context.pasteCursor = { x: 32, y: 76 };
+  h.key("v"); await flush();
+  assert.deepEqual(h.calls.find(call => Array.isArray(call) && call[0] === "paste"), ["paste", { pageIndex: 1, center: [32, 76] }]);
+  await h.context.runClipboard("paste", false, null);
+  assert.deepEqual(h.calls.filter(call => Array.isArray(call) && call[0] === "paste").at(-1), ["paste", { pageIndex: 1, center: [50, 100] }], "toolbar paste explicitly ignores the former canvas cursor");
+  await h.context.runClipboard("paste", false, { x: 91, y: 37 });
+  assert.deepEqual(h.calls.filter(call => Array.isArray(call) && call[0] === "paste").at(-1), ["paste", { pageIndex: 1, center: [91, 37] }], "context paste uses its original anchor");
 }
 {
   const h = harness(); h.key("x"); await flush();
@@ -131,5 +142,60 @@ for (const options of [{ defaultPrevented: true }, { isComposing: true }, { keyC
   await h.context.runClipboard("copy");
   assert.equal(h.errors[0].message, "Capture failed"); assert.equal(h.context.running, false);
   assert.equal(h.buttons.get('[data-action="cancel-operation"]').hidden, true);
+}
+{
+  const h = harness(), publications = [];
+  h.context.session.exportClipboard = async ({ signal }) => { signal.throwIfAborted(); return Uint8Array.of(3, 4); };
+  h.context.tabClipboard.publish = (bytes, startedAt) => { publications.push({ bytes: [...bytes], startedAt }); return "local-copy"; };
+  await h.context.runClipboard("copy");
+  assert.deepEqual(publications[0].bytes, [3, 4]); assert(Number.isSafeInteger(publications[0].startedAt));
+  assert.equal(h.context.clipboardTransferId, "local-copy");
+  await h.context.runClipboard("duplicate"); assert.equal(publications.length, 1, "Duplicate preserves the shared object clipboard");
+}
+{
+  const h = harness(); h.context.session.exportClipboard = async () => { throw new Error("Cannot transfer font assets"); };
+  await h.context.runClipboard("cut");
+  assert.equal(h.selection.length, 0); assert.equal(h.context.session.canPaste(), true);
+  assert(h.calls.some(call => Array.isArray(call) && call[0] === "refresh"), "a completed cut is presented even when cross-tab export fails");
+  assert.equal(h.errors[0].message, "Cannot transfer font assets"); assert.equal(h.context.running, false);
+}
+{
+  const h = harness(), imported = [], pending = deferred();
+  const shared = { id: "other-pdf", bytes: Uint8Array.of(6, 7) };
+  h.context.tabClipboard = { hasValue: () => true, getId: () => shared.id, get: () => shared };
+  h.context.session.importClipboard = async (bytes, { signal }) => { imported.push([...bytes]); await pending.promise; signal.throwIfAborted(); h.setAvailable(true); return 1; };
+  h.context.pasteCursor = { x: 32, y: 76 };
+  h.context.sharedClipboardChanged(); assert.equal(h.buttons.get('[data-action="paste"]').disabled, false, "another PDF enables Paste in a fresh editor");
+  assert.equal(h.context.session.canPaste(), false);
+  const operation = h.context.runClipboard("paste");
+  assert.equal(h.context.running, true); assert.equal(h.context.clipboardRunning, true);
+  assert(!h.calls.some(call => Array.isArray(call) && call[0] === "paste"), "font/resource preparation finishes before inserting objects");
+  h.context.pasteCursor = { x: 90, y: 90 }; pending.resolve(); await operation;
+  assert.deepEqual(imported, [[6, 7]]);
+  assert.deepEqual(h.calls.find(call => Array.isArray(call) && call[0] === "paste"), ["paste", { pageIndex: 1, center: [32, 76] }], "asynchronous import preserves the invoked cursor target");
+  assert.equal(h.context.clipboardTransferId, "other-pdf"); assert.equal(h.context.running, false);
+  await h.context.runClipboard("paste"); assert.equal(imported.length, 1, "repeat Paste retains destination-owned clipboard and offset history");
+  assert.deepEqual(h.errors, []);
+}
+{
+  const h = harness(), pending = deferred();
+  h.context.tabClipboard = { hasValue: () => true, getId: () => "cancel-import", get: () => ({ id: "cancel-import", bytes: Uint8Array.of(1) }) };
+  h.context.session.importClipboard = (_bytes, { signal }) => { signal.addEventListener("abort", () => pending.reject(new DOMException("Cancelled", "AbortError")), { once: true }); return pending.promise; };
+  const operation = h.context.runClipboard("paste"); h.key("Escape"); await operation;
+  assert(!h.calls.some(call => Array.isArray(call) && call[0] === "paste"));
+  assert.equal(h.context.running, false); assert.equal(h.context.clipboardTransferId, null);
+  assert.match(h.statuses.at(-1), /cancelled/);
+}
+{
+  const h = harness(); h.setAvailable(true); h.context.clipboardTransferId = "old";
+  let shared = true;
+  h.context.session.clearClipboard = () => { h.setAvailable(false); h.calls.push("clear-local"); };
+  h.context.tabClipboard = { hasValue: () => shared, get: () => null, clear() { shared = false; h.context.sharedClipboardChanged(); } };
+  h.context.clearObjectClipboardForText({ target: { input: true } });
+  assert.equal(h.context.session.canPaste(), false); assert.equal(h.context.clipboardTransferId, null);
+  assert.equal(h.buttons.get('[data-action="paste"]').disabled, true, "native text copy clears stale local and shared objects");
+  h.setAvailable(true); shared = true;
+  h.context.clearObjectClipboardForText({ clipboardData: { types: ["text/plain"] } });
+  assert.equal(h.context.session.canPaste(), false, "viewer page-text copy also invalidates old object copies");
 }
 console.log("Editor clipboard UI: shortcuts, target-layer focus, IME/text guards, busy capture, cancellation, frame handoff and paste-in-place passed.");

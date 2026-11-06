@@ -13,7 +13,7 @@ type Node = { kind: string; entries?: unknown; start?: number; length?: number; 
 const encoder = new TextEncoder(), decoder = new TextDecoder();
 const types = { Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array };
 
-/** Recovery-only binary graph: retains typed arrays, maps and shared buffers. */
+/** Detached editor data graph: retains typed arrays, maps and shared buffers. */
 export function encodeEditorRecoveryGraph(value: unknown): Uint8Array {
   const nodes: Node[] = [], seen = new Map<object, number>(), chunks: Uint8Array[] = []; let bytes = 0;
   const buffers = new Map<number, { buffer: ArrayBufferLike; direct: boolean; ranges: { offset: number; length: number }[]; base?: number }>();

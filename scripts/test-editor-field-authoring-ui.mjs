@@ -40,7 +40,7 @@ try {
         dialogs.push(dialog); return dialog;
       }, document: {}, report: error => errors.push(error)
     });
-    for (const name of ["pageAt", "sceneBoundsToClient", "selectedEditorField", "fieldObjectOwner", "fieldAtClientPoint", "openFieldEditor", "updateShapeGesture", "pointerDown", "pointerMove", "pointerUp"])
+    for (const name of ["pageAt", "sceneBoundsToClient", "selectedEditorField", "fieldObjectOwner", "fieldValueLocked", "fieldAtClientPoint", "openFieldEditor", "updateShapeGesture", "pointerDown", "pointerMove", "pointerUp"])
       vm.runInContext(sourceFunction(source, name), context);
     const pointerEvent = (x, y) => ({ clientX: x, clientY: y, pointerId: 1, pointerType: "mouse", button: 0,
       target: { getAttribute: () => null, closest: () => null }, preventDefault() {}, stopPropagation() {} });
@@ -48,6 +48,21 @@ try {
       async draw(start, end = start) { await context.pointerDown(pointerEvent(...start)); context.pointerMove(pointerEvent(...end)); context.pointerUp(pointerEvent(...end)); await tick(); },
       close() { context.disposed = true; context.fieldDialog?.close(); session.dispose(); }
     };
+  }
+  {
+    const f = fixture();
+    try {
+      const radio = x => f.session.addObject({ kind: "field", fieldType: "radio", name: "Choice", onValue: String(x),
+        pageIndex: 0, x, y: 40, width: 20, height: 20 });
+      const a = radio(20), b = radio(60);
+      f.context.latestScene = { ...f.session.sourceScene, annotations: [a, b].map(id => editorFieldAnnotation(f.session.getObject(id))) };
+      f.session.setObjectsLocked([b], true);
+      assert.equal(f.context.fieldValueLocked(a), true, "locking a radio sibling protects their shared value");
+      assert.equal(f.context.fieldAtClientPoint({ x: 25, y: 45 }), null, "an unlocked sibling cannot activate a locked shared field");
+      f.session.setObjectsLocked([b], false);
+      assert.equal(f.context.fieldValueLocked(a), false);
+      assert.equal(f.context.fieldAtClientPoint({ x: 25, y: 45 }), a);
+    } finally { f.close(); }
   }
   {
     const f = fixture();

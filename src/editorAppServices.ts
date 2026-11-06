@@ -24,6 +24,7 @@ import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 import { createEditorFieldAppearanceReader } from "./editorFormAppearance";
 import { createLoadYielder, waitForLoad } from "./loadCancellation";
 import { compileEditorFieldGeometry } from "./editorFormFields";
+import { readEditorPdfFieldLockState } from "./editorPdfFieldLocks";
 
 export interface EditorAppServicesOptions {
   sourcePdf?: Uint8Array;
@@ -115,7 +116,7 @@ export async function createEditorAppServicesFromSnapshot(options: EditorAppServ
           const document = await NativePdfDocument.open({ kind: "bytes", bytes: sourcePdf }, { password, signal: sharedSignal });
           let bytes: Uint8Array;
           try { const writer = new NativePdfWriter(document); await applyEditorPdfFields(writer, capturedValues, fonts,
-            { signal: sharedSignal, onWarning: diagnostic }); bytes = await writer.save(sharedSignal); }
+            { signal: sharedSignal, onWarning: diagnostic, allowEditorLockReadOnly: true }); bytes = await writer.save(sharedSignal); }
           finally { await document.close(); }
           // Regenerated appearances can still reference nonembedded source fonts.
           const parser = await openPdf({ kind: "bytes", bytes }, { password, signal: sharedSignal,
@@ -228,7 +229,10 @@ export async function createEditorAppServicesFromSnapshot(options: EditorAppServ
           for (const annotation of await registry.getPageAnnotations(page, signal)) if (annotation.field) fields.set(annotation.id, annotation.field);
           const widgets = (await forms.listPageAnnotations(page, signal)).filter(annotation => fields.has(annotation.id));
           for (let index = 0; index < widgets.length; index++) {
-            const annotation = widgets[index], field = fields.get(annotation.id)!;
+            const annotation = widgets[index];
+            let field = fields.get(annotation.id)!;
+            const lockState = await readEditorPdfFieldLockState(document, annotation.dictionary, signal);
+            if (lockState.readOnlyFromLock) { field = { ...field, flags: field.flags - (field.flags & 1) }; fields.set(annotation.id, field); }
             const frame = await readEditorFieldFrame(document, annotation, signal);
             const textStyle = await styles.read(frame ? { ...annotation, rectangle: frame.rect } : annotation, signal);
             if (field && textStyle) fields.set(annotation.id, { ...field, textStyle });

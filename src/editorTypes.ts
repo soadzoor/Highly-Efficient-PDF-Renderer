@@ -294,6 +294,8 @@ export interface EditorDuplicateOptions extends EditorClipboardOptions { offset?
 export interface EditorPasteOptions {
   /** Composed scene offset; defaults to successive 12/-12 steps for copy, zero for cut. */
   offset?: readonly [number, number];
+  /** Place the copied bounds' center at this composed scene point on the destination page. Cannot be combined with offset. */
+  target?: { pageIndex: number; center: readonly [number, number] };
 }
 
 export interface EditorSession {
@@ -336,8 +338,14 @@ export interface EditorSession {
   copySelection(options?: EditorClipboardOptions): Promise<number>;
   /** Capture successfully before deleting the selected objects as one undoable edit. */
   cutSelection(options?: EditorClipboardOptions): Promise<number>;
+  /** Export only the copied models, appearances and required fonts as portable clipboard bytes. */
+  exportClipboard(options?: EditorClipboardOptions): Promise<Uint8Array | null>;
+  /** Install copied content from another editor without changing document history. */
+  importClipboard(data: Uint8Array, options?: EditorClipboardOptions): Promise<number>;
+  /** Forget copied objects and cancel pending clipboard captures/imports without changing history. */
+  clearClipboard(): void;
   canPaste(): boolean;
-  /** Paste independent copies into the active layer, retaining their original pages. */
+  /** Paste independent copies into the active layer; target places all copies on its destination page. */
   pasteSelection(options?: EditorPasteOptions): readonly string[];
   groupSelection(): string | null;
   ungroupSelection(): void;

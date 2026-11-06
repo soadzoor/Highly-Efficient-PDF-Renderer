@@ -6,7 +6,7 @@ import vm from "node:vm";
 import { sourceFunction } from "./lib/sourceFunction.mjs";
 
 const source = await readFile(new URL("../src/editorUi.ts", import.meta.url), "utf8");
-assert.match(source, /objects:\s*\{\s*canRun:\s*canUseClipboard,\s*run:\s*runClipboard/, "stock editors always configure Duplicate/Copy/Cut/Paste alongside drawing order");
+assert.match(source, /objects:\s*\{\s*canRun:\s*canUseClipboard,\s*run:\s*action => runClipboard\(action, false, contextPasteClient\)/, "stock editors preserve the context-menu paste anchor alongside drawing order");
 function harness() {
   let selection = ["a", "b"], pickResult = "c", projection = 1;
   const shown = [], selected = [], calls = { picks: 0, closes: 0 };
@@ -46,6 +46,10 @@ function harness() {
   const h = harness(); h.setHit(null); h.context.canUseClipboard = action => action === "paste";
   await h.context.openContextMenu(h.event());
   assert.deepEqual(h.selection, []); assert.deepEqual(h.shown, [{ x: 30, y: 40 }], "blank document space offers Paste without retaining a misleading hit selection");
+  h.context.host.clientToScenePoint = () => null;
+  await h.context.openContextMenu(h.event());
+  assert.deepEqual(h.shown.at(-1), { x: 30, y: 40 }, "page gutters offer Paste even when unprojection has no page hit");
+  assert.equal(h.shown.length, 2);
   h.context.host.getCanvas = () => ({ getBoundingClientRect: () => ({ left: 50, top: 100, width: 400, height: 200 }) });
   h.context.showSelectionContextMenu(); assert.deepEqual(h.shown.at(-1), { x: 250, y: 200 }, "keyboard Paste menu is available with no canvas selection");
 }

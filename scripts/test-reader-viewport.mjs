@@ -46,7 +46,7 @@ globalThis.ResizeObserver = class { observe() {} disconnect() {} };
 
 class Element {
   children = []; parentElement = null;
-  style = { setProperty(name, value) { this[name] = String(value); }, getPropertyValue(name) { return this[name] ?? ""; } };
+  style = { setProperty(name, value) { this[name] = String(value); }, getPropertyValue(name) { return this[name] ?? ""; }, removeProperty(name) { delete this[name]; } };
   dataset = {}; attributes = new Map(); listeners = new Map();
   className = ""; hidden = false; value = ""; disabled = false; textContent = ""; title = "";
   width = 300; height = 150; captures = new Set(); _left = 0; _top = 0;
@@ -163,9 +163,15 @@ class Element {
   get clientHeight() {
     if (this.classList.contains("reader-toolbar")) return this.hidden ? 0 : 64;
     if (this.classList.contains("reader-scroll") || this.classList.contains("reader-thumbnails")) {
-      return this.hidden ? 0 : this.ownerDocument.viewportHeight - (this.ownerDocument.querySelector(".reader-toolbar")?.clientHeight ?? 64);
+      return this.hidden ? 0 : this.ownerDocument.viewportHeight - (this.ownerDocument.querySelector(".reader-toolbar")?.clientHeight ?? 64) -
+        (this.classList.contains("reader-scroll") ? this.editorInset : 0);
     }
     return Number.parseFloat(this.style.height) || this.height;
+  }
+  get editorInset() {
+    const doc = this.ownerDocument;
+    return doc.body.classList.contains("reader-active") && doc.body.classList.contains("hepr-editing")
+      ? Number.parseFloat(doc.documentElement.style.getPropertyValue("--hepr-editor-toolbar-inset")) || 0 : 0;
   }
   get scrollWidth() {
     const width = Number.parseFloat(this.querySelector(".reader-surface")?.style.width) || this.clientWidth;
@@ -197,7 +203,7 @@ class Element {
     }
     const scroller = this.ownerDocument.querySelector(".reader-scroll");
     const left = this.ownerDocument.querySelector(".reader-thumbnails")?.clientWidth ?? 0;
-    const top = this.ownerDocument.querySelector(".reader-toolbar")?.clientHeight ?? 64;
+    const top = (this.ownerDocument.querySelector(".reader-toolbar")?.clientHeight ?? 64) + this.editorInset;
     const width = Number.parseFloat(this.style.width) || scroller?.clientWidth || this.clientWidth;
     const height = Number.parseFloat(this.style.height) || scroller?.clientHeight || this.clientHeight;
     return { left, top, width, height, right: left + width, bottom: top + height };
@@ -277,9 +283,40 @@ function editorWheelBridge(env) {
 
 try {
   const { createReaderViewport } = await import("../src/readerViewport.ts");
+  const { createEditorToolbarInset } = await import("../src/editorToolbarInset.ts");
   const { READER_ACTUAL_SIZE_ZOOM, readerContentMetrics, readerViewFromScroll } = await import("../src/readerGeometry.ts");
   const { createViewerLinkNavigation, resolveAnnotationView } = await import("../src/viewerLinkNavigation.ts");
   const { createAnnotationInteractionController } = await import("../src/annotationInteraction.ts");
+  for (const width of [320, 1000]) {
+    const css = await readFile(new URL("../src/readerViewport.css", import.meta.url), "utf8");
+    assert.match(css, /\.hepr-editing\.reader-active \.reader-scroll\s*\{\s*margin-top:\s*var\(--hepr-editor-toolbar-inset, 0px\)/);
+    const env = environment(width), doc = env.document, reader = createReaderViewport(env.options);
+    reader.setDocument({ identity: "editor-inset", pageRects: pageRects(2) }); reader.setLayout("reader");
+    const scroller = doc.querySelector(".reader-scroll"), originalHeight = scroller.clientHeight;
+    const toolbar = doc.createElement("div"); toolbar.height = width < 700 ? 220 : 120;
+    toolbar.getBoundingClientRect = () => ({ height: toolbar.height });
+    const reservation = createEditorToolbarInset(toolbar);
+    doc.body.classList.add("hepr-editing"); reservation.update(true); reader.resize(); reader.goToPage(0);
+    assert.equal(scroller.clientHeight, originalHeight - toolbar.height - 16, "Reader uses the unobstructed document viewport");
+    let view = reader.getView(), canvas = env.canvas.getBoundingClientRect();
+    const pageTop = canvas.top + view.height / 2 - (0 - view.centerY) * view.zoom;
+    assert(pageTop >= 64 + toolbar.height + 16, "the first page's top is below the entire Edit toolbar at scroll zero");
+    assert.equal(scroller.scrollTop, 0);
+    doc.querySelector('[data-reader="fit-page"]').emit("click"); view = reader.getView();
+    assert(800 * view.zoom <= scroller.clientHeight - 48 + 1e-7, "Fit Page includes both page margins below the toolbar");
+    doc.querySelector('[data-reader="hide-toolbar"]').emit("click");
+    assert.equal(scroller.clientHeight, env.document.viewportHeight - toolbar.height - 16);
+    toolbar.height += 40; reservation.update(true); reader.resize();
+    assert.equal(scroller.clientHeight, env.document.viewportHeight - toolbar.height - 16, "wrapping updates Reader height");
+    reader.goToPage(1); assert.equal(reader.snapshot().pageIndex, 1);
+    const zoom = doc.querySelector(".reader-zoom"); zoom.value = "150"; zoom.emit("change");
+    const freeZoom = reader.getView().zoom;
+    toolbar.height += 10; reservation.update(true); reader.resize(); close(reader.getView().zoom, freeZoom, "toolbar resize preserves free zoom");
+    reader.setLayout("grid"); assert.equal(scroller.clientHeight, env.document.viewportHeight, "Grid keeps its full canvas height");
+    reader.setLayout("reader"); reservation.update(false); doc.body.classList.remove("hepr-editing"); reader.resize();
+    assert.equal(scroller.clientHeight, env.document.viewportHeight, "leaving Edit restores Reader height");
+    reservation.dispose(); reader.dispose();
+  }
   for (const width of [320, 1000]) for (const settingsId of ["hud", "panel"]) {
     const env = environment(width), doc = env.document;
     const settings = doc.createElement("aside"); settings.id = settingsId; settings.classList.add("collapsed");
@@ -421,12 +458,32 @@ try {
       close(reader.getView().centerY, before.centerY, "centered pinch zoom adds no vertical wheel scrolling");
       assert.equal(env.views.length, viewCount + 1);
     }
+    const previousFocus = env.document.activeElement;
+    for (const tagName of ["input", "textarea", "select"]) for (const focused of [false, true])
+      for (const modifiers of [{}, { shiftKey: true }, { ctrlKey: true }, { metaKey: true }]) {
+        const input = env.document.createElement(tagName); input.className = "hepr-editor-field"; input.value = "37";
+        input.type = tagName === "input" ? "number" : ""; input.selectionStart = input.selectionEnd = 1; input.selectedIndex = 1;
+        env.document.activeElement = focused ? input : previousFocus;
+        reader.setView(base); const before = reader.getView(), bounds = env.canvas.getBoundingClientRect(), viewCount = env.views.length;
+        const count = bridge.dispatches.length;
+        const wheel = bridge.wheel({ ...modifiers, deltaY: 40, target: input,
+          clientX: bounds.left + before.width / 2, clientY: bounds.top + before.height / 2 });
+        assert(wheel.defaultPrevented && wheel.propagationStopped, `${tagName}: document navigation consumes the field wheel`);
+        assert.equal(bridge.dispatches.length, count + 1);
+        if (modifiers.ctrlKey || modifiers.metaKey) {
+          close(reader.getView().zoom, before.zoom * Math.exp(-40 * .002), "wheel over fields zooms the document");
+          close(reader.getView().centerY, before.centerY, "centered field zoom does not add wheel scrolling");
+        } else {
+          close(reader.getView().centerX, before.centerX + (modifiers.shiftKey ? 40 / before.zoom : 0), "Shift-wheel over fields scrolls horizontally");
+          close(reader.getView().centerY, before.centerY - (modifiers.shiftKey ? 0 : 40 / before.zoom), "wheel over fields scrolls vertically");
+        }
+        assert.equal(env.views.length, viewCount + 1, "field wheel navigation changes the camera exactly once");
+        assert.equal(input.value, "37"); assert.equal(input.selectedIndex, 1);
+        assert.equal(input.selectionStart, 1); assert.equal(input.selectionEnd, 1);
+        assert.equal(env.document.activeElement, focused ? input : previousFocus, "hovering a field does not change focus");
+      }
+    env.document.activeElement = previousFocus;
     const dispatchCount = bridge.dispatches.length, beforeNested = reader.getView();
-    for (const tagName of ["TEXTAREA", "SELECT"]) {
-      const wheel = bridge.wheel({ deltaY: 40, target: { tagName, closest: () => ({}) } });
-      assert(!wheel.defaultPrevented && !wheel.propagationStopped, `${tagName} retains its native wheel interaction`);
-    }
-    assert.equal(bridge.dispatches.length, dispatchCount); assert.deepEqual(reader.getView(), beforeNested);
     let resizeCancellations = 0;
     const draft = { resizeControls: { cancel() { resizeCancellations++; } } }; bridge.context.activeText = draft;
     assert(bridge.wheel({ deltaY: 40 }).defaultPrevented, "active rich text forwards document wheel navigation");

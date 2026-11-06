@@ -5,6 +5,7 @@ import { isPdfDictionary, isPdfRef, type PdfDictionary, type PdfRef, type PdfVal
 import { NativePdfWriter, pdfAsciiValue, pdfNameValue, pdfNumberValue, pdfStreamValue, pdfTextValue } from "./pdf/nativeWriter";
 import { normalizePrimitiveColor } from "./colorInput";
 import { editorFieldAnnotation } from "./editorFormFields";
+import { setEditorPdfFieldReadOnly } from "./editorPdfFieldLocks";
 
 /** Add real AcroForm fields without disturbing existing field roots/resources. */
 export function createEditorPdfFieldWriter(writer: NativePdfWriter, fonts: EditorFontRegistry, signal?: AbortSignal,
@@ -13,7 +14,7 @@ export function createEditorPdfFieldWriter(writer: NativePdfWriter, fonts: Edito
   const resolve = async (value: PdfValue | undefined): Promise<PdfValue | undefined> => isPdfRef(value)
     ? writer.get(value) ?? await document.resolveValue(value, signal) : value;
   const root = document.getWriterState().xref.trailers.map(trailer => trailer.get("Root")).find(isPdfRef);
-  const groups = new Map<string, { reference: PdfRef; dictionary: PdfDictionary; type: string; states: Set<string>; kids: PdfRef[] }>();
+  const groups = new Map<string, { reference: PdfRef; dictionary: PdfDictionary; type: string; states: Set<string>; kids: PdfRef[]; locked: boolean; readOnly: boolean; flags: number }>();
   const fontEntries = new Map<string, PdfValue>(), fontResources = new Map<string, Promise<string>>();
   let initialFonts: PdfDictionary | undefined;
   const stream = async (bytes: Uint8Array | string, dictionary: PdfDictionary = new Map()): Promise<PdfRef> => {
@@ -78,7 +79,7 @@ export function createEditorPdfFieldWriter(writer: NativePdfWriter, fonts: Edito
   };
   return {
     async add(object: EditorFieldObject, options: {
-      rectangle: PdfBox; page: PdfRef | null; flags: number; optionalContent?: PdfValue;
+      rectangle: PdfBox; page: PdfRef | null; flags: number; locked?: boolean; optionalContent?: PdfValue;
       appearance(object: EditorFieldObject): Promise<PdfRef>;
     }): Promise<PdfRef> {
       signal?.throwIfAborted();
@@ -100,8 +101,11 @@ export function createEditorPdfFieldWriter(writer: NativePdfWriter, fonts: Edito
           : Array.isArray(input) ? input.map(item => pdfTextValue(item)) : pdfTextValue(String(input ?? ""));
         dictionary.set("V", value(metadata.value));
         if (object.defaultValue !== undefined) dictionary.set("DV", value(object.defaultValue));
-        group = { reference: writer.add(dictionary), dictionary, type: object.fieldType, states: new Set(), kids: [] }; groups.set(object.name, group);
+        group = { reference: writer.add(dictionary), dictionary, type: object.fieldType, states: new Set(), kids: [],
+          locked: false, readOnly: false, flags: metadata.flags }; groups.set(object.name, group);
       }
+      group.locked ||= Boolean(options.locked); group.readOnly ||= Boolean(metadata.flags & 1);
+      setEditorPdfFieldReadOnly(group.dictionary, group.flags, group.readOnly || group.locked, !group.readOnly && group.locked);
       group.states.add(onValue);
       const color = normalizePrimitiveColor(object.color ?? 0).map(pdfNumberValue).join(" ");
       const da = button ? `${color} rg` : `/${await fontResource(object)} ${pdfNumberValue(object.fontSize ?? 0)} Tf ${color} rg`;

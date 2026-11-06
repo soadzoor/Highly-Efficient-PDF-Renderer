@@ -42,6 +42,7 @@ import { createEditorGlyphStoreCache } from "./editorGlyphStoreCache";
 import { editorClipboardStore, releaseEditorClipboard, registerEditorCapturedSourceReader, type EditorCapturedSource, type EditorClipboardSnapshot } from "./editorClipboard";
 import { validateEditorReviewMetadata } from "./editorReview";
 import { compileEditorLinks, editorSourceLinks, editorSourceLinkAnnotation, validateEditorLink, getEditorLinkDiagnostics, registerEditorLinkRebinder } from "./editorLinks";
+import { encodePortableEditorClipboard, decodePortableEditorClipboard, portableEditorSourceScene } from "./editorClipboardPayload";
 
 interface Snapshot {
   objects: Map<string, EditorObject>;
@@ -385,7 +386,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     const object = snapshot.objects.get(id) ?? sourceObject(id);
     if (object.kind === "source") {
       const captured = capturedSource(object);
-      if (captured) return { ...captured.frame, transform: multiplyEditorMatrices(object.transform, captured.frame.transform) };
+      if (captured) return { ...captured.frame, pageIndex: object.pageIndex, transform: multiplyEditorMatrices(object.transform, captured.frame.transform) };
       if (snapshot.objects.has(id)) return { bounds: object.bounds, transform: object.transform, pageIndex: object.pageIndex };
       if (!object.primitives.length) return { bounds: object.bounds,
         transform: object.annotationId ? snapshot.annotationEdits.get(object.annotationId)?.transform ?? EDITOR_IDENTITY : EDITOR_IDENTITY, pageIndex: object.pageIndex };
@@ -697,12 +698,14 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     assertLive(); const signal = suppliedSignal ? AbortSignal.any([suppliedSignal, lifetime.signal]) : lifetime.signal;
     signal.throwIfAborted();
     const snapshot = state, roots = snapshot.selection.slice(); if (!roots.length) return 0;
+    const bounds = session.getSelectionBounds()!;
     if (cut) assertUnlocked(roots);
     const store = editorClipboardStore(session), sequence = ++store.sequence;
     const objects = new Map<string, EditorObject>(), frames = new Map<string, EditorSelectionFrame>();
     const visit = (id: string) => {
       if (objects.has(id)) return;
       const object = internalObject(id), link = readLink(id), detached = copy({ ...object, ...(link ? { link } : {}) });
+      if (object.kind === "source" && snapshot.sourceLocks.has(sourceLockKey(object))) detached.locked = true;
       if (detached.kind === "text" && detached.pageNumberingId) { delete detached.pageNumberingId; detached.locked = false; }
       objects.set(id, detached);
       if (object.kind === "group") object.children.forEach(visit);
@@ -746,11 +749,26 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     if (cut && (state.identity !== snapshot.identity || JSON.stringify(state.selection) !== JSON.stringify(roots))) {
       throw new Error("The selection or document changed while copying. Cut was cancelled; the selected objects are unchanged.");
     }
-    const captured: EditorClipboardSnapshot = { source: sourceScene, roots, objects, sources, basis, cut, pastes: 0 }, previous = store.value;
+    const captured: EditorClipboardSnapshot = { source: sourceScene, roots, objects, sources, bounds, basis, cut, pastes: 0 }, previous = store.value;
     store.value = captured;
     try { if (cut) session.deleteSelection(); else emit(); }
     catch (error) { store.value = previous; throw error; }
     return roots.length;
+  };
+  const normalizeSourceCopyScene = (scene: VectorScene, pageIndex: number, textPageIndex: number): VectorScene => {
+    const rect = sourceScene.pageRects.slice(pageIndex * 4, pageIndex * 4 + 4), counts = scenePrimitiveCounts(scene);
+    const pageBounds = { minX: Math.min(rect[0], rect[2]), minY: Math.min(rect[1], rect[3]), maxX: Math.max(rect[0], rect[2]), maxY: Math.max(rect[1], rect[3]) };
+    const normalized = detachEditorGeometryAnnotationLayers({ ...scene, pageCount: 1, pagesPerRow: 1, pageRects: rect,
+      pageBounds, bounds: { ...pageBounds }, pageTextRanges: Uint32Array.of(0, scene.textInstanceCount),
+      pagePrimitiveRanges: Uint32Array.from(PAGE_PRIMITIVE_KINDS.flatMap(kind => [0, counts[kind]])),
+      pdfPages: undefined, annotations: undefined, markedContent: undefined, structureElements: undefined,
+      textIndex: scene.textIndex ? { version: 2, pages: [scene.textIndex.pages[textPageIndex]] } : null,
+      rasterLayers: scene.rasterLayers.map(layer => ({ ...layer, pageIndex: 0 })),
+      gradientFillPaintMeta: scene.gradientFillPaintMeta.slice(), gradientStrokeRunMetaB: scene.gradientStrokeRunMetaB.slice() });
+    for (let i = 0; i < normalized.gradientFillPaintMeta.length; i += 4) normalized.gradientFillPaintMeta[i + 3] = 0;
+    for (let i = 0; i < normalized.gradientStrokeRunMetaB.length; i += 4) normalized.gradientStrokeRunMetaB[i + 1] = 0;
+    retainEditorAnnotationPlacements(scene, normalized);
+    return normalized;
   };
   const capturedSourceScene = (id: string, snapshot = state): VectorScene | undefined => {
     const object = snapshot.objects.get(id), captured = object && capturedSource(object);
@@ -758,7 +776,8 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
     const styled = bakeEditorSourceScene(captured.scene, sourceCopyAppearance(object, captured.scene), lifetime.signal, options.onDiagnostic);
     const colored = applyEditorSourceColors(styled, colorEdits(styled, sceneRefs(styled), object.color, object.fill));
     retainEditorAnnotationPlacements(captured.scene, colored);
-    return transformWholeEditorScene(colored, object.transform, lifetime.signal, options.onDiagnostic);
+    return normalizeSourceCopyScene(transformWholeEditorScene(colored, object.transform, lifetime.signal, options.onDiagnostic),
+      object.pageIndex, captured.frame.pageIndex ?? object.pageIndex);
   };
   const captureRecoveryData = (): RecoveryStateData => {
     const owners = editorPaintIdentity(sourceScene), counts = scenePrimitiveCounts(sourceScene);
@@ -1176,18 +1195,98 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       } finally { if (store.sequence === sequence) { store.value = previous; emit(); } }
     },
     cutSelection(clipboardOptions = {}) { return captureSelection(true, clipboardOptions.signal); },
+    async exportClipboard(clipboardOptions = {}) {
+      assertLive(); const signal = clipboardOptions.signal ? AbortSignal.any([clipboardOptions.signal, lifetime.signal]) : lifetime.signal;
+      signal.throwIfAborted();
+      const store = editorClipboardStore(session), captured = store.value, sequence = store.sequence;
+      if (!captured) return null;
+      if (captured.source !== sourceScene) throw new Error("Document pages changed since these objects were copied. Copy them again before exporting the clipboard.");
+      const objects = new Map<string, EditorObject>(), sources = new Map<string, EditorCapturedSource>();
+      const reference = pageOrigin(captured.objects.get(captured.roots[0])!.pageIndex), rebase: EditorMatrix = [1, 0, 0, 1, -reference[0], -reference[1]];
+      const styles: { fontId?: string; fontFamily?: string; fontWeight?: number | "normal" | "bold"; fontStyle?: string }[] = [];
+      let retained = false;
+      for (const [id, original] of captured.objects) {
+        const object = copy(original); delete object.layerId; delete object.layerCondition;
+        if (object.link?.type === "destination" || object.link?.type === "object" && !captured.objects.has(object.link.objectId)) delete object.link;
+        if (object.kind !== "source") {
+          const origin = pageOrigin(object.pageIndex);
+          object.transform = multiplyEditorMatrices([1, 0, 0, 1, origin[0] - reference[0], origin[1] - reference[1]], object.transform);
+        } else object.transform = multiplyEditorMatrices(rebase, object.transform);
+        object.pageIndex = 0;
+        if (object.kind === "text" || object.kind === "field") styles.push(object);
+        if (object.kind === "text") styles.push(...(object.runs ?? []).map(run => ({ ...object, ...run })));
+        const source = captured.sources.get(id);
+        if (source) {
+          const normalized = normalizeSourceCopyScene(source.scene, original.pageIndex, source.frame.pageIndex ?? original.pageIndex);
+          const portable = portableEditorSourceScene(normalized, (object as EditorSourceObject).bounds); retained ||= portable.retained;
+          sources.set(id, { scene: portable.scene, frame: { ...copy(source.frame), pageIndex: 0 } });
+        }
+        objects.set(id, object);
+      }
+      const required = new Set(styles.flatMap(style => style.fontId ? [style.fontId] : []));
+      const assets = styles.length && options.captureRecoveryFonts ? await options.captureRecoveryFonts() : [];
+      const fonts = assets.filter(font => required.has(font.id) || styles.some(style => {
+        const selected = style.fontId ? assets.find(asset => asset.id === style.fontId) : undefined;
+        const weight = style.fontWeight ?? selected?.fontWeight ?? 400, fontStyle = style.fontStyle ?? selected?.fontStyle ?? "normal";
+        return (selected?.family ?? style.fontFamily) === font.family && (weight === "bold" ? 700 : typeof weight === "number" ? weight : 400) === font.fontWeight &&
+          (fontStyle === "italic" || fontStyle === "oblique" ? "italic" : "normal") === font.fontStyle;
+      }));
+      for (const id of required) if (!fonts.some(font => font.id === id)) throw new Error("This editor cannot export the copied object's font assets.");
+      signal.throwIfAborted(); assertLive();
+      if (store.sequence !== sequence || store.value !== captured) throw new DOMException("A newer clipboard operation superseded this export.", "AbortError");
+      if (retained) options.onDiagnostic?.({ code: "editor.clipboard-retained-appearance", severity: "warning",
+        message: "Copied composite artwork retains its current raster appearance without source-page replay resources." });
+      return encodePortableEditorClipboard({ format: "hepr-editor-clipboard", version: 1, roots: [...captured.roots], objects, sources,
+        bounds: editorTransformBounds(captured.bounds, rebase), ...(captured.basis ? { basis: multiplyEditorMatrices(rebase, captured.basis) } : {}), fonts });
+    },
+    async importClipboard(input, clipboardOptions = {}) {
+      assertLive(); const signal = clipboardOptions.signal ? AbortSignal.any([clipboardOptions.signal, lifetime.signal]) : lifetime.signal;
+      signal.throwIfAborted();
+      if (!(input instanceof Uint8Array)) throw new TypeError("Portable clipboard data must be bytes.");
+      const bytes = new Uint8Array(input), data = decodePortableEditorClipboard(bytes, validateObject);
+      const store = editorClipboardStore(session), sequence = ++store.sequence;
+      if (data.fonts.length && !options.restoreRecoveryFonts) throw new Error("This editor cannot import the copied object's font assets.");
+      await options.restoreRecoveryFonts?.(data.fonts, signal); signal.throwIfAborted(); assertLive();
+      if (store.sequence !== sequence) throw new DOMException("A newer clipboard operation superseded this import.", "AbortError");
+      const origin = pageOrigin(0), objects = new Map<string, EditorObject>();
+      for (const [id, original] of data.objects) {
+        const object = copy(original);
+        if (object.kind === "source") object.transform = multiplyEditorMatrices([1, 0, 0, 1, ...origin], object.transform);
+        objects.set(id, object);
+      }
+      const rebase: EditorMatrix = [1, 0, 0, 1, ...origin];
+      store.value = { source: sourceScene, roots: data.roots, objects, sources: data.sources, bounds: editorTransformBounds(data.bounds, rebase),
+        basis: data.basis ? multiplyEditorMatrices(rebase, data.basis) : undefined, cut: false, pastes: 0 };
+      emit(); return data.roots.length;
+    },
+    clearClipboard() { assertLive(); const store = editorClipboardStore(session); store.value = null; store.sequence++; emit(); },
     canPaste() { assertLive(); return editorClipboardStore(session).value !== null; },
     pasteSelection(pasteOptions = {}) {
       assertLive(); const store = editorClipboardStore(session), captured = store.value;
       if (!captured) return [];
       if (captured.source !== sourceScene) throw new Error("Document pages changed since these objects were copied. Copy them again, or undo the page change before pasting.");
-      const step = captured.cut ? 0 : captured.pastes + 1, offset = pasteOptions.offset ?? [12 * step, -12 * step];
+      const target = pasteOptions.target;
+      if (target) {
+        if (pasteOptions.offset !== undefined) throw new TypeError("A paste target cannot be combined with an offset.");
+        if (!Number.isSafeInteger(target.pageIndex) || target.pageIndex < 0 || target.pageIndex >= pageCount) throw new RangeError("Paste destination page is out of range.");
+        finite(target.center?.[0], "Paste center X"); finite(target.center?.[1], "Paste center Y");
+      }
+      const step = captured.cut ? 0 : captured.pastes + 1;
+      const offset = target ? [target.center[0] - (captured.bounds.minX + captured.bounds.maxX) / 2,
+        target.center[1] - (captured.bounds.minY + captured.bounds.maxY) / 2] : pasteOptions.offset ?? [12 * step, -12 * step];
       finite(offset[0], "Paste X offset"); finite(offset[1], "Paste Y offset");
       const destination = session.getActiveLayer(); if (destination !== null) editorLayer(state.layers.catalog, destination);
       const ids = new Map([...captured.objects.keys()].map(id => [id, nextObjectId()])), additions: EditorObject[] = [];
       const fieldNames = new Map<string, string>(), reservedFieldNames = new Set<string>();
       for (const [id, original] of captured.objects) {
         const object = copy(original); object.id = ids.get(id)!;
+        if (target) {
+          if (object.kind !== "source") {
+            const previousOrigin = pageOrigin(object.pageIndex), nextOrigin = pageOrigin(target.pageIndex);
+            object.transform = multiplyEditorMatrices([1, 0, 0, 1, previousOrigin[0] - nextOrigin[0], previousOrigin[1] - nextOrigin[1]], object.transform);
+          }
+          object.pageIndex = target.pageIndex;
+        }
         if (object.kind === "field") {
           const name = fieldNames.get(object.name) ?? freshFieldName(object.name, reservedFieldNames); fieldNames.set(object.name, name); object.name = name;
         }
@@ -1207,8 +1306,14 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
           for (const object of additions) state.objects.set(object.id, object);
           normalizeRadioGroups();
           state.layers = { ...state.layers }; state.selection = roots; state.selectionBasis = roots.length > 1 ? captured.basis : undefined;
+          // Position newly inserted copies without treating their retained locks
+          // as an attempt to modify existing locked content.
+          const matrix = editorMatrix([1, 0, 0, 1, offset[0], offset[1]]);
+          if (!editorMatrixIsIdentity(matrix)) {
+            for (const id of roots) editorTransformBounds(objectBounds(id), matrix);
+            state = transformedSnapshot(state, matrix);
+          }
         });
-        session.transformSelection([1, 0, 0, 1, offset[0], offset[1]]);
         state.selection = state.selection.filter(objectVisible);
       });
       store.value = { ...captured, pastes: captured.pastes + 1 };
@@ -1246,6 +1351,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
       }
       if (sourceScene.annotations?.some(annotation => annotation.field?.name === name && (annotation.field.flags & 1) !== 0)) throw new Error("This PDF field is read-only.");
       if (!sourceScene.annotations?.some(annotation => annotation.field?.name === name)) throw new RangeError(`Unknown PDF field ${name}.`);
+      assertUnlocked(sourceScene.annotations.filter(annotation => annotation.field?.name === name).map(annotation => `annotation:${annotation.id}`));
       change(() => state.fields.set(name, copy(value)));
     },
     getFieldValues() { return fieldValues(); },
@@ -1564,15 +1670,7 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
           const local = geometry; geometry = { ...local }; retainEditorAnnotationPlacements(local, geometry);
           setEditorPaintRole(geometry, ref => ref.kind === "raster" ? null : ref.kind === "fill" || ref.kind === "gradient-fill" ? "fill" : "color");
           geometry = transformWholeEditorScene(geometry, object.transform, signal, options.onDiagnostic);
-          geometry.pageCount = 1; geometry.pageRects = sourceScene.pageRects.slice(object.pageIndex * 4, object.pageIndex * 4 + 4);
-          geometry.pageTextRanges = Uint32Array.of(0, geometry.textInstanceCount); geometry.pagePrimitiveRanges = undefined;
-          geometry.pdfPages = undefined; geometry.annotations = undefined;
-          geometry = detachEditorGeometryAnnotationLayers(geometry);
-          geometry.markedContent = undefined; geometry.structureElements = undefined;
-          if (geometry.textIndex) geometry.textIndex = { version: 2, pages: [geometry.textIndex.pages[object.pageIndex]] };
-          geometry.rasterLayers = geometry.rasterLayers.map(layer => ({ ...layer, pageIndex: 0 }));
-          for (let i = 0; i < geometry.gradientFillPaintMeta.length; i += 4) geometry.gradientFillPaintMeta[i + 3] = 0;
-          for (let i = 0; i < geometry.gradientStrokeRunMetaB.length; i += 4) geometry.gradientStrokeRunMetaB[i + 1] = 0;
+          geometry = normalizeSourceCopyScene(geometry, object.pageIndex, captured?.frame.pageIndex ?? object.pageIndex);
         } else {
           const originObject = geometryOrigins.get(object) ?? object;
           let promise = compiled.get(originObject);
@@ -1706,7 +1804,8 @@ export function createEditorSession(sourceScene: VectorScene, options: EditorSes
         createLayer: readOnly, updateLayer: readOnly, moveLayer: readOnly, setLayerOrder: readOnly, removeLayer: readOnly,
         setActiveLayer: readOnly, assignObjectsToLayer: readOnly, assignSelectionToLayer: readOnly, selectLayerContents: readOnly, copyObjectLayerMembership: readOnly,
         addObject: readOnly, updateObject: readOnly, transformSelection: readOnly, setPreviewTransform: readOnly,
-        deleteSelection: readOnly, cloneSelection: readOnly, duplicateSelection: readOnly, copySelection: readOnly, cutSelection: readOnly, canPaste: () => false, pasteSelection: readOnly, groupSelection: readOnly, ungroupSelection: readOnly,
+        deleteSelection: readOnly, cloneSelection: readOnly, duplicateSelection: readOnly, copySelection: readOnly, cutSelection: readOnly,
+        exportClipboard: readOnly, importClipboard: readOnly, clearClipboard: readOnly, canPaste: () => false, pasteSelection: readOnly, groupSelection: readOnly, ungroupSelection: readOnly,
         setFieldValue: readOnly, updateAnnotation: readOnly, transaction: readOnly, undo: readOnly, redo: readOnly, markSaved: readOnly,
         rotatePages: readOnly, removePages: readOnly, insertPdf: readOnly, reorderPages: readOnly, duplicatePages: readOnly, cropPages: readOnly, extractPages: readOnly,
         subscribe: readOnly, savePdf: readOnly, saveHep: readOnly, captureRecovery: readOnly, restoreRecovery: readOnly, dispose: readOnly

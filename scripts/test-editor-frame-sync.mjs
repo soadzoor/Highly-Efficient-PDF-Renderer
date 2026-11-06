@@ -91,7 +91,7 @@ function harness(frameHost = true) {
     styleEditorFieldControl(control, annotation, family) { control.fontStyleAnnotation = annotation; control.fontFamily = family; },
     report: error => assert.fail(String(error))
   });
-  for (const name of ["sceneBoundsToClient", "focusPendingField", "canActivateField", "activateField", "updateTextVisibility", "updateGeometry", "updateFieldPaint", "fieldControlAnnotation", "renderFields", "setTool", "fieldAtClientPoint", "doubleClick"]) vm.runInContext(sourceFunction(nested, name), context);
+  for (const name of ["sceneBoundsToClient", "focusPendingField", "canActivateField", "activateField", "fieldObjectOwner", "fieldValueLocked", "updateTextVisibility", "updateGeometry", "updateFieldPaint", "fieldControlAnnotation", "renderFields", "setTool", "fieldAtClientPoint", "doubleClick"]) vm.runInContext(sourceFunction(nested, name), context);
   vm.runInContext(`${tickSource}\n${apiSource}`, context);
   return {
     context, host, document, fields, controls, callbacks, events, raf,

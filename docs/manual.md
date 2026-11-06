@@ -468,20 +468,35 @@ draft without discarding the text, and showing it restores the draft.
 Select artwork and use **Copy** (Ctrl/Cmd+C) or **Cut** (Ctrl/Cmd+X), click a
 different layer row, then **Paste** (Ctrl/Cmd+V). The same commands are available
 in the toolbar and Select-tool context menu, including Paste on empty document
-space. Copies use successive small offsets; **Paste in place**
-(Ctrl/Cmd+Shift+V) preserves the original position. Cut/paste preserves position
-by default. Cut and paste have separate Undo steps. Layer-row focus keeps object
+space. Keyboard paste centers the copied objects at the cursor on its page;
+context-menu paste uses the original right-click position. Toolbar paste, or
+paste while the cursor is outside a page, uses the most visible page's center.
+**Paste in place** (Ctrl/Cmd+Shift+V) preserves the original position and pages.
+Cut and paste have separate Undo steps. Layer-row focus keeps object
 shortcuts available; typing in a layer name, textbox or form retains normal text
 copy/paste and IME input.
 
-The clipboard belongs to the open document and stays in memory. Added textboxes,
+The object clipboard stays in browser memory and is shared between HEPR Edit
+tabs on the same site (the same protocol, host and port). Open both PDFs in Edit,
+copy in the source tab, then paste in the destination tab. Switching PDFs in one
+tab also retains the copy. Once another tab receives the copy, it can paste even
+after the source tab closes. Closing all participating tabs clears the copy;
+neither document bytes nor clipboard data are stored persistently for sharing.
+Normal input/text copy and paste keeps using the system clipboard; copying text
+inside the viewer clears the previous shared object copy.
+
+Added textboxes,
 images, handwriting and groups retain their editing models; source PDF artwork
 and form widgets copy their current appearance as independent artwork. Changing
 the original field later does not change its copy, and copied widgets do not
-become new linked form fields. Paste retains the source pages and assigns the
-chosen layer, including hidden destinations without showing them automatically.
+become new linked form fields. Ordinary paste moves the copies onto the target
+page, retaining their relative spacing and assigning the chosen layer, including
+hidden destinations without showing them automatically.
 After a page-structure change, recopy before pasting, or undo that page change.
-Neither PDF nor HEP stores the clipboard.
+Neither PDF nor HEP stores the clipboard. Cross-document copies keep their own
+fonts and editable models; copied links to objects outside the selection or pages
+of the source PDF are omitted. Composite source artwork that already uses a
+raster preview keeps that appearance when transferred.
 
 With **Select** active, right-click an object or anywhere inside the current
 selection frame to open its drawing-order menu. **Bring to front** and **Send to
@@ -521,6 +536,11 @@ edge scrolling, cancellation, nested reordering and narrow dock layout in both
 viewers. Check real touch scrolling outside grips. Copy/cut artwork, select a
 different row and paste; test paste-in-place, hidden destinations, Undo/Redo,
 normal text clipboard behavior and cancelled source captures.
+Open two different PDFs in Edit tabs, including native-to-Three and Three-to-native
+copies. Paste mixed groups, text with imported fonts, images, fields and source
+artwork onto another page; verify placement, layers, undo/redo and saved PDF
+appearance. After the destination receives a copy, close the source tab and paste
+again. Copy ordinary text in an input and check that object Paste clears.
 
 ### Manual editing verification
 
@@ -583,12 +603,24 @@ that images retain their captured page location or cancel safely.
 In Reader layout with Select active, scroll over empty space, selected objects,
 and their handles. Repeat with a drawing tool; check wheel/trackpad scrolling,
 Shift-wheel horizontal movement and Ctrl/Cmd-wheel zoom in both viewers/backends.
+Repeat while hovering focused and unfocused form inputs, dropdowns and multiline
+fields; document navigation should preserve field values, focus and the caret.
+While dragging an area selection, scroll and zoom with a stationary cursor,
+then hold the middle button to pan. Release either button first and verify the
+selection bounds and cancellation. In Reader Edit, scroll to the first page's
+top and use Fit Page with wrapped toolbars, hidden main toolbar and narrow windows;
+the page should remain below the Edit toolbar.
 Double-click empty, filled, rotated and resized form fields with Select active.
 Create each form-field type in both viewers/backends, including a radio group,
 multiline text and a multi-select list. Test click/drag placement, property edits,
 required/read-only behavior, fonts, long values, colors, transforms, copy/paste
-and undo/redo. Save/reopen in HEPR and Chrome, enter characters absent from the
-initial value, and verify field values and appearances remain editable. Rotate,
+and undo/redo. Lock fields directly and through groups, save, and reopen in
+Chrome: locked text, choices, checkboxes and radio values must remain unchanged
+when clicked or typed into, while unrelated unlocked fields remain fillable.
+Reopen in HEPR, unlock and fill, then save again; explicitly read-only fields
+must stay read-only. Locking one radio/shared-field widget protects their shared
+value. Save/reopen unlocked fields in HEPR and Chrome, enter characters absent
+from the initial value, and verify field values and appearances remain editable. Rotate,
 reorder and duplicate pages, checking independent copied names/radio groups and
 no doubled search text or appearances. Check flattened PDF, HEP and printing.
 Check that Fill activates and the clicked widget receives focus without moving

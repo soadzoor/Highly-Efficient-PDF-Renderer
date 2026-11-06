@@ -17,6 +17,9 @@ import { triggerBrowserDownload, formatPdfDownloadFilename } from "./downloadUti
 import type { EditorSignature } from "./editorSignatures";
 import { showSignatureDialog } from "./editorSignatureUi";
 import { editorSignaturePlacement } from "./editorSignaturePlacement";
+import { resolveEditorPasteTarget } from "./editorPastePlacement";
+import { createEditorToolbarInset } from "./editorToolbarInset";
+import { editorTabClipboard } from "./editorTabClipboard";
 import { findEditorPdfFormOverlaps } from "./editorPdfFormOverlap";
 import { chooseEditorPdfFormExport } from "./editorPdfFormExportUi";
 import { appendEditorInkSamples, editorInkCaptureTolerance } from "./editorInkCapture";
@@ -123,7 +126,7 @@ type TextDraft = EditorTextBoxBounds & { element: HTMLDivElement; objectId?: str
   selection?: Range; appliedFontSize?: { value: number; range: Range };
   pageIndex: number; transform: EditorMatrix; opacity?: number; lineHeight?: number; baseline: EditorTextDraftBaseline; resizeControls?: ReturnType<typeof createEditorTextResizeControls>;
   backdrop?: HTMLDivElement; originalBounds?: EditorTextBoxBounds };
-type PointerGesture = { id: number; start: PrimitivePoint; startClient: PrimitivePoint; last: PrimitivePoint; points: [number, number][]; bounds: Bounds | null; frame?: EditorSelectionFrame; action: "draw" | "text" | "marquee" | "move" | "resize" | "rotate"; additive: boolean; dragging?: boolean; handle?: string; freeResize?: boolean; freeRotation?: boolean; ink?: EditorInkInput; shape?: EditorShapeInput; textPageIndex?: number };
+type PointerGesture = { id: number; start: PrimitivePoint; startClient: PrimitivePoint; last: PrimitivePoint; lastClient?: PrimitivePoint; startPageIndex?: number; lastPageIndex?: number; points: [number, number][]; bounds: Bounds | null; frame?: EditorSelectionFrame; action: "draw" | "text" | "marquee" | "move" | "resize" | "rotate"; additive: boolean; dragging?: boolean; handle?: string; freeResize?: boolean; freeRotation?: boolean; ink?: EditorInkInput; shape?: EditorShapeInput; textPageIndex?: number };
 interface PresentedScene {
   sourceScene: VectorScene;
   revision: number;
@@ -148,6 +151,7 @@ function colorCss(color: EditorColor | undefined): string {
 export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): Promise<EditorUi> {
   const source = host.getSource(), lifetime = new AbortController();
   signal?.throwIfAborted();
+  const tabClipboard = editorTabClipboard(host.getCanvas().ownerDocument.defaultView!);
   const abortInitialization = (): void => lifetime.abort();
   signal?.addEventListener("abort", abortInitialization, { once: true });
   let services: Awaited<ReturnType<typeof createEditorAppServices>> | undefined;
@@ -203,6 +207,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   let renderRevision = 0, operation: AbortController | null = null, running = false;
   let savePreparing = false;
   let clipboardRunning = false;
+  let clipboardTransferId: string | null = null;
   let recovery: EditorRecoveryController | undefined, recoveryKey = "", recoveryOffered = false;
   let recoveryDialog: { close(): void } | null = null, recoveryNotice = "", exportedRevision = -1;
   let recoveryRunning = false;
@@ -223,6 +228,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   let draftLayerRevision = -1;
   let draftLayers = new Map<string, boolean>();
   let textRequest = 0;
+  let pasteCursor: PrimitivePoint | null = null, contextPasteClient: PrimitivePoint | null = null;
   let pointer: PointerGesture | null = null;
   let pendingPick: { id: number; point: PrimitivePoint; client: PrimitivePoint; lastClient: PrimitivePoint; released: boolean; canceled: boolean } | null = null;
   let polygon: { pageIndex: number; points: [number, number][]; object: EditorShapeInput; preview: EditorShapeInput; previousPointCount?: number } | null = null;
@@ -289,7 +295,10 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   let fieldPaintCache: { scene: VectorScene; annotations: Map<string, NonNullable<VectorScene["annotations"]>[number]>;
     appearances: ReturnType<typeof getSceneAnnotationRuns> } | null = null;
   overlay.append(graphic, fields); document.body.append(toolbar, overlay);
+  const toolbarReservation = createEditorToolbarInset(toolbar);
   const query = <T extends HTMLElement>(selector: string): T => toolbar.querySelector<T>(selector)!;
+  const releaseTabClipboard = tabClipboard.subscribe(sharedClipboardChanged);
+  lifetime.signal.addEventListener("abort", releaseTabClipboard, { once: true });
   const property = (name: string): HTMLInputElement => query(`[data-prop="${name}"]`);
   const status = query<HTMLSpanElement>("[data-status]");
   const appearanceControls = createEditorPropertyControls({ session, control: name => property(name),
@@ -406,7 +415,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     canRun: action => canOpenContextMenu() && session.canReorderSelection(action),
     run: action => { if (canOpenContextMenu()) commit(() => session.reorderSelection(action)); },
     objects: {
-      canRun: canUseClipboard, run: runClipboard
+      canRun: canUseClipboard, run: action => runClipboard(action, false, contextPasteClient)
     }, extra: [
       { action: "delete", label: "Delete", canRun: () => canOpenContextMenu() && !savePreparing && session.getSelection().length > 0 && !selectionLocked(), run: () => commit(() => session.deleteSelection()) },
       { action: "lock", label: "Lock", canRun: () => canOpenContextMenu() && session.getSelection().some(id => !session.isObjectLocked(id)), run: () => commit(() => session.setObjectsLocked(session.getSelection(), true)) },
@@ -418,8 +427,10 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   });
   const cameraPan = createEditorCameraPan({ overlay, getCanvas: host.getCanvas,
     canPan: () => active && !disposed && !running && !savePreparing && !structuralRunning && Boolean(host.panCameraByPixels),
-    begin() { contextMenu.close(); cancelPointerGesture(); signatureHover = null; updatePolygonPreview(); host.beginCameraPan?.(); },
+    begin() { contextMenu.close(); if (pointer?.action !== "marquee") cancelPointerGesture(); signatureHover = null; updatePolygonPreview(); host.beginCameraPan?.(); },
     pan: (dx, dy) => host.panCameraByPixels?.(dx, dy), end: () => host.endCameraPan?.(),
+    getSharedPointerId: () => pointer?.action === "marquee" ? pointer.id : undefined,
+    onSharedPointerMove: pointerMove, onSharedPointerUp: pointerUp, onCancel: () => cancelPointerGesture(),
     onStateChange: () => host.onBusyChange?.(running || savePreparing || structuralRunning || cameraPan.isPanning() || links.isBusy())
   });
   const review = createEditorReviewController({ overlay, session, getScene: () => latestScene,
@@ -494,7 +505,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     const toolbarLeft = `${rect.left + toolbarInset}px`, toolbarWidth = `${Math.max(0, rect.width - toolbarInset * 2)}px`;
     if (toolbar.style.left !== toolbarLeft) toolbar.style.left = toolbarLeft;
     if (toolbar.style.right !== "auto") toolbar.style.right = "auto";
-    if (toolbar.style.width !== toolbarWidth) toolbar.style.width = toolbarWidth;
+    if (toolbar.style.width !== toolbarWidth) { toolbar.style.width = toolbarWidth; toolbarReservation.update(active && !toolbar.hidden); }
     overlay.style.left = `${rect.left}px`; overlay.style.top = `${rect.top}px`;
     overlay.style.width = `${rect.width}px`; overlay.style.height = `${rect.height}px`;
     graphic.setAttribute("viewBox", `0 0 ${rect.width} ${rect.height}`);
@@ -541,8 +552,9 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       } else if (pointer.action === "draw" && pointer.shape) {
         drawDrawingPreview(pointer.shape, shapePreview, rect);
       } else if (pointer.action === "marquee" || pointer.action === "text") {
-        const start = pointer.action === "text" ? host.sceneToClientPoint(pointer.start.x, pointer.start.y, pointer.textPageIndex) : pointer.startClient;
-        const p = host.sceneToClientPoint(pointer.last.x, pointer.last.y, pointer.textPageIndex);
+        if (pointer.action === "marquee") updateMarqueePoint(pointer);
+        const start = host.sceneToClientPoint(pointer.start.x, pointer.start.y, pointer.action === "text" ? pointer.textPageIndex : pointer.startPageIndex);
+        const p = pointer.action === "marquee" ? pointer.lastClient : host.sceneToClientPoint(pointer.last.x, pointer.last.y, pointer.textPageIndex);
         if (start && p) svg("rect", { x: Math.min(start.x, p.x) - rect.left, y: Math.min(start.y, p.y) - rect.top,
           width: Math.abs(p.x - start.x), height: Math.abs(p.y - start.y), class: "hepr-editor-marquee" });
       }
@@ -731,7 +743,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     updateLinkButtons();
     for (const button of toolbar.querySelectorAll<HTMLButtonElement>('[data-action^="align-"], [data-action^="distribute-"]')) button.disabled = !state.selection.length || selectionLocked();
     updateClipboardButtons();
-    if (tool === "form") for (const control of fieldDrafts.keys()) control.disabled = session.isObjectLocked(fieldObjectOwner(control.dataset.fieldId!));
+    if (tool === "form") for (const control of fieldDrafts.keys()) control.disabled = fieldValueLocked(control.dataset.fieldId!);
     const frame = session.getSelectionFrame();
     updateTransformControls(frame);
     if (!state.previewing) updateRotationValue(frame);
@@ -806,52 +818,81 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   function changeHistory(redo: boolean): void {
     commit(() => { if (redo) session.redo(); else session.undo(); if (tool === "form") renderFields(); });
   }
+  function sharedClipboardChanged(): void {
+    if (disposed) return;
+    if (!tabClipboard.hasValue()) { clipboardTransferId = null; session.clearClipboard(); }
+    updateClipboardButtons();
+  }
   function updateClipboardButtons(): void {
     const unavailable = running || savePreparing || structuralRunning || activeText !== null;
     for (const action of ["copy", "cut", "duplicate"]) query<HTMLButtonElement>(`[data-action="${action}"]`).disabled = unavailable || !session.getSelection().length || action !== "copy" && selectionLocked();
-    query<HTMLButtonElement>('[data-action="paste"]').disabled = unavailable || !session.canPaste();
+    query<HTMLButtonElement>('[data-action="paste"]').disabled = unavailable || !(session.canPaste() || tabClipboard.hasValue());
   }
   function canUseClipboard(action: EditorObjectMenuAction): boolean {
     return active && !disposed && !running && !savePreparing && !structuralRunning && !activeText && !pointer && !pendingPick && !polygon && !isSceneSettling() &&
       !cameraPan.isPanning() && !links.isOpen() &&
-      (action === "paste" ? session.canPaste() : session.getSelection().length > 0 && (action === "copy" || !selectionLocked()));
+      (action === "paste" ? session.canPaste() || tabClipboard.hasValue() : session.getSelection().length > 0 && (action === "copy" || !selectionLocked()));
   }
-  async function runClipboard(action: EditorObjectMenuAction, inPlace = false): Promise<void> {
+  function pasteTarget(client: PrimitivePoint | null) {
+    return resolveEditorPasteTarget(session.sourceScene.pageRects, host.getCanvas().getBoundingClientRect(),
+      (x, y, pageIndex) => host.sceneToClientPoint(x, y, pageIndex), (x, y) => host.clientToScenePoint(x, y), client);
+  }
+  async function runClipboard(action: EditorObjectMenuAction, inPlace = false, client: PrimitivePoint | null = pasteCursor): Promise<void> {
     if (!canUseClipboard(action)) return;
+    const startedAt = action === "copy" || action === "cut" ? tabClipboard.beginCopy() : 0;
+    const sharedId = action === "paste" ? tabClipboard.getId() : null;
+    const importing = sharedId !== null && sharedId !== clipboardTransferId;
+    const incoming = importing ? tabClipboard.get() : null;
+    const placement = inPlace ? { offset: [0, 0] as const } : { target: action === "paste" ? pasteTarget(client) : undefined };
     flushColorDraft();
     contextMenu.close();
+    const paste = (): number => {
+      const ids = session.pasteSelection(placement);
+      if (ids.length) {
+        const layer = session.getLayers().find(item => item.id === session.getActiveLayer());
+        const hidden = ids.some(id => !session.isObjectVisible(id));
+        setStatus(`Pasted ${ids.length} ${ids.length === 1 ? "object" : "objects"} into ${layer?.name ?? "Unlayered"}.${hidden ? " Some objects are hidden by their layer." : ""}`);
+      }
+      return ids.length;
+    };
     if (action === "paste") {
       if (tool !== "select") setTool("select");
-      commit(() => {
-        const ids = session.pasteSelection(inPlace ? { offset: [0, 0] } : undefined);
-        if (ids.length) {
-          const layer = session.getLayers().find(item => item.id === session.getActiveLayer());
-          const hidden = ids.some(id => !session.isObjectVisible(id));
-          setStatus(`Pasted ${ids.length} ${ids.length === 1 ? "object" : "objects"} into ${layer?.name ?? "Unlayered"}.${hidden ? " Some objects are hidden by their layer." : ""}`);
-        }
-      });
-      return;
+      if (!importing) { commit(() => { paste(); }); return; }
     }
     cancelPointerGesture(false); textRequest++;
     const abort = new AbortController(); operation = abort;
     const signal = AbortSignal.any([lifetime.signal, abort.signal]);
     clipboardRunning = running = true; updatePointerCursor(); updateClipboardButtons(); host.onBusyChange?.(true);
     query('[data-action="cancel-operation"]').hidden = false;
-    setStatus(action === "duplicate" ? "Duplicating objects…" : action === "cut" ? "Cutting objects…" : "Copying objects…");
-    let copied = 0, failed = false;
+    setStatus(action === "paste" ? "Preparing copied objects…" : action === "duplicate" ? "Duplicating objects…" : action === "cut" ? "Cutting objects…" : "Copying objects…");
+    let copied = 0, failed = false, needsRefresh = false;
     try {
-      copied = action === "duplicate" ? (await session.duplicateSelection({ signal })).length
-        : action === "cut" ? await session.cutSelection({ signal }) : await session.copySelection({ signal });
+      if (action === "paste" && incoming) {
+        await session.importClipboard(incoming.bytes, { signal }); signal.throwIfAborted();
+        clipboardTransferId = incoming.id; updateFonts(); copied = paste();
+      } else {
+        copied = action === "duplicate" ? (await session.duplicateSelection({ signal })).length
+          : action === "cut" ? await session.cutSelection({ signal }) : await session.copySelection({ signal });
+      }
+      needsRefresh = action !== "copy" && copied > 0;
       signal.throwIfAborted();
-      if (action !== "copy" && copied) await refreshScene(signal, false, true);
+      if ((action === "copy" || action === "cut") && copied) {
+        const bytes = await session.exportClipboard({ signal }); signal.throwIfAborted();
+        if (bytes) clipboardTransferId = tabClipboard.publish(bytes, startedAt);
+      }
+      if (needsRefresh) { await refreshScene(signal, false, true); needsRefresh = false; }
     } catch (error) { failed = true; report(error); }
     finally {
+      // A cut or paste may already be committed when sharing/preparation fails.
+      if (needsRefresh && !disposed && !lifetime.signal.aborted) {
+        try { await refreshScene(lifetime.signal, false, true); } catch (error) { report(error); }
+      }
       if (operation === abort) operation = null;
       clipboardRunning = running = false; host.onBusyChange?.(false);
       if (!disposed) {
         updatePointerCursor(); updateClipboardButtons(); query('[data-action="cancel-operation"]').hidden = true;
         if (signal.aborted) setStatus("Clipboard operation cancelled.");
-        else if (!failed && copied) setStatus(action === "duplicate" ? `Duplicated ${copied} ${copied === 1 ? "object" : "objects"}.`
+        else if (!failed && copied && action !== "paste") setStatus(action === "duplicate" ? `Duplicated ${copied} ${copied === 1 ? "object" : "objects"}.`
           : `${copied} ${copied === 1 ? "object" : "objects"} ${action === "cut" ? "cut" : "copied"}. Select a layer and paste.`);
       }
     }
@@ -958,7 +999,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
           updateFieldPaint();
         }), { usePdfAppearance: currentAnnotation.hasAppearance || Boolean(appearances.get(annotation.id)?.length) });
       if (input) {
-        input.disabled = session.isObjectLocked(fieldObjectOwner(annotation.id));
+        input.disabled = fieldValueLocked(annotation.id);
         input.hidden = Boolean(host.subscribeToFrames);
         input.addEventListener("input", () => { updateFieldPaint(input); recovery?.draftChanged(); });
         fieldDrafts.set(input, editorFieldDraftSignature(input)); fields.append(input);
@@ -983,7 +1024,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   function fieldAtClientPoint(client: PrimitivePoint): string | null {
     for (const annotation of [...(latestScene.annotations ?? [])].reverse()) {
-      if (!canEditEditorField(annotation) || !session.isAnnotationVisible(annotation.id) || session.isObjectLocked(fieldObjectOwner(annotation.id))) continue;
+      if (!canEditEditorField(annotation) || !session.isAnnotationVisible(annotation.id) || fieldValueLocked(annotation.id)) continue;
       const source = getEditorAnnotationSource(latestScene, annotation.id) ?? annotation;
       const geometry = editorFieldClientGeometry(source, latestScene.pdfPages,
         (point, pageIndex) => host.sceneToClientPoint(point.x, point.y, pageIndex), getEditorAnnotationFrameTransform(latestScene, annotation.id));
@@ -1015,6 +1056,11 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   function fieldObjectOwner(id: string): string {
     try { if (session.getObject(id).kind === "field") return id; } catch { /* Source widgets use annotation-owned identities. */ }
     return `annotation:${id}`;
+  }
+  function fieldValueLocked(id: string): boolean {
+    const annotations = latestScene.annotations ?? [], name = annotations.find(annotation => annotation.id === id)?.field?.name;
+    return session.isObjectLocked(fieldObjectOwner(id)) || Boolean(name && annotations.some(annotation =>
+      annotation.field?.name === name && session.isObjectLocked(fieldObjectOwner(annotation.id))));
   }
   function activateField(id: string): void {
     setTool("form");
@@ -1244,7 +1290,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     }
     if (tool === "signature") { signatureHover = event.pointerType === "touch" ? null : client; if (signature) placeSignature(point); return; }
     if (tool === "image") { if (pendingImage) placeImage(point); return; }
-    let action: PointerGesture["action"] = "draw";
+    let action: PointerGesture["action"] = "draw", lastClient = client;
     if (tool === "select") {
       if (handle) action = handle === "rotate" ? "rotate" : "resize";
       else if (moveFrame) action = "move";
@@ -1262,7 +1308,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         const currentProjection = host.sceneToClientPoint(point.x, point.y);
         if (sourceScene !== session.sourceScene || revision !== session.revision || projection && (!currentProjection ||
             Math.abs(currentProjection.x - projection.x) + Math.abs(currentProjection.y - projection.y) > .1)) { cancelPointerGesture(); return; }
-        pendingPick = null; updatePointerCursor(); flushColorDraft(false);
+        pendingPick = null; lastClient = request.lastClient; updatePointerCursor(); flushColorDraft(false);
         if (id) {
           interaction.selectHit(id, event);
           if (additive) return;
@@ -1290,6 +1336,11 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       : drawingShape ? createShapeDraft(tool as EditorShapeInput["shape"], pageIndex) : undefined;
     pointer = { id: event.pointerId, start: point, startClient: client, last: point, points, ink, shape, bounds: session.getSelectionBounds(), frame: gestureFrame ?? session.getSelectionFrame() ?? undefined, action, additive, handle: handle ?? undefined,
       freeResize: event.shiftKey, freeRotation: event.altKey };
+    if (action === "marquee") {
+      const pageIndex = pageAt(point);
+      pointer.startPageIndex = pointer.lastPageIndex = pageIndex >= 0 ? pageIndex : undefined;
+      updateMarqueePoint(pointer, lastClient);
+    }
     alignmentSnap = action === "move" ? createEditorAlignmentSnap(session) : null;
     updateShapeGesture(pointer, point);
     updatePointerCursor();
@@ -1318,6 +1369,19 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       updatePointerCursor(); updateLinkButtons();
     }
   }
+  function updateMarqueePoint(gesture: PointerGesture, client = gesture.lastClient ?? gesture.startClient): void {
+    gesture.lastClient = client;
+    // Hit another page first; an explicit last page also projects gaps/margins.
+    let point = host.clientToScenePoint(client.x, client.y);
+    if (point) {
+      const pageIndex = pageAt(point);
+      if (pageIndex >= 0) gesture.lastPageIndex = pageIndex;
+    } else {
+      const pageIndex = gesture.lastPageIndex ?? gesture.startPageIndex;
+      if (pageIndex !== undefined) point = host.clientToScenePoint(client.x, client.y, pageIndex);
+    }
+    if (point) gesture.last = point;
+  }
   function pointerMove(event: PointerEvent): void {
     fieldActivation.pointerMove(event);
     textActivation.pointerMove(event);
@@ -1328,7 +1392,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     }
     if (pendingPick?.id === event.pointerId) pendingPick.lastClient = { x: event.clientX, y: event.clientY };
     if (!pointer || event.pointerId !== pointer.id) return;
-    const point = host.clientToScenePoint(event.clientX, event.clientY, pointer.textPageIndex ?? pointer.ink?.pageIndex ?? pointer.shape?.pageIndex ?? (pointer.action !== "draw" && pointer.action !== "marquee" ? pointer.frame?.pageIndex : undefined)); if (!point) return;
+    if (pointer.action === "marquee") { updateMarqueePoint(pointer, { x: event.clientX, y: event.clientY }); event.preventDefault(); return; }
+    const point = host.clientToScenePoint(event.clientX, event.clientY, pointer.textPageIndex ?? pointer.ink?.pageIndex ?? pointer.shape?.pageIndex ?? (pointer.action !== "draw" ? pointer.frame?.pageIndex : undefined)); if (!point) return;
     pointer.last = point; pointer.freeResize = event.shiftKey; pointer.freeRotation = event.altKey;
     if (pointer.action === "draw" && tool === "ink") {
       const pageIndex = pointer.ink!.pageIndex;
@@ -1384,7 +1449,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         p.freeResize = event.shiftKey; p.freeRotation = event.altKey;
       }
       clearPreview(true);
-      overlay.releasePointerCapture?.(event.pointerId);
+      if (!cameraPan.isPanning()) overlay.releasePointerCapture?.(event.pointerId);
       const moved = Math.hypot(event.clientX - p.startClient.x, event.clientY - p.startClient.y) > 2;
       if (p.action === "text") {
         const last = host.clientToScenePoint(event.clientX, event.clientY, p.textPageIndex) ?? p.last;
@@ -1392,6 +1457,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         void startText(p.start, undefined, undefined, moved ? { x: Math.min(x, endX), y: Math.min(y, endY),
           width: Math.max(1, Math.abs(endX - x)), height: Math.max(1, Math.abs(endY - y)) } : undefined).catch(report);
       } else if (p.action === "marquee") {
+        updateMarqueePoint(p, { x: event.clientX, y: event.clientY });
         interaction.selectArea({ minX: Math.min(p.start.x, p.last.x), minY: Math.min(p.start.y, p.last.y), maxX: Math.max(p.start.x, p.last.x), maxY: Math.max(p.start.y, p.last.y) }, { shiftKey: p.additive });
       } else if (p.action !== "draw") {
         if (moved && p.bounds) {
@@ -1979,7 +2045,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
         if (layerDialog && !layerDialog.open) layerDialog.showModal();
         host.showLayerControls?.(); layerControls.show(); break;
       case "undo": changeHistory(false); break; case "redo": changeHistory(true); break;
-      case "copy": case "cut": case "paste": case "duplicate": void runClipboard(button.dataset.action); break;
+      case "copy": case "cut": case "paste": case "duplicate": void runClipboard(button.dataset.action, false, null); break;
       case "delete": commit(() => session.deleteSelection()); break;
       case "group": commit(() => session.groupSelection()); break; case "ungroup": commit(() => session.ungroupSelection()); break;
       case "lock": commit(() => session.setObjectsLocked(session.getSelection(), true)); break;
@@ -2185,6 +2251,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   }
   function showSelectionContextMenu(): void {
     if (!canOpenContextMenu()) return;
+    contextPasteClient = null;
     const frame = session.getSelection().length ? session.getSelectionFrame() : null;
     if (!frame) {
       if (canUseClipboard("paste")) {
@@ -2199,11 +2266,16 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
   async function openContextMenu(event: MouseEvent): Promise<void> {
     if (!canOpenContextMenu() || (event.target as Element).closest(".hepr-editor-field,.hepr-editor-text-input")) return;
     event.preventDefault(); event.stopPropagation(); contextMenu.close();
+    contextPasteClient = { x: event.clientX, y: event.clientY };
     const request = ++textRequest, target = event.target as Element, selection = session.getSelection();
     if (selection.length && (target.getAttribute("data-selection-move") === "true" || target.getAttribute("data-handle"))) {
       contextMenu.show({ x: event.clientX, y: event.clientY }); return;
     }
-    const point = host.clientToScenePoint(event.clientX, event.clientY); if (!point) return;
+    const point = host.clientToScenePoint(event.clientX, event.clientY);
+    if (!point) {
+      if (canUseClipboard("paste")) { session.select([]); contextMenu.show(contextPasteClient); }
+      return;
+    }
     const revision = session.revision, sourceScene = session.sourceScene, selectionKey = JSON.stringify(selection);
     const before = host.sceneToClientPoint(point.x, point.y);
     const id = await pick(point, { x: event.clientX, y: event.clientY });
@@ -2218,23 +2290,28 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     contextMenu.show({ x: event.clientX, y: event.clientY });
   }
   overlay.addEventListener("contextmenu", event => { void openContextMenu(event).catch(report); });
+  window.addEventListener("pointermove", event => {
+    const target = event.target;
+    pasteCursor = active && (target === host.getCanvas() || target instanceof Node && overlay.contains(target))
+      ? { x: event.clientX, y: event.clientY } : null;
+  }, { capture: true, signal: lifetime.signal });
+  window.addEventListener("pointerout", event => { if (!event.relatedTarget) pasteCursor = null; }, { signal: lifetime.signal });
   overlay.addEventListener("pointermove", pointerMove); overlay.addEventListener("pointerup", pointerUp);
   overlay.addEventListener("pointerenter", pointerMove);
   overlay.addEventListener("pointerleave", () => { signatureHover = null; updatePolygonPreview(); });
   overlay.addEventListener("pointercancel", () => { signatureHover = null; cancelPointerGesture(); });
   overlay.addEventListener("lostpointercapture", event => { if (pointer?.id === event.pointerId || pendingPick?.id === event.pointerId && !pendingPick.released) cancelPointerGesture(); });
   function forwardWheel(event: WheelEvent): void {
-    if ((event.target as Element).closest(".hepr-editor-field")) return;
     activeText?.resizeControls?.cancel();
     fieldActivation.reset();
     textActivation.reset();
     event.preventDefault(); event.stopPropagation();
-    if (pendingPick || pointer && pointer.action !== "draw") cancelPointerGesture();
+    if (pendingPick || pointer && pointer.action !== "draw" && pointer.action !== "marquee") cancelPointerGesture();
     host.getCanvas().dispatchEvent(new WheelEvent("wheel", { bubbles: true, cancelable: true, clientX: event.clientX, clientY: event.clientY,
       deltaX: event.deltaX, deltaY: event.deltaY, deltaZ: event.deltaZ, deltaMode: event.deltaMode, ctrlKey: event.ctrlKey, metaKey: event.metaKey, shiftKey: event.shiftKey }));
   }
   overlay.addEventListener("wheel", forwardWheel, { passive: false });
-  window.addEventListener("blur", () => { fieldActivation.reset(); textActivation.reset(); }, { signal: lifetime.signal });
+  window.addEventListener("blur", () => { pasteCursor = null; fieldActivation.reset(); textActivation.reset(); }, { signal: lifetime.signal });
   async function doubleClick(event: MouseEvent): Promise<void> {
     if (!active || running || links.isOpen()) return;
     if (tool === "polygon" || tool === "polyline") { completePolygon(true); return; }
@@ -2327,6 +2404,13 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       nudgeSelectionByPixels(event.key === "ArrowLeft" ? -d : event.key === "ArrowRight" ? d : 0, event.key === "ArrowUp" ? -d : event.key === "ArrowDown" ? d : 0); }
   }
   window.addEventListener("keydown", keydown, { signal: lifetime.signal });
+  function clearObjectClipboardForText(event: ClipboardEvent): void {
+    if (disposed) return;
+    if (inputTarget(event.target) || document.getSelection()?.isCollapsed === false || review.getTextSelection()?.text ||
+        event.clipboardData?.types.includes("text/plain")) tabClipboard.clear();
+  }
+  window.addEventListener("copy", clearObjectClipboardForText, { signal: lifetime.signal });
+  window.addEventListener("cut", clearObjectClipboardForText, { signal: lifetime.signal });
   window.addEventListener("keydown", transformModifiers, { signal: lifetime.signal });
   window.addEventListener("keyup", transformModifiers, { signal: lifetime.signal });
   function hasUnsavedChanges(): boolean {
@@ -2446,6 +2530,8 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       }
       try {
         active = value; toolbar.hidden = overlay.hidden = !value; document.body.classList.toggle("hepr-editing", value);
+        pasteCursor = contextPasteClient = null;
+        toolbarReservation.update(value);
         cameraPan.setActive(value);
         review.setActive(value);
         links.setActive(value); updateLinkButtons();
@@ -2463,6 +2549,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       } catch (error) {
         if (value && !disposed) {
           active = false; toolbar.hidden = overlay.hidden = true; document.body.classList.remove("hepr-editing");
+          toolbarReservation.update(false);
           cameraPan.setActive(false);
           review.setActive(false);
           links.setActive(false);
@@ -2481,6 +2568,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       releaseTextPaints();
       colorDraft = null;
       cameraPan.dispose();
+      toolbarReservation.dispose();
       review.dispose(); links.dispose(); recoveryDialog?.close(); fieldDialog?.close(); pageNumberingDialog?.close();
       if (discardRecovery && recovery) { const controller = recovery; void controller.discard().finally(() => controller.dispose()).catch(() => {}); }
       else recovery?.dispose();

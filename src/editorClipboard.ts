@@ -1,5 +1,5 @@
 import type { EditorObject, EditorSelectionFrame, EditorSession } from "./editorTypes";
-import type { VectorScene } from "./pdfVectorExtractor";
+import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 
 /** Editor-only snapshots. These never become part of scene or document persistence. */
 export interface EditorCapturedSource {
@@ -11,6 +11,7 @@ export interface EditorClipboardSnapshot {
   roots: readonly string[];
   objects: ReadonlyMap<string, EditorObject>;
   sources: ReadonlyMap<string, EditorCapturedSource>;
+  bounds: Bounds;
   basis?: EditorSelectionFrame["transform"];
   cut: boolean;
   pastes: number;

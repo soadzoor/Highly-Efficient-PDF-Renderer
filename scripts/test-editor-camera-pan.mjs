@@ -45,7 +45,7 @@ try {
     h.event("pointerup", { clientX: 49, clientY: 43, buttons: 0 });
     assert.deepEqual(h.calls.filter(Array.isArray).filter(call => call[0] !== "state"), [[20, 15], [-5, -10], [4, -2]], "camera deltas include final release coordinates without document transforms");
     assert.equal(h.calls.filter(call => call === "end").length, 1); assert(!h.pan.isPanning()); assert(!h.overlay.captures.size);
-    assert.equal(h.overlay.dataset.cameraPan, undefined); assert.equal(h.window.listeners.size, 2, "only start/auxclick listeners remain in idle Edit");
+    assert.equal(h.overlay.dataset.cameraPan, undefined); assert.equal(h.window.listeners.size, 3, "only start/chord/auxclick listeners remain in idle Edit");
     assert(h.event("auxclick", { target: h.canvas }).defaultPrevented);
     assert(!h.event("auxclick", { button: 2 }).defaultPrevented);
     h.pan.setActive(false); assert.equal(h.window.listeners.size, 0); h.pan.dispose();

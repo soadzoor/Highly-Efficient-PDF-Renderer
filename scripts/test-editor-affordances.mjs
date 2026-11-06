@@ -212,11 +212,20 @@ for (const change of ["camera", "source", "revision"]) {
     assert.equal(document.activeElement, element); assert.equal(document.getSelection(), caret); assert.equal(caret.anchorOffset, 5); assert.equal(caret.focusOffset, 5);
     assert.equal(gestures.session.revision, revision); assert.equal(gestures.currentState.selection, selection, "zooming neither commits the textbox nor changes document selection");
   }
-  const count = forwarded.length, fieldWheel = wheel(true, { ctrlKey: true }); order.length = 0;
-  gestures.forwardWheel(fieldWheel);
-  assert.equal(forwarded.length, count, "form fields retain their own wheel behavior"); assert.deepEqual(order, []);
-  assert.equal(fieldWheel.prevented, 0); assert.equal(fieldWheel.stopped, 0);
-  gestures.activeText = null; gestures.document = previousDocument;
+  gestures.activeText = null;
+  const input = { value: "37", selectionStart: 1, selectionEnd: 1 };
+  document.activeElement = input;
+  for (const modifiers of [{}, { ctrlKey: true }, { metaKey: true }, { shiftKey: true }]) {
+    const count = forwarded.length, fieldWheel = wheel(true, modifiers); order.length = 0;
+    gestures.forwardWheel(fieldWheel);
+    assert.equal(forwarded.length, count + 1, "hovered form fields forward document wheel navigation");
+    assert.deepEqual(order, ["wheel"]);
+    assert.equal(fieldWheel.prevented, 1, "native wheel defaults cannot change the field value"); assert.equal(fieldWheel.stopped, 1);
+    assert.equal(input.value, "37"); assert.equal(document.activeElement, input);
+    assert.equal(input.selectionStart, 1); assert.equal(input.selectionEnd, 1);
+    assert.equal(gestures.session.revision, revision); assert.equal(gestures.currentState.selection, selection);
+  }
+  gestures.document = previousDocument;
 }
 gestures.running = true; const preventBeforeBusy = prevented; await gestures.pointerDown(event(13));
 assert.equal(prevented, preventBeforeBusy); assert.equal(gestures.pointer, null, "busy operations cannot start document gestures");

@@ -210,8 +210,11 @@ lists can set `multiSelect`. Checkbox/radio `onValue` defaults to `Yes`; radio
 widgets share a name and use distinct `onValue` values. Other authored names
 must be unique, including against existing source fields; new names cannot contain
 periods (reserved for PDF field hierarchies). Required fields may
-remain empty while authoring; `readOnly` restricts filling, independently of the
-object's editing lock. Number values must be finite; dates use `YYYY-MM-DD`.
+remain empty while authoring; `readOnly` restricts filling independently of the
+object's editing lock. Object/group locks also make the field read-only in
+editable PDF exports. If widgets share a field value, any locked widget protects
+the whole shared value. Reopening and unlocking restores fillability unless the
+field was explicitly read-only. Number values must be finite; dates use `YYYY-MM-DD`.
 
 PDF saves create standard AcroForm field trees and widget appearances, embedding
 the actual font programs for later typing. Text-like fields retain an inert
@@ -329,10 +332,44 @@ rendered appearance as independent artwork, without linked field semantics.
 Clipboard state survives selection, layer and Undo/Redo changes, is never saved,
 and requires recopy or undo before pasting across a page-structure change.
 
+`await exportClipboard({ signal? })` returns selection-only portable bytes, or
+null for an empty clipboard. `await importClipboard(bytes, { signal? })` prepares
+those copies in another editor without editing its document; `pasteSelection`
+then inserts them as one undoable change. Imported in-place copies retain the
+primary source page's local position on destination page zero. Object groups,
+images, rich text, locks and copied-object links survive; links to uncopied
+objects or source PDF pages are omitted. Registered authored fonts travel with
+the selection through the session's font capture/restore hooks. Frozen retained
+artwork uses its existing raster appearance and emits a diagnostic rather than
+carrying source-page replay resources. The payload excludes the source PDF and
+unselected page metadata. `clearClipboard()` clears clipboard contents without
+changing document history.
+
+The stock editors share this portable clipboard between open Edit tabs of the
+same origin through browser memory. Switching PDFs in the same tab retains it;
+once another tab has received a copy, it can paste after the source tab closes.
+Object sharing does not require system-clipboard permissions or persistent
+storage. Native text copying in viewer tabs clears the shared object clipboard.
+
+Supply `pasteSelection({ target: { pageIndex, center: [x, y] } })` to place the
+copied bounds' center at a composed editor-scene point and assign every copied
+object to that page. This preserves relative spacing, sizes, transforms and
+locks, including selections copied from multiple pages. Targeted paste does not
+add cascading offsets or resize/clamp content to the destination page. A target
+and an offset cannot be combined.
+
 ```ts
 await editor.cutSelection({ signal });
 editor.setActiveLayer(notes);
 const pasted = editor.pasteSelection();
+const centered = editor.pasteSelection({ target: { pageIndex: 1, center: [120, 240] } });
+
+await sourceEditor.copySelection();
+const portable = await sourceEditor.exportClipboard();
+if (portable) {
+  await destinationEditor.importClipboard(portable);
+  destinationEditor.pasteSelection({ target: { pageIndex: 0, center: [120, 240] } });
+}
 ```
 
 `copyObjectLayerMembership(sourceId, targetId)` copies the exact current

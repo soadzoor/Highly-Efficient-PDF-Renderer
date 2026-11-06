@@ -6,6 +6,34 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Changed
+
+- Center pasted objects at the cursor on its page, using the visible page's
+  center for toolbar paste or when the cursor is outside a page. Preserve
+  paste-in-place, grouping, relative spacing, layers and locks; add an explicit
+  destination-page/center option to the editor paste API.
+- Share selected objects between PDFs in same-origin Edit tabs and across
+  document changes, including fonts, groups, images and frozen source artwork.
+  Transfer selection-only data in browser memory; add portable clipboard
+  export/import/clear APIs and keep native text copying independent. Retained
+  composite artwork transfers its current raster appearance with a diagnostic.
+
+### Fixed
+
+- Preserve copied source artwork in editable PDF exports from HEP/source-less
+  documents and when pasting across pages, including text, images, gradients
+  and recovered copies.
+- Keep area selection active during wheel scrolling, zoom and middle-button
+  camera panning, with document-anchored bounds, shared pointer capture and
+  cancellation across mouse-button release orders.
+- Forward document scrolling and zoom over form inputs, dropdowns and multiline
+  fields in Edit without changing their values, focus or caret.
+- Reserve the measured Edit toolbar height in Reader so the first page's top
+  and fitted pages remain visible when controls wrap or the main toolbar hides.
+- Save locked form objects as standard read-only PDF fields, including shared
+  fields, radio groups and group locks. Reopening and unlocking restores
+  fillability while preserving explicit read-only settings and existing values.
+
 ## [0.2.1] - 2026-11-04
 
 ### Added

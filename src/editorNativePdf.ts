@@ -32,10 +32,11 @@ import { prepareEditorNativePdfLayers } from "./editorNativeLayers";
 import { applyEditorSceneLayers, assignEditorGeometryLayer, reorderEditorSceneLayers, editorLayerPaintRank } from "./editorLayerScene";
 import { isScenePaintRunVisible, scenePaintOrderedRuns } from "./scenePaintQuery";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
-import { getEditorCapturedSourceScene } from "./editorClipboard";
+import { getEditorCapturedSourceScene, registerEditorCapturedSourceReader } from "./editorClipboard";
 import type { NativeMissingFontResolver } from "./pdf/nativeFont";
 import { writeEditorNativePdfLinks } from "./editorPdfLinks";
 import { createEditorPdfFieldWriter } from "./editorPdfFields";
+import { applyEditorPdfSourceFieldLocks, flushEditorPdfDictionaryReplacements, pendingEditorPdfDictionary, readEditorPdfAnnotationFlags, readEditorPdfFieldLockState, replaceEditorPdfDictionary } from "./editorPdfFieldLocks";
 import { importNativePdfValue as importEditorPdfValue, importNativePdfLayers } from "./pdfNativeImport";
 export { importNativePdfValue as importEditorPdfValue } from "./pdfNativeImport";
 
@@ -295,7 +296,9 @@ function decorateFieldAppearance(writer: NativePdfWriter, annotation: NativePdfA
 
 /** Apply values and explicit appearances without touching unrelated PDF objects. */
 export async function applyEditorPdfFields(writer: NativePdfWriter, values: ReadonlyMap<string, EditorFieldValue>,
-  fonts: EditorFontRegistry, options: { signal?: AbortSignal; onWarning?: (message: string) => void; onProgress?: LoadProgressCallback } = {}): Promise<void> {
+  fonts: EditorFontRegistry, options: { signal?: AbortSignal; onWarning?: (message: string) => void; onProgress?: LoadProgressCallback;
+    /** Editor sessions enforce object locks separately and can unlock their own synthesized ReadOnly. */
+    allowEditorLockReadOnly?: boolean } = {}): Promise<void> {
   const progress = createLoadProgressReporter(options.onProgress);
   progress.report(0, { stage: "compile", sourceType: "pdf", unit: "sections", processed: 0, total: values.size });
   if (!values.size) { progress.complete({ sourceType: "pdf", unit: "sections", processed: 0, total: 0 }); return; }
@@ -337,7 +340,8 @@ export async function applyEditorPdfFields(writer: NativePdfWriter, values: Read
     progress.report(processed / Math.max(1, targets.length), { stage: field.fieldType === "Tx" ? "pdf-text" : "compile",
       sourceType: "pdf", unit: "sections", processed, total: targets.length, sourcePageIndex: annotation.pageIndex, sourcePageCount: document.pages.length });
     found.add(name);
-    if (field.fieldFlags & 1) throw new Error(`Field ${name} is read-only.`);
+    if (field.fieldFlags & 1 && !(options.allowEditorLockReadOnly &&
+      (await readEditorPdfFieldLockState(document, annotation.dictionary, options.signal)).readOnlyFromLock)) throw new Error(`Field ${name} is read-only.`);
     if (!["Tx", "Ch", "Btn"].includes(field.fieldType ?? "") || (field.fieldType === "Btn" && (field.fieldFlags & (1 << 16)))) {
       throw new Error(`Field ${name} is not a fillable text, choice, checkbox or radio field.`);
     }
@@ -451,6 +455,7 @@ export async function applyEditorPdfFields(writer: NativePdfWriter, values: Read
   }
   for (const name of values.keys()) if (!found.has(name)) throw new RangeError(`Unknown form field ${name}.`);
   for (const changed of changedOwners.values()) if (changed.ref) writer.set(changed.ref, changed.dictionary);
+  for (const [before, after] of directReplacements) replaceEditorPdfDictionary(writer, before, after);
   // Direct widgets and direct field parents belong to their containing array
   // or dictionary. Rebuild those owners instead of mutating parser Maps, and
   // retain indirect identities shared by /Fields, /Kids and page /Annots.
@@ -646,6 +651,7 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
       pdfPages: Array.from({ length: base.pageCount }, (_, index) => ({ pageIndex: index, sourcePageIndex: index,
         pdfToScene: [1, 0, 0, 1, base.pageRects[index * 4], base.pageRects[index * 4 + 1]] })) },
       getSourceEdits: () => [], getAnnotationEdits: () => [], getFieldValues: () => new Map() };
+    registerEditorCapturedSourceReader(wrapper, id => getEditorCapturedSourceScene(session, id));
     const blob = await saveEditorNativePdf(scene, wrapper, { ...childOptions(.5, 1), protection: options.protection },
       { ...services, password: undefined, sourceSceneIsPageContent: true });
     progress.complete({ sourceType: "scene" }); return blob;
@@ -659,7 +665,7 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
     const sourceFieldNames = new Set(session.sourceScene.annotations?.flatMap(annotation => annotation.field?.name &&
       !annotationEdits.get(annotation.id)?.deleted ? [annotation.field.name] : []));
     await applyEditorPdfFields(writer, new Map([...session.getFieldValues()].filter(([name]) => sourceFieldNames.has(name))),
-      services.fonts, childOptions(.05, .25));
+      services.fonts, { ...childOptions(.05, .25), allowEditorLockReadOnly: true });
     const layerEdits = session.getLayerEdits();
     const objectOrderChanged = layerEdits.objectOrderChanged === true;
     const paintOrderChanged = objectOrderChanged || layerEdits.stackingChanged;
@@ -782,6 +788,7 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
     // only the selected appearance, keeping fields/actions and unrelated /APs.
     const forms = new NativePdfFormAppearanceRegistry(document);
     const widgetIds = new Set<string>();
+    const sourceWidgets: NativePdfAnnotationAppearance[] = [];
     for (let pageIndex = 0; pageIndex < session.sourceScene.pageCount; pageIndex++) {
       const sourceIndex = session.sourceScene.pdfPages?.find(page => page.pageIndex === pageIndex)?.sourcePageIndex ?? pageIndex;
       const originalPage = document.getPage(sourceIndex);
@@ -794,7 +801,7 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
           return rank;
         }, arrangedObjectRank(`annotation:${annotation.id}`) ?? -1) : editorLayerPaintRank(scene.optionalContent, scene.annotations?.find(item => item.id === annotation.id)?.optionalContent);
         annotationRanks.set(annotationKey(annotation.ref ?? annotation.dictionary), rank === -1 ? null : rank);
-        if (annotation.subtype === "Widget") widgetIds.add(annotation.id);
+        if (annotation.subtype === "Widget") { widgetIds.add(annotation.id); sourceWidgets.push(annotation); }
         const progressMetadata = { sourceType: "pdf" as const, unit: "sections" as const, total: annotations.length,
           pageIndex, pageCount: session.sourceScene.pageCount, sourcePageIndex: sourceIndex, sourcePageCount: document.pages.length };
         progress.report(start, { ...progressMetadata, stage: "compile", processed: index });
@@ -806,7 +813,7 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
         const affected = edits.filter(edit => refs.some(ref => ref.kind === edit.ref.kind && ref.index === edit.ref.index));
         const annotationEdit = annotationEdits.get(annotation.id);
         const membershipChanged = changedAnnotationMemberships.has(annotation.id);
-        const locked = session.isObjectLocked(`annotation:${annotation.id}`), originalFlags = Number(annotation.dictionary.get("F") ?? 0),
+        const locked = session.isObjectLocked(`annotation:${annotation.id}`), originalFlags = await readEditorPdfAnnotationFlags(writer, annotation.dictionary, options.signal),
           lockChanged = locked !== ((originalFlags & 128) !== 0);
         if (!affected.length && !annotationEdit && !membershipChanged && !lockChanged) continue;
         if (annotationEdit?.deleted || (refs.length && refs.every(ref => affected.some(edit => edit.ref.kind === ref.kind && edit.ref.index === ref.index && edit.deleted)))) {
@@ -817,17 +824,18 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
           continue;
         }
         const pendingAnnotation = annotation.ref ? writer.get(annotation.ref) : undefined;
-        const originalDictionary = new Map(isPdfDictionary(pendingAnnotation) ? pendingAnnotation : annotation.dictionary);
+        const originalDictionary = new Map(pendingEditorPdfDictionary(writer, isPdfDictionary(pendingAnnotation) ? pendingAnnotation : annotation.dictionary));
         if (affected.some(edit => edit.color !== undefined)) await retainEditorWidgetTextColor(document, annotation,
           session.sourceScene.annotations?.find(item => item.id === annotation.id)?.field?.type, refs, affected, originalDictionary, options.signal);
         if (annotation.subtype === "Link" && !annotation.ref && !originalDictionary.has("NM")) originalDictionary.set("NM", pdfTextValue(annotation.id));
-        if (lockChanged) originalDictionary.set("F", locked ? originalFlags | 128 : originalFlags & ~128);
+        if (lockChanged) originalDictionary.set("F", originalFlags - (originalFlags & 128) + (locked ? 128 : 0));
         if (annotationEdit?.contents !== undefined) originalDictionary.set("Contents", pdfTextValue(annotationEdit.contents));
         if (annotationEdit?.author !== undefined) originalDictionary.set("T", pdfTextValue(annotationEdit.author));
         const geometryChanged = affected.length > 0 || (annotationEdit && !annotationEdit.transform.every((value, index) => value === [1, 0, 0, 1, 0, 0][index]));
         if (!geometryChanged && !membershipChanged) {
           if (annotation.ref) writer.set(annotation.ref, originalDictionary);
           else {
+            replaceEditorPdfDictionary(writer, annotation.dictionary, originalDictionary);
             const owner = pageDictionary(sourceIndex), raw = await document.resolveValue(owner.get("Annots"), options.signal);
             if (Array.isArray(raw)) owner.set("Annots", raw.map(item => item === annotation.dictionary ? writer.add(originalDictionary) : item));
           }
@@ -948,6 +956,7 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
         if (metadata?.pdfGeometry.inkList) dictionary.set("InkList", metadata.pdfGeometry.inkList.map(path => [...path]));
         if (annotation.ref) writer.set(annotation.ref, dictionary);
         else {
+          replaceEditorPdfDictionary(writer, annotation.dictionary, dictionary);
           const owner = pageDictionary(sourceIndex), raw = await document.resolveValue(owner.get("Annots"), options.signal);
           if (Array.isArray(raw)) owner.set("Annots", raw.map(item => {
             if (item !== annotation.dictionary) return item;
@@ -983,7 +992,7 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
       const captured = getEditorCapturedSourceScene(session, object.id);
       const cloneSource = captured ?? await applyEditorSceneLayers(session.sourceScene, session.getObjectLayerEdits(object.id), { signal: options.signal, onDiagnostic: options.onDiagnostic });
       const cloned = captured ?? transformWholeEditorScene(compactEditorScene(cloneSource, keep), object.transform, options.signal);
-      const view = assignEditorGeometryLayer(new ScenePageViews(cloned).extract(object.pageIndex).scene, layerEdits.catalog, object.layerId, object.layerCondition);
+      const view = assignEditorGeometryLayer(captured ?? new ScenePageViews(cloned).extract(object.pageIndex).scene, layerEdits.catalog, object.layerId, object.layerCondition);
       const imported = await importEditorPdfPage(new Uint8Array(await (await writeScenePdf(view, work.options)).arrayBuffer()), writer, options.signal);
       const sourceIndex = session.sourceScene.pdfPages?.find(page => page.pageIndex === object.pageIndex)?.sourcePageIndex ?? object.pageIndex;
       const page = document.getPage(sourceIndex), matrix = invertEditorMatrix(computeNativePdfPageGeometry(page).pageMatrix);
@@ -991,14 +1000,15 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
       const local = { minX: box.minX - r[i], minY: box.minY - r[i + 1], maxX: box.maxX - r[i], maxY: box.maxY - r[i + 1] };
       imported.form.set("BBox", [local.minX, local.minY, local.maxX, local.maxY]); imported.form.set("Matrix", [...matrix]);
       const rect = editorTransformBounds(local, matrix);
+      const cloneFlags = 4 | (session.isObjectLocked(object.id) ? 128 : 0);
       const cloneAnnotation = new Map<string, PdfValue>([["Type", pdfNameValue("Annot")], ["Subtype", pdfNameValue("Stamp")],
-        ["NM", pdfTextValue(object.id)], ["F", 4], ["Rect", [rect.minX, rect.minY, rect.maxX, rect.maxY]],
+        ["NM", pdfTextValue(object.id)], ["F", cloneFlags], ["Rect", [rect.minX, rect.minY, rect.maxX, rect.maxY]],
         ["AP", new Map([["N", writer.add(pdfStreamValue(imported.content, imported.form))]])]]);
       const cloneMembership = object.layerCondition === undefined ? undefined : session.getObjectLayerCondition(object.id);
       const cloneLayer = object.layerCondition === undefined ? layers.groupReference(object.layerId)
         : layers.conditionReference(cloneMembership!.catalog, cloneMembership!.condition);
       if (cloneLayer && typeof cloneLayer !== "boolean") cloneAnnotation.set("OC", cloneLayer);
-      if (cloneLayer === false) cloneAnnotation.set("F", 6);
+      if (cloneLayer === false) cloneAnnotation.set("F", cloneFlags | 2);
       const annotation = writer.add(cloneAnnotation);
       const cloneRanks = view.drawRuns?.map(run => editorLayerPaintRank(view.optionalContent, run.optionalContent)).filter((rank): rank is number => rank !== null) ?? [];
       annotationRanks.set(annotationKey(annotation), paintOrderChanged ? arrangedObjectRank(object.id)
@@ -1022,6 +1032,7 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
         const membership = session.getObjectLayerCondition(object.id), layer = layers.conditionReference(membership.catalog, membership.condition);
         const reference = await authoredFields.add(object, { rectangle, page: page.ref,
           flags: (layer === false ? 6 : 4) | (session.isObjectLocked(object.id) ? 128 : 0),
+          locked: session.isObjectLocked(object.id),
           ...(typeof layer !== "boolean" ? { optionalContent: layer } : {}),
           appearance: async field => {
             const compiled = await services.compileObject(field, options.signal);
@@ -1149,6 +1160,8 @@ export async function saveEditorNativePdf(scene: VectorScene, session: EditorSes
       } else catalog.delete("HEPRDocument");
       writer.set(root, catalog);
     }
+    await applyEditorPdfSourceFieldLocks(writer, session, sourceWidgets, options.signal);
+    await flushEditorPdfDictionaryReplacements(writer, options.signal);
     progress.report(.94, { stage: "compile", sourceType: "pdf", unit: "sections", processed: processedObjects, total: objectCount });
     const bytes = await writer.save(options.signal, { protection: options.protection });
     progress.complete({ sourceType: "pdf", unit: "bytes", processed: bytes.length, total: bytes.length });

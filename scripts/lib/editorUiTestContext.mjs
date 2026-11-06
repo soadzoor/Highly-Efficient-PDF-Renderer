@@ -6,6 +6,7 @@ import vm from "node:vm";
 export function editorUiTestContext(values = {}) {
   if (values.host && !values.host.sceneToClientPoint) values.host.sceneToClientPoint = () => null;
   if (values.session && !values.session.isObjectLocked) values.session.isObjectLocked = () => false;
+  if (values.session && !values.session.exportClipboard) values.session.exportClipboard = async () => null;
   return vm.createContext({
     disposed: false, running: false, structuralRunning: false, savePreparing: false, AbortSignal, AbortController,
     async waitForLoad(promise, signal) { signal?.throwIfAborted(); const value = await promise; signal?.throwIfAborted(); return value; },
@@ -24,6 +25,9 @@ export function editorUiTestContext(values = {}) {
     recovery: null, recoveryKey: "", recoveryReady: Promise.resolve(), recoveryOffered: false,
     recoveryDialog: null, pageNumberingDialog: null, recoveryRunning: false, discardRecovery: false, exportedRevision: null,
     cameraPan: { cancel() {}, isPanning: () => false, setActive() {}, dispose() {} },
+    toolbarReservation: { update() {}, dispose() {} }, pasteCursor: null, contextPasteClient: null,
+    tabClipboard: { beginCopy: () => Date.now(), hasValue: () => false, getId: () => null, get: () => null, publish: () => null, clear() {} }, clipboardTransferId: null, updateFonts() {},
+    fieldValueLocked: () => false,
     fieldActivation: { pointerDown() {}, pointerMove() {}, pointerUp: () => null, reset() {} }, canActivateField: () => false,
     textActivation: { pointerDown() {}, pointerMove() {}, pointerUp: () => null, reset() {} }, canActivateText: () => false,
     textAtClientPoint: () => null, updateTextEditButton() {},
