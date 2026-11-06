@@ -20,6 +20,8 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
+- Open PDFs whose form field names contain literal periods, preserving field
+  names, values and appearances while reporting a compatibility warning.
 - Preserve copied source artwork in editable PDF exports from HEP/source-less
   documents and when pasting across pages, including text, images, gradients
   and recovered copies.

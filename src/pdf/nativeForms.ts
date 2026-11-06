@@ -73,6 +73,7 @@ export interface NativePdfAcroFormMetadata {
 
 export interface NativePdfWidgetMetadata {
   readonly fieldType?: string;
+  /** Decoded source `/T` components, preserving literal periods. */
   readonly partialNames: readonly string[];
   readonly fullyQualifiedName?: string;
   readonly value?: PdfValue;
@@ -853,9 +854,12 @@ export class NativePdfFormAppearanceRegistry {
       if (partialName) {
         const decodedName = decodePdfString(partialName, pageIndex, annotationIndex);
         if (decodedName.includes(".")) {
-          throw new PdfError("invalid-object", "A partial field /T name contains a period.", {
+          this.emitDiagnostic({
+            code: "annotation.field-partial-name-period",
+            severity: "warning",
             pageIndex,
-            details: { annotationIndex, reason: "field-partial-name-period" }
+            message: "A partial field /T name contains a period; its literal name, values and appearance were retained.",
+            details: { annotationIndex, partialName: decodedName }
           });
         }
         names.push(decodedName);

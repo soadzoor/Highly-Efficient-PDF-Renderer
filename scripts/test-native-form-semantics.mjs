@@ -465,7 +465,50 @@ for (const [encodedName, expectedName] of [
   );
 }
 
-for (const malformedName of ["(Bad.Name)", "<FEFF00>", "<FEFFD800>"]) {
+for (const [parentName, childName, expectedNames] of [
+  ["(Bad.Name)", "", ["Bad.Name"]],
+  ["(Parent.Name)", "/T (Child.Name)", ["Parent.Name", "Child.Name"]],
+  ["(Parent)", "/T <FEFF004300680069006C0064002E004E0061006D0065>", ["Parent", "Child.Name"]]
+]) {
+  await withDocument(
+    fieldFixture({
+      widget: `<< /Type /Annot /Subtype /Widget /Parent 5 0 R ${childName} /Rect [0 0 1 1] /AP << /N 7 0 R >> >>`,
+      field: `<< /FT /Tx /T ${parentName} /V (retained value) /DV (retained default) /Ff 4096 /Kids [4 0 R] >>`,
+      extraObjects: [{ number: 7, body: tinyPdfStream("/Subtype /Form /BBox [0 0 1 1]", "q 0 0 1 1 re f Q") }]
+    }),
+    async (dottedNames) => {
+      const diagnostics = [];
+      const registry = new NativePdfFormAppearanceRegistry(dottedNames, {
+        onDiagnostic: (diagnostic) => diagnostics.push(diagnostic)
+      });
+      const annotations = await registry.listPageAnnotations(0);
+      const [annotation] = annotations;
+      assert.deepEqual(annotation.widget.partialNames, expectedNames, "literal periods do not create extra field ancestors");
+      assert.equal(annotation.widget.fullyQualifiedName, expectedNames.join("."));
+      assert.equal(decodeString(annotation.widget.value), "retained value");
+      assert.equal(decodeString(annotation.widget.defaultValue), "retained default");
+      assert.equal(annotation.widget.fieldFlags, 4096);
+      const appearance = await registry.resolveAnnotationAppearance(annotation);
+      assert(appearance, "a dotted field name does not suppress its appearance");
+      assert.deepEqual(
+        await registry.decodeFormContent(appearance.normalAppearance.form),
+        encoder.encode("q 0 0 1 1 re f Q")
+      );
+      assert.equal(await registry.listPageAnnotations(0), annotations);
+      const dottedComponents = expectedNames.filter((name) => name.includes(".")).reverse();
+      assert.deepEqual(diagnostics.map((diagnostic) => diagnostic.details.partialName), dottedComponents);
+      for (const diagnostic of diagnostics) {
+        assert.equal(diagnostic.code, "annotation.field-partial-name-period");
+        assert.equal(diagnostic.severity, "warning");
+        assert.equal(diagnostic.pageIndex, 0);
+        assert.equal(diagnostic.details.annotationIndex, 0);
+      }
+      assert.deepEqual(registry.getDiagnostics(), diagnostics, "cached reads do not repeat name warnings");
+    }
+  );
+}
+
+for (const malformedName of ["<FEFF00>", "<FEFFD800>"]) {
   await withDocument(
     fieldFixture({
       widget: "<< /Type /Annot /Subtype /Widget /Parent 5 0 R /Rect [0 0 1 1] >>",
