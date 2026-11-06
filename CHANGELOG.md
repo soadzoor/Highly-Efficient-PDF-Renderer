@@ -6,6 +6,8 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-06
+
 ### Changed
 
 - Move textboxes while editing their content by dragging their borders with a
@@ -1074,7 +1076,7 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   shadings, and physical press calibration are tracked in the
   [follow-up checklist](docs/development.md#font-local-postscript-follow-ups).
 
-[Unreleased]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.2.2...HEAD
 [0.1.57]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.56...v0.1.57
 [0.1.58]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.57...v0.1.58
 [0.1.59]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.58...v0.1.59
@@ -1092,3 +1094,4 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 [0.1.71]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.70...v0.1.71
 [0.2.0]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.71...v0.2.0
 [0.2.1]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.2.0...v0.2.1
+[0.2.2]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.2.1...v0.2.2
