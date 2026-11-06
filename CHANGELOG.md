@@ -8,6 +8,8 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Changed
 
+- Move textboxes while editing their content by dragging their borders with a
+  move cursor, preserving text formatting, wrapping and automatic sizing.
 - Center pasted objects at the cursor on its page, using the visible page's
   center for toolbar paste or when the cursor is outside a page. Preserve
   paste-in-place, grouping, relative spacing, layers and locks; add an explicit
@@ -20,6 +22,9 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
+- Let auto-sized textboxes shrink below their original minimum dimensions when
+  reducing the size of all their text. Release Size input focus on canvas clicks
+  or Enter so arrow keys can move selected objects again.
 - Open PDFs whose form field names contain literal periods, preserving field
   names, values and appearances while reporting a compatibility warning.
 - Preserve copied source artwork in editable PDF exports from HEP/source-less

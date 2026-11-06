@@ -85,6 +85,14 @@ function harness() {
   assert.equal(saved.x, draft.x); assert.equal(saved.y, draft.y); assert.equal(saved.fontSize, 12, "automatic sizing retains the original character size");
   const resize = h.resizeOptions();
   const originalBounds = { x: draft.x, y: draft.y, width: draft.width, height: draft.height }, autoSize = draft.autoSize;
+  const movedBounds = { ...originalBounds, x: draft.x + 25, y: draft.y - 10 };
+  resize.onMove(movedBounds); resize.onChange();
+  assert.deepEqual(plain(resize.getBounds()), movedBounds, "moving updates only the pending textbox's position");
+  assert.equal(draft.autoSize, autoSize, "moving a click-created textbox preserves automatic sizing");
+  const movedDraft = await c.readTextDraft();
+  assert.equal(movedDraft.x, movedBounds.x); assert.equal(movedDraft.y, movedBounds.y);
+  assert.equal(movedDraft.fontSize, saved.fontSize); assert.equal(movedDraft.text, saved.text);
+  resize.onMove(originalBounds); resize.onChange(true);
   resize.onResizeStart();
   resize.onResize({ x: draft.x, y: draft.y + draft.height - 40, width: 120, height: 40 });
   assert.equal(draft.autoSize, undefined);

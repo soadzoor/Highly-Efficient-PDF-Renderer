@@ -137,7 +137,7 @@ try {
     await context.openTextEditor();
     const editing = context.activeText, original = session.getObject(id), html = editing.element.innerHTML, top = editing.y + editing.height;
     const resizeChrome = overlay.childNodes.find(node => node.className === "hepr-editor-text-resize-controls");
-    assert(resizeChrome && !resizeChrome.hidden); assert.equal(resizeChrome.childNodes.length, 8);
+    assert(resizeChrome && !resizeChrome.hidden); assert.equal(resizeChrome.childNodes.length, 12);
     assert(!editing.element.contains(resizeChrome), "resize handles remain outside editable content");
     const east = resizeChrome.childNodes.find(node => node.dataset.textResize === "e"), southeast = resizeChrome.childNodes.find(node => node.dataset.textResize === "se");
     const revisionBeforeResize = session.revision;
@@ -163,6 +163,18 @@ try {
     assert.deepEqual(draft.runs, original.runs); assert.deepEqual(draft.transform, original.transform);
     const fullLayout = await layoutEditorText(original, services.fonts), narrowLayout = await layoutEditorText(draft, services.fonts);
     assert(new Set(narrowLayout.glyphs.map(glyph => glyph.y)).size > new Set(fullLayout.glyphs.map(glyph => glyph.y)).size, "narrowing changes wrapping in the actual text compiler");
+    const border = resizeChrome.childNodes.find(node => node.dataset.textMove === "nw"), beforeMove = { x: editing.x, y: editing.y };
+    const moveStart = { x: editing.x, y: editing.y + editing.height };
+    dispatch(border, "pointerdown", moveStart.x, moveStart.y);
+    dispatch(resizeChrome, "pointermove", moveStart.x + 20, moveStart.y + 10);
+    assert.equal(editing.x, beforeMove.x + 20); assert.equal(editing.y, beforeMove.y + 10);
+    assert.equal(document.activeElement, editing.element); assert.equal(editing.element.innerHTML, html);
+    assert.equal(session.revision, revisionBeforeResize, "border moves retain the open draft and wait for Apply");
+    context.keydown({ key: "Escape", target: editing.element, preventDefault() {}, stopPropagation() {} });
+    assert.equal(editing.x, beforeMove.x); assert.equal(editing.y, beforeMove.y, "Escape rolls back translation without discarding content");
+    dispatch(border, "pointerdown", moveStart.x, moveStart.y);
+    dispatch(resizeChrome, "pointerup", moveStart.x + 25, moveStart.y);
+    assert.equal(editing.x, beforeMove.x + 25); assert.equal(editing.y, beforeMove.y);
     acknowledgeTextPaints = false;
     await context.pointerDown(event(450, 400, 400)); assert.equal(context.activeText, null); assert(!overlay.childNodes.includes(resizeChrome), "committing removes interactive resize chrome");
     assert(overlay.childNodes.includes(editing.element) && overlay.childNodes.includes(editing.backdrop), "outside Apply keeps resized text and original mask until its frame is drawn");
@@ -174,7 +186,9 @@ try {
     context.releaseTextPaints({ sourceScene: session.sourceScene, revision: committedRevision }); acknowledgeTextPaints = true;
     assert(!overlay.childNodes.includes(editing.element) && !overlay.childNodes.includes(editing.backdrop), "the matching drawn frame removes the retained text and original mask together");
     assert.equal(session.getObject(id).width, 55); assert.equal(session.getObject(id).height, 18); assert.equal(session.getObject(id).fontSize, original.fontSize);
-    session.undo(); assert.equal(session.getObject(id).width, original.width); session.redo(); assert.equal(session.getObject(id).width, 55);
+    assert.equal(session.getObject(id).x, beforeMove.x + 25, "Apply commits content-edit translation with its bounds and text");
+    session.undo(); assert.equal(session.getObject(id).width, original.width); assert.equal(session.getObject(id).x, original.x);
+    session.redo(); assert.equal(session.getObject(id).width, 55); assert.equal(session.getObject(id).x, beforeMove.x + 25);
     await context.openTextEditor(); assert.equal(context.activeText.height, 18, "reopening retains explicitly chosen bounds");
     assert(!rich.hasPendingEditorTextChanges(context.activeText), "reopening does not create geometry changes");
     context.changeTransform({ dataset: { transform: "width" }, value: "130" });

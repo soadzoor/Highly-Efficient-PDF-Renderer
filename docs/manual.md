@@ -190,15 +190,22 @@ files, or request installed fonts in a browser that supports local font access.
 Font bytes are used for committed rendering and PDF output.
 While editing content, Size updates the selected characters immediately; at a
 caret it sets the size for newly typed text. You can keep typing in the Size
-input without losing the saved text selection. In Select, changing Size updates
+input without losing the saved text selection. Press Enter to finish entering a
+size; clicking the canvas also releases Size input focus so arrow keys move
+selected objects again. In Select, changing Size updates
 all text in each selected textbox and scales its width and height proportionally,
 keeping its transformed top-left position fixed. Undo restores size and bounds
 together. Form fields retain their chosen dimensions.
 With **Text**, click to create a compact textbox centered on the click; it grows
 in width and height as you type, keeping its text's top-left anchor steady.
+Changing the size of all its text also scales its minimum dimensions, allowing
+the box to shrink with smaller fonts.
 Drag instead to draw a textbox that keeps the width and height you choose.
 While editing a textbox, drag its edge or corner handles to change its width,
-height and wrapping without scaling characters. Use W/H for exact dimensions;
+height and wrapping without scaling characters. Drag the blue border between
+handles, where the cursor shows Move, to move the box while keeping its content
+editor open. Moving preserves text formatting, wrapping and automatic sizing.
+Use W/H for exact dimensions;
 arrow keys on a focused handle resize by 1 unit, or 10 with Shift. Escape during
 a drag restores the previous bounds and keeps the content editor open.
 Double-click an edge handle to fit that axis to the content, or a corner to fit

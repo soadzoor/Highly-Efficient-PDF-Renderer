@@ -248,7 +248,7 @@ const pickerRequests = [], reportedPicks = [], pointerListeners = new Map();
 gestures.pick = () => new Promise((resolve, reject) => pickerRequests.push({ resolve, reject }));
 gestures.report = error => reportedPicks.push(error);
 gestureOverlay.addEventListener = (name, listener) => pointerListeners.set(name, listener);
-const pointerRegistration = source.match(/^  overlay\.addEventListener\("pointerdown",[^\n]+$/m)?.[0];
+const pointerRegistration = source.match(/^  overlay\.addEventListener\("pointerdown", event =>[^\n]+$/m)?.[0];
 assert(pointerRegistration, "the stock pointer-down listener must be exercised");
 vm.runInContext(pointerRegistration.trim(), gestures);
 pointerListeners.get("pointerdown")(event(21)); const rejectedRequest = gestures.pendingPick;

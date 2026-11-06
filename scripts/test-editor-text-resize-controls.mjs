@@ -16,23 +16,79 @@ const pointer = (type, values = {}) => Object.assign(new Event(type, { cancelabl
 });
 const keyboard = (key, values = {}) => Object.assign(new Event("keydown", { cancelable: true }), { key, ...values });
 const initial = { x: 10, y: 20, width: 100, height: 50 };
-function setup(inverse = point => ({ x: point.x, y: -point.y }), measure = () => ({ width: 60, height: 30 })) {
-  let bounds = { ...initial }, allowed = true, changes = 0, writes = 0, starts = 0;
+function setup(inverse = point => ({ x: point.x, y: -point.y }), measure = () => ({ width: 60, height: 30 }), movable = false) {
+  let bounds = { ...initial }, allowed = true, changes = 0, writes = 0, starts = 0, moves = 0;
   const measurements = [], cancellations = [];
   const overlay = new Element(), model = { fontSize: 12, transform: [1, 0, 0, 1, 0, 0], text: "unchanged" };
   const controls = createEditorTextResizeControls(document, overlay, {
     getBounds: () => ({ ...bounds }), canResize: () => allowed, clientToLocal: inverse,
     getContentSize: measure && ((width, height) => { measurements.push([width, height]); return measure(width, height); }),
     onResizeStart: () => { starts++; },
+    onMove: movable ? next => { bounds = next; moves++; } : undefined,
     onResize: next => { bounds = next; writes++; }, onChange: canceled => { changes++; cancellations.push(canceled); }
   });
   const container = overlay.children[0], handle = name => container.children.find(button => button.dataset.textResize === name);
   controls.update((x, y) => ({ x, y: -y }), { x: 5, y: 7 }, true);
-  return { controls, container, overlay, model, handle, measurements, cancellations, get bounds() { return bounds; }, get changes() { return changes; }, get writes() { return writes; }, get starts() { return starts; },
+  return { controls, container, overlay, model, handle, measurements, cancellations, get bounds() { return bounds; }, get changes() { return changes; }, get writes() { return writes; }, get starts() { return starts; }, get moves() { return moves; },
+    border: corner => container.children.find(element => element.dataset.textMove === corner),
     get capture() { return container.children.find(button => button.capture !== null)?.capture ?? null; },
     set allowed(value) { allowed = value; }, down: (name, values) => handle(name).dispatchEvent(pointer("pointerdown", values)),
     move: values => container.dispatchEvent(pointer("pointermove", values)), up: values => container.dispatchEvent(pointer("pointerup", values)),
     fit: (name, values) => handle(name).dispatchEvent(pointer("dblclick", values)) };
+}
+
+for (const corner of ["nw", "ne", "se", "sw"]) {
+  const test = setup(undefined, undefined, true), border = test.border(corner), model = structuredClone(test.model);
+  assert.equal(test.container.children.length, 12);
+  assert.equal(test.container.children.at(-1), test.handle("nw"), "resize handles sit above border hit areas");
+  test.overlay.style.cursor = "text";
+  const down = pointer("pointerdown"); border.dispatchEvent(down);
+  assert(down.defaultPrevented, "border dragging cannot commit the draft through an outside click");
+  assert.equal(border.capture, 1); assert.equal(test.overlay.style.cursor, "move");
+  test.move({ pointerId: 2, clientX: 99 }); assert.deepEqual(test.bounds, initial, "another pointer cannot move the draft");
+  test.move({ clientX: 20, clientY: 10 });
+  assert.deepEqual(test.bounds, { ...initial, x: 30, y: 10 }); assert.equal(test.changes, 0);
+  test.up({ clientX: 25, clientY: 15 });
+  assert.deepEqual(test.bounds, { ...initial, x: 35, y: 5 }, "final release coordinates translate without resizing");
+  assert.equal(test.changes, 1); assert.equal(test.capture, null); assert.equal(test.overlay.style.cursor, "text");
+  assert.equal(test.writes, 0); assert.equal(test.starts, 0, "translation cannot enter the manual resize sizing mode");
+  assert.deepEqual(test.model, model, "moving retains fonts, text and transforms");
+  test.controls.dispose();
+}
+
+{
+  const test = setup(point => ({ x: -point.y / 2, y: point.x / 3 }), undefined, true);
+  test.controls.update((x, y) => ({ x: 3 * y, y: -2 * x }), { x: 5, y: 7 }, true);
+  assert.equal(test.border("nw").style.left, "205px"); assert.equal(test.border("nw").style.top, "-27px");
+  assert.equal(test.border("nw").style.width, "200px");
+  assert.equal(test.border("nw").style.transform, `translateY(-50%) rotate(${-Math.PI / 2}rad)`);
+  test.border("ne").dispatchEvent(pointer("pointerdown")); test.up({ clientX: 60, clientY: -20 });
+  assert.deepEqual(test.bounds, { ...initial, x: 20, y: 40 }, "rotated and scaled views translate in textbox-local coordinates");
+  test.controls.dispose();
+}
+
+for (const end of ["pointercancel", "lostpointercapture", "Escape", "cancel"]) {
+  const test = setup(undefined, undefined, true); test.overlay.style.cursor = "text";
+  test.border("nw").dispatchEvent(pointer("pointerdown")); test.move({ clientX: 20, clientY: 10 });
+  if (end === "Escape") test.container.dispatchEvent(keyboard("Escape"));
+  else if (end === "cancel") assert.equal(test.controls.cancel(), true);
+  else test.container.dispatchEvent(pointer(end));
+  assert.deepEqual(test.bounds, initial, `${end} restores the starting position without discarding text`);
+  assert.equal(test.writes, 0); assert.equal(test.changes, 1); assert.equal(test.capture, null);
+  assert.equal(test.overlay.style.cursor, "text"); assert.deepEqual(test.cancellations, [true]);
+  test.controls.dispose();
+}
+
+{
+  const test = setup(undefined, undefined, true), border = test.border("nw");
+  test.allowed = false; border.dispatchEvent(pointer("pointerdown")); test.move({ clientX: 20 }); test.up({ clientX: 20 });
+  assert.equal(test.moves, 0, "locked or stale drafts cannot move");
+  test.allowed = true; border.dispatchEvent(pointer("pointerdown")); test.move({ clientX: 20 });
+  test.controls.update((x, y) => ({ x, y }), { x: 0, y: 0 }, false);
+  assert.equal(test.capture, null); assert(test.container.hidden, "hiding a moving draft releases capture");
+  test.controls.dispose(); const moves = test.moves;
+  border.dispatchEvent(pointer("pointerdown")); test.move({ clientX: 100 }); test.up({ clientX: 100 });
+  assert.equal(test.moves, moves, "disposed controls cannot move a draft");
 }
 
 {

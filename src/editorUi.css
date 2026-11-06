@@ -48,11 +48,13 @@ input.hepr-editor-field[data-pdf-pending=true][type=checkbox],input.hepr-editor-
 input.hepr-editor-field[type=checkbox]:focus-visible,input.hepr-editor-field[type=radio]:focus-visible{outline:1px solid #1765d7;outline-offset:1px}
 input.hepr-editor-field,textarea.hepr-editor-field{cursor:text}select.hepr-editor-field{cursor:default}input.hepr-editor-field[type=checkbox],input.hepr-editor-field[type=radio]{cursor:pointer}
 /* Keep editable line breaking when the applied draft waits for its rendered frame. */
+.hepr-editor-overlay:focus{outline:none}
 .hepr-editor-text-input{position:absolute;box-sizing:border-box;background:#fffffff0;border:0;color:#111;outline:1px solid #1765d7;padding:0;transform-origin:top left;overflow:visible;overflow-wrap:break-word;-webkit-line-break:after-white-space;cursor:text;pointer-events:auto;line-height:1.2}
 .hepr-editor-text-input div,.hepr-editor-text-input p{margin:0;padding:0}
 .hepr-editor-text-backdrop{position:absolute;background:#fff;transform-origin:top left;pointer-events:none}
 .hepr-editor-text-resize-controls{position:absolute;inset:0;pointer-events:none;z-index:1}
 .hepr-editor-text-resize-controls[hidden]{display:none}
+.hepr-editor-text-move-border{position:absolute;height:8px;transform-origin:0 50%;cursor:move;pointer-events:auto;touch-action:none}
 .hepr-editor-text-resize-handle{position:absolute;box-sizing:border-box;width:10px;height:10px;padding:0;border:1px solid #1765d7;border-radius:0;background:#fff;transform:translate(-50%,-50%);pointer-events:auto;touch-action:none}
 .hepr-editor-text-resize-handle:hover,.hepr-editor-text-resize-handle:active{background:#fff}
 .hepr-editor-text-resize-handle:focus-visible{outline:2px solid #1765d7;outline-offset:2px}

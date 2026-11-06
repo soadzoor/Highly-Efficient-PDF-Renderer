@@ -70,6 +70,12 @@ try {
       applyEditorPropertyPatch(sized, { fontSize: 6 }); const shrunk = sized.getObject(id);
       assert.deepEqual([shrunk.x, shrunk.y, shrunk.width, shrunk.height], [20, 55, 40, 15]);
       projectTopLeft(shrunk).forEach((value, i) => near(value, anchor[i]));
+      for (const fontSize of [3, 1, .25]) {
+        applyEditorPropertyPatch(sized, { fontSize }); const smaller = sized.getObject(id), frame = sized.getSelectionFrame();
+        near(smaller.height, 30 * fontSize / 12); near(smaller.width, 80 * fontSize / 12);
+        near(frame.bounds.maxY - frame.bounds.minY, smaller.height, "selection bounds keep shrinking with tiny font sizes");
+        projectTopLeft(smaller).forEach((value, i) => near(value, anchor[i]));
+      }
     }
     const shapeId = sized.addObject({ kind: "shape", shape: "rectangle", pageIndex: 0, x: 0, y: 0, width: 10, height: 10, strokeWidth: 0, color: "red" });
     const textId = sized.addObject({ kind: "text", pageIndex: 0, x: 20, y: 40, width: 80, height: 30, text: "Text", fontSize: 12 });

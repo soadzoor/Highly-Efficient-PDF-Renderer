@@ -287,7 +287,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     ${editorIconButton("action", "layers", "Add, edit, reorder or remove PDF layers")}${editorIconButton("action", "pages", "Add, resize, organize, crop or extract PDF pages")}${editorIconButton("action", "page-numbers", "Configure automatic page numbers")}${editorIconButton("action", "pdf-password", "Keep, remove or change PDF password protection")}${editorIconButton("action", "save-pdf", "Download an editable PDF (Ctrl/Cmd+S)")}${editorIconButton("action", "flatten", "Download a flattened PDF copy")}${editorIconButton("action", "save-hep", "Download the edited document as HEP")}${editorIconButton("action", "print", "Print the edited document")}${editorIconButton("action", "recovery", "Manage local recovery drafts")}
     ${editorIconButton("action", "cancel-operation", "Cancel the current operation", "hidden")}<span data-status role="status" aria-live="polite"></span><span data-recovery-status role="status" aria-live="polite"></span>
   </div><div class="hepr-editor-help">Ctrl/Cmd + click toggles objects; Shift + click adds them. Drag empty space to select fully contained objects. Corner resizing scales objects and text proportionally; hold Shift to resize freely. Rotation snaps within 5° of multiples of 45°, including 0°; hold Alt/Option to disable snapping. Double-click a textbox to edit its content; resizing while editing changes the box and wrapping without scaling characters. Escape cancels.</div>`;
-  const overlay = document.createElement("div"); overlay.className = "hepr-editor-overlay"; overlay.dataset.tool = tool;
+  const overlay = document.createElement("div"); overlay.className = "hepr-editor-overlay"; overlay.dataset.tool = tool; overlay.tabIndex = -1;
   const graphic = document.createElementNS(SVG_NS, "svg"); graphic.classList.add("hepr-editor-graphic");
   const fields = document.createElement("div"); fields.className = "hepr-editor-fields"; fields.hidden = true;
   const fieldDrafts = new Map<EditorFieldControl, string>();
@@ -604,7 +604,14 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (editing.appliedFontSize?.value === size && editing.appliedFontSize.range === range) return;
     const allText = !editing.element.textContent || !range.collapsed && range.toString() === editing.element.textContent;
     const next = applyEditorTextRangeCss(editing.element, range, "fontSize", `${size}px`); if (!next) return;
-    if (allText) editing.element.style.fontSize = `${size}px`;
+    if (allText) {
+      const previousSize = parseFloat(editing.element.style.fontSize);
+      editing.element.style.fontSize = `${size}px`;
+      if (editing.autoSize && previousSize > 0) {
+        const ratio = size / previousSize;
+        editing.autoSize = { width: editing.autoSize.width * ratio, height: editing.autoSize.height * ratio };
+      }
+    }
     editing.selection = next; editing.appliedFontSize = { value: size, range: next };
     if (document.activeElement === editing.element) restoreTextSelection(editing);
     updateTextAutoSize(editing); updateGeometry(); recovery?.draftChanged();
@@ -1637,6 +1644,7 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
       getContentSize: fitWidth => textContentSize(editing, fitWidth),
       onResizeStart: () => { resizeAutoSize = editing.autoSize; },
       onResize: bounds => { if (canResize()) { Object.assign(editing, bounds, { fixedHeight: true, autoSize: undefined }); updateGeometry(); } },
+      onMove: bounds => { if (canResize()) { Object.assign(editing, bounds); updateGeometry(); } },
       onChange: canceled => { if (canceled && resizeAutoSize) editing.autoSize = resizeAutoSize; resizeAutoSize = undefined; recovery?.draftChanged(); } });
     updateClipboardButtons();
     updateTextEditButton();
@@ -2244,6 +2252,22 @@ export async function createEditorUi(host: EditorUiHost, signal?: AbortSignal): 
     if (changeOpacity(input)) return;
     if (input.dataset.transform) changeTransform(input);
     else changeAppearance(input);
+  });
+  function focusCanvasFromToolbar(event: PointerEvent): void {
+    if (!active || disposed || event.button !== 0 || !document.activeElement || !toolbar.contains(document.activeElement)) return;
+    // Pointer gestures prevent the browser's default focus transfer, including
+    // clicks that only finish a text draft and captured border/handle drags.
+    const target = event.target as Element;
+    if (activeText && (activeText.element.contains(target) || target.closest(".hepr-editor-text-resize-controls")))
+      activeText.element.focus({ preventScroll: true });
+    else overlay.focus({ preventScroll: true });
+  }
+  overlay.addEventListener("pointerdown", focusCanvasFromToolbar, { capture: true, signal: lifetime.signal });
+  toolbar.addEventListener("keydown", event => {
+    const input = event.target as HTMLInputElement;
+    if (event.key !== "Enter" || event.isComposing || input.dataset.prop !== "font-size" || running || savePreparing || structuralRunning) return;
+    event.preventDefault(); event.stopPropagation(); input.blur();
+    if (activeText) activeText.element.focus({ preventScroll: true }); else overlay.focus({ preventScroll: true });
   });
   overlay.addEventListener("pointerdown", event => { void pointerDown(event).catch(report); });
   function canOpenContextMenu(): boolean {
