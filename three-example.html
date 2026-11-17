@@ -4,8 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>HEPR Three.js Example</title>
-    <style>:root{--lightningcss-light:initial;--lightningcss-dark: ;color-scheme:light}html,body{overscroll-behavior:none;color:#e8edf5;background:#11161d;height:100%;margin:0;font-family:Segoe UI,Tahoma,Geneva,Verdana,sans-serif;overflow:hidden}#app{position:fixed;inset:0}#viewport{touch-action:none;cursor:grab;width:100%;height:100%;display:block}#viewport:active{cursor:grabbing}#panel{--viewer-settings-background:#151b24;color:#e8edf5;box-sizing:border-box;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);z-index:2;background:#0d121ae6;border:1px solid #ffffff1f;border-radius:10px;width:min(620px,100vw - 32px);max-height:calc(100vh - 50px);padding:12px;position:fixed;top:16px;left:16px;overflow-y:auto}#panel.collapsed{display:none}#load-diagnostics-report{box-sizing:border-box;width:100%;height:200px;font-size:12px}#load-diagnostics-status{overflow-wrap:anywhere;font-size:12px}.panel-header{justify-content:space-between;align-items:center;gap:10px;display:flex}.panel-content{margin-top:8px}.panel-title{margin:0;font-size:16px}.row,.toolbar,.toggles,.number-row{align-items:center;gap:8px;margin-bottom:8px;display:flex}.row:last-child,.number-row:last-child{margin-bottom:0}select,button,input{font:inherit}.toolbar,.toggles{flex-wrap:wrap}.has-reader-toolbar .startup-controls{display:none}select,button{color:#e8edf5;background:#162030;border:1px solid #ffffff2e;border-radius:6px;padding:7px 10px}button{cursor:pointer}button:disabled{opacity:.6;cursor:default}.settings-close{justify-content:center;align-items:center;gap:6px;height:30px;padding:5px 8px;line-height:1;display:inline-flex}.toggle{-webkit-user-select:none;user-select:none;align-items:center;gap:6px;font-size:13px;display:inline-flex}.toggle input{margin:0}.number-row{grid-template-columns:max-content minmax(110px,1fr);font-size:13px;display:grid}.number-row select{width:min(220px,100%)}.number-row>input[type=number]{width:min(120px,100%);min-width:0}.number-row input[type=color]{border-radius:6px;width:44px;height:28px;padding:0}.color-controls{align-items:center;gap:6px;min-width:0;display:flex}.color-controls input[type=number]{width:64px;min-width:0}.color-controls input[type=range]{width:min(180px,22vw)}.color-suffix{color:#e8edf5a8;font-size:12px}#status{opacity:.92;font-size:13px}.meter-row{color:#e8edf5e0;justify-content:space-between;font-size:13px}.meter-label{color:#e8edf5a8}.meter-value{font-variant-numeric:tabular-nums}#parse-loader{opacity:.94;align-items:center;gap:8px;font-size:13px;display:inline-flex}#parse-loader[hidden]{display:none!important}#drop-indicator{pointer-events:none;opacity:0;color:#e8edf5;text-shadow:0 1px 10px #00000080;background:0 0;place-items:center;font-size:clamp(1.1rem,2.2vw,1.6rem);font-weight:600;transition:opacity .12s ease-out;display:grid;position:fixed;inset:0}#drop-indicator.active{opacity:1}#drop-indicator.dragging{background:#0a162880}.row[hidden],.toggle[hidden]{display:none!important}.example-dropdown{position:relative}.example-trigger{cursor:pointer;justify-content:space-between;align-items:center;gap:10px;min-width:190px;max-width:100%;transition:border-color .12s,box-shadow .12s,background .12s;display:inline-flex}.example-trigger:hover:not(:disabled){background:#1d2a3e;border-color:#ffffff52}.example-trigger:disabled{opacity:.6;cursor:not-allowed}.example-dropdown.open .example-trigger{border-color:#60a5fab3;box-shadow:0 0 0 3px #60a5fa2e}.example-trigger-label{text-overflow:ellipsis;white-space:nowrap;align-items:center;gap:8px;display:inline-flex;overflow:hidden}.example-trigger-count{color:#e8edf5d9;background:#ffffff1f;border-radius:999px;justify-content:center;align-items:center;min-width:20px;height:20px;padding:0 6px;font-size:12px;font-weight:600;line-height:1;display:inline-flex}.example-trigger-chevron{color:#e8edf599;font-size:12px;line-height:1;transition:transform .14s}.example-dropdown.open .example-trigger-chevron{transform:rotate(180deg)}.example-menu{z-index:40;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);background:#131a26f7;border:1px solid #ffffff24;border-radius:12px;outline:none;width:max-content;max-width:min(460px,100vw - 32px);padding:6px;animation:.12s ease-out menu-pop;position:fixed;overflow-y:auto;box-shadow:0 12px 32px #00000080}.example-menu[hidden]{display:none}@keyframes menu-pop{0%{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}.example-menu-row{border-radius:8px;justify-content:space-between;align-items:center;gap:14px;padding:6px 10px;display:flex}.example-menu-row:hover{background:#ffffff0f}.example-menu-name{text-overflow:ellipsis;white-space:nowrap;color:#e8edf5;flex:1;min-width:0;font-size:13px;overflow:hidden}.example-menu-actions{flex-shrink:0;gap:6px;display:inline-flex}.example-chip{color:#e8edf5;cursor:pointer;background:#ffffff0a;border:1px solid #fff3;border-radius:999px;align-items:center;gap:6px;padding:3px 10px;font-size:12px;line-height:1.3;transition:background .1s,color .1s,border-color .1s;display:inline-flex}.example-chip:hover,.example-chip:focus-visible{color:#11161d;background:#e8edf5;border-color:#e8edf5}.example-chip-kind{font-weight:600}.example-chip-size{color:#e8edf58c;font-family:Cascadia Mono,Consolas,monospace;font-size:11px}.example-chip:hover .example-chip-size,.example-chip:focus-visible .example-chip-size{color:#11161da6}.search-row{grid-template-columns:max-content 1fr}.search-controls{align-items:center;gap:6px;min-width:0;display:flex}.search-controls input[type=search]{color:#e8edf5;background:#162030;border:1px solid #ffffff2e;border-radius:6px;flex:1;min-width:0;padding:6px 8px}.search-controls input[type=search]:disabled{opacity:.6}.search-count{text-align:right;color:#e8edf5a8;font-variant-numeric:tabular-nums;flex-shrink:0;min-width:3.2em;font-size:12px}.search-count[hidden]{display:none}.search-controls button{width:32px;min-width:32px;padding:6px 0;font-size:12px}#text-search-case[aria-pressed=true],.page-layout-buttons button[aria-pressed=true]{color:#11161d;background:#e8edf5;border-color:#e8edf5}.number-row[hidden]{display:none!important}.page-layout-controls{flex-wrap:wrap;align-items:center;gap:10px;display:flex}.page-layout-buttons{gap:6px;display:flex}.page-layout-progress{color:#e8edf5cc;font-variant-numeric:tabular-nums;align-items:center;gap:6px;font-size:12px;display:inline-flex}.page-layout-progress[hidden]{display:none}.page-layout-progress progress{appearance:none;background:#ffffff24;border:none;border-radius:3px;width:90px;height:6px;overflow:hidden}.page-layout-progress progress::-webkit-progress-bar{background:#ffffff24}.page-layout-progress progress::-webkit-progress-value{background:#60a5fa}.page-layout-progress progress::-moz-progress-bar{background:#60a5fa}.page-layout-buttons button{padding:5px 12px;font-size:13px}.loader-spinner{border:2px solid #e8edf540;border-top-color:#e8edf5;border-radius:50%;width:14px;height:14px;animation:.8s linear infinite spin}@keyframes spin{0%{transform:rotate(0)}to{transform:rotate(360deg)}}</style>
-    <script type="module" crossorigin src="./assets/three-BHNUWusb.js"></script>
+    <style>:root{--lightningcss-light:initial;--lightningcss-dark: ;color-scheme:light}html,body{overscroll-behavior:none;color:#e8edf5;background:#11161d;height:100%;margin:0;font-family:Segoe UI,Tahoma,Geneva,Verdana,sans-serif;overflow:hidden}#viewport{touch-action:none;cursor:grab;width:100%;height:100%;display:block}#viewport:active{cursor:grabbing}#panel{--viewer-settings-background:#151b24;color:#e8edf5;box-sizing:border-box;padding:12px}#load-diagnostics-report{box-sizing:border-box;width:100%;height:200px;font-size:12px}#load-diagnostics-status{overflow-wrap:anywhere;font-size:12px}.panel-header{justify-content:space-between;align-items:center;gap:10px;display:flex}.panel-content{margin-top:8px}.panel-title{margin:0;font-size:16px}.row,.toolbar,.toggles,.number-row{align-items:center;gap:8px;margin-bottom:8px;display:flex}.row:last-child,.number-row:last-child{margin-bottom:0}select,button,input{font:inherit}.toolbar,.toggles{flex-wrap:wrap}select,button{color:#e8edf5;background:#162030;border:1px solid #ffffff2e;border-radius:6px;padding:7px 10px}button{cursor:pointer}button:disabled{opacity:.6;cursor:default}.settings-close{justify-content:center;align-items:center;gap:6px;height:30px;padding:5px 8px;line-height:1;display:inline-flex}.toggle{-webkit-user-select:none;user-select:none;align-items:center;gap:6px;font-size:13px;display:inline-flex}.toggle input{margin:0}.number-row{grid-template-columns:max-content minmax(110px,1fr);font-size:13px;display:grid}.number-row select{width:min(220px,100%)}.number-row>input[type=number]{width:min(120px,100%);min-width:0}.number-row input[type=color]{border-radius:6px;width:44px;height:28px;padding:0}.color-controls{align-items:center;gap:6px;min-width:0;display:flex}.color-controls input[type=number]{width:64px;min-width:0}.color-controls input[type=range]{width:min(180px,22vw)}.color-suffix{color:#e8edf5a8;font-size:12px}#status{opacity:.92;font-size:13px}.meter-row{color:#e8edf5e0;justify-content:space-between;font-size:13px}.meter-label{color:#e8edf5a8}.meter-value{font-variant-numeric:tabular-nums}#parse-loader{opacity:.94;align-items:center;gap:8px;font-size:13px;display:inline-flex}#parse-loader[hidden]{display:none!important}#drop-indicator{pointer-events:none;opacity:0;color:#e8edf5;text-shadow:0 1px 10px #00000080;background:0 0;place-items:center;font-size:clamp(1.1rem,2.2vw,1.6rem);font-weight:600;transition:opacity .12s ease-out;display:grid;position:fixed;inset:0}#drop-indicator.active{opacity:1}#drop-indicator.dragging{background:#0a162880}.row[hidden],.toggle[hidden]{display:none!important}.example-dropdown{position:relative}.example-trigger{cursor:pointer;justify-content:space-between;align-items:center;gap:10px;min-width:190px;max-width:100%;transition:border-color .12s,box-shadow .12s,background .12s;display:inline-flex}.example-trigger:hover:not(:disabled){background:#1d2a3e;border-color:#ffffff52}.example-trigger:disabled{opacity:.6;cursor:not-allowed}.example-dropdown.open .example-trigger{border-color:#60a5fab3;box-shadow:0 0 0 3px #60a5fa2e}.example-trigger-label{text-overflow:ellipsis;white-space:nowrap;align-items:center;gap:8px;display:inline-flex;overflow:hidden}.example-trigger-count{color:#e8edf5d9;background:#ffffff1f;border-radius:999px;justify-content:center;align-items:center;min-width:20px;height:20px;padding:0 6px;font-size:12px;font-weight:600;line-height:1;display:inline-flex}.example-trigger-chevron{color:#e8edf599;font-size:12px;line-height:1;transition:transform .14s}.example-dropdown.open .example-trigger-chevron{transform:rotate(180deg)}.example-menu{z-index:40;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);background:#131a26f7;border:1px solid #ffffff24;border-radius:12px;outline:none;width:max-content;max-width:min(460px,100vw - 32px);padding:6px;animation:.12s ease-out menu-pop;position:fixed;overflow-y:auto;box-shadow:0 12px 32px #00000080}.example-menu[hidden]{display:none}@keyframes menu-pop{0%{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}.example-menu-row{border-radius:8px;justify-content:space-between;align-items:center;gap:14px;padding:6px 10px;display:flex}.example-menu-row:hover{background:#ffffff0f}.example-menu-name{text-overflow:ellipsis;white-space:nowrap;color:#e8edf5;flex:1;min-width:0;font-size:13px;overflow:hidden}.example-menu-actions{flex-shrink:0;gap:6px;display:inline-flex}.example-chip{color:#e8edf5;cursor:pointer;background:#ffffff0a;border:1px solid #fff3;border-radius:999px;align-items:center;gap:6px;padding:3px 10px;font-size:12px;line-height:1.3;transition:background .1s,color .1s,border-color .1s;display:inline-flex}.example-chip:hover,.example-chip:focus-visible{color:#11161d;background:#e8edf5;border-color:#e8edf5}.example-chip-kind{font-weight:600}.example-chip-size{color:#e8edf58c;font-family:Cascadia Mono,Consolas,monospace;font-size:11px}.example-chip:hover .example-chip-size,.example-chip:focus-visible .example-chip-size{color:#11161da6}.search-row{grid-template-columns:max-content 1fr}.search-controls{align-items:center;gap:6px;min-width:0;display:flex}.search-controls input[type=search]{color:#e8edf5;background:#162030;border:1px solid #ffffff2e;border-radius:6px;flex:1;min-width:0;padding:6px 8px}.search-controls input[type=search]:disabled{opacity:.6}.search-count{text-align:right;color:#e8edf5a8;font-variant-numeric:tabular-nums;flex-shrink:0;min-width:3.2em;font-size:12px}.search-count[hidden]{display:none}.search-controls button{width:32px;min-width:32px;padding:6px 0;font-size:12px}#text-search-case[aria-pressed=true],.page-layout-buttons button[aria-pressed=true]{color:#11161d;background:#e8edf5;border-color:#e8edf5}.number-row[hidden]{display:none!important}.page-layout-controls{flex-wrap:wrap;align-items:center;gap:10px;display:flex}.page-layout-buttons{gap:6px;display:flex}.page-layout-progress{color:#e8edf5cc;font-variant-numeric:tabular-nums;align-items:center;gap:6px;font-size:12px;display:inline-flex}.page-layout-progress[hidden]{display:none}.page-layout-progress progress{appearance:none;background:#ffffff24;border:none;border-radius:3px;width:90px;height:6px;overflow:hidden}.page-layout-progress progress::-webkit-progress-bar{background:#ffffff24}.page-layout-progress progress::-webkit-progress-value{background:#60a5fa}.page-layout-progress progress::-moz-progress-bar{background:#60a5fa}.page-layout-buttons button{padding:5px 12px;font-size:13px}.loader-spinner{border:2px solid #e8edf540;border-top-color:#e8edf5;border-radius:50%;width:14px;height:14px;animation:.8s linear infinite spin}@keyframes spin{0%{transform:rotate(0)}to{transform:rotate(360deg)}}</style>
+    <script type="module" crossorigin src="./assets/three-RsuuY1RS.js"></script>
     <link rel="modulepreload" crossorigin href="./assets/modulepreload-polyfill-P2Xu9kJm.js">
     <link rel="modulepreload" crossorigin href="./assets/loadCancellation-CzY3WYC4.js">
     <link rel="modulepreload" crossorigin href="./assets/optionalContentData-CFyj-zla.js">
@@ -21,14 +21,14 @@
     <link rel="modulepreload" crossorigin href="./assets/editorScenePreview-C3Xe9kDC.js">
     <link rel="modulepreload" crossorigin href="./assets/primitiveHighlightShaders-CPudfn7s.js">
     <link rel="modulepreload" crossorigin href="./assets/optionalContentText-DsEQ16TT.js">
-    <link rel="modulepreload" crossorigin href="./assets/viewerWorkspace-CljhApl3.js">
+    <link rel="modulepreload" crossorigin href="./assets/drawCallMetrics-BO7UTHYq.js">
+    <link rel="modulepreload" crossorigin href="./assets/pdfSignature-b94fXhPM.js">
+    <link rel="modulepreload" crossorigin href="./assets/textSelection-DnW-I01I.js">
     <link rel="modulepreload" crossorigin href="./assets/hepLodOptions-CJDRnI5c.js">
     <link rel="modulepreload" crossorigin href="./assets/preload-helper-uBIymjUX.js">
     <link rel="modulepreload" crossorigin href="./assets/scenePaintGraph-BzYBxZUM.js">
     <link rel="modulepreload" crossorigin href="./assets/vectorStrokePaintOrder-DAyOQBq7.js">
     <link rel="modulepreload" crossorigin href="./assets/vectorStrokeLodCore-1QwnaWA5.js">
-    <link rel="modulepreload" crossorigin href="./assets/pdfSignature-b94fXhPM.js">
-    <link rel="modulepreload" crossorigin href="./assets/toolbarIcons-wHNaZ0JM.js">
     <link rel="modulepreload" crossorigin href="./assets/heprDocumentData-BnKXbCiZ.js">
     <link rel="modulepreload" crossorigin href="./assets/retainedPageReplay-Cy82Y0kr.js">
     <link rel="modulepreload" crossorigin href="./assets/nativeTypes-BQHnFu7D.js">
@@ -45,7 +45,7 @@
     <link rel="modulepreload" crossorigin href="./assets/searchHighlights-BEXk7Kvl.js">
     <link rel="modulepreload" crossorigin href="./assets/webGlPdfRenderer-B4pkwoy0.js">
     <link rel="modulepreload" crossorigin href="./assets/textRecognitionController-C3IoN9MH.js">
-    <link rel="modulepreload" crossorigin href="./assets/viewerTextRecognition-3DpfTIzp.js">
+    <link rel="modulepreload" crossorigin href="./assets/viewerTextRecognition-BoCyj0zt.js">
     <link rel="modulepreload" crossorigin href="./assets/annotationData-YY2W-tlh.js">
     <link rel="modulepreload" crossorigin href="./assets/viewerLinkNavigation-DmY0lRCi.js">
     <link rel="modulepreload" crossorigin href="./assets/scenePageViews-sP0fmvee.js">
@@ -68,31 +68,21 @@
     <link rel="modulepreload" crossorigin href="./assets/textRecognitionScene-BWKwnrRR.js">
     <link rel="modulepreload" crossorigin href="./assets/threeRasterTextures-Dyo94IQ7.js">
     <link rel="modulepreload" crossorigin href="./assets/webGpuRasterCompression-Bw9dTK6a.js">
-    <link rel="modulepreload" crossorigin href="./assets/src-yYcBjpcO.js">
+    <link rel="modulepreload" crossorigin href="./assets/src-C0q4m6O8.js">
     <link rel="modulepreload" crossorigin href="./assets/three.webgpu-BF6OtKoX.js">
     <link rel="modulepreload" crossorigin href="./assets/hepSizePolicy-CO_f3PrJ.js">
     <link rel="modulepreload" crossorigin href="./assets/hepBuilder-ecHGJX7I.js">
-    <link rel="stylesheet" crossorigin href="./assets/viewerWorkspace-Bpfmakh6.css">
-    <link rel="stylesheet" crossorigin href="./assets/toolbarIcons-CouB_J_r.css">
-    <link rel="stylesheet" crossorigin href="./assets/viewerTextRecognition-GqvokAi0.css">
+    <link rel="stylesheet" crossorigin href="./assets/drawCallMetrics-CNF8ATdA.css">
+    <link rel="stylesheet" crossorigin href="./assets/textSelection-D1PbhwDs.css">
+    <link rel="stylesheet" crossorigin href="./assets/viewerTextRecognition-BzI1N94R.css">
   </head>
   <body>
-    <div id="app">
-      <canvas id="viewport"></canvas>
-    </div>
-
-    <div id="panel" role="group" aria-label="Three.js HEPR controls">
-      <div class="panel-header">
-        <h2 class="panel-title">Settings</h2>
-        <button id="toggle-panel" class="settings-close" type="button" data-toolbar-icon="close" aria-expanded="true" aria-controls="panel-content" aria-label="Close settings" title="Close settings">Close settings</button>
-      </div>
-      <div id="panel-content" class="panel-content">
-        <div class="toolbar startup-controls">
-          <a class="package-version" href="https://www.npmjs.com/package/@soadzoor/hepr" target="_blank" rel="noopener noreferrer" title="HEPR package version used by this build">npm v0.2.2</a>
+    <div class="reader-shell">
+      <div id="reader-toolbar" class="reader-toolbar" role="toolbar" aria-label="Document controls">
+        <div class="reader-primary-controls">
+          <a class="package-version" href="https://www.npmjs.com/package/@soadzoor/hepr" target="_blank" rel="noopener noreferrer" title="HEPR package version used by this build">npm v0.2.3</a>
           <button id="open-file" type="button" data-toolbar-icon="open" title="Open a PDF or HEPR-exported .hep file">Open PDF / HEP</button>
           <button id="new-pdf" type="button" data-toolbar-icon="pages" title="Create a new PDF">New PDF</button>
-          <button id="editor-mode" type="button" data-toolbar-icon="edit" aria-pressed="false" title="Enter PDF editing mode">Edit PDF</button>
-          <button id="print-pdf" type="button" data-toolbar-icon="print" title="Print the current document" disabled>Print</button>
           <div id="example-dropdown" class="example-dropdown">
             <button id="example-select" class="example-trigger" type="button" title="Load example PDF or HEP file" aria-label="Load example PDF or HEP file" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
               <span id="example-select-label" class="example-trigger-label">Examples (loading...)</span>
@@ -100,167 +90,203 @@
             </button>
             <div id="example-menu" class="example-menu" hidden></div>
           </div>
+          <button id="editor-mode" type="button" data-toolbar-icon="edit" aria-pressed="false" title="Enter PDF editing mode">Edit PDF</button>
+          <button id="print-pdf" type="button" data-toolbar-icon="print" title="Print the current document" disabled>Print</button>
         </div>
-        <input id="file-input" type="file" accept=".pdf,.hep,application/pdf,application/x-hep" hidden />
-        <div class="toolbar settings-downloads">
-          <button id="download-data" type="button" data-toolbar-icon="download-hep" hidden disabled>Download HEP</button>
-          <button id="download-pdf" type="button" data-toolbar-icon="download-pdf" hidden disabled>Download PDF</button>
-        </div>
-      <div class="toggles">
-        <label class="toggle">
-          <input id="text-selection-checkbox" type="checkbox" checked />
-          <span>Text selection</span>
-        </label>
-        <div id="text-recognition-controls"></div>
-        <label class="toggle" title="PDF only. Reconstruct stored text with substitute fonts; omit pictures and diagrams. Pages without stored text are blank.">
-          <input id="ocr-text-checkbox" type="checkbox" />
-          <span>Use OCR text instead of scans</span>
-        </label>
-        <label class="toggle" title="PDF only. Show large documents progressively as you navigate. Off loads all page overviews before display; scan detail still loads on zoom.">
-          <input id="page-streaming-checkbox" type="checkbox" />
-          <span>Stream pages</span>
-        </label>
-        <label class="toggle" title="PDF only. Load every selected page and prepare scan textures during parsing for faster zoom refinement. Uses more loading time and CPU memory. Overrides page streaming; packed monochrome scans remain lossless, while color and grayscale compression may soften fine text.">
-          <input id="compress-scans-checkbox" type="checkbox" checked />
-          <span>GPU compress scans</span>
-        </label>
-        <label id="touch-rotate-row" class="toggle" hidden>
-          <input id="touch-rotate-checkbox" type="checkbox" />
-          <span>Touch rotate</span>
-        </label>
+        <label class="reader-layout-label">Layout <select class="reader-layout" aria-label="Page layout"></select></label>
+    <div class="reader-reading-controls">
+      <button type="button" class="hepr-toolbar-icon-button" data-toolbar-icon="thumbnails" title="Toggle page thumbnails" aria-label="Toggle page thumbnails" data-reader="thumbnails" aria-expanded="false"><svg class="hepr-toolbar-icon" data-icon="thumbnails" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M10 3v18M5.5 6h2m-2 4h2m-2 4h2m-2 4h2"/></svg><span class="hepr-toolbar-button-label" aria-hidden="true">Toggle page thumbnails</span></button>
+      <button type="button" class="hepr-toolbar-icon-button" data-toolbar-icon="previous" title="Previous page" aria-label="Previous page" data-reader="previous"><svg class="hepr-toolbar-icon" data-icon="previous" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m15 4-8 8 8 8"/></svg><span class="hepr-toolbar-button-label" aria-hidden="true">Previous page</span></button>
+      <input class="reader-page-number" type="number" min="1" value="1" aria-label="Page number" />
+      <span class="reader-page-count">/ 0</span>
+      <button type="button" class="hepr-toolbar-icon-button" data-toolbar-icon="next" title="Next page" aria-label="Next page" data-reader="next"><svg class="hepr-toolbar-icon" data-icon="next" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m9 4 8 8-8 8"/></svg><span class="hepr-toolbar-button-label" aria-hidden="true">Next page</span></button>
+      <button type="button" class="hepr-toolbar-icon-button" data-toolbar-icon="zoom-out" title="Zoom out" aria-label="Zoom out" data-reader="zoom-out"><svg class="hepr-toolbar-icon" data-icon="zoom-out" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="10" cy="10" r="7"/><path d="m15 15 6 6M6 10h8"/></svg><span class="hepr-toolbar-button-label" aria-hidden="true">Zoom out</span></button>
+      <input class="reader-zoom" type="text" inputmode="decimal" value="100%" aria-label="Zoom percentage" />
+      <button type="button" class="hepr-toolbar-icon-button" data-toolbar-icon="zoom-in" title="Zoom in" aria-label="Zoom in" data-reader="zoom-in"><svg class="hepr-toolbar-icon" data-icon="zoom-in" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="10" cy="10" r="7"/><path d="m15 15 6 6M6 10h8m-4-4v8"/></svg><span class="hepr-toolbar-button-label" aria-hidden="true">Zoom in</span></button>
+      <button type="button" class="hepr-toolbar-icon-button" data-toolbar-icon="fit-width" title="Fit Width" aria-label="Fit Width" data-reader="fit-width"><svg class="hepr-toolbar-icon" data-icon="fit-width" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="5" y="3" width="14" height="18" rx="1"/><path d="M2 12h20m-17-3-3 3 3 3m14-6 3 3-3 3"/></svg><span class="hepr-toolbar-button-label" aria-hidden="true">Fit Width</span></button>
+      <button type="button" class="hepr-toolbar-icon-button" data-toolbar-icon="fit-page" title="Fit Page" aria-label="Fit Page" data-reader="fit-page"><svg class="hepr-toolbar-icon" data-icon="fit-page" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="7" y="5" width="10" height="14" rx="1"/><path d="M3 8V2h6m6 0h6v6m0 8v6h-6m-6 0H3v-6"/></svg><span class="hepr-toolbar-button-label" aria-hidden="true">Fit Page</span></button>
+    </div>
+    <button type="button" class="hepr-toolbar-icon-button" data-toolbar-icon="find" title="Find text in the document (Ctrl/Cmd+F)" aria-label="Find text in the document (Ctrl/Cmd+F)" data-reader="find"><svg class="hepr-toolbar-icon" data-icon="find" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="10" cy="10" r="7"/><path d="m15 15 6 6"/></svg><span class="hepr-toolbar-button-label" aria-hidden="true">Find text in the document (Ctrl/Cmd+F)</span></button>
+    <button type="button" class="hepr-toolbar-icon-button" data-toolbar-icon="settings" title="Settings" aria-label="Settings" data-reader="settings"><svg class="hepr-toolbar-icon" data-icon="settings" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M5 3v18M12 3v18M19 3v18"/><path d="M2 8h6m1 8h6m1-10h6" stroke-width="4"/></svg><span class="hepr-toolbar-button-label" aria-hidden="true">Settings</span></button>
+    <button type="button" class="hepr-toolbar-icon-button" data-toolbar-icon="hide-toolbar" title="Hide toolbar" aria-label="Hide toolbar" data-reader="hide-toolbar" aria-controls="reader-toolbar" aria-expanded="true"><svg class="hepr-toolbar-icon" data-icon="hide-toolbar" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="3" width="18" height="5" rx="1"/><path d="m7 17 5-5 5 5M12 12v10"/></svg><span class="hepr-toolbar-button-label" aria-hidden="true">Hide toolbar</span></button>
+    <span class="reader-announcement" role="status" aria-live="polite"></span>
       </div>
-      <label class="toggle"><input id="annotation-bubbles-checkbox" type="checkbox" checked /><span>Annotation bubbles</span></label>
-      <div id="drawing-selection"></div>
-      <div id="pdf-layers"></div>
-      <div id="pdf-annotations"></div>
-      <div class="number-row search-row">
-        <label for="text-search-input">Find Text</label>
-        <div class="search-controls">
-          <input id="text-search-input" type="search" placeholder="Load a document to search" autocomplete="off" spellcheck="false" disabled />
-          <span id="text-search-count" class="search-count" hidden>0/0</span>
-          <button id="text-search-prev" type="button" data-toolbar-icon="search-previous" title="Previous match (Shift+Enter)" aria-label="Previous match (Shift+Enter)" disabled>▲</button>
-          <button id="text-search-next" type="button" data-toolbar-icon="search-next" title="Next match (Enter)" aria-label="Next match (Enter)" disabled>▼</button>
-          <button id="text-search-case" type="button" data-toolbar-icon="match-case" title="Match case" aria-label="Match case" aria-pressed="false" disabled>Aa</button>
-        </div>
-      </div>
-      <div id="page-layout-row" class="number-row" hidden>
-        <span id="page-layout-label">Page Layout</span>
-        <div class="page-layout-controls">
-          <div class="page-layout-buttons" role="group" aria-labelledby="page-layout-label">
-            <button type="button" data-page-layout="reader" data-toolbar-icon="reader" aria-pressed="false">Reader</button>
-            <button type="button" data-page-layout="grid" data-toolbar-icon="grid" aria-pressed="true">Grid</button>
-            <button type="button" data-page-layout="sphere" data-toolbar-icon="sphere" aria-pressed="false">Sphere</button>
-            <button type="button" data-page-layout="helix" data-toolbar-icon="helix" aria-pressed="false">Helix</button>
+      <button type="button" class="hepr-toolbar-icon-button reader-toolbar-restore" data-toolbar-icon="show-toolbar" title="Show toolbar" aria-label="Show toolbar" data-reader="show-toolbar" aria-controls="reader-toolbar" aria-expanded="false" hidden><svg class="hepr-toolbar-icon" data-icon="show-toolbar" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="3" width="18" height="5" rx="1"/><path d="m7 16 5 5 5-5M12 11v10"/></svg><span class="hepr-toolbar-button-label" aria-hidden="true">Show toolbar</span></button>
+      <div class="reader-workspace viewer-workspace">
+        <aside class="reader-thumbnails" aria-label="Page thumbnails" hidden></aside>
+        <div class="reader-scroll" tabindex="0" role="region" aria-label="Document pages">
+          <div class="reader-surface">
+            <canvas id="viewport"></canvas>
           </div>
-          <span id="page-layout-progress" class="page-layout-progress" role="status" hidden>
+        </div>
+
+        <div id="panel" class="viewer-settings" role="group" aria-label="Three.js HEPR controls">
+          <div class="panel-header">
+            <h2 class="panel-title">Settings</h2>
+            <button id="toggle-panel" class="settings-close" type="button" data-toolbar-icon="close" aria-expanded="true" aria-controls="panel-content" aria-label="Close settings" title="Close settings">Close settings</button>
+          </div>
+          <div id="panel-content" class="panel-content">
+            <input id="file-input" type="file" accept=".pdf,.hep,application/pdf,application/x-hep" hidden />
+            <div class="toolbar settings-downloads">
+              <button id="download-data" type="button" data-toolbar-icon="download-hep" hidden disabled>Download HEP</button>
+              <button id="download-pdf" type="button" data-toolbar-icon="download-pdf" hidden disabled>Download PDF</button>
+            </div>
+          <div class="toggles">
+            <label class="toggle">
+              <input id="text-selection-checkbox" type="checkbox" checked />
+              <span>Text selection</span>
+            </label>
+            <div id="text-recognition-controls"></div>
+            <label class="toggle" title="PDF only. Reconstruct stored text with substitute fonts; omit pictures and diagrams. Pages without stored text are blank.">
+              <input id="ocr-text-checkbox" type="checkbox" />
+              <span>Use OCR text instead of scans</span>
+            </label>
+            <label class="toggle" title="PDF only. Show large documents progressively as you navigate. Off loads all page overviews before display; scan detail still loads on zoom.">
+              <input id="page-streaming-checkbox" type="checkbox" />
+              <span>Stream pages</span>
+            </label>
+            <label class="toggle" title="PDF only. Load every selected page and prepare scan textures during parsing for faster zoom refinement. Uses more loading time and CPU memory. Overrides page streaming; packed monochrome scans remain lossless, while color and grayscale compression may soften fine text.">
+              <input id="compress-scans-checkbox" type="checkbox" checked />
+              <span>GPU compress scans</span>
+            </label>
+            <label id="touch-rotate-row" class="toggle" hidden>
+              <input id="touch-rotate-checkbox" type="checkbox" />
+              <span>Touch rotate</span>
+            </label>
+          </div>
+          <label class="toggle"><input id="annotation-bubbles-checkbox" type="checkbox" checked /><span>Annotation bubbles</span></label>
+          <div id="drawing-selection"></div>
+          <div id="pdf-layers"></div>
+          <div id="pdf-annotations"></div>
+          <div class="number-row search-row">
+            <label for="text-search-input">Find Text</label>
+            <div class="search-controls">
+              <input id="text-search-input" type="search" placeholder="Load a document to search" autocomplete="off" spellcheck="false" disabled />
+              <span id="text-search-count" class="search-count" hidden>0/0</span>
+              <button id="text-search-prev" type="button" data-toolbar-icon="search-previous" title="Previous match (Shift+Enter)" aria-label="Previous match (Shift+Enter)" disabled>▲</button>
+              <button id="text-search-next" type="button" data-toolbar-icon="search-next" title="Next match (Enter)" aria-label="Next match (Enter)" disabled>▼</button>
+              <button id="text-search-case" type="button" data-toolbar-icon="match-case" title="Match case" aria-label="Match case" aria-pressed="false" disabled>Aa</button>
+            </div>
+          </div>
+          <div id="page-layout-row" class="number-row" hidden>
+            <span id="page-layout-label">Page Layout</span>
+            <div class="page-layout-controls">
+              <div class="page-layout-buttons" role="group" aria-labelledby="page-layout-label">
+                <button type="button" data-page-layout="reader" data-toolbar-icon="reader" aria-pressed="false">Reader</button>
+                <button type="button" data-page-layout="grid" data-toolbar-icon="grid" aria-pressed="true">Grid</button>
+                <button type="button" data-page-layout="sphere" data-toolbar-icon="sphere" aria-pressed="false">Sphere</button>
+                <button type="button" data-page-layout="helix" data-toolbar-icon="helix" aria-pressed="false">Helix</button>
+              </div>
+              <span id="page-layout-progress" class="page-layout-progress" role="status" hidden>
+                <span class="loader-spinner" aria-hidden="true"></span>
+                <progress id="page-layout-progress-bar" max="100" value="0" aria-label="Preparing pages"></progress>
+                <span id="page-layout-progress-text">0%</span>
+              </span>
+            </div>
+          </div>
+          <div class="number-row">
+            <label for="backend-select">Renderer Backend</label>
+            <select id="backend-select" aria-label="Renderer backend">
+              <option value="webgl" selected>WebGL</option>
+              <option value="webgpu">WebGPU</option>
+            </select>
+          </div>
+          <div class="number-row">
+            <label for="vector-lod-select">Vector LOD</label>
+            <select id="vector-lod-select" aria-label="Vector LOD mode">
+              <option value="auto" selected>Auto</option>
+              <option value="off">Off</option>
+              <option value="force">Force</option>
+            </select>
+          </div>
+          <div class="number-row">
+            <label for="minimum-stroke-width-input" title="Minimum vector stroke width in device pixels. 0 preserves source widths.">Minimum stroke width (px)</label>
+            <input id="minimum-stroke-width-input" type="number" min="0" step="any" value="0" autocomplete="off" />
+          </div>
+          <div class="number-row">
+            <label for="text-lod-select">Text LOD</label>
+            <select id="text-lod-select" aria-label="Text LOD mode">
+              <option value="auto" selected>Auto</option>
+              <option value="off">Off</option>
+            </select>
+          </div>
+          <div class="number-row number-row-color">
+            <label for="page-bg-color">Page Background</label>
+            <div class="color-controls">
+              <input id="page-bg-color" type="color" value="#ffffff" />
+              <input id="page-bg-opacity-slider" type="range" min="0" max="100" step="1" value="100" aria-label="Page Background Opacity Slider" />
+              <input id="page-bg-opacity" type="number" min="0" max="100" step="1" value="100" aria-label="Page Background Opacity" />
+              <span class="color-suffix">%</span>
+            </div>
+          </div>
+          <div class="number-row number-row-color">
+            <label for="vector-color">Vector Override</label>
+            <div class="color-controls">
+              <input id="vector-color" type="color" value="#000000" />
+              <input id="vector-opacity-slider" type="range" min="0" max="100" step="1" value="0" aria-label="Vector Override Opacity Slider" />
+              <input id="vector-opacity" type="number" min="0" max="100" step="1" value="0" aria-label="Vector Override Opacity" />
+              <span class="color-suffix">%</span>
+            </div>
+          </div>
+          <label class="toggle">
+            <input id="load-diagnostics-enabled" type="checkbox" />
+            <span>Record loading diagnostics</span>
+          </label>
+          <div class="row">
+            <button id="show-load-report" type="button" data-toolbar-icon="pages">Show load report</button>
+            <button id="copy-load-report" type="button" data-toolbar-icon="duplicate">Copy load report</button>
+          </div>
+          <div id="load-diagnostics-status" class="row" role="status"></div>
+          <textarea id="load-diagnostics-report" readonly hidden aria-label="Loading diagnostics report"></textarea>
+          <div id="status" class="row">Waiting for PDF or HEP source.</div>
+          <div id="parse-loader" class="row" hidden>
             <span class="loader-spinner" aria-hidden="true"></span>
-            <progress id="page-layout-progress-bar" max="100" value="0" aria-label="Preparing pages"></progress>
-            <span id="page-layout-progress-text">0%</span>
-          </span>
+            <span id="parse-loader-text">0.00% Parsing / loading...</span>
+          </div>
+          <div class="row meter-row">
+            <span class="meter-label">File</span>
+            <span id="file-value" class="meter-value">-</span>
+          </div>
+          <div class="row meter-row">
+            <span class="meter-label">Source Segments</span>
+            <span id="source-segments-value" class="meter-value">-</span>
+          </div>
+          <div class="row meter-row">
+            <span class="meter-label">Visible Segments</span>
+            <span id="visible-segments-value" class="meter-value">-</span>
+          </div>
+          <div class="row meter-row">
+            <span class="meter-label">Parse / Prepare</span>
+            <span id="times-value" class="meter-value">-</span>
+          </div>
+          <div class="row meter-row">
+            <span class="meter-label">Zoom</span>
+            <span id="zoom-value" class="meter-value">-</span>
+          </div>
+          <div class="row meter-row">
+            <span class="meter-label">FPS</span>
+            <span id="fps-value" class="meter-value">-</span>
+          </div>
+          <div class="row meter-row">
+            <span class="meter-label">Draw calls / frame</span>
+            <span id="draw-calls-value" class="meter-value">-</span>
+          </div>
+          <div class="row meter-row">
+            <span class="meter-label">Draw</span>
+            <span id="draw-stats-value" class="meter-value">-</span>
+          </div>
+          <div class="row meter-row">
+            <span class="meter-label">Vector LOD</span>
+            <span id="lod-stats-value" class="meter-value">-</span>
+          </div>
+          <div class="row meter-row">
+            <span class="meter-label">Text LOD</span>
+            <span id="text-lod-stats-value" class="meter-value">-</span>
+          </div>
+          </div>
         </div>
-      </div>
-      <div class="number-row">
-        <label for="backend-select">Renderer Backend</label>
-        <select id="backend-select" aria-label="Renderer backend">
-          <option value="webgl" selected>WebGL</option>
-          <option value="webgpu">WebGPU</option>
-        </select>
-      </div>
-      <div class="number-row">
-        <label for="vector-lod-select">Vector LOD</label>
-        <select id="vector-lod-select" aria-label="Vector LOD mode">
-          <option value="auto" selected>Auto</option>
-          <option value="off">Off</option>
-          <option value="force">Force</option>
-        </select>
-      </div>
-      <div class="number-row">
-        <label for="minimum-stroke-width-input" title="Minimum vector stroke width in device pixels. 0 preserves source widths.">Minimum stroke width (px)</label>
-        <input id="minimum-stroke-width-input" type="number" min="0" step="any" value="0" autocomplete="off" />
-      </div>
-      <div class="number-row">
-        <label for="text-lod-select">Text LOD</label>
-        <select id="text-lod-select" aria-label="Text LOD mode">
-          <option value="auto" selected>Auto</option>
-          <option value="off">Off</option>
-        </select>
-      </div>
-      <div class="number-row number-row-color">
-        <label for="page-bg-color">Page Background</label>
-        <div class="color-controls">
-          <input id="page-bg-color" type="color" value="#ffffff" />
-          <input id="page-bg-opacity-slider" type="range" min="0" max="100" step="1" value="100" aria-label="Page Background Opacity Slider" />
-          <input id="page-bg-opacity" type="number" min="0" max="100" step="1" value="100" aria-label="Page Background Opacity" />
-          <span class="color-suffix">%</span>
-        </div>
-      </div>
-      <div class="number-row number-row-color">
-        <label for="vector-color">Vector Override</label>
-        <div class="color-controls">
-          <input id="vector-color" type="color" value="#000000" />
-          <input id="vector-opacity-slider" type="range" min="0" max="100" step="1" value="0" aria-label="Vector Override Opacity Slider" />
-          <input id="vector-opacity" type="number" min="0" max="100" step="1" value="0" aria-label="Vector Override Opacity" />
-          <span class="color-suffix">%</span>
-        </div>
-      </div>
-      <label class="toggle">
-        <input id="load-diagnostics-enabled" type="checkbox" />
-        <span>Record loading diagnostics</span>
-      </label>
-      <div class="row">
-        <button id="show-load-report" type="button" data-toolbar-icon="pages">Show load report</button>
-        <button id="copy-load-report" type="button" data-toolbar-icon="duplicate">Copy load report</button>
-      </div>
-      <div id="load-diagnostics-status" class="row" role="status"></div>
-      <textarea id="load-diagnostics-report" readonly hidden aria-label="Loading diagnostics report"></textarea>
-      <div id="status" class="row">Waiting for PDF or HEP source.</div>
-      <div id="parse-loader" class="row" hidden>
-        <span class="loader-spinner" aria-hidden="true"></span>
-        <span id="parse-loader-text">0.00% Parsing / loading...</span>
-      </div>
-      <div class="row meter-row">
-        <span class="meter-label">File</span>
-        <span id="file-value" class="meter-value">-</span>
-      </div>
-      <div class="row meter-row">
-        <span class="meter-label">Source Segments</span>
-        <span id="source-segments-value" class="meter-value">-</span>
-      </div>
-      <div class="row meter-row">
-        <span class="meter-label">Visible Segments</span>
-        <span id="visible-segments-value" class="meter-value">-</span>
-      </div>
-      <div class="row meter-row">
-        <span class="meter-label">Parse / Prepare</span>
-        <span id="times-value" class="meter-value">-</span>
-      </div>
-      <div class="row meter-row">
-        <span class="meter-label">Zoom</span>
-        <span id="zoom-value" class="meter-value">-</span>
-      </div>
-      <div class="row meter-row">
-        <span class="meter-label">FPS</span>
-        <span id="fps-value" class="meter-value">-</span>
-      </div>
-      <div class="row meter-row">
-        <span class="meter-label">Draw calls / frame</span>
-        <span id="draw-calls-value" class="meter-value">-</span>
-      </div>
-      <div class="row meter-row">
-        <span class="meter-label">Draw</span>
-        <span id="draw-stats-value" class="meter-value">-</span>
-      </div>
-      <div class="row meter-row">
-        <span class="meter-label">Vector LOD</span>
-        <span id="lod-stats-value" class="meter-value">-</span>
-      </div>
-      <div class="row meter-row">
-        <span class="meter-label">Text LOD</span>
-        <span id="text-lod-stats-value" class="meter-value">-</span>
-      </div>
       </div>
     </div>
-
     <div id="drop-indicator">Drop PDF or HEP file to render</div>
   </body>
 </html>
