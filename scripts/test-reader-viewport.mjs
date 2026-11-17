@@ -41,11 +41,12 @@ const hooks = registerHooks({
     return next(url, context);
   }
 });
+const { readerNavigationMarkup, readerToolbarRestoreMarkup } = await import("./lib/readerViewportMarkup.mjs");
 const previousObserver = globalThis.ResizeObserver;
 globalThis.ResizeObserver = class { observe() {} disconnect() {} };
 
 class Element {
-  children = []; parentElement = null;
+  children = []; parentElement = null; appendOperations = 0;
   style = { setProperty(name, value) { this[name] = String(value); }, getPropertyValue(name) { return this[name] ?? ""; }, removeProperty(name) { delete this[name]; } };
   dataset = {}; attributes = new Map(); listeners = new Map();
   className = ""; hidden = false; value = ""; disabled = false; textContent = ""; title = "";
@@ -62,6 +63,7 @@ class Element {
   getAttribute(name) { return this.attributes.get(name) ?? null; }
   removeAttribute(name) { this.attributes.delete(name); }
   append(...nodes) {
+    this.appendOperations++;
     for (const node of nodes) {
       if (node.tagName === "fragment") { this.append(...node.children.slice()); continue; }
       node.remove(); node.parentElement = this; this.children.push(node);
@@ -230,7 +232,10 @@ function environment(width = 700, height = 800, { browserScrollLimit = Infinity,
     querySelector: selector => document.body.querySelector(selector) });
   document.documentElement = new Element("html", document);
   document.body = new Element("body", document);
-  let canvas = document.createElement("canvas"); canvas.id = "viewport"; document.body.append(canvas);
+  const shell = document.createElement("div"); shell.className = "reader-shell";
+  shell.innerHTML = `<div id="reader-toolbar" class="reader-toolbar"><div class="reader-primary-controls"></div>${readerNavigationMarkup()}</div>${readerToolbarRestoreMarkup()}<div class="reader-workspace viewer-workspace"><aside class="reader-thumbnails" hidden></aside><div class="reader-scroll"><div class="reader-surface"></div></div></div>`;
+  document.body.append(shell);
+  let canvas = document.createElement("canvas"); canvas.id = "viewport"; shell.querySelector(".reader-surface").append(canvas);
   const views = [], requests = [];
   const env = { document, window, views, requests, frames, get canvas() { return canvas; },
     replaceCanvas() { const next = document.createElement("canvas"); next.id = "viewport"; canvas.remove(); canvas = next; return next; },
@@ -249,6 +254,24 @@ const tick = () => new Promise(resolve => setTimeout(resolve, 0));
 async function until(predicate) { for (let i = 0; i < 100; i++) { if (predicate()) return; await tick(); } assert.fail("Reader asynchronous work did not settle"); }
 function close(actual, expected, message) { assert(Math.abs(actual - expected) < 1e-7, `${message}: ${actual} != ${expected}`); }
 function deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; }
+
+function initialHtmlElements(html) {
+  const root = { children: [] }, stack = [root], elements = [];
+  const clean = html.replace(/<!--[\s\S]*?-->|<(?:style|script)\b[^>]*>[\s\S]*?<\/(?:style|script)>/gi, "");
+  for (const [markup, closing, tagName, attributes] of clean.matchAll(/<(\/)?([a-z][\w:-]*)\b([^>]*)>/gi)) {
+    const tag = tagName.toLowerCase();
+    if (closing) {
+      assert.equal(stack.at(-1).tag, tag, `initial HTML closes its ${tag} element`);
+      stack.pop(); continue;
+    }
+    const attrs = new Map([...attributes.matchAll(/([\w:-]+)(?:="([^"]*)")?/g)].map(([, key, value]) => [key, value ?? ""]));
+    const node = { tag, attrs, parent: stack.at(-1), children: [] };
+    node.parent.children.push(node); elements.push(node);
+    if (!/\/\s*>$/.test(markup) && !/^(?:area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/.test(tag)) stack.push(node);
+  }
+  assert.equal(stack.length, 1, "initial HTML has no unclosed layout elements");
+  return elements;
+}
 
 const editorUiSource = await readFile(new URL("../src/editorUi.ts", import.meta.url), "utf8");
 const editorWheelRegistration = editorUiSource.match(/^  overlay\.addEventListener\("wheel", forwardWheel, \{ passive: false \}\);$/m)?.[0];
@@ -287,6 +310,36 @@ try {
   const { READER_ACTUAL_SIZE_ZOOM, readerContentMetrics, readerViewFromScroll } = await import("../src/readerGeometry.ts");
   const { createViewerLinkNavigation, resolveAnnotationView } = await import("../src/viewerLinkNavigation.ts");
   const { createAnnotationInteractionController } = await import("../src/annotationInteraction.ts");
+  for (const [filename, settingsId] of [["index.html", "hud"], ["three-example.html", "panel"]]) {
+    const html = await readFile(new URL(`../${filename}`, import.meta.url), "utf8");
+    assert.match(html, /%HEPR_READER_NAVIGATION%/);
+    assert.match(html, /%HEPR_READER_TOOLBAR_RESTORE%/);
+    const elements = initialHtmlElements(html.replaceAll("%HEPR_READER_NAVIGATION%", readerNavigationMarkup())
+      .replaceAll("%HEPR_READER_TOOLBAR_RESTORE%", readerToolbarRestoreMarkup()));
+    const byId = id => elements.find(node => node.attrs.get("id") === id);
+    const byClass = name => elements.find(node => (node.attrs.get("class") ?? "").split(/\s+/).includes(name));
+    const ids = elements.map(node => node.attrs.get("id")).filter(Boolean);
+    assert.equal(new Set(ids).size, ids.length, `${filename} has one instance of each control in its initial HTML`);
+    const shell = byClass("reader-shell"), workspace = byClass("reader-workspace"), primary = byClass("reader-primary-controls");
+    assert.equal(shell.parent.tag, "body", `${filename} mounts the workspace before JavaScript runs`);
+    assert.equal(byId("reader-toolbar").parent, shell);
+    assert.equal(primary.parent, byId("reader-toolbar"));
+    assert.equal(workspace.parent, shell);
+    assert.equal(byClass("reader-thumbnails").parent, workspace);
+    assert.equal(byClass("reader-scroll").parent, workspace);
+    assert.equal(byClass("reader-surface").parent, byClass("reader-scroll"));
+    assert.equal(byId("viewport").parent, byClass("reader-surface"), `${filename} starts with its canvas in the final document area`);
+    assert.equal(byId(settingsId).parent, workspace, `${filename} starts with Settings docked beside the document`);
+    assert.equal(workspace.children.at(-1), byId(settingsId), `${filename} places Settings in the rightmost column`);
+    assert((byId(settingsId).attrs.get("class") ?? "").split(/\s+/).includes("viewer-settings"));
+    for (const id of ["open-file", "new-pdf", "editor-mode", "print-pdf", "example-dropdown"])
+      assert.equal(byId(id).parent, primary, `${filename} starts with ${id} in the persistent toolbar`);
+    for (const stylesheet of ["readerViewport.css", "viewerWorkspace.css", "toolbarIcons.css", ...(filename === "index.html" ? ["style.css"] : [])]) {
+      const link = elements.find(node => node.tag === "link" && node.attrs.get("href") === `/src/${stylesheet}`);
+      assert(link && link.attrs.get("rel") === "stylesheet" && link.parent.tag === "head", `${filename} loads ${stylesheet} before initial paint`);
+    }
+    assert.doesNotMatch(html, /startup-controls/, `${filename} has no legacy startup controls to move`);
+  }
   for (const width of [320, 1000]) {
     const css = await readFile(new URL("../src/readerViewport.css", import.meta.url), "utf8");
     assert.match(css, /\.hepr-editing\.reader-active \.reader-scroll\s*\{\s*margin-top:\s*var\(--hepr-editor-toolbar-inset, 0px\)/);
@@ -319,20 +372,28 @@ try {
   }
   for (const width of [320, 1000]) for (const settingsId of ["hud", "panel"]) {
     const env = environment(width), doc = env.document;
-    const settings = doc.createElement("aside"); settings.id = settingsId; settings.classList.add("collapsed");
-    const startup = doc.createElement("div"); startup.className = "startup-controls";
+    const settings = doc.createElement("aside"); settings.id = settingsId; settings.className = "viewer-settings collapsed";
+    const shell = doc.querySelector(".reader-shell"), workspace = doc.querySelector(".reader-workspace");
+    workspace.append(settings);
+    const primary = doc.querySelector(".reader-primary-controls");
     const open = doc.createElement("button"); open.id = "open-file";
     const create = doc.createElement("button"); create.id = "new-pdf";
     const examples = doc.createElement("div"); examples.id = "example-dropdown";
-    startup.append(open, create, examples); settings.append(startup); doc.body.append(settings);
+    primary.append(open, create, examples);
     let creations = 0; create.addEventListener("click", () => creations++);
     env.options.settingsPanel = settings;
-    const reader = createReaderViewport(env.options), primary = doc.querySelector(".reader-primary-controls");
-    assert(doc.body.classList.contains("has-reader-toolbar"));
-    assert.deepEqual(primary.children.map(node => node.id), ["open-file", "new-pdf", "example-dropdown"], "New PDF moves beside Open before the startup controls are hidden");
-    assert.equal(doc.querySelector("#new-pdf"), create, "toolbar mounting retains the original button and its handlers");
+    const structure = [doc.body, shell, workspace, primary, settings, doc.querySelector(".reader-surface")]
+      .map(node => ({ node, parent: node.parentElement, children: node.children.slice(), appends: node.appendOperations }));
+    const reader = createReaderViewport(env.options);
+    for (const { node, parent, children, appends } of structure) {
+      assert.equal(node.parentElement, parent, "Reader initialization retains the initial parent of each workspace element");
+      assert.deepEqual(node.children, children, "Reader initialization preserves the initial workspace and controls");
+      assert.equal(node.appendOperations, appends, "Reader initialization does not reappend Settings, toolbar controls or canvas");
+    }
+    assert.deepEqual(primary.children.map(node => node.id), ["open-file", "new-pdf", "example-dropdown"], "New PDF is beside Open from the initial HTML");
+    assert.equal(doc.querySelector("#new-pdf"), create, "Reader binding retains the original button and its handlers");
     assert.equal(doc.body.descendants().filter(node => node.id === "new-pdf").length, 1, "New PDF has one live button");
-    assert(!create.closest(".startup-controls") && !create.closest(".viewer-settings"), "New PDF stays outside hidden startup controls and closed Settings");
+    assert(!create.closest(".viewer-settings"), "New PDF stays outside closed Settings");
     assert(!doc.querySelector(".reader-toolbar").hidden, "creation is available before opening a document");
     create.emit("click"); assert.equal(creations, 1);
     reader.setDocument({ identity: "creation-toolbar", pageRects: pageRects(2) });
@@ -349,8 +410,8 @@ try {
   }
   for (const width of [320, 700, 1000]) {
     const env = environment(width), doc = env.document;
-    const settings = doc.createElement("aside"); settings.id = "hud";
-    const field = doc.createElement("input"); settings.append(field); doc.body.append(settings);
+    const settings = doc.createElement("aside"); settings.id = "hud"; settings.className = "viewer-settings";
+    const field = doc.createElement("input"); settings.append(field); doc.querySelector(".reader-workspace").append(settings);
     let changes = 0; field.addEventListener("change", () => changes++);
     env.options.settingsPanel = settings;
     env.options.onSettings = () => { settings.classList.toggle("collapsed"); reader.settingsChanged(); };
@@ -358,7 +419,7 @@ try {
     const scroller = doc.querySelector(".reader-scroll"), settingsButton = doc.querySelector('[data-reader="settings"]');
     assert.equal(settings.parentElement, workspace, "Settings is a workspace column, beside the document scroller");
     assert.equal(workspace.children.at(-1), settings, "Settings is the rightmost column");
-    assert.equal(settings.querySelector("input"), field, "docking retains the existing controls and handlers");
+    assert.equal(settings.querySelector("input"), field, "Reader binding retains the initial settings controls and handlers");
     field.emit("change"); assert.equal(changes, 1);
     assert.equal(settingsButton.getAttribute("aria-controls"), "hud");
     assert.equal(settingsButton.getAttribute("aria-expanded"), "true");

@@ -1,13 +1,9 @@
-import "./readerViewport.css";
-import "./viewerWorkspace.css";
-import "./toolbarIcons.css";
 import { WebGlPdfRenderer } from "./webGlPdfRenderer";
 import type { RendererApi } from "./rendererTypes";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { RetainedPageReplay } from "./retainedPageReplay";
 import { createDefaultOptionalContentSnapshot } from "./optionalContent";
 import type { ThumbnailPixels } from "./thumbnailTypes";
-import { toolbarButton } from "./toolbarIcons";
 import {
   READER_ACTUAL_SIZE_ZOOM, READER_MARGIN, readerCaptureAnchor, readerContentMetrics,
   readerFitZoom, readerPageAtPoint, readerRestoreAnchor, readerScrollFromView,
@@ -43,33 +39,9 @@ const READER_SCROLL_SURFACE_SIZE = 1_000_000;
 export function createReaderViewport(options: ReaderViewportOptions) {
   const document = options.getCanvas().ownerDocument, window = document.defaultView!;
   const lifetime = new AbortController();
-  const shell = document.createElement("div");
-  shell.className = "reader-shell";
-  shell.innerHTML = `<div id="reader-toolbar" class="reader-toolbar" role="toolbar" aria-label="Document controls">
-    <div class="reader-primary-controls"></div>
-    <label class="reader-layout-label">Layout <select class="reader-layout" aria-label="Page layout"></select></label>
-    <div class="reader-reading-controls">
-      ${toolbarButton("thumbnails", "Toggle page thumbnails", 'data-reader="thumbnails" aria-expanded="false"')}
-      ${toolbarButton("previous", "Previous page", 'data-reader="previous"')}
-      <input class="reader-page-number" type="number" min="1" value="1" aria-label="Page number" />
-      <span class="reader-page-count">/ 0</span>
-      ${toolbarButton("next", "Next page", 'data-reader="next"')}
-      ${toolbarButton("zoom-out", "Zoom out", 'data-reader="zoom-out"')}
-      <input class="reader-zoom" type="text" inputmode="decimal" value="100%" aria-label="Zoom percentage" />
-      ${toolbarButton("zoom-in", "Zoom in", 'data-reader="zoom-in"')}
-      ${toolbarButton("fit-width", "Fit Width", 'data-reader="fit-width"')}
-      ${toolbarButton("fit-page", "Fit Page", 'data-reader="fit-page"')}
-    </div>
-    ${toolbarButton("find", "Find text in the document (Ctrl/Cmd+F)", 'data-reader="find"')}
-    ${toolbarButton("settings", "Settings", 'data-reader="settings"')}
-    ${toolbarButton("hide-toolbar", "Hide toolbar", 'data-reader="hide-toolbar" aria-controls="reader-toolbar" aria-expanded="true"')}
-    <span class="reader-announcement" role="status" aria-live="polite"></span>
-  </div>${toolbarButton("show-toolbar", "Show toolbar", 'data-reader="show-toolbar" aria-controls="reader-toolbar" aria-expanded="false" hidden', "reader-toolbar-restore")}<div class="reader-workspace viewer-workspace">
-    <aside class="reader-thumbnails" aria-label="Page thumbnails" hidden></aside>
-    <div class="reader-scroll" tabindex="0" role="region" aria-label="Document pages">
-      <div class="reader-surface"></div>
-    </div>
-  </div>`;
+  const initialShell = document.querySelector<HTMLDivElement>(".reader-shell");
+  if (!initialShell) throw new Error("Reader workspace is missing from the page.");
+  const shell = initialShell;
   const query = <T extends HTMLElement>(selector: string): T => shell.querySelector<T>(selector)!;
   const toolbar = query<HTMLDivElement>(".reader-toolbar");
   const hideToolbar = query<HTMLButtonElement>('[data-reader="hide-toolbar"]');
@@ -90,20 +62,10 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     const option = document.createElement("option"); option.value = layout.value; option.textContent = layout.label;
     layoutSelect.append(option);
   }
-  // Move controls rather than duplicate IDs or attach a second set of handlers.
-  const primary = query<HTMLDivElement>(".reader-primary-controls");
-  for (const selector of [".package-version", "#open-file", "#new-pdf", "#example-dropdown"]) {
-    const element = document.querySelector<HTMLElement>(selector);
-    if (element) primary.append(element);
-  }
   if (options.settingsPanel) {
-    options.settingsPanel.classList.add("viewer-settings");
-    query<HTMLElement>(".reader-workspace").append(options.settingsPanel);
     if (options.settingsPanel.id) settingsButton.setAttribute("aria-controls", options.settingsPanel.id);
     settingsButton.setAttribute("aria-expanded", String(!options.settingsPanel.classList.contains("collapsed")));
   }
-  document.body.append(shell);
-  document.body.classList.add("has-reader-toolbar");
   let attachedCanvas: HTMLCanvasElement | null = null;
   let canvasLifetime: AbortController | null = null;
   let identity: unknown, rects: Float32Array = new Float32Array(0), active = false, disposed = false;
@@ -478,7 +440,8 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   }
   function canvasChanged(): void {
     cancelActiveGesture(); canvasLifetime?.abort();
-    attachedCanvas = options.getCanvas(); surface.append(attachedCanvas);
+    attachedCanvas = options.getCanvas();
+    if (attachedCanvas.parentElement !== surface) surface.append(attachedCanvas);
     canvasLifetime = new AbortController();
     const signal = canvasLifetime.signal;
     attachedCanvas.addEventListener("wheel", event => {

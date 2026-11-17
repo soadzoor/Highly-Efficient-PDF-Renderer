@@ -4,7 +4,6 @@ import { createViewerLinkNavigation } from "./viewerLinkNavigation";
 import { createAnnotationOverlay, isLinkAnnotation } from "./annotationOverlay";
 import { createAnnotationInteractionController, type AnnotationInteractionController } from "./annotationInteraction";
 import { createNativeAnnotationInteractionAdapter } from "./nativeAnnotationInteraction";
-import "./style.css";
 import "./drawingSelectionControls.css";
 import "./pdfLayerControls.css";
 import "./pdfPasswordPrompt.css";
@@ -713,7 +712,6 @@ readerViewport = createReaderViewport({
   onFind: () => { setHudCollapsed(false); textSearchWidget.focusInput(); },
   onSettings: () => setHudCollapsed(!hudPanelElement.classList.contains("collapsed"))
 });
-document.querySelector(".reader-primary-controls")?.append(editorModeButton, printPdfButton);
 const recognitionControls = createViewerTextRecognitionControls({
   onSettingsChange(setting) {
     nativeTextRecognition?.configure(nativeRecognitionSettings(setting));

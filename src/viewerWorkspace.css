@@ -9,8 +9,8 @@
 .viewer-workspace-root { position: absolute; inset: 0; }
 .viewer-document { position: relative; flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
 
-/* Keep the existing panel nodes and controls, but give Settings its own column.
-   ID specificity overrides the standalone demos' original floating panels. */
+/* Settings shares a workspace row with the document. ID specificity keeps
+   docking consistent with each demo's panel theme. */
 .viewer-workspace > #hud.viewer-settings,
 .viewer-workspace > #panel.viewer-settings {
   position: relative;

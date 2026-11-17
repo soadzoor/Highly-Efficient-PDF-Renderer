@@ -29,19 +29,6 @@ body {
   cursor: grabbing;
 }
 
-.panel {
-  position: fixed;
-  left: 16px;
-  top: 16px;
-  width: min(560px, calc(100vw - 32px));
-  background: rgba(250, 251, 252, 0.9);
-  border: 1px solid rgba(15, 23, 42, 0.16);
-  border-radius: 10px;
-  padding: 12px 14px;
-  backdrop-filter: blur(6px);
-  box-shadow: 0 8px 22px rgba(15, 23, 42, 0.12);
-}
-
 .panel-header {
   display: flex;
   align-items: center;
@@ -55,17 +42,11 @@ body {
 }
 
 #hud {
-  max-height: calc(100vh - 50px);
-  overflow-y: auto;
-  z-index: 20;
+  padding: 12px 14px;
 }
 
 .panel-content {
   margin-top: 8px;
-}
-
-.panel.collapsed {
-  display: none;
 }
 
 .toolbar {
@@ -76,10 +57,6 @@ body {
 }
 
 .toolbar button[hidden] {
-  display: none;
-}
-
-.has-reader-toolbar .startup-controls {
   display: none;
 }
 

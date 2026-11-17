@@ -5,21 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Highly Efficient PDF Renderer</title>
     <link rel="stylesheet" href="/src/package-version.css" />
+    <link rel="stylesheet" href="/src/style.css" />
+    <link rel="stylesheet" href="/src/readerViewport.css" />
+    <link rel="stylesheet" href="/src/viewerWorkspace.css" />
+    <link rel="stylesheet" href="/src/toolbarIcons.css" />
   </head>
   <body>
-    <canvas id="viewport"></canvas>
-    <div id="hud" class="panel">
-      <div class="panel-header">
-        <h2 class="panel-title">Settings</h2>
-        <button id="toggle-hud" class="settings-close" type="button" data-toolbar-icon="close" aria-expanded="true" aria-controls="hud-content" aria-label="Close settings" title="Close settings">Close settings</button>
-      </div>
-      <div id="hud-content" class="panel-content">
-        <div class="toolbar startup-controls">
+    <div class="reader-shell">
+      <div id="reader-toolbar" class="reader-toolbar" role="toolbar" aria-label="Document controls">
+        <div class="reader-primary-controls">
           <a class="package-version" href="https://www.npmjs.com/package/@soadzoor/hepr" target="_blank" rel="noopener noreferrer" title="HEPR package version used by this build">npm v%HEPR_PACKAGE_VERSION%</a>
           <button id="open-file" type="button" data-toolbar-icon="open" title="Open a PDF or HEPR-exported .hep file">Open PDF / HEP</button>
           <button id="new-pdf" type="button" data-toolbar-icon="pages" title="Create a new PDF">New PDF</button>
-          <button id="editor-mode" type="button" data-toolbar-icon="edit" aria-pressed="false" title="Enter PDF editing mode">Edit PDF</button>
-          <button id="print-pdf" type="button" data-toolbar-icon="print" title="Print the current document" disabled>Print</button>
           <div id="example-dropdown" class="example-dropdown">
             <button id="example-select" class="example-trigger" type="button" title="Load example PDF or HEP file" aria-label="Load example PDF or HEP file" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
               <span id="example-select-label" class="example-trigger-label">Examples (loading...)</span>
@@ -27,115 +24,135 @@
             </button>
             <div id="example-menu" class="example-menu" hidden></div>
           </div>
+          <button id="editor-mode" type="button" data-toolbar-icon="edit" aria-pressed="false" title="Enter PDF editing mode">Edit PDF</button>
+          <button id="print-pdf" type="button" data-toolbar-icon="print" title="Print the current document" disabled>Print</button>
         </div>
-        <input id="file-input" type="file" accept=".pdf,.hep,application/pdf,application/x-hep" hidden />
-        <div class="toolbar settings-downloads">
-          <button id="download-data" type="button" data-toolbar-icon="download-hep" hidden disabled>Download HEP</button>
-          <button id="download-pdf" type="button" data-toolbar-icon="download-pdf" hidden disabled>Download PDF</button>
-          <button id="download-all-data" type="button" data-toolbar-icon="download-all" hidden disabled>Download All Example HEP Files</button>
-        </div>
-        <div class="number-row search-row">
-          <label for="text-search-input">Find Text</label>
-          <div class="search-controls">
-            <input id="text-search-input" type="search" placeholder="Load a document to search" autocomplete="off" spellcheck="false" disabled />
-            <span id="text-search-count" class="search-count" hidden>0/0</span>
-            <button id="text-search-prev" type="button" data-toolbar-icon="search-previous" class="search-nav" title="Previous match (Shift+Enter)" aria-label="Previous match (Shift+Enter)" disabled>▲</button>
-            <button id="text-search-next" type="button" data-toolbar-icon="search-next" class="search-nav" title="Next match (Enter)" aria-label="Next match (Enter)" disabled>▼</button>
-            <button id="text-search-case" type="button" data-toolbar-icon="match-case" class="search-case" title="Match case" aria-label="Match case" aria-pressed="false" disabled>Aa</button>
+        %HEPR_READER_NAVIGATION%
+      </div>
+      %HEPR_READER_TOOLBAR_RESTORE%
+      <div class="reader-workspace viewer-workspace">
+        <aside class="reader-thumbnails" aria-label="Page thumbnails" hidden></aside>
+        <div class="reader-scroll" tabindex="0" role="region" aria-label="Document pages">
+          <div class="reader-surface">
+            <canvas id="viewport"></canvas>
           </div>
         </div>
-        <div class="number-row">
-          <label for="text-selection-checkbox">Text Selection</label>
-          <input id="text-selection-checkbox" type="checkbox" checked />
-        </div>
-        <div id="text-recognition-controls" class="viewer-text-recognition-native"></div>
-        <div class="number-row" title="PDF only. Reconstruct stored text with substitute fonts; omit pictures and diagrams. Pages without stored text are blank.">
-          <label for="ocr-text-checkbox">Use OCR text instead of scans</label>
-          <input id="ocr-text-checkbox" type="checkbox" />
-        </div>
-        <div class="number-row" title="PDF only. Show large documents progressively as you navigate. Off loads all page overviews before display; scan detail still loads on zoom.">
-          <label for="page-streaming-checkbox">Stream pages</label>
-          <input id="page-streaming-checkbox" type="checkbox" />
-        </div>
-        <div class="number-row" title="PDF only. Load every selected page and prepare scan textures during parsing for faster zoom refinement. Uses more loading time and CPU memory. Overrides page streaming; packed monochrome scans remain lossless, while color and grayscale compression may soften fine text.">
-          <label for="compress-scans-checkbox">GPU compress scans</label>
-          <input id="compress-scans-checkbox" type="checkbox" checked />
-        </div>
-        <div class="number-row">
-          <label for="annotation-bubbles-checkbox">Annotation bubbles</label>
-          <input id="annotation-bubbles-checkbox" type="checkbox" checked />
-        </div>
-        <div id="drawing-selection"></div>
-        <div id="pdf-layers"></div>
-        <div id="pdf-annotations"></div>
-        <div class="number-row">
-          <label for="backend-select">Renderer Backend</label>
-          <select id="backend-select">
-            <option value="webgl" selected>WebGL</option>
-            <option value="webgpu">WebGPU</option>
-          </select>
-        </div>
-        <div class="number-row">
-          <label for="vector-lod-mode">Vector LOD</label>
-          <select id="vector-lod-mode">
-            <option value="auto" selected>Auto</option>
-            <option value="off">Off</option>
-            <option value="force">Force</option>
-          </select>
-        </div>
-        <div class="number-row">
-          <label for="minimum-stroke-width-input" title="Minimum vector stroke width in device pixels. 0 preserves source widths.">Minimum stroke width (px)</label>
-          <input id="minimum-stroke-width-input" type="number" min="0" step="any" value="0" autocomplete="off" />
-        </div>
-        <div class="number-row">
-          <label for="text-lod-mode">Text LOD</label>
-          <select id="text-lod-mode">
-            <option value="auto" selected>Auto</option>
-            <option value="off">Off</option>
-          </select>
-        </div>
-        <div class="number-row number-row-color">
-          <label for="page-bg-color">Page Background</label>
-          <div class="color-controls">
-            <input id="page-bg-color" type="color" value="#ffffff" />
-            <label for="page-bg-opacity-slider" class="sr-only">Page Background Opacity Slider</label>
-            <input id="page-bg-opacity-slider" type="range" min="0" max="100" step="1" value="100" />
-            <label for="page-bg-opacity" class="sr-only">Page Background Opacity</label>
-            <input id="page-bg-opacity" type="number" min="0" max="100" step="1" value="100" />
-            <span class="color-suffix">%</span>
+        <div id="hud" class="viewer-settings">
+          <div class="panel-header">
+            <h2 class="panel-title">Settings</h2>
+            <button id="toggle-hud" class="settings-close" type="button" data-toolbar-icon="close" aria-expanded="true" aria-controls="hud-content" aria-label="Close settings" title="Close settings">Close settings</button>
+          </div>
+          <div id="hud-content" class="panel-content">
+            <input id="file-input" type="file" accept=".pdf,.hep,application/pdf,application/x-hep" hidden />
+            <div class="toolbar settings-downloads">
+              <button id="download-data" type="button" data-toolbar-icon="download-hep" hidden disabled>Download HEP</button>
+              <button id="download-pdf" type="button" data-toolbar-icon="download-pdf" hidden disabled>Download PDF</button>
+              <button id="download-all-data" type="button" data-toolbar-icon="download-all" hidden disabled>Download All Example HEP Files</button>
+            </div>
+            <div class="number-row search-row">
+              <label for="text-search-input">Find Text</label>
+              <div class="search-controls">
+                <input id="text-search-input" type="search" placeholder="Load a document to search" autocomplete="off" spellcheck="false" disabled />
+                <span id="text-search-count" class="search-count" hidden>0/0</span>
+                <button id="text-search-prev" type="button" data-toolbar-icon="search-previous" class="search-nav" title="Previous match (Shift+Enter)" aria-label="Previous match (Shift+Enter)" disabled>▲</button>
+                <button id="text-search-next" type="button" data-toolbar-icon="search-next" class="search-nav" title="Next match (Enter)" aria-label="Next match (Enter)" disabled>▼</button>
+                <button id="text-search-case" type="button" data-toolbar-icon="match-case" class="search-case" title="Match case" aria-label="Match case" aria-pressed="false" disabled>Aa</button>
+              </div>
+            </div>
+            <div class="number-row">
+              <label for="text-selection-checkbox">Text Selection</label>
+              <input id="text-selection-checkbox" type="checkbox" checked />
+            </div>
+            <div id="text-recognition-controls" class="viewer-text-recognition-native"></div>
+            <div class="number-row" title="PDF only. Reconstruct stored text with substitute fonts; omit pictures and diagrams. Pages without stored text are blank.">
+              <label for="ocr-text-checkbox">Use OCR text instead of scans</label>
+              <input id="ocr-text-checkbox" type="checkbox" />
+            </div>
+            <div class="number-row" title="PDF only. Show large documents progressively as you navigate. Off loads all page overviews before display; scan detail still loads on zoom.">
+              <label for="page-streaming-checkbox">Stream pages</label>
+              <input id="page-streaming-checkbox" type="checkbox" />
+            </div>
+            <div class="number-row" title="PDF only. Load every selected page and prepare scan textures during parsing for faster zoom refinement. Uses more loading time and CPU memory. Overrides page streaming; packed monochrome scans remain lossless, while color and grayscale compression may soften fine text.">
+              <label for="compress-scans-checkbox">GPU compress scans</label>
+              <input id="compress-scans-checkbox" type="checkbox" checked />
+            </div>
+            <div class="number-row">
+              <label for="annotation-bubbles-checkbox">Annotation bubbles</label>
+              <input id="annotation-bubbles-checkbox" type="checkbox" checked />
+            </div>
+            <div id="drawing-selection"></div>
+            <div id="pdf-layers"></div>
+            <div id="pdf-annotations"></div>
+            <div class="number-row">
+              <label for="backend-select">Renderer Backend</label>
+              <select id="backend-select">
+                <option value="webgl" selected>WebGL</option>
+                <option value="webgpu">WebGPU</option>
+              </select>
+            </div>
+            <div class="number-row">
+              <label for="vector-lod-mode">Vector LOD</label>
+              <select id="vector-lod-mode">
+                <option value="auto" selected>Auto</option>
+                <option value="off">Off</option>
+                <option value="force">Force</option>
+              </select>
+            </div>
+            <div class="number-row">
+              <label for="minimum-stroke-width-input" title="Minimum vector stroke width in device pixels. 0 preserves source widths.">Minimum stroke width (px)</label>
+              <input id="minimum-stroke-width-input" type="number" min="0" step="any" value="0" autocomplete="off" />
+            </div>
+            <div class="number-row">
+              <label for="text-lod-mode">Text LOD</label>
+              <select id="text-lod-mode">
+                <option value="auto" selected>Auto</option>
+                <option value="off">Off</option>
+              </select>
+            </div>
+            <div class="number-row number-row-color">
+              <label for="page-bg-color">Page Background</label>
+              <div class="color-controls">
+                <input id="page-bg-color" type="color" value="#ffffff" />
+                <label for="page-bg-opacity-slider" class="sr-only">Page Background Opacity Slider</label>
+                <input id="page-bg-opacity-slider" type="range" min="0" max="100" step="1" value="100" />
+                <label for="page-bg-opacity" class="sr-only">Page Background Opacity</label>
+                <input id="page-bg-opacity" type="number" min="0" max="100" step="1" value="100" />
+                <span class="color-suffix">%</span>
+              </div>
+            </div>
+            <div class="number-row number-row-color">
+              <label for="vector-color">Vector Override</label>
+              <div class="color-controls">
+                <input id="vector-color" type="color" value="#000000" />
+                <label for="vector-opacity-slider" class="sr-only">Vector Override Opacity Slider</label>
+                <input id="vector-opacity-slider" type="range" min="0" max="100" step="1" value="0" />
+                <label for="vector-opacity" class="sr-only">Vector Override Opacity</label>
+                <input id="vector-opacity" type="number" min="0" max="100" step="1" value="0" />
+                <span class="color-suffix">%</span>
+              </div>
+            </div>
+            <div id="status" class="status">Waiting for PDF or HEP file...</div>
+            <div id="parse-loader" class="parse-loader" hidden>
+              <span class="loader-spinner" aria-hidden="true"></span>
+              <span id="parse-loader-text">0.00% Parsing / loading...</span>
+            </div>
+            <div id="runtime" class="runtime"></div>
+            <div id="metrics" class="metrics">
+              <div class="metric-row"><span class="metric-label">File</span><span id="metric-file" class="metric-value">-</span></div>
+              <div class="metric-row"><span class="metric-label">Source Segments</span><span id="metric-source-segments" class="metric-value">-</span></div>
+              <div class="metric-row"><span class="metric-label">Merged Segments</span><span id="metric-merged-segments" class="metric-value">-</span></div>
+              <div class="metric-row"><span class="metric-label">Emitted Vector Segments</span><span id="metric-visible-segments" class="metric-value">-</span></div>
+              <div class="metric-row"><span class="metric-label">Stroke Accounting</span><span id="metric-reductions" class="metric-value">-</span></div>
+              <div class="metric-row"><span class="metric-label">Cull Discards</span><span id="metric-cull-discards" class="metric-value">-</span></div>
+              <div class="metric-row"><span class="metric-label">Parse / Upload</span><span id="metric-times" class="metric-value">-</span></div>
+              <div class="metric-row"><span class="metric-label">FPS</span><span id="metric-fps" class="metric-value">-</span></div>
+              <div class="metric-row"><span class="metric-label">Draw calls / frame</span><span id="metric-draw-calls" class="metric-value">-</span></div>
+              <div class="metric-row"><span class="metric-label">Texture</span><span id="metric-texture" class="metric-value">-</span></div>
+              <div class="metric-row"><span class="metric-label">Grid Max Cell</span><span id="metric-grid-max-cell" class="metric-value">-</span></div>
+            </div>
+            <div class="help">Reader: scroll through pages; Ctrl/Cmd + wheel or pinch to zoom. Grid: drag to pan, wheel or pinch to zoom. Drag-and-drop a PDF or HEP file to open it.</div>
           </div>
         </div>
-        <div class="number-row number-row-color">
-          <label for="vector-color">Vector Override</label>
-          <div class="color-controls">
-            <input id="vector-color" type="color" value="#000000" />
-            <label for="vector-opacity-slider" class="sr-only">Vector Override Opacity Slider</label>
-            <input id="vector-opacity-slider" type="range" min="0" max="100" step="1" value="0" />
-            <label for="vector-opacity" class="sr-only">Vector Override Opacity</label>
-            <input id="vector-opacity" type="number" min="0" max="100" step="1" value="0" />
-            <span class="color-suffix">%</span>
-          </div>
-        </div>
-        <div id="status" class="status">Waiting for PDF or HEP file...</div>
-        <div id="parse-loader" class="parse-loader" hidden>
-          <span class="loader-spinner" aria-hidden="true"></span>
-          <span id="parse-loader-text">0.00% Parsing / loading...</span>
-        </div>
-        <div id="runtime" class="runtime"></div>
-        <div id="metrics" class="metrics">
-          <div class="metric-row"><span class="metric-label">File</span><span id="metric-file" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Source Segments</span><span id="metric-source-segments" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Merged Segments</span><span id="metric-merged-segments" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Emitted Vector Segments</span><span id="metric-visible-segments" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Stroke Accounting</span><span id="metric-reductions" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Cull Discards</span><span id="metric-cull-discards" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Parse / Upload</span><span id="metric-times" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">FPS</span><span id="metric-fps" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Draw calls / frame</span><span id="metric-draw-calls" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Texture</span><span id="metric-texture" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Grid Max Cell</span><span id="metric-grid-max-cell" class="metric-value">-</span></div>
-        </div>
-        <div class="help">Reader: scroll through pages; Ctrl/Cmd + wheel or pinch to zoom. Grid: drag to pan, wheel or pinch to zoom. Drag-and-drop a PDF or HEP file to open it.</div>
       </div>
     </div>
     <div id="drop-indicator" class="drop-indicator">Drop PDF or HEP file to render</div>

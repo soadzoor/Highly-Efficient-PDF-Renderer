@@ -173,10 +173,9 @@ try {
   assert.equal(three.getThreePrintDocument().scene, threeObject.sceneData, "a PDF without retained source bytes can still print its loaded scene");
   threeObject.sourceLabel = ""; assert.equal(three.getThreePrintDocument().label, "document");
 
-  for (const [stockSource, html] of [[nativeSource, nativeHtml], [threeSource, threeHtml]]) {
-    assert.match(html, /<button\b[^>]*id="print-pdf"[^>]*>Print<\/button>/);
-    assert.match(stockSource, /document\.querySelector\("\.reader-primary-controls"\)\?\.append\(editorModeButton,\s*printPdfButton\)/,
-      "Print is attached to the persistent Reader toolbar alongside Edit");
+  for (const html of [nativeHtml, threeHtml]) {
+    assert.match(html, /<div class="reader-primary-controls">[\s\S]*?<button\b[^>]*id="editor-mode"[^>]*>Edit PDF<\/button>\s*<button\b[^>]*id="print-pdf"[^>]*>Print<\/button>\s*<\/div>\s*%HEPR_READER_NAVIGATION%/,
+      "Print starts in the persistent Reader toolbar alongside Edit before JavaScript runs");
   }
   // The controller's initial refresh immediately reads getDocument/isBusy.
   // Each captured stock binding must already have left its temporal dead zone.

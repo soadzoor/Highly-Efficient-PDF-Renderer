@@ -6,6 +6,13 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Fixed
+
+- Render Settings in its right-hand dock from the initial page load in both
+  viewers, removing the obsolete floating layout and startup relocation of the
+  panel and toolbar controls. Include shared navigation markup and layout styles
+  in the initial HTML so the old left-hand panel no longer flashes during loading.
+
 ## [0.2.2] - 2026-11-06
 
 ### Changed

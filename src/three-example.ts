@@ -587,7 +587,6 @@ async function getThreeReaderPageThumbnail(pageIndex: number, options: { maxDime
     }
   }
 }
-document.querySelector(".reader-primary-controls")?.append(editorModeButton, printPdfButton);
 viewerPrintAction = createViewerPrintAction({ button: printPdfButton, document,
   getDocument: getThreePrintDocument,
   isBusy: () => sourceLoadController !== null || editorInitialization !== null || editorSceneApplicationActive ||

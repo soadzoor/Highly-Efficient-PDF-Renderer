@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { defineConfig } from "vite";
 import { shaderCommentCompactionPlugin } from "./scripts/lib/compactShaderComments.mjs";
+import { readerNavigationMarkup, readerToolbarRestoreMarkup } from "./scripts/lib/readerViewportMarkup.mjs";
 
 export default defineConfig(({ mode }) => {
   const sourceDir = `${resolve(import.meta.dirname, "src")}/`;
@@ -43,9 +44,14 @@ export default defineConfig(({ mode }) => {
     // The viewer supplies an exact-version WASM URL after local-OCR consent.
     resolve: { conditions: ["onnxruntime-web-use-extern-wasm"] },
     plugins: [shaderCommentCompactionPlugin(sourceDir), {
-      name: "package-version-label",
-      transformIndexHtml(html) {
-        return html.replaceAll("%HEPR_PACKAGE_VERSION%", version);
+      name: "viewer-html",
+      transformIndexHtml: {
+        order: "pre",
+        handler(html) {
+          return html.replaceAll("%HEPR_PACKAGE_VERSION%", version)
+            .replaceAll("%HEPR_READER_NAVIGATION%", readerNavigationMarkup())
+            .replaceAll("%HEPR_READER_TOOLBAR_RESTORE%", readerToolbarRestoreMarkup());
+        }
       }
     }],
     worker: { format: "es", plugins: () => [shaderCommentCompactionPlugin(sourceDir)] },
